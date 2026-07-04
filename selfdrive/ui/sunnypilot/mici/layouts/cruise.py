@@ -16,6 +16,7 @@ from openpilot.system.ui.lib.multilang import tr
 from openpilot.system.ui.widgets.scroller import NavScroller
 from openpilot.selfdrive.ui.ui_state import ui_state
 from openpilot.system.ui.lib.application import gui_app
+from openpilot.sunnypilot.selfdrive.car.intelligent_cruise_button_management.controller import DECEL_OVERSHOOT_PARAMS
 
 SL_MODE_LABELS = [tr("off"), tr("info"), tr("warn"), tr("assist")]
 SL_SOURCE_LABELS = [tr("car"), tr("map"), tr("car-first"), tr("map-first"), tr("combined")]
@@ -55,12 +56,14 @@ class CruiseLayoutMici(NavScroller):
     self._prev_icbm_available: bool | None = None
     self._prev_has_long_or_icbm: bool | None = None
     self._prev_sla_available: bool | None = None
+    self._prev_overshoot_available: bool | None = None
 
     # --- Main view items ---
     self._icbm_toggle = BigParamControl(tr("intelligent cruise button management"), "IntelligentCruiseButtonManagement")
     self._dec_toggle = BigParamControl(tr("dynamic experimental control"), "DynamicExperimentalControl")
     self._scc_v_toggle = BigParamControl(tr("smart cruise vision"), "SmartCruiseControlVision")
     self._scc_m_toggle = BigParamControl(tr("smart cruise map"), "SmartCruiseControlMap")
+    self._scc_do_toggle = BigParamControl(tr("decel overshoot"), "SmartCruiseDecelOvershoot")
     self._custom_acc_btn = BigButtonSP(tr("custom increments"))
     self._speed_limit_btn = BigButtonSP(tr("speed limit"))
 
@@ -69,7 +72,7 @@ class CruiseLayoutMici(NavScroller):
 
     self._scroller.add_widgets([
       self._icbm_toggle, self._dec_toggle,
-      self._scc_v_toggle, self._scc_m_toggle,
+      self._scc_v_toggle, self._scc_m_toggle, self._scc_do_toggle,
       self._custom_acc_btn, self._speed_limit_btn,
     ])
 
@@ -101,6 +104,7 @@ class CruiseLayoutMici(NavScroller):
     self._dec_toggle.refresh()
     self._scc_v_toggle.refresh()
     self._scc_m_toggle.refresh()
+    self._scc_do_toggle.refresh()
 
     cp_ready = ui_state.CP is not None and ui_state.CP_SP is not None
     has_long = cp_ready and ui_state.has_longitudinal_control
@@ -108,17 +112,24 @@ class CruiseLayoutMici(NavScroller):
     icbm_available = cp_ready and ui_state.CP_SP.intelligentCruiseButtonManagementAvailable and not has_long
     # Compute from toggle state directly — avoids 5s update_params delay
     has_icbm = icbm_available and self._icbm_toggle._checked
+    # decel overshoot drives the stock ACC through ICBM; needs a measured per-brand plant map
+    overshoot_available = has_icbm and cp_ready and ui_state.CP.brand in DECEL_OVERSHOOT_PARAMS
 
     self._icbm_toggle.set_enabled(icbm_available and offroad)
     self._dec_toggle.set_enabled(has_long)
     self._scc_v_toggle.set_enabled(has_long or has_icbm)
     self._scc_m_toggle.set_enabled(has_long or has_icbm)
+    self._scc_do_toggle.set_enabled(overshoot_available)
     self._custom_acc_btn.set_enabled(((has_long and not ui_state.CP.pcmCruise) or has_icbm) and offroad if cp_ready else False)
 
     # Transition tracking — only remove params on True→False transitions
     if not icbm_available and self._prev_icbm_available is not False:
       ui_state.params.remove("IntelligentCruiseButtonManagement")
     self._prev_icbm_available = icbm_available
+
+    if not overshoot_available and self._prev_overshoot_available is not False:
+      ui_state.params.remove("SmartCruiseDecelOvershoot")
+    self._prev_overshoot_available = overshoot_available
 
     has_long_or_icbm = has_long or has_icbm
     if not has_long_or_icbm and self._prev_has_long_or_icbm is not False:
