@@ -5,7 +5,7 @@ This file is part of sunnypilot and is licensed under the MIT License.
 See the LICENSE.md file in the root directory for more details.
 """
 from cereal import car, custom
-from opendbc.car import structs, apply_hysteresis
+from opendbc.car import structs
 from openpilot.common.constants import CV
 from openpilot.common.realtime import DT_CTRL
 from openpilot.sunnypilot.selfdrive.car.intelligent_cruise_button_management.helpers import get_minimum_set_speed
@@ -15,9 +15,17 @@ LongitudinalPlanSource = custom.LongitudinalPlanSP.LongitudinalPlanSource
 State = custom.IntelligentCruiseButtonManagement.IntelligentCruiseButtonManagementState
 SendButtonState = custom.IntelligentCruiseButtonManagement.SendButtonState
 
-ALLOWED_SPEED_THRESHOLD = 1.8  # m/s, ~4 MPH
-HYST_GAP = 0.0  # currently disabled; TODO-SP: might need to be brand-specific
 INACTIVE_TIMER = 0.4
+# Reaction deadband, in display units (mph/kph). The planner target (sccVision especially)
+# jitters by ±1-2 units frame-to-frame; with no deadband ICBM saturates its 0.2s button pacing
+# ping-ponging SET+/SET- around the noise. Don't leave HOLDING until the error is at least
+# this large; increasing/decreasing still run to the exact target once started. This is the
+# single anti-jitter mechanism: it filters target-vs-cluster error, which subsumes filtering
+# the target's own motion (the former apply_hysteresis/HYST_GAP seam).
+REACT_DEADBAND = 2
+# The error must persist this long before acting, so a single-frame target glitch
+# (e.g. a bad map sample) or a momentary dip can't trigger a button burst.
+REACT_TIMER = 0.3
 
 
 SEND_BUTTONS = {
@@ -40,22 +48,14 @@ class IntelligentCruiseButtonManagement:
 
     self.is_ready = False
     self.is_ready_prev = False
-    self.v_target_ms_last = 0.0
     self.is_metric = False
 
-    self.cruise_button_timers = CRUISE_BUTTON_TIMER
-
-  @property
-  def v_cruise_equal(self) -> bool:
-    return self.v_target == self.v_cruise_cluster
+    self.cruise_button_timers = dict(CRUISE_BUTTON_TIMER)
 
   def update_calculations(self, CS: car.CarState, LP_SP: custom.LongitudinalPlanSP) -> None:
     speed_conv = CV.MS_TO_KPH if self.is_metric else CV.MS_TO_MPH
-    ms_conv = CV.KPH_TO_MS if self.is_metric else CV.MPH_TO_MS
 
-    self.v_target_ms_last = apply_hysteresis(LP_SP.vTarget, self.v_target_ms_last, HYST_GAP * ms_conv)
-
-    self.v_target = round(self.v_target_ms_last * speed_conv)
+    self.v_target = round(LP_SP.vTarget * speed_conv)
     self.v_cruise_min = get_minimum_set_speed(self.is_metric)
     self.v_cruise_cluster = round(CS.cruiseState.speedCluster * speed_conv)
 
@@ -71,18 +71,19 @@ class IntelligentCruiseButtonManagement:
         # PRE_ACTIVE
         if self.state == State.preActive:
           if self.pre_active_timer <= 0:
-            if self.v_cruise_equal:
-              self.state = State.holding
-
-            elif self.v_target > self.v_cruise_cluster:
+            if self.v_target - self.v_cruise_cluster >= REACT_DEADBAND:
               self.state = State.increasing
 
-            elif self.v_target < self.v_cruise_cluster and self.v_cruise_cluster > self.v_cruise_min:
+            elif self.v_cruise_cluster - self.v_target >= REACT_DEADBAND and self.v_cruise_cluster > self.v_cruise_min:
               self.state = State.decreasing
+
+            else:
+              self.state = State.holding
 
         # HOLDING
         elif self.state == State.holding:
-          if not self.v_cruise_equal:
+          if abs(self.v_target - self.v_cruise_cluster) >= REACT_DEADBAND:
+            self.pre_active_timer = int(REACT_TIMER / DT_CTRL)
             self.state = State.preActive
 
         # ACCELERATING

@@ -10,6 +10,7 @@ from cereal import car, custom
 from opendbc.car import structs
 from openpilot.common.constants import CV
 from openpilot.common.params import Params
+from openpilot.common.realtime import DT_CTRL
 from openpilot.sunnypilot.selfdrive.car.intelligent_cruise_button_management.helpers import get_minimum_set_speed
 from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.speed_limit_assist import ACTIVE_STATES as SLA_ACTIVE_STATES
 from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.helpers import compare_cluster_target
@@ -24,6 +25,21 @@ CRUISE_BUTTON_TIMER = {ButtonType.decelCruise: 0, ButtonType.accelCruise: 0,
 V_CRUISE_MIN = 8
 V_CRUISE_MAX = 145
 V_CRUISE_UNSET = 255
+
+# Dash re-sync window for non-pcmCruiseSpeed (ICBM) cars. The car's own ECU keeps the real
+# set speed and steps it on wheel-button presses, while openpilot integrates the same presses
+# independently — the two drift whenever their stepping cadences differ (long-press snaps,
+# gas-override presses, the ECU applying a trailing long-press increment right after release).
+# ICBM then "corrects" the dash to openpilot's stale value, moving the set speed away from
+# what the driver dialed. So: while the driver is pressing +/- and briefly after, adopt the
+# dash as the source of truth.
+# Both values were measured on a Mazda CX-5 2022 (trailing increment lands well inside 1 s,
+# dash steps 1 mph); revalidate for other ICBM brands whose ECUs step differently.
+DASH_SYNC_SETTLE_TIME = 1.0  # s after the last press; absorbs the ECU's trailing increment
+DASH_SYNC_SETTLE_FRAMES = int(DASH_SYNC_SETTLE_TIME / DT_CTRL)
+DASH_SYNC_AGREE_KPH = 2 * CV.MPH_TO_KPH  # dash is only authoritative if it matched v_cruise at press
+                                         # start (i.e. ICBM wasn't holding the dash away for SCC/SLA)
+DASH_SYNC_BUTTONS = (ButtonType.accelCruise, ButtonType.decelCruise)
 
 
 def update_manual_button_timers(CS: car.CarState, button_timers: dict[car.CarState.ButtonEvent.Type, int]) -> None:
@@ -52,7 +68,11 @@ class VCruiseHelperSP:
     self.short_increment = self.params.get("CustomAccShortPressIncrement", return_default=True)
     self.long_increment = self.params.get("CustomAccLongPressIncrement", return_default=True)
 
-    self.enable_button_timers = CRUISE_BUTTON_TIMER
+    self.enable_button_timers = dict(CRUISE_BUTTON_TIMER)
+
+    # Dash re-sync (non-pcmCruiseSpeed cars)
+    self.dash_sync_frames = 0
+    self.dash_sync_allowed = False
 
     # Speed Limit Assist
     self.sla_state = SpeedLimitAssistState.disabled
@@ -106,6 +126,30 @@ class VCruiseHelperSP:
       return enabled and self.enabled_prev
 
     return enabled
+
+  def update_dash_sync(self, CS: car.CarState) -> None:
+    if self.CP_SP.pcmCruiseSpeed or not self.CP.pcmCruise:
+      return
+
+    if not CS.cruiseState.available or self.v_cruise_kph in (V_CRUISE_UNSET, -1):
+      self.dash_sync_frames = 0
+      return
+
+    pressed = any(self.enable_button_timers[b] > 0 for b in DASH_SYNC_BUTTONS)
+    if not pressed and self.dash_sync_frames <= 0:
+      return
+
+    dash_kph = CS.cruiseState.speed * CV.MS_TO_KPH
+    if pressed:
+      if self.dash_sync_frames <= 0:
+        self.dash_sync_allowed = abs(dash_kph - self.v_cruise_kph) <= DASH_SYNC_AGREE_KPH
+      self.dash_sync_frames = DASH_SYNC_SETTLE_FRAMES
+    else:
+      self.dash_sync_frames -= 1
+
+    if self.dash_sync_frames > 0 and self.dash_sync_allowed and dash_kph > 1:
+      self.v_cruise_kph = float(np.clip(round(dash_kph, 1), self.v_cruise_min, V_CRUISE_MAX))
+      self.v_cruise_cluster_kph = self.v_cruise_kph
 
   def update_speed_limit_assist(self, is_metric, LP_SP: custom.LongitudinalPlanSP) -> None:
     resolver = LP_SP.speedLimit.resolver

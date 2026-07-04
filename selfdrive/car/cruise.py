@@ -69,6 +69,8 @@ class VCruiseHelper(VCruiseHelperSP):
       self.v_cruise_kph = V_CRUISE_UNSET
       self.v_cruise_cluster_kph = V_CRUISE_UNSET
 
+    self.update_dash_sync(CS)
+
     if not self.CP.pcmCruise or not self.CP_SP.pcmCruiseSpeed:
       self.update_button_timers(CS, enabled)
 
@@ -120,8 +122,12 @@ class VCruiseHelper(VCruiseHelperSP):
     else:
       self.v_cruise_kph += v_cruise_delta * CRUISE_INTERVAL_SIGN[button_type]
 
-    # If set is pressed while overriding, clip cruise speed to minimum of vEgo
-    if CS.gasPressed and button_type in (ButtonType.decelCruise, ButtonType.setCruise):
+    # If set is pressed while overriding, clip cruise speed to minimum of vEgo.
+    # Only valid when openpilot owns the set speed: on ICBM cars (pcmCruise with
+    # pcmCruiseSpeed False) the stock ECU simply decrements on SET-, so clipping to vEgo
+    # here inflates v_cruise above the real dash and ICBM would then chase the overridden speed.
+    op_owns_set_speed = not self.CP.pcmCruise or self.CP_SP.pcmCruiseSpeed
+    if CS.gasPressed and op_owns_set_speed and button_type in (ButtonType.decelCruise, ButtonType.setCruise):
       self.v_cruise_kph = max(self.v_cruise_kph, CS.vEgo * CV.MS_TO_KPH)
 
     self.v_cruise_kph = np.clip(round(self.v_cruise_kph, 1), self.v_cruise_min, V_CRUISE_MAX)
