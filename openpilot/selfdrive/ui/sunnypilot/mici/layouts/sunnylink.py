@@ -6,7 +6,6 @@ See the LICENSE.md file in the root directory for more details.
 """
 import pyray as rl
 
-from collections.abc import Callable
 
 from openpilot.cereal import custom
 from openpilot.selfdrive.ui.mici.widgets.button import BigButton, BigToggle

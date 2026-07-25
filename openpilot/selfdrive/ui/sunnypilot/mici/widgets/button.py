@@ -12,11 +12,12 @@ from collections.abc import Callable
 
 import pyray as rl
 
-from openpilot.selfdrive.ui.mici.widgets.button import BigButton, BigMultiParamToggle, BigMultiToggle
+from openpilot.selfdrive.ui.mici.widgets.button import BigButton, BigMultiParamToggle, BigMultiToggle, BigParamControl
 from openpilot.selfdrive.ui.ui_state import ui_state
 from openpilot.system.ui.lib.application import FontWeight, gui_app
 from openpilot.system.ui.lib.multilang import tr
 from openpilot.system.ui.lib.text_measure import measure_text_cached
+from openpilot.system.ui.widgets.scroller import NavScroller
 
 BADGE_GREEN = (rl.Color(100, 180, 120, 88), rl.Color(130, 200, 145, 230))   # (border, text)
 BADGE_GREY = (rl.Color(255, 255, 255, 40), rl.Color(170, 170, 170, 180))   # (border, text)
@@ -40,15 +41,10 @@ class BigButtonSP(BigButton):
     # Init before super: BigButton.__init__ calls _update_label_layout which reads these
     self._badge_labels: list[str] | None = None
     self._disabled: bool = False
-    self._active: bool = True
     BigButton.__init__(self, text, value, icon, scroll)
 
   def set_subtitle_font_size(self, size: int):
     self._sub_label.set_font_size(size)
-
-  def set_active(self, active: bool) -> None:
-    """Controls badge dimming, not interactivity."""
-    self._active = active
 
   def set_badges(self, entries: list[tuple[str, str]]):
     """Set badge pills from (key, value) pairs. 'off' hides, 'on' shows key, else shows value."""
@@ -88,7 +84,7 @@ class BigButtonSP(BigButton):
     """Render badge labels as outlined pill chips in a flow layout."""
     font = gui_app.font(FontWeight.BOLD)
     font_size, h_pad, gap = 28, 10, 8
-    alpha_mult = 1.0 if self._active else 0.3
+    alpha_mult = 1.0 if self.enabled else 0.3  # dim badges with the card
     border_base, text_base = BADGE_GREY if self._disabled else BADGE_GREEN
     border = rl.Color(border_base.r, border_base.g, border_base.b, int(border_base.a * alpha_mult))
     text_color = rl.Color(text_base.r, text_base.g, text_base.b, int(text_base.a * alpha_mult))
@@ -143,17 +139,15 @@ class BigButtonSP(BigButton):
       badge_margin = 8
       self._draw_badges(rl.Rectangle(label_x, label_y + badge_margin, self._width_hint(), sub_label_height - badge_margin))
 
-  def link_sub_panel(self, items):
-    """Create a sub-panel NavScroller with the given items, linked to this button's click."""
-    from openpilot.system.ui.widgets.scroller import NavScroller
-    view = NavScroller()
-    view._scroller.add_widgets(items)  # upstream NavScroller doesn't expose _Scroller API directly
+  def link_sub_panel(self, items) -> "SubPanelSP":
+    """Create a self-refreshing sub-panel with the given items, linked to this button's click."""
+    view = SubPanelSP(items)
     self.set_click_callback(lambda: gui_app.push_widget(view))
     return view
 
   def _render(self, _):
     txt_bg, btn_x, btn_y, scale = self._handle_background()
-    bg_tint = CARD_ACTIVE_TINT if self._badge_labels and self._active and not self._disabled else rl.WHITE
+    bg_tint = CARD_ACTIVE_TINT if self._badge_labels and self.enabled and not self._disabled else rl.WHITE
     if self._scroll:
       scaled_rect = rl.Rectangle(btn_x, btn_y, self._rect.width * scale, self._rect.height * scale)
       rl.draw_rectangle_rounded(scaled_rect, 0.4, 7, rl.Color(0, 0, 0, int(255 * 0.5)))
@@ -162,6 +156,49 @@ class BigButtonSP(BigButton):
     else:
       rl.draw_texture_ex(txt_bg, (btn_x, btn_y), 0, scale, bg_tint)
       self._draw_content(btn_y)
+
+
+class SubPanelSP(NavScroller):
+  """NavScroller that refreshes its own param widgets while it is on screen.
+
+  gui_app renders only the top `_nav_stack_widgets_to_render` (2 on MICI) nav-stack widgets, so a
+  layout is not rendered — and its _update_state does not run — once a sub-panel opens a sub-panel
+  of its own. A panel nested that deep has to drive its own widgets; the parent layout cannot.
+  """
+
+  def __init__(self, items):
+    super().__init__()
+    self._scroller.add_widgets(items)  # upstream NavScroller doesn't expose _Scroller API directly
+    self._refreshable = [i for i in items if hasattr(i, "refresh")]
+
+  def _update_state(self):
+    super()._update_state()
+    for item in self._refreshable:
+      item.refresh()
+
+
+class BigParamControlSP(BigParamControl):
+  """BigParamControl that reads off — and takes no input — while `depends_on` is unmet.
+
+  For settings the car ignores unless some other setting feeds them, like BSM delay under auto
+  lane change. The param keeps the user's choice, so it comes back when the dependency is met
+  again; only the display is suppressed. Nothing can overwrite it meanwhile: Widget.render only
+  dispatches mouse events while enabled, and `depends_on` gates that too.
+
+  `depends_on` is passed to set_enabled as a callable, so a tap on the parent toggle takes
+  effect the same frame rather than the next one.
+  """
+
+  def __init__(self, text: str, param: str, depends_on: Callable[[], bool] | None = None, **kwargs):
+    super().__init__(text, param, **kwargs)
+    self._depends_on = depends_on
+    if depends_on is not None:
+      self.set_enabled(depends_on)
+
+  def refresh(self):
+    super().refresh()
+    if self._depends_on is not None and not self._depends_on():
+      self.set_checked(False)
 
 
 class BigMultiParamToggleSP(BigMultiParamToggle):
@@ -252,9 +289,11 @@ class BigParamOption(BigButton):
     self.set_click_callback(self._open_picker)
 
   def _read_value(self) -> int:
+    # float params store the physical value (2.5 m/s²) while the picker works in a 1..500
+    # integer domain — same x100 convention as OptionControlSP.use_float_scaling on TICI
     val = ui_state.params.get(self._param, return_default=True)
     try:
-      return int(float(val)) if val is not None else self._min_value
+      return int(float(val) * (100 if self._float_param else 1)) if val is not None else self._min_value
     except (ValueError, TypeError):
       return self._min_value
 
@@ -285,7 +324,6 @@ class BigParamOption(BigButton):
     )
 
   def _open_picker(self):
-    from openpilot.system.ui.widgets.scroller import NavScroller
     # NavScroller doesn't pass kwargs to _Scroller (NavWidget.__init__ rejects them),
     # so we set scroll_indicator and pad directly on _scroller after construction
     view = NavScroller()

@@ -230,10 +230,11 @@ class NumberPickerScreen(Widget):
         break
 
   def _read_value(self) -> int:
+    # float params store the physical value (2.5 m/s²) while the picker works in a 1..500
+    # integer domain — same x100 convention as OptionControlSP.use_float_scaling on TICI
     val = self._params.get(self._param, return_default=True)
     try:
-      # float() needed: float_param options store values as float in params
-      return int(float(val)) if val is not None else self._min_value
+      return int(float(val) * (100 if self._float_param else 1)) if val is not None else self._min_value
     except (ValueError, TypeError):
       return self._min_value
 
@@ -254,7 +255,7 @@ class NumberPickerScreen(Widget):
     if center.raw_value != self._last_center_value:
       self._last_center_value = center.raw_value
       # put() is non-blocking by default (block=False); upstream removed put_nonblocking
-      self._params.put(self._param, float(center.raw_value) if self._float_param else center.raw_value)
+      self._params.put(self._param, center.raw_value / 100.0 if self._float_param else center.raw_value)
 
   def _update_state(self):
     super()._update_state()
