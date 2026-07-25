@@ -36,7 +36,9 @@ class ControlsExt(ModelStateBase):
 
   def initialize_lateral_control(self, lac, CI, dt):
     enforce_torque_control = self.params.get_bool("EnforceTorqueControl")
-    torque_versions = self.params.get("TorqueControlTune")
+    # return_default: params_keys.h declares 0.0 (v0) as the default, and an unset param would
+    # otherwise read as None and fall through to the newest tune
+    torque_versions = self.params.get("TorqueControlTune", return_default=True)
     if not enforce_torque_control:
       if self.CP.lateralTuning.which() == 'torque':
         return LatControlTorqueV0(self.CP, self.CP_SP, CI, dt)  # FIXME-SP: revert when upstream fixes tuning issues with v1
