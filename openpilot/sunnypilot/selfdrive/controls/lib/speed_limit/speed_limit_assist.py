@@ -91,7 +91,14 @@ class SpeedLimitAssist:
 
     self._plus_hold = 0.
     self._minus_hold = 0.
+    self._plus_press = 0.
+    self._minus_press = 0.
     self._last_carstate_ts = 0.
+    # Set when the driver dismisses an active session with a +/- press; blocks the
+    # dial-to-target auto-reactivation until the next limit change. Without it, a settled
+    # press would deactivate and instantly re-activate: the cluster still equals the limit
+    # for a tick or two until the ECU's own ±1 step lands, and SLA would fight the driver.
+    self._driver_dismissed = False
 
     # TODO-SP: SLA's own output_a_target for planner
     # Solution functions mapped to respective states
@@ -150,8 +157,18 @@ class SpeedLimitAssist:
     now = time.monotonic()
     self._last_carstate_ts = now
 
+    # Presses come from the driver alone: openpilot's injected button frames are CAN
+    # transmissions and never loop back into buttonEvents. Release edges arm the confirm
+    # latches; press edges arm the manual-override latches (consumed by the active-state
+    # guard). Both are held CRUISE_BUTTON_CONFIRM_HOLD so the 20 Hz state machine can't
+    # miss a one-frame edge (this method runs at carState rate).
     for b in CS.buttonEvents:
-      if not b.pressed:
+      if b.pressed:
+        if b.type in CRUISE_BUTTONS_PLUS:
+          self._plus_press = max(self._plus_press, now + CRUISE_BUTTON_CONFIRM_HOLD)
+        elif b.type in CRUISE_BUTTONS_MINUS:
+          self._minus_press = max(self._minus_press, now + CRUISE_BUTTON_CONFIRM_HOLD)
+      else:
         if b.type in CRUISE_BUTTONS_PLUS:
           self._plus_hold = max(self._plus_hold, now + CRUISE_BUTTON_CONFIRM_HOLD)
         elif b.type in CRUISE_BUTTONS_MINUS:
@@ -222,6 +239,15 @@ class SpeedLimitAssist:
     else:
       self.state = SpeedLimitAssistState.pending
 
+  def _consume_driver_press(self) -> bool:
+    # One-shot: was a +/- press latched recently? Cleared on read either way so a single
+    # press can't fire twice; expired latches clear too.
+    now = time.monotonic()
+    pressed = now <= self._plus_press or now <= self._minus_press
+    self._plus_press = 0.
+    self._minus_press = 0.
+    return pressed
+
   def _update_non_pcm_long_confirmed_state(self) -> bool:
     if self.target_set_speed_confirmed:
       return True
@@ -231,7 +257,12 @@ class SpeedLimitAssist:
 
     req_plus, req_minus = compare_cluster_target(self.v_cruise_cluster, self._speed_limit_final_last, self.is_metric)
 
-    return self._get_button_release(req_plus, req_minus)
+    confirmed = self._get_button_release(req_plus, req_minus)
+    if confirmed:
+      # the confirm press must not double as a manual override next cycle
+      self._plus_press = 0.
+      self._minus_press = 0.
+    return confirmed
 
   def update_state_machine_pcm_op_long(self):
     self.long_engaged_timer = max(0, self.long_engaged_timer - 1)
@@ -312,12 +343,24 @@ class SpeedLimitAssist:
     if self.state != SpeedLimitAssistState.disabled:
       if not self.long_enabled or not self.enabled:
         self.state = SpeedLimitAssistState.disabled
+        self._driver_dismissed = False
 
       else:
         # ACTIVE
         if self.state == SpeedLimitAssistState.active:
-          if self.v_cruise_cluster_changed:
+          # Manual override: only a genuine driver +/- press deactivates. The set-speed
+          # cluster is NOT a proxy for that here — on button-actuated cars the confirm
+          # press's own ±1 step and ICBM walking the dash toward the limit both move the
+          # cluster, and deactivating on those made confirmation self-destruct: one tap
+          # confirmed, the next frame's cluster change tore it back down. Injected button
+          # frames never appear in buttonEvents (no CAN self-reception), so the press
+          # latch is driver-only by construction. A press mid-move aborts (the servo then
+          # restores the driver's setpoint); a press once settled hands the buttons back
+          # to the driver — both are this same transition, and SLA re-arms on the next
+          # limit change from inactive.
+          if self._consume_driver_press():
             self.state = SpeedLimitAssistState.inactive
+            self._driver_dismissed = True
 
           elif self.speed_limit_changed and self.apply_confirm_speed_threshold:
             self.state = SpeedLimitAssistState.preActive
@@ -336,7 +379,8 @@ class SpeedLimitAssist:
           if self.speed_limit_changed:
             self.state = SpeedLimitAssistState.preActive
             self.pre_active_timer = int(PRE_ACTIVE_GUARD_PERIOD[self.pcm_op_long] / DT_MDL)
-          elif self._update_non_pcm_long_confirmed_state():
+            self._driver_dismissed = False
+          elif not self._driver_dismissed and self._update_non_pcm_long_confirmed_state():
             self.state = SpeedLimitAssistState.active
 
     # DISABLED
