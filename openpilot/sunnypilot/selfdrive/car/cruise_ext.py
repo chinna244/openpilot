@@ -18,6 +18,8 @@ from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.helpers import comp
 
 ButtonType = car.CarState.ButtonEvent.Type
 SpeedLimitAssistState = custom.LongitudinalPlanSP.SpeedLimit.AssistState
+LongitudinalPlanSource = custom.LongitudinalPlanSP.LongitudinalPlanSource
+IcbmState = custom.IntelligentCruiseButtonManagement.IntelligentCruiseButtonManagementState
 
 CRUISE_BUTTON_TIMER = {ButtonType.decelCruise: 0, ButtonType.accelCruise: 0,
                        ButtonType.setCruise: 0, ButtonType.resumeCruise: 0,
@@ -27,20 +29,20 @@ V_CRUISE_MIN = 8
 V_CRUISE_MAX = 145
 V_CRUISE_UNSET = 255
 
-# Dash re-sync window for non-pcmCruiseSpeed (ICBM) cars. The car's own ECU keeps the real
-# set speed and steps it on wheel-button presses, while openpilot integrates the same presses
-# independently — the two drift whenever their stepping cadences differ (long-press snaps,
-# gas-override presses, the ECU applying a trailing long-press increment right after release).
-# ICBM then "corrects" the dash to openpilot's stale value, moving the set speed away from
-# what the driver dialed. So: while the driver is pressing +/- and briefly after, adopt the
-# dash as the source of truth.
-# Both values were measured on a Mazda CX-5 2022 (trailing increment lands well inside 1 s,
-# dash steps 1 mph); revalidate for other ICBM brands whose ECUs step differently.
-DASH_SYNC_SETTLE_TIME = 1.0  # s after the last press; absorbs the ECU's trailing increment
-DASH_SYNC_SETTLE_FRAMES = int(DASH_SYNC_SETTLE_TIME / DT_CTRL)
-DASH_SYNC_AGREE_KPH = 2 * CV.MPH_TO_KPH  # dash is only authoritative if it matched v_cruise at press
-                                         # start (i.e. ICBM wasn't holding the dash away for SCC/SLA)
-DASH_SYNC_BUTTONS = (ButtonType.accelCruise, ButtonType.decelCruise)
+# Setpoint reconciliation for non-pcmCruiseSpeed (ICBM) cars. The car's own ECU keeps the
+# real set speed and steps it on wheel-button presses, while openpilot integrates the same
+# presses independently — the two drift whenever their stepping cadences differ (long-press
+# snaps to a grid, gas-override presses, the ECU applying a trailing long-press increment
+# right after release). The dash is the ECU's truth of the driver's setpoint, but only when
+# nothing is deliberately holding it away from v_cruise: while a limiter (SCC/SLA) is the
+# plan source or ICBM is mid-move, dash != v_cruise by design and adopting it would destroy
+# the driver's baseline. So: while the driver is pressing +/- and briefly after, adopt the
+# dash as the source of truth iff the plan source is cruise and ICBM is not actively stepping.
+# The settle time absorbs the ECU's trailing long-press increment (lands well inside 1 s on
+# a Mazda CX-5 2022; revalidate for other ICBM brands whose ECUs step differently).
+RECONCILE_SETTLE_TIME = 1.0  # s after the last press
+RECONCILE_SETTLE_FRAMES = int(RECONCILE_SETTLE_TIME / DT_CTRL)
+RECONCILE_BUTTONS = (ButtonType.accelCruise, ButtonType.decelCruise)
 
 
 def update_manual_button_timers(CS: car.CarState, button_timers: dict[car.CarState.ButtonEvent.Type, int]) -> None:
@@ -71,9 +73,12 @@ class VCruiseHelperSP:
 
     self.enable_button_timers = dict(CRUISE_BUTTON_TIMER)
 
-    # Dash re-sync (non-pcmCruiseSpeed cars)
-    self.dash_sync_frames = 0
-    self.dash_sync_allowed = False
+    # Setpoint reconciliation (non-pcmCruiseSpeed cars)
+    self.reconcile_frames = 0
+
+    # Plan/actuation regime, updated from longitudinalPlanSP + carControlSP each frame
+    self.lp_source = LongitudinalPlanSource.cruise
+    self.icbm_state = IcbmState.inactive
 
     # Speed Limit Assist
     self.sla_state = SpeedLimitAssistState.disabled
@@ -81,7 +86,6 @@ class VCruiseHelperSP:
     self.has_speed_limit = False
     self.speed_limit_final_last = 0.
     self.speed_limit_final_last_kph = 0.
-    self.prev_speed_limit_final_last_kph = 0.
     self.req_plus = False
     self.req_minus = False
 
@@ -128,42 +132,48 @@ class VCruiseHelperSP:
 
     return enabled
 
-  def update_dash_sync(self, CS: car.CarState) -> None:
+  def reconcile_setpoint_with_dash(self, CS: car.CarState) -> None:
     if self.CP_SP.pcmCruiseSpeed or not self.CP.pcmCruise:
       return
 
     if not CS.cruiseState.available or self.v_cruise_kph in (V_CRUISE_UNSET, -1):
-      self.dash_sync_frames = 0
+      self.reconcile_frames = 0
       return
 
-    pressed = any(self.enable_button_timers[b] > 0 for b in DASH_SYNC_BUTTONS)
-    if not pressed and self.dash_sync_frames <= 0:
+    pressed = any(self.enable_button_timers[b] > 0 for b in RECONCILE_BUTTONS)
+    if pressed:
+      self.reconcile_frames = RECONCILE_SETTLE_FRAMES
+    elif self.reconcile_frames > 0:
+      self.reconcile_frames -= 1
+    else:
+      return
+
+    # The dash is only authoritative when it is supposed to equal v_cruise: no limiter is
+    # driving the plan and ICBM isn't mid-move. Evaluated per-frame so a regime change during
+    # the settle window (e.g. SLA deactivating on this very press) blocks adoption until the
+    # servo has actually restored the dash.
+    if self.lp_source != LongitudinalPlanSource.cruise:
+      return
+    if self.icbm_state in (IcbmState.increasing, IcbmState.decreasing):
       return
 
     dash_kph = CS.cruiseState.speed * CV.MS_TO_KPH
-    if pressed:
-      if self.dash_sync_frames <= 0:
-        self.dash_sync_allowed = abs(dash_kph - self.v_cruise_kph) <= DASH_SYNC_AGREE_KPH
-      self.dash_sync_frames = DASH_SYNC_SETTLE_FRAMES
-    else:
-      self.dash_sync_frames -= 1
-
-    if self.dash_sync_frames > 0 and self.dash_sync_allowed and dash_kph > 1:
+    if dash_kph > 1:
       self.v_cruise_kph = float(np.clip(round(dash_kph, 1), self.v_cruise_min, V_CRUISE_MAX))
       self.v_cruise_cluster_kph = self.v_cruise_kph
 
-  def update_speed_limit_assist(self, is_metric, LP_SP: custom.LongitudinalPlanSP) -> None:
+  def update_speed_limit_assist(self, is_metric, LP_SP: custom.LongitudinalPlanSP,
+                                CC_SP: custom.CarControlSP) -> None:
     resolver = LP_SP.speedLimit.resolver
     self.has_speed_limit = resolver.speedLimitValid or resolver.speedLimitLastValid
     self.speed_limit_final_last = LP_SP.speedLimit.resolver.speedLimitFinalLast
     self.speed_limit_final_last_kph = self.speed_limit_final_last * CV.MS_TO_KPH
+    self.prev_sla_state = self.sla_state
     self.sla_state = LP_SP.speedLimit.assist.state
+    self.lp_source = LP_SP.longitudinalPlanSource
+    self.icbm_state = CC_SP.intelligentCruiseButtonManagement.state
     self.req_plus, self.req_minus = compare_cluster_target(self.v_cruise_cluster_kph * CV.KPH_TO_MS,
                                                            self.speed_limit_final_last, is_metric)
-
-  @property
-  def update_speed_limit_final_last_changed(self) -> bool:
-    return self.has_speed_limit and bool(self.speed_limit_final_last_kph != self.prev_speed_limit_final_last_kph)
 
   def update_speed_limit_assist_pre_active_confirmed(self, button_type: car.CarState.ButtonEvent.Type) -> bool:
     if self.sla_state == SpeedLimitAssistState.preActive or self.prev_sla_state == SpeedLimitAssistState.preActive:
@@ -174,10 +184,11 @@ class VCruiseHelperSP:
 
     return False
 
-  def update_speed_limit_assist_v_cruise_non_pcm(self) -> None:
-    if self.sla_state in SLA_ACTIVE_STATES and (self.prev_sla_state not in SLA_ACTIVE_STATES or
-                                                self.update_speed_limit_final_last_changed):
-      self.v_cruise_kph = np.clip(round(self.speed_limit_final_last_kph, 1), self.v_cruise_min, V_CRUISE_MAX)
-
-    self.prev_sla_state = self.sla_state
-    self.prev_speed_limit_final_last_kph = self.speed_limit_final_last_kph
+  @property
+  def speed_limit_assist_owns_buttons(self) -> bool:
+    # While SLA is active on a button-actuated car, +/- presses carry SLA semantics (abort a
+    # move in flight, or re-anchor to the dash once settled) — never a v_cruise increment.
+    # The dash keeps the ECU's response to the press; reconcile_setpoint_with_dash adopts it
+    # once the plan source is back to cruise and the servo is idle. Incrementing here as well
+    # would double-count the press against the ECU's own step.
+    return self.sla_state in SLA_ACTIVE_STATES

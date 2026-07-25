@@ -54,7 +54,6 @@ class VCruiseHelper(VCruiseHelperSP):
       if not self.CP.pcmCruise or (not self.CP_SP.pcmCruiseSpeed and _enabled):
         # if stock cruise is completely disabled, then we can use our own set speed logic
         self._update_v_cruise_non_pcm(CS, _enabled, is_metric)
-        self.update_speed_limit_assist_v_cruise_non_pcm()
         self.v_cruise_cluster_kph = self.v_cruise_kph
       else:
         self.v_cruise_kph = CS.cruiseState.speed * CV.MS_TO_KPH
@@ -69,7 +68,7 @@ class VCruiseHelper(VCruiseHelperSP):
       self.v_cruise_kph = V_CRUISE_UNSET
       self.v_cruise_cluster_kph = V_CRUISE_UNSET
 
-    self.update_dash_sync(CS)
+    self.reconcile_setpoint_with_dash(CS)
 
     if not self.CP.pcmCruise or not self.CP_SP.pcmCruiseSpeed:
       self.update_button_timers(CS, enabled)
@@ -114,6 +113,11 @@ class VCruiseHelper(VCruiseHelperSP):
     # True: Disallow set speed changes when user confirmed the target set speed during preActive state
     # False: Allow set speed changes as SLA is not requesting user confirmation
     if self.update_speed_limit_assist_pre_active_confirmed(button_type):
+      return
+
+    # While SLA is active, presses carry SLA semantics (abort/re-anchor) — the setpoint is
+    # updated by dash reconciliation instead, so the ECU's step isn't double-counted here.
+    if self.speed_limit_assist_owns_buttons:
       return
 
     long_press, v_cruise_delta = VCruiseHelperSP.update_v_cruise_delta(self, long_press, v_cruise_delta)
