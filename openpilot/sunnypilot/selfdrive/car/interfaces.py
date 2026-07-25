@@ -25,6 +25,29 @@ def log_fingerprint(CP: structs.CarParams) -> None:
     sentry.capture_fingerprint(CP.carFingerprint, CP.brand)
 
 
+def _seed_mazda_torque_defaults(CP: structs.CarParams, params: Params = None) -> None:
+  """One-time: default the full torque-control stack ON for steer-to-zero Mazdas (2022+ CX-5 EPS).
+
+  Gated on the EPS, not the model: minSteerSpeed == 0 is the same "CX-5 2022+ EPS present" proxy
+  used by the steering tune (values.py) and carstate, so the CX-9 sharing this EPS and EPS swaps
+  are covered. Seeded once via a marker param so the user can still toggle any of these off later.
+  TorqueControlTune defaults to 0.0 (== torque learner v0), so it needs no seeding here.
+  """
+  if params is None:
+    params = Params()
+
+  if CP.brand != "mazda" or CP.minSteerSpeed > 0:
+    return
+  if params.get_bool("MazdaTorqueDefaultsApplied"):
+    return
+
+  params.put_bool("EnforceTorqueControl", True)     # torque lateral control
+  params.put_bool("LiveTorqueParamsToggle", True)   # self-tune (live torque params)
+  params.put_bool("SpeedDependentTorqueToggle", True)  # per-speed-bin learning
+  params.put_bool("MazdaTorqueDefaultsApplied", True)
+  cloudlog.warning("Seeded steer-to-zero Mazda torque-control defaults (EnforceTorqueControl, self-tune, speed-dependent)")
+
+
 def _enforce_torque_lateral_control(CP: structs.CarParams, params: Params = None, enabled: bool = False) -> bool:
   if params is None:
     params = Params()
@@ -93,6 +116,7 @@ def _cleanup_unsupported_params(CP: structs.CarParams, CP_SP: structs.CarParamsS
 
 
 def setup_interfaces(CI: CarInterfaceBase, params: Params = None) -> None:
+  _seed_mazda_torque_defaults(CI.CP, params)
   enforce_torque = _enforce_torque_lateral_control(CI.CP, params)
   nnlc_enabled = _initialize_neural_network_lateral_control(CI.CP, CI.CP_SP, params)
   _initialize_intelligent_cruise_button_management(CI.CP, CI.CP_SP, params)

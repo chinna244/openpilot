@@ -198,6 +198,8 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"ModelManager_Favs", {PERSISTENT | BACKUP, STRING}},
     {"ModelManager_LastSyncTime", {CLEAR_ON_MANAGER_START | CLEAR_ON_OFFROAD_TRANSITION, INT, "0"}},
     {"ModelManager_ModelsCache", {PERSISTENT | BACKUP, JSON}},
+    // mazda-dev: one-time marker so the Firehose Model is applied as the default exactly once (see models/default_bootstrap.py)
+    {"DefaultModelApplied", {PERSISTENT | BACKUP, BOOL}},
 
     // Neural Network Lateral Control
     {"NeuralNetworkLateralControl", {PERSISTENT | BACKUP, BOOL, "0"}},
@@ -280,4 +282,6 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"TorqueParamsOverrideEnabled", {PERSISTENT | BACKUP, BOOL, "0"}},
     {"TorqueParamsOverrideFriction", {PERSISTENT | BACKUP, FLOAT, "0.1"}},
     {"TorqueParamsOverrideLatAccelFactor", {PERSISTENT | BACKUP, FLOAT, "2.5"}},
+    // mazda-dev: one-time marker so steer-to-zero Mazda torque-control defaults are seeded exactly once (see sunnypilot/selfdrive/car/interfaces.py)
+    {"MazdaTorqueDefaultsApplied", {PERSISTENT | BACKUP, BOOL}},
 };
