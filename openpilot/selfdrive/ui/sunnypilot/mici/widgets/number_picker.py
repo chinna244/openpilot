@@ -253,7 +253,8 @@ class NumberPickerScreen(Widget):
     center = self._picker_items[self._center_index()]
     if center.raw_value != self._last_center_value:
       self._last_center_value = center.raw_value
-      self._params.put_nonblocking(self._param, float(center.raw_value) if self._float_param else center.raw_value)
+      # put() is non-blocking by default (block=False); upstream removed put_nonblocking
+      self._params.put(self._param, float(center.raw_value) if self._float_param else center.raw_value)
 
   def _update_state(self):
     super()._update_state()
