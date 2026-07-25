@@ -51,9 +51,14 @@ class TorqueEstimatorExt:
     self.use_live_torque_params = self._params.get_bool("LiveTorqueParamsToggle")
     self.custom_torque_params = self._params.get_bool("CustomTorqueParams")
     self.torque_override_enabled = self._params.get_bool("TorqueParamsOverrideEnabled")
-    # Independently gated — not restricted by ALLOWED_CARS brand list
+    # Speed-dep extends the self-tune learner, so it only runs when the same conditions the
+    # UI requires are enabled (Enforce Torque Control + Self-Tune). Otherwise the per-bin SVD
+    # fits would burn CPU every cycle without ever being consumed (use_params would be False).
+    # Not restricted by the ALLOWED_CARS brand list — that gate is intentionally separate.
     self.speed_binned = (self.CP.lateralTuning.which() == 'torque'
-                         and self._params.get_bool("SpeedDependentTorqueToggle"))
+                         and self._params.get_bool("SpeedDependentTorqueToggle")
+                         and self.enforce_torque_control_toggle
+                         and self.use_live_torque_params)
     # Defaults — overwritten by TorqueEstimator.__init__ before initialize_custom_params runs
     self.min_bucket_points = RELAXED_MIN_BUCKET_POINTS
     self.factor_sanity = 0.0
@@ -156,7 +161,8 @@ class TorqueEstimatorExt:
     """Create a single speed-bin TorqueBuckets instance.
     Per-bucket minimums are scaled down from the global learner since each
     speed bin sees a fraction of the total data."""
-    scaled_min = np.maximum(self.min_bucket_points // len(self.speed_bin_bounds), 1)
+    # min_bucket_points is a Python list upstream (torqued.py) — coerce before integer-dividing
+    scaled_min = np.maximum(np.asarray(self.min_bucket_points) // len(self.speed_bin_bounds), 1)
     return TorqueBuckets(x_bounds=STEER_BUCKET_BOUNDS,
                          min_points=scaled_min,
                          min_points_total=int(scaled_min.sum()),
@@ -186,8 +192,12 @@ class TorqueEstimatorExt:
           cache_ltp = evt.liveTorqueParameters
       from openpilot.selfdrive.locationd.torqued import MIN_FILTER_DECAY
       n_bins = len(self.speed_bin_bounds)
-      # Reject cache from a different config (e.g. TOML update changed bin centers)
-      if not np.allclose(list(cache_ltp.speedBinCenters), self.speed_bin_centers, atol=0.01):
+      # Reject cache from a different config (e.g. TOML update changed bin centers).
+      # Length-guard first: a legacy/global-only cache has an empty speedBinCenters and
+      # np.allclose would raise on the shape mismatch (caught below, but noisy every boot).
+      cached_centers = list(cache_ltp.speedBinCenters)
+      if (len(cached_centers) != len(self.speed_bin_centers)
+          or not np.allclose(cached_centers, self.speed_bin_centers, atol=0.01)):
         cloudlog.info("speed-dep: config changed, restarting learning")
         return
       if (len(cache_ltp.speedBinLatAccelFactors) == n_bins and
@@ -207,7 +217,7 @@ class TorqueEstimatorExt:
   def _estimate_params_speed_binned(self):
     """Run independent SVD fit per speed bin. Resets bin on NaN with valid data."""
     from openpilot.selfdrive.locationd.torqued import TorqueBuckets, STEER_BUCKET_BOUNDS, \
-      POINTS_PER_BUCKET, FRICTION_FACTOR, FIT_POINTS_TOTAL, slope2rot, MIN_FILTER_DECAY, MAX_FILTER_DECAY
+      POINTS_PER_BUCKET, FRICTION_FACTOR, slope2rot, MIN_FILTER_DECAY, MAX_FILTER_DECAY
 
     results = []
     for i, bucket in enumerate(self.speed_bin_points):
@@ -221,8 +231,9 @@ class TorqueEstimatorExt:
         results.append((i, self._speed_bin_last_valid[i]))
         continue
 
-      # Same total least squares SVD as upstream's estimate_params()
-      points = bucket.get_points(FIT_POINTS_TOTAL)
+      # Same total least squares SVD as upstream's estimate_params(); self.fit_points honors
+      # the decimated/qlog point count (FIT_POINTS_TOTAL_QLOG) instead of over-requesting.
+      points = bucket.get_points(self.fit_points)
       try:
         _, _, v = np.linalg.svd(points, full_matrices=False)
         slope, offset = -v.T[0:2, 2] / v.T[2, 2]  # slope = latAccelFactor
