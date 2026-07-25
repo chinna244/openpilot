@@ -7,24 +7,20 @@ See the LICENSE.md file in the root directory for more details.
 
 
 from openpilot.selfdrive.ui.mici.widgets.button import BigParamControl
-from openpilot.selfdrive.ui.sunnypilot.mici.widgets.button import BigMultiParamToggleSP
-from openpilot.selfdrive.ui.ui_state import ui_state
 from openpilot.system.ui.lib.multilang import tr
 from openpilot.system.ui.widgets.scroller import NavScroller
 
 
+# Only params the MICI onroad path actually consumes. BlindSpot + RainbowMode render on MICI;
+# GreenLightAlert + LeadDepartAlert gate alert emission in the longitudinal planner (controls-side).
+# Toggles that only drove the TICI onroad renderers (TorqueBar, StandstillTimer, RoadNameToggle,
+# TrueVEgoUI, HideVEgoUI, ShowTurnSignals, RocketFuel, ChevronInfo, DevUIInfo) were no-ops here and
+# were removed.
 TOGGLE_PARAMS = [
   (tr("blind spot"), "BlindSpot"),
-  (tr("steering arc"), "TorqueBar"),
   (tr("rainbow mode"), "RainbowMode"),
-  (tr("standstill timer"), "StandstillTimer"),
-  (tr("road name"), "RoadNameToggle"),
   (tr("green light alert"), "GreenLightAlert"),
   (tr("lead depart alert"), "LeadDepartAlert"),
-  (tr("true speed"), "TrueVEgoUI"),
-  (tr("hide speed"), "HideVEgoUI"),
-  (tr("turn signals"), "ShowTurnSignals"),
-  (tr("accel bar"), "RocketFuel"),
 ]
 
 
@@ -32,7 +28,6 @@ class VisualsLayoutMici(NavScroller):
   def __init__(self):
     super().__init__()
 
-    self._prev_has_long: bool | None = None
     self._toggles: dict[str, BigParamControl] = {}
     items = []
     for label, param in TOGGLE_PARAMS:
@@ -40,29 +35,9 @@ class VisualsLayoutMici(NavScroller):
       self._toggles[param] = toggle
       items.append(toggle)
 
-    self._chevron_info = BigMultiParamToggleSP(
-      tr("chevron info"), "ChevronInfo",
-      [tr("off"), tr("dist"), tr("speed"), tr("time"), tr("all")],
-    )
-    self._dev_ui_info = BigMultiParamToggleSP(
-      tr("dev UI"), "DevUIInfo",
-      [tr("off"), tr("bottom"), tr("right"), tr("R&B")],
-    )
-    items.append(self._chevron_info)
-    items.append(self._dev_ui_info)
-
     self._scroller.add_widgets(items)
 
   def _update_state(self):
     super()._update_state()
     for _param, toggle in self._toggles.items():
       toggle.refresh()
-    self._chevron_info.refresh()
-    self._dev_ui_info.refresh()
-
-    has_long = ui_state.has_longitudinal_control
-    self._chevron_info.set_enabled(has_long)
-    if not has_long and self._prev_has_long is not False:
-      ui_state.params.put("ChevronInfo", 0)
-      self._chevron_info.refresh()
-    self._prev_has_long = has_long
