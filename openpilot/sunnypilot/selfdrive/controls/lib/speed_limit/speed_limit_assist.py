@@ -91,8 +91,7 @@ class SpeedLimitAssist:
 
     self._plus_hold = 0.
     self._minus_hold = 0.
-    self._plus_press = 0.
-    self._minus_press = 0.
+    self._press_deadline = 0.
     self._last_carstate_ts = 0.
     # Set when the driver dismisses an active session with a +/- press; blocks the
     # dial-to-target auto-reactivation until the next limit change. Without it, a settled
@@ -158,20 +157,18 @@ class SpeedLimitAssist:
     self._last_carstate_ts = now
 
     # Presses come from the driver alone: openpilot's injected button frames are CAN
-    # transmissions and never loop back into buttonEvents. Release edges arm the confirm
-    # latches; press edges arm the manual-override latches (consumed by the active-state
-    # guard). Both are held CRUISE_BUTTON_CONFIRM_HOLD so the 20 Hz state machine can't
-    # miss a one-frame edge (this method runs at carState rate).
+    # transmissions and never loop back into buttonEvents. Release edges arm the
+    # direction-aware confirm latches; press edges arm one direction-less override latch
+    # (the active-state guard deactivates on any +/- press). All are held
+    # CRUISE_BUTTON_CONFIRM_HOLD so the 20 Hz state machine can't miss a one-frame edge
+    # (this method runs at carState rate).
     for b in CS.buttonEvents:
-      if b.pressed:
-        if b.type in CRUISE_BUTTONS_PLUS:
-          self._plus_press = max(self._plus_press, now + CRUISE_BUTTON_CONFIRM_HOLD)
-        elif b.type in CRUISE_BUTTONS_MINUS:
-          self._minus_press = max(self._minus_press, now + CRUISE_BUTTON_CONFIRM_HOLD)
-      else:
-        if b.type in CRUISE_BUTTONS_PLUS:
+      if b.type in CRUISE_BUTTONS_PLUS or b.type in CRUISE_BUTTONS_MINUS:
+        if b.pressed:
+          self._press_deadline = max(self._press_deadline, now + CRUISE_BUTTON_CONFIRM_HOLD)
+        elif b.type in CRUISE_BUTTONS_PLUS:
           self._plus_hold = max(self._plus_hold, now + CRUISE_BUTTON_CONFIRM_HOLD)
-        elif b.type in CRUISE_BUTTONS_MINUS:
+        else:
           self._minus_hold = max(self._minus_hold, now + CRUISE_BUTTON_CONFIRM_HOLD)
 
   def _get_button_release(self, req_plus: bool, req_minus: bool) -> bool:
@@ -242,10 +239,8 @@ class SpeedLimitAssist:
   def _consume_driver_press(self) -> bool:
     # One-shot: was a +/- press latched recently? Cleared on read either way so a single
     # press can't fire twice; expired latches clear too.
-    now = time.monotonic()
-    pressed = now <= self._plus_press or now <= self._minus_press
-    self._plus_press = 0.
-    self._minus_press = 0.
+    pressed = time.monotonic() <= self._press_deadline
+    self._press_deadline = 0.
     return pressed
 
   def _update_non_pcm_long_confirmed_state(self) -> bool:
@@ -260,8 +255,7 @@ class SpeedLimitAssist:
     confirmed = self._get_button_release(req_plus, req_minus)
     if confirmed:
       # the confirm press must not double as a manual override next cycle
-      self._plus_press = 0.
-      self._minus_press = 0.
+      self._press_deadline = 0.
     return confirmed
 
   def update_state_machine_pcm_op_long(self):

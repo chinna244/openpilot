@@ -17,6 +17,7 @@ import sys
 from pathlib import Path
 
 from openpilot.tools.lib.logreader import LogReader
+from openpilot.common.constants import CV
 from openpilot.common.params import Params
 from openpilot.cereal import custom
 from opendbc.car.structs import car
@@ -76,7 +77,7 @@ def main(log_path):
       cs = msg.carState
       cs_count += 1
       prev_cluster = cluster_ms
-      cluster_ms = cs.vCruiseCluster / 3.6  # kph -> m/s
+      cluster_ms = cs.vCruiseCluster * CV.KPH_TO_MS
 
       CS = car.CarState()
       evs = []

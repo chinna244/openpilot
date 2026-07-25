@@ -92,7 +92,6 @@ class VCruiseHelperSP:
     # Speed Limit Assist
     self.sla_state = SpeedLimitAssistState.disabled
     self.prev_sla_state = SpeedLimitAssistState.disabled
-    self.has_speed_limit = False
     self.speed_limit_final_last = 0.
     self.speed_limit_final_last_kph = 0.
     self.req_plus = False
@@ -135,7 +134,7 @@ class VCruiseHelperSP:
       # applies on the release edge, and by then SLA has usually already consumed the press
       # and gone inactive — deciding at release would let an SLA-owned press (confirm,
       # abort, re-anchor) leak through and bump the setpoint it was supposed to leave alone.
-      for b in (ButtonType.accelCruise, ButtonType.decelCruise):
+      for b in RECONCILE_BUTTONS:
         if self.enable_button_timers[b] == 1:
           self._press_owned_by_sla = self.sla_state in SLA_ACTIVE_STATES
 
@@ -157,9 +156,11 @@ class VCruiseHelperSP:
       self.reconcile_frames = 0
       return
 
-    dash_kph = CS.cruiseState.speed * CV.MS_TO_KPH
-
     pressed = any(self.enable_button_timers[b] > 0 for b in RECONCILE_BUTTONS)
+    if not pressed and self.reconcile_frames <= 0:
+      return
+
+    dash_kph = CS.cruiseState.speed * CV.MS_TO_KPH
     if pressed:
       if self.reconcile_frames <= 0:
         # evaluated once at press start, before the press's own ECU effect lands
@@ -168,10 +169,8 @@ class VCruiseHelperSP:
         agree_sla = sla_session and abs(dash_kph - self.speed_limit_final_last_kph) <= RECONCILE_AGREE_KPH
         self.reconcile_allowed = agree_setpoint or agree_sla
       self.reconcile_frames = RECONCILE_SETTLE_FRAMES
-    elif self.reconcile_frames > 0:
-      self.reconcile_frames -= 1
     else:
-      return
+      self.reconcile_frames -= 1
 
     if not self.reconcile_allowed:
       return
@@ -191,8 +190,7 @@ class VCruiseHelperSP:
   def update_speed_limit_assist(self, is_metric, LP_SP: custom.LongitudinalPlanSP,
                                 CC_SP: custom.CarControlSP) -> None:
     resolver = LP_SP.speedLimit.resolver
-    self.has_speed_limit = resolver.speedLimitValid or resolver.speedLimitLastValid
-    self.speed_limit_final_last = LP_SP.speedLimit.resolver.speedLimitFinalLast
+    self.speed_limit_final_last = resolver.speedLimitFinalLast
     self.speed_limit_final_last_kph = self.speed_limit_final_last * CV.MS_TO_KPH
     self.prev_sla_state = self.sla_state
     self.sla_state = LP_SP.speedLimit.assist.state

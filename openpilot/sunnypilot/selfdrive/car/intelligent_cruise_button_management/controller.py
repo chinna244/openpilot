@@ -31,15 +31,18 @@ REACT_DEADBAND = 2
 # The error must persist this long before acting, so a single-frame target glitch
 # (e.g. a bad map sample) or a momentary dip can't trigger a button burst.
 REACT_TIMER = 0.3
-# Moves DOWN act after REACT_TIMER; moves UP wait for the target to hold still this long
-# first. Two reasons: transient limiter dips arrive in trains (back-to-back curves), and
-# restoring between them both churns the dash and delays the next deceleration on ECUs
-# that won't commit to decel while the set speed is moving. It also gives the driver-
-# setpoint reconciliation (card) time to adopt the dash after a driver press before the
-# servo could chase a stale target — settled-press re-anchoring is race-free because of
-# this. Decel-overshoot release is exempt: its slewed rise is the one sanctioned
-# continuous up-tracking (measured; the ECU tolerates slow monotonic rises).
+# Moves DOWN act after REACT_TIMER; on cars whose profile declares
+# decel_needs_stable_setpoint, moves UP additionally wait for the target to hold still
+# this long first. Two reasons: transient limiter dips arrive in trains (back-to-back
+# curves), and restoring between them both churns the dash and delays the next
+# deceleration on ECUs that won't commit to decel while the set speed is moving. It also
+# gives the driver-setpoint reconciliation (card) time to adopt the dash after a driver
+# press before the servo could chase a stale target — settled-press re-anchoring is
+# race-free because of this. Decel-overshoot release is exempt: its slewed rise is the
+# one sanctioned continuous up-tracking (measured; the ECU tolerates slow monotonic
+# rises).
 RESTORE_QUIET_TIME = 3.0
+RESTORE_QUIET_FRAMES = int(RESTORE_QUIET_TIME / DT_CTRL)
 
 # Deceleration overshoot: a stock ACC's deceleration scales with the gap between the dash
 # set speed and the ACTUAL speed, not the target — commanding dash = target produces almost
@@ -97,6 +100,7 @@ class IntelligentCruiseButtonManagement:
     self.pre_active_timer = 0
     self.restore_quiet_timer = 0
     self.v_target_prev = 0
+    self.react_deadband = REACT_DEADBAND
 
     self.is_ready = False
     self.is_ready_prev = False
@@ -110,16 +114,10 @@ class IntelligentCruiseButtonManagement:
     self.hold_active = False
     self.hold_frames = 0
     self.hold_start_cluster = 0
+    self.hold_step_landed = False
     self.longpress_faulted = False  # set for the drive when a synthesized hold doesn't land
 
-    self.frame = 0
     self.cruise_button_timers = dict(CRUISE_BUTTON_TIMER)
-
-  @property
-  def react_deadband(self) -> int:
-    # Exact tracking against the (stable) driver setpoint; jitter band against limiters.
-    # Overshoot keeps the limiter band: its command moves by design.
-    return REACT_DEADBAND if self.limiter_active or self.overshoot_mph > 0 else 1
 
   def update_decel_overshoot(self, CS: car.CarState, LP_SP: custom.LongitudinalPlanSP) -> float:
     if self.overshoot_params is None:
@@ -156,6 +154,10 @@ class IntelligentCruiseButtonManagement:
     self.v_cruise_min = get_minimum_set_speed(self.is_metric)
     self.v_cruise_cluster = round(CS.cruiseState.speedCluster * speed_conv)
 
+    # Exact tracking against the (stable) driver setpoint; jitter band against limiters.
+    # Overshoot keeps the limiter band: its command moves by design.
+    self.react_deadband = REACT_DEADBAND if self.limiter_active or self.overshoot_mph > 0 else 1
+
   def update_restore_quiet_timer(self) -> None:
     # Counts how long an up-error has persisted against a still target; any target motion
     # or the error closing resets it. Bypassed entirely while overshoot is releasing.
@@ -177,15 +179,16 @@ class IntelligentCruiseButtonManagement:
       self.hold_active = True
       self.hold_frames = 0
       self.hold_start_cluster = self.v_cruise_cluster
+      self.hold_step_landed = False
     elif self.hold_active:
       self.hold_frames += 1
       if remaining < self.profile.longpress_step:
         self.hold_active = False
       elif self.v_cruise_cluster == self.hold_start_cluster:
-        # the ECU should have snapped by now; if the dash never moved, this ECU does not
+        # the ECU should have stepped by now; if the dash never moved, this ECU does not
         # integrate synthesized holds — fall back to taps for the rest of the drive
-        timeout = self.profile.longpress_first_step_s + HOLD_FIRST_STEP_MARGIN
-        if self.hold_frames * DT_CTRL > timeout:
+        due = self.profile.longpress_step_period_s if self.hold_step_landed else self.profile.longpress_first_step_s
+        if self.hold_frames * DT_CTRL > due + HOLD_FIRST_STEP_MARGIN:
           self.longpress_faulted = True
           self.hold_active = False
           cloudlog.event("icbm_longpress_fallback", brand=self.CP.brand)
@@ -193,6 +196,7 @@ class IntelligentCruiseButtonManagement:
         # a step landed; re-arm the watchdog from the new dash value
         self.hold_start_cluster = self.v_cruise_cluster
         self.hold_frames = 0
+        self.hold_step_landed = True
 
   def update_state_machine(self) -> custom.IntelligentCruiseButtonManagement.SendButtonState:
     self.pre_active_timer = max(0, self.pre_active_timer - 1)
@@ -220,7 +224,8 @@ class IntelligentCruiseButtonManagement:
         elif self.state == State.holding:
           down_pending = self.v_cruise_cluster - self.v_target >= self.react_deadband
           up_pending = self.v_target - self.v_cruise_cluster >= self.react_deadband
-          up_allowed = self.overshoot_mph > 0 or self.restore_quiet_timer >= int(RESTORE_QUIET_TIME / DT_CTRL)
+          up_allowed = (self.overshoot_mph > 0 or not self.profile.decel_needs_stable_setpoint
+                        or self.restore_quiet_timer >= RESTORE_QUIET_FRAMES)
           if down_pending or (up_pending and up_allowed):
             self.pre_active_timer = int(REACT_TIMER / DT_CTRL)
             self.state = State.preActive
@@ -272,4 +277,3 @@ class IntelligentCruiseButtonManagement:
     self.cruise_button = self.update_state_machine()
 
     self.is_ready_prev = self.is_ready
-    self.frame += 1
