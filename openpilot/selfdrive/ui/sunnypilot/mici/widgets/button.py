@@ -7,11 +7,12 @@ See the LICENSE.md file in the root directory for more details.
 
 # SP-specific mici widget extensions — keeps upstream button.py clean.
 
+import math
 from collections.abc import Callable
 
 import pyray as rl
 
-from openpilot.selfdrive.ui.mici.widgets.button import BigButton, BigMultiParamToggle
+from openpilot.selfdrive.ui.mici.widgets.button import BigButton, BigMultiParamToggle, BigMultiToggle
 from openpilot.selfdrive.ui.ui_state import ui_state
 from openpilot.system.ui.lib.application import FontWeight, gui_app
 from openpilot.system.ui.lib.multilang import tr
@@ -164,7 +165,17 @@ class BigButtonSP(BigButton):
 
 
 class BigMultiParamToggleSP(BigMultiParamToggle):
-  """BigMultiParamToggle with bounds-checked param reading, refresh, and dynamic pill spacing."""
+  """BigMultiParamToggle with bounds-checked param reading, refresh, and dynamic pill spacing.
+
+  Upstream stores the selected option's index in the param. Pass `values` (same length as
+  `options`) to store an arbitrary value per option instead — for params whose stored value
+  isn't its position in the list, like AutoLaneChangeTimer, where "off" is -1.
+  """
+
+  def __init__(self, text: str, param: str, options: list[str], values: list | None = None, **kwargs):
+    assert values is None or len(values) == len(options)
+    self._values = values  # set before super(): BigMultiParamToggle.__init__ calls _load_value()
+    super().__init__(text, param, options, **kwargs)
 
   def _draw_content(self, btn_y: float):
     # Skip BigToggle (draws single pill) — we draw multiple pills with dynamic spacing below
@@ -179,12 +190,37 @@ class BigMultiParamToggleSP(BigMultiParamToggle):
       y += step
 
   def _get_param_index(self) -> int:
-    """Upstream uses raw `params.get()` without bounds — this clamps to valid range."""
+    """Upstream uses raw `params.get()` without bounds — this clamps to range, or maps
+    the stored value back through self._values."""
+    if self._values is not None:
+      return self._index_from_value()
     idx = self._params.get(self._param, return_default=True) or 0
     return max(0, min(int(idx), len(self._options) - 1))
 
+  def _index_from_value(self) -> int:
+    """Match the stored value against self._values; unset resolves to the param's declared default."""
+    assert self._values is not None
+    raw = self._params.get(self._param, return_default=True)
+    for i, val in enumerate(self._values):
+      try:
+        if math.isclose(float(val), float(raw), rel_tol=1e-5):
+          return i
+      except (TypeError, ValueError):
+        if str(val) == str(raw):
+          return i
+    return 0
+
   def _load_value(self):
     self.set_value(self._options[self._get_param_index()])
+
+  def _handle_mouse_release(self, mouse_pos):
+    if self._values is None:
+      super()._handle_mouse_release(mouse_pos)
+      return
+    # cycle the option, but skip BigMultiParamToggle._handle_mouse_release's index write
+    BigMultiToggle._handle_mouse_release(self, mouse_pos)
+    # block: refresh() reads this back every frame, a late write would flip the pill back
+    self._params.put(self._param, self._values[self._options.index(self.value)], block=True)
 
   def refresh(self):
     new_value = self._options[self._get_param_index()]

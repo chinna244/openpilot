@@ -6,7 +6,6 @@ See the LICENSE.md file in the root directory for more details.
 """
 
 import json
-import math
 import os
 
 from opendbc.car.structs import car
@@ -22,7 +21,7 @@ from openpilot.system.ui.lib.multilang import tr
 from openpilot.system.ui.widgets.scroller import NavScroller
 from openpilot.selfdrive.ui.ui_state import ui_state
 from openpilot.sunnypilot.mads.helpers import MadsSteeringModeOnBrake, get_mads_limited_brands
-from openpilot.sunnypilot.selfdrive.controls.lib.auto_lane_change import AutoLaneChangeMode
+from openpilot.sunnypilot.selfdrive.controls.lib.auto_lane_change import AUTO_LANE_CHANGE_TIMER, AutoLaneChangeMode
 from openpilot.system.ui.lib.application import gui_app
 
 TORQUE_VERSIONS_PATH = os.path.join(BASEDIR, "openpilot", "sunnypilot", "selfdrive", "controls", "lib",
@@ -30,22 +29,23 @@ TORQUE_VERSIONS_PATH = os.path.join(BASEDIR, "openpilot", "sunnypilot", "selfdri
 
 MADS_STEERING_MODE_LABELS = [tr("remain"), tr("pause"), tr("disengage")]
 
+# AutoLaneChangeTimer stores the mode itself (OFF is -1), so the keys are the stored values, not
+# indices. Timed labels come from AUTO_LANE_CHANGE_TIMER so they can't drift from the controller.
+ALC_LABELS = {
+  AutoLaneChangeMode.OFF: tr("off"),
+  AutoLaneChangeMode.NUDGE: tr("nudge"),
+  AutoLaneChangeMode.NUDGELESS: tr("nudgeless"),
+} | {mode: f"{AUTO_LANE_CHANGE_TIMER[mode]:g} {tr('s')}" for mode in
+     (AutoLaneChangeMode.HALF_SECOND, AutoLaneChangeMode.ONE_SECOND,
+      AutoLaneChangeMode.TWO_SECONDS, AutoLaneChangeMode.THREE_SECONDS)}
+
 
 def _on_off(val: bool) -> str:
   return "on" if val else "off"
 
 
 def _alc_label(v: int) -> str:
-  # AutoLaneChangeTimer: -1 Off, 0 Nudge, 1 Nudgeless, 2-5 timed (0.5/1/2/3s) — mirrors TICI lane_change_settings
-  return {
-    AutoLaneChangeMode.OFF: tr("off"),
-    AutoLaneChangeMode.NUDGE: tr("nudge"),
-    AutoLaneChangeMode.NUDGELESS: tr("nudgeless"),
-    2: f"0.5 {tr('s')}",
-    3: f"1 {tr('s')}",
-    4: f"2 {tr('s')}",
-    5: f"3 {tr('s')}",
-  }.get(v, tr("nudge"))
+  return ALC_LABELS.get(v, ALC_LABELS[AutoLaneChangeMode.NUDGE])
 
 
 class SteeringLayoutMici(NavScroller):
@@ -88,9 +88,8 @@ class SteeringLayoutMici(NavScroller):
 
     # --- Lane change sub-panel ---
     # AutoLaneChangeTimer is a 7-value mode (-1..5), not a boolean — matches TICI lane_change_settings
-    self._lc_timer = BigParamOption(tr("auto lane change"), "AutoLaneChangeTimer",
-                                    min_value=AutoLaneChangeMode.OFF, max_value=5, value_change_step=1,
-                                    label_callback=_alc_label, picker_label_callback=_alc_label)
+    self._lc_timer = BigMultiParamToggleSP(tr("auto lane change"), "AutoLaneChangeTimer",
+                                           list(ALC_LABELS.values()), values=list(ALC_LABELS))
     self._lc_bsm = BigParamControl(tr("bsm delay"), "AutoLaneChangeBsmDelay")
     self._lc_view = self._lane_change_btn.link_sub_panel([self._lc_timer, self._lc_bsm])
 
@@ -107,13 +106,12 @@ class SteeringLayoutMici(NavScroller):
     # --- Torque sub-panel ---
     self._torque_toggle = BigParamControl(tr("enable torque control"), "EnforceTorqueControl")
 
-    # Torque tune version selector — MICI selection sub-view mirroring the TICI TorqueControlTune tree dialog
-    self._tq_versions = self._load_torque_versions()
-    self._tq_version_btn = BigButtonSP(tr("tune version"))
-    self._tq_version_btn.set_subtitle_font_size(24)
-    version_options = [self._make_tq_version_option(tr("default"), None)]
-    version_options += [self._make_tq_version_option(label, ver) for label, ver in self._tq_versions.items()]
-    self._tq_version_view = self._tq_version_btn.link_sub_panel(version_options)
+    # Torque tune version selector — inline pill selector over the TICI TorqueControlTune options,
+    # oldest first. No "default" option: the param's own default (0.0, v0) is what unset resolves to.
+    # The fallback keeps the widget constructible if the versions file is ever unreadable.
+    tq_versions = self._load_torque_versions() or {tr("default"): 0.0}
+    self._tq_version = BigMultiParamToggleSP(tr("tune version"), "TorqueControlTune",
+                                             list(tq_versions), values=list(tq_versions.values()))
 
     self._tq_self_tune_btn = BigButtonSP(tr("self tune"))
     self._tq_self_tune_btn.set_subtitle_font_size(24)
@@ -134,13 +132,14 @@ class SteeringLayoutMici(NavScroller):
                                        picker_label_callback=lambda x: f"{x / 100}", float_param=True)
     self._tq_custom_view = self._tq_custom_btn.link_sub_panel([self._tq_custom, self._tq_manual_rt, self._tq_lat_accel, self._tq_friction])
 
-    self._tq_items_rest = [self._tq_version_btn, self._tq_self_tune_btn, self._tq_custom_btn]
-    self._tq_view = self._torque_settings_btn.link_sub_panel([self._torque_toggle] + self._tq_items_rest)
+    self._tq_items_rest = [self._tq_self_tune_btn, self._tq_custom_btn]
+    self._tq_view = self._torque_settings_btn.link_sub_panel([self._torque_toggle, self._tq_version] + self._tq_items_rest)
 
   # --- Torque tune version selector ---
   @staticmethod
   def _load_torque_versions() -> dict[str, float]:
-    """Load {label: version} from latcontrol_torque_versions.json, sorted newest-first (matches TICI)."""
+    """Load {label: version} from latcontrol_torque_versions.json, sorted oldest-first so the
+    selector reads v0 → v1 and a future version appends at the newest end."""
     try:
       with open(TORQUE_VERSIONS_PATH) as f:
         data = json.load(f)
@@ -152,33 +151,7 @@ class SteeringLayoutMici(NavScroller):
         versions[label] = float(info["version"])
       except (KeyError, ValueError, TypeError):
         pass
-    return dict(sorted(versions.items(), key=lambda kv: kv[1], reverse=True))
-
-  def _make_tq_version_option(self, label: str, version: float | None) -> BigButtonSP:
-    btn = BigButtonSP(label)
-
-    def _select():
-      if version is None:
-        ui_state.params.remove("TorqueControlTune")  # Default — clear override
-      else:
-        ui_state.params.put("TorqueControlTune", version)
-      gui_app.pop_widget()
-
-    btn.set_click_callback(_select)
-    return btn
-
-  def _current_tq_version_label(self) -> str:
-    val = ui_state.params.get("TorqueControlTune")
-    if val is None:
-      return tr("default")
-    try:
-      cur = float(val)
-    except (ValueError, TypeError):
-      return tr("default")
-    for label, ver in self._tq_versions.items():
-      if math.isclose(ver, cur, rel_tol=1e-5):
-        return label
-    return tr("default")
+    return dict(sorted(versions.items(), key=lambda kv: kv[1]))
 
   # --- Main view state ---
   def _update_state(self):
@@ -296,11 +269,12 @@ class SteeringLayoutMici(NavScroller):
     if not gui_app.widget_in_stack(self._tq_view):
       return
 
-    self._tq_version_btn.set_value(self._current_tq_version_label())
     self._torque_toggle.refresh()
+    self._tq_version.refresh()
     nnlc = ui_state.params.get_bool("NeuralNetworkLateralControl")
     offroad = ui_state.is_offroad()
     self._torque_toggle.set_enabled(torque_allowed and offroad and not nnlc)
+    self._tq_version.set_enabled(enforce_torque)
 
     for item in self._tq_items_rest:
       item.set_enabled(enforce_torque)
