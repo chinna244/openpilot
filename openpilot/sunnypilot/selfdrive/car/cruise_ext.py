@@ -43,6 +43,13 @@ V_CRUISE_UNSET = 255
 RECONCILE_SETTLE_TIME = 1.0  # s after the last press
 RECONCILE_SETTLE_FRAMES = int(RECONCILE_SETTLE_TIME / DT_CTRL)
 RECONCILE_BUTTONS = (ButtonType.accelCruise, ButtonType.decelCruise)
+# The dash must have been at an intended resting value when the press started: the driver
+# setpoint (normal cruising, incl. small drift from dropped presses) or an active SLA
+# session's target (a settled re-anchor press). A dash in transit matches neither — e.g.
+# a press that aborts an SLA move mid-walk: the servo gets knocked idle and the plan
+# source snaps back to cruise on that same press, so without this latch the settle window
+# would adopt the half-walked dash and destroy the baseline the servo is about to restore.
+RECONCILE_AGREE_KPH = 2 * CV.MPH_TO_KPH
 
 
 def update_manual_button_timers(CS: car.CarState, button_timers: dict[car.CarState.ButtonEvent.Type, int]) -> None:
@@ -75,6 +82,8 @@ class VCruiseHelperSP:
 
     # Setpoint reconciliation (non-pcmCruiseSpeed cars)
     self.reconcile_frames = 0
+    self.reconcile_allowed = False
+    self._press_owned_by_sla = False
 
     # Plan/actuation regime, updated from longitudinalPlanSP + carControlSP each frame
     self.lp_source = LongitudinalPlanSource.cruise
@@ -122,6 +131,14 @@ class VCruiseHelperSP:
       update_manual_button_timers(CS, self.enable_button_timers)
       button_pressed = any(self.enable_button_timers[k] > 0 for k in self.enable_button_timers)
 
+      # Ownership is decided at the press edge and holds for the whole press. The increment
+      # applies on the release edge, and by then SLA has usually already consumed the press
+      # and gone inactive — deciding at release would let an SLA-owned press (confirm,
+      # abort, re-anchor) leak through and bump the setpoint it was supposed to leave alone.
+      for b in (ButtonType.accelCruise, ButtonType.decelCruise):
+        if self.enable_button_timers[b] == 1:
+          self._press_owned_by_sla = self.sla_state in SLA_ACTIVE_STATES
+
       if enabled and not self.enabled_prev:
         self.enabled_prev = not button_pressed
         enabled = False
@@ -140,24 +157,33 @@ class VCruiseHelperSP:
       self.reconcile_frames = 0
       return
 
+    dash_kph = CS.cruiseState.speed * CV.MS_TO_KPH
+
     pressed = any(self.enable_button_timers[b] > 0 for b in RECONCILE_BUTTONS)
     if pressed:
+      if self.reconcile_frames <= 0:
+        # evaluated once at press start, before the press's own ECU effect lands
+        agree_setpoint = abs(dash_kph - self.v_cruise_kph) <= RECONCILE_AGREE_KPH
+        sla_session = self.sla_state in SLA_ACTIVE_STATES or self.prev_sla_state in SLA_ACTIVE_STATES
+        agree_sla = sla_session and abs(dash_kph - self.speed_limit_final_last_kph) <= RECONCILE_AGREE_KPH
+        self.reconcile_allowed = agree_setpoint or agree_sla
       self.reconcile_frames = RECONCILE_SETTLE_FRAMES
     elif self.reconcile_frames > 0:
       self.reconcile_frames -= 1
     else:
       return
 
-    # The dash is only authoritative when it is supposed to equal v_cruise: no limiter is
-    # driving the plan and ICBM isn't mid-move. Evaluated per-frame so a regime change during
-    # the settle window (e.g. SLA deactivating on this very press) blocks adoption until the
-    # servo has actually restored the dash.
+    if not self.reconcile_allowed:
+      return
+
+    # Per-frame regime gates: even a legitimate window must not adopt while a limiter is
+    # driving the plan or ICBM is stepping the dash — those are the moments the dash is
+    # deliberately somewhere else.
     if self.lp_source != LongitudinalPlanSource.cruise:
       return
     if self.icbm_state in (IcbmState.increasing, IcbmState.decreasing):
       return
 
-    dash_kph = CS.cruiseState.speed * CV.MS_TO_KPH
     if dash_kph > 1:
       self.v_cruise_kph = float(np.clip(round(dash_kph, 1), self.v_cruise_min, V_CRUISE_MAX))
       self.v_cruise_cluster_kph = self.v_cruise_kph
@@ -186,9 +212,9 @@ class VCruiseHelperSP:
 
   @property
   def speed_limit_assist_owns_buttons(self) -> bool:
-    # While SLA is active on a button-actuated car, +/- presses carry SLA semantics (abort a
-    # move in flight, or re-anchor to the dash once settled) — never a v_cruise increment.
-    # The dash keeps the ECU's response to the press; reconcile_setpoint_with_dash adopts it
-    # once the plan source is back to cruise and the servo is idle. Incrementing here as well
+    # A press that started while SLA was active carries SLA semantics (abort a move in
+    # flight, or re-anchor to the dash once settled) — never a v_cruise increment. The dash
+    # keeps the ECU's response to the press; reconcile_setpoint_with_dash adopts it once
+    # the plan source is back to cruise and the servo is idle. Incrementing here as well
     # would double-count the press against the ECU's own step.
-    return self.sla_state in SLA_ACTIVE_STATES
+    return self._press_owned_by_sla
