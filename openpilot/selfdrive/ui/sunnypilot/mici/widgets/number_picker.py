@@ -23,8 +23,8 @@ class _Scroller(_BaseScroller):
   def _get_scroll(self, visible_items, content_size):
     if self._snap_items and not self._snap_ready:
       # First layout after show — item positions are stale, skip snap correction
+      # (calling update() with no snap_target skips snap for this frame)
       self._snap_ready = True
-      self._scroll_snap_filter.x = 0
       self.scroll_panel.update(self._rect, content_size)
       return self.scroll_panel.get_offset()
     return super()._get_scroll(visible_items, content_size)

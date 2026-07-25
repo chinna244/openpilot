@@ -72,7 +72,7 @@ class DisplayLayoutMici(NavScroller):
     )
     self._brightness_timer = BigParamOption(
       tr("brightness delay"), "OnroadScreenOffTimer",
-      min_value=0, max_value=11,
+      min_value=0, max_value=15,
       value_map=ONROAD_BRIGHTNESS_TIMER_VALUES,
       label_callback=_timer_label,
       picker_label_callback=_timer_picker_label,
