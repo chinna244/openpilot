@@ -283,7 +283,7 @@ class TestSpeedLimitAssist:
 class TestSpeedLimitAssistNonPcm:
   """Stock-ACC (button-actuated) cars: pcmCruise=True, openpilotLongitudinalControl=False,
   pcmCruiseSpeed=False. Confirmation and manual override run on driver press latches, never
-  on set-speed cluster changes — the cluster moves for the confirm press's own ±1 step and
+  on set-speed cluster changes: the cluster moves for the confirm press's own ±1 step and
   for every ICBM-injected press, and deactivating on those made confirmation self-destruct
   (the seg16 confirm bug, docs/sla-icbm-redesign.md F1)."""
 

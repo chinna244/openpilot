@@ -115,8 +115,8 @@ class VCruiseHelper(VCruiseHelperSP):
     if self.update_speed_limit_assist_pre_active_confirmed(button_type):
       return
 
-    # While SLA is active, presses carry SLA semantics (abort/re-anchor) — the setpoint is
-    # updated by dash reconciliation instead, so the ECU's step isn't double-counted here.
+    # While SLA is active, presses carry SLA semantics (abort/re-anchor); the setpoint is
+    # updated by dash reconciliation instead, so the ECU's step is not counted twice.
     if self.speed_limit_assist_owns_buttons:
       return
 

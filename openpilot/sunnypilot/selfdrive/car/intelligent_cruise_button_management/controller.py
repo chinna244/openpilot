@@ -21,31 +21,26 @@ State = custom.IntelligentCruiseButtonManagement.IntelligentCruiseButtonManageme
 SendButtonState = custom.IntelligentCruiseButtonManagement.SendButtonState
 
 INACTIVE_TIMER = 0.4
-# Reaction deadband in display units (mph/kph), applied only while a limiter (SCC/SLA)
-# drives the plan: those targets jitter by ±1-2 units frame-to-frame and with no deadband
-# the servo saturates its button pacing ping-ponging SET+/SET- around the noise. When the
-# plan source is cruise the target IS the driver's setpoint — a stable integer — so the
-# servo tracks it exactly (deadband 1): any residual dash error, e.g. from a press the ECU
-# dropped, self-heals instead of stranding the dash 1 unit low forever.
+# Reaction deadband in display units, applied only while a limiter (SCC/SLA) drives the
+# plan; those targets jitter 1-2 units frame to frame and an undamped servo ping-pongs
+# SET+/SET- around the noise. A cruise-source target is the driver setpoint, a stable
+# integer, so track it exactly: a dash residual from a dropped press self-heals instead
+# of stranding the dash low.
 REACT_DEADBAND = 2
 # The error must persist this long before acting, so a single-frame target glitch
 # (e.g. a bad map sample) or a momentary dip can't trigger a button burst.
 REACT_TIMER = 0.3
-# Moves DOWN act after REACT_TIMER; on cars whose profile declares
-# decel_needs_stable_setpoint, moves UP additionally wait for the target to hold still
-# this long first. Two reasons: transient limiter dips arrive in trains (back-to-back
-# curves), and restoring between them both churns the dash and delays the next
-# deceleration on ECUs that won't commit to decel while the set speed is moving. It also
-# gives the driver-setpoint reconciliation (card) time to adopt the dash after a driver
-# press before the servo could chase a stale target — settled-press re-anchoring is
-# race-free because of this. Decel-overshoot release is exempt: its slewed rise is the
-# one sanctioned continuous up-tracking (measured; the ECU tolerates slow monotonic
-# rises).
+# Down moves act after REACT_TIMER. Up moves on decel_needs_stable_setpoint cars wait for
+# the target to hold still this long first: limiter dips arrive in trains, and restoring
+# between them churns the dash and delays the next decel on an ECU that will not commit
+# while the set speed is moving. The quiet window also gives card time to adopt the dash
+# after a driver press before the servo could chase a stale target. Decel-overshoot
+# release is exempt; its slow monotonic rise is measured as tolerated.
 RESTORE_QUIET_TIME = 3.0
 RESTORE_QUIET_FRAMES = int(RESTORE_QUIET_TIME / DT_CTRL)
 
 # Deceleration overshoot: a stock ACC's deceleration scales with the gap between the dash
-# set speed and the ACTUAL speed, not the target — commanding dash = target produces almost
+# set speed and the ACTUAL speed, not the target: commanding dash = target produces almost
 # nothing until the car is already several mph over it, so it arrives at curves hot. When the
 # planner demands deceleration, command the dash below vEgo by the gap that yields the
 # requested decel, capped at the planner target from above (down-only: a stale command
@@ -70,10 +65,9 @@ DECEL_OVERSHOOT_RELEASE = 3.  # mph/s
 DECEL_OVERSHOOT_SOURCES = (LongitudinalPlanSource.sccVision, LongitudinalPlanSource.sccMap,
                            LongitudinalPlanSource.speedLimitAssist)
 
-# A hold is abandoned (and long-press disabled for the drive) if the dash hasn't moved at
-# all this long after the profile says the first step should have landed. Synthesized holds
-# interleave with the wheel's genuine button-up frames on the bus, so an ECU may refuse to
-# integrate them as a hold — taps are the proven fallback.
+# Abandon a hold (and disable long-press for the drive) if the dash never moved this long
+# past the profile's expected step time. Synthesized holds interleave with the wheel's
+# genuine button-up frames, so an ECU may refuse them; taps are the proven fallback.
 HOLD_FIRST_STEP_MARGIN = 0.5  # s
 
 TAP_BUTTONS = {
@@ -159,8 +153,8 @@ class IntelligentCruiseButtonManagement:
     self.react_deadband = REACT_DEADBAND if self.limiter_active or self.overshoot_mph > 0 else 1
 
   def update_restore_quiet_timer(self) -> None:
-    # Counts how long an up-error has persisted against a still target; any target motion
-    # or the error closing resets it. Bypassed entirely while overshoot is releasing.
+    # how long an up-error has persisted against a still target; any target motion or the
+    # error closing resets it
     up_error = self.v_target - self.v_cruise_cluster
     if up_error >= self.react_deadband and self.v_target == self.v_target_prev:
       self.restore_quiet_timer += 1
@@ -186,7 +180,7 @@ class IntelligentCruiseButtonManagement:
         self.hold_active = False
       elif self.v_cruise_cluster == self.hold_start_cluster:
         # the ECU should have stepped by now; if the dash never moved, this ECU does not
-        # integrate synthesized holds — fall back to taps for the rest of the drive
+        # integrate synthesized holds; fall back to taps for the rest of the drive
         due = self.profile.longpress_step_period_s if self.hold_step_landed else self.profile.longpress_first_step_s
         if self.hold_frames * DT_CTRL > due + HOLD_FIRST_STEP_MARGIN:
           self.longpress_faulted = True

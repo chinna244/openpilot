@@ -6,7 +6,7 @@ confirmation self-destructed (952c07dea500f4e2/0000004f--fea08aad07/16, 65 mph z
 dash set 50, SLA target 70) through the CURRENT non-pcm SpeedLimitAssist and checks:
 
   1. the driver's first matching press confirms (preActive -> active), and
-  2. the session STAYS active until the next genuine driver press — on the shipped build
+  2. the session STAYS active until the next genuine driver press; on the shipped build
      it fell to inactive within one cycle because the confirm press's own cluster change
      tripped the manual-override guard, while the cluster provably changed in that window.
 
@@ -110,7 +110,7 @@ def main(log_path):
 
   print(f"\n  {cs_count} carState frames, {len(press_times)} driver +/- presses")
   # Informational only: in this recording the driver re-pressed (mashing at the old bug)
-  # before the cluster ever moved, so cluster robustness can't be shown open-loop here —
+  # before the cluster ever moved, so cluster robustness can't be shown open-loop here;
   # the closed-loop harness (test_icbm_sla_loop.py) covers it.
   print(f"  cluster changes observed while active: {cluster_changes_after_confirm}")
   assert confirm_time is not None, "FAIL: confirmation never happened in replay"

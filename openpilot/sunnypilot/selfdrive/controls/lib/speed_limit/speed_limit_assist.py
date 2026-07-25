@@ -94,9 +94,8 @@ class SpeedLimitAssist:
     self._press_deadline = 0.
     self._last_carstate_ts = 0.
     # Set when the driver dismisses an active session with a +/- press; blocks the
-    # dial-to-target auto-reactivation until the next limit change. Without it, a settled
-    # press would deactivate and instantly re-activate: the cluster still equals the limit
-    # for a tick or two until the ECU's own ±1 step lands, and SLA would fight the driver.
+    # dial-to-target auto-reactivation until the next limit change. The cluster still
+    # equals the limit briefly after a settled press, and SLA must not fight the driver.
     self._driver_dismissed = False
 
     # TODO-SP: SLA's own output_a_target for planner
@@ -156,12 +155,10 @@ class SpeedLimitAssist:
     now = time.monotonic()
     self._last_carstate_ts = now
 
-    # Presses come from the driver alone: openpilot's injected button frames are CAN
-    # transmissions and never loop back into buttonEvents. Release edges arm the
-    # direction-aware confirm latches; press edges arm one direction-less override latch
-    # (the active-state guard deactivates on any +/- press). All are held
-    # CRUISE_BUTTON_CONFIRM_HOLD so the 20 Hz state machine can't miss a one-frame edge
-    # (this method runs at carState rate).
+    # Presses come only from the driver; injected frames are CAN transmissions and never
+    # loop back into buttonEvents. Release edges arm the direction-aware confirm latches,
+    # press edges arm one direction-less override latch, all held CRUISE_BUTTON_CONFIRM_HOLD
+    # so the 20 Hz machine cannot miss a one-frame edge (this runs at carState rate).
     for b in CS.buttonEvents:
       if b.type in CRUISE_BUTTONS_PLUS or b.type in CRUISE_BUTTONS_MINUS:
         if b.pressed:
@@ -342,16 +339,12 @@ class SpeedLimitAssist:
       else:
         # ACTIVE
         if self.state == SpeedLimitAssistState.active:
-          # Manual override: only a genuine driver +/- press deactivates. The set-speed
-          # cluster is NOT a proxy for that here — on button-actuated cars the confirm
-          # press's own ±1 step and ICBM walking the dash toward the limit both move the
-          # cluster, and deactivating on those made confirmation self-destruct: one tap
-          # confirmed, the next frame's cluster change tore it back down. Injected button
-          # frames never appear in buttonEvents (no CAN self-reception), so the press
-          # latch is driver-only by construction. A press mid-move aborts (the servo then
-          # restores the driver's setpoint); a press once settled hands the buttons back
-          # to the driver — both are this same transition, and SLA re-arms on the next
-          # limit change from inactive.
+          # Manual override: only a genuine driver +/- press deactivates. The cluster is
+          # not a proxy for that: the confirm press's own step and ICBM walking the dash
+          # both move it, and deactivating on it made confirmation self-destruct. Injected
+          # frames never appear in buttonEvents, so the latch is driver-only. Mid-move the
+          # press aborts (the servo then restores the setpoint); settled, it hands the
+          # buttons back. SLA re-arms on the next limit change.
           if self._consume_driver_press():
             self.state = SpeedLimitAssistState.inactive
             self._driver_dismissed = True

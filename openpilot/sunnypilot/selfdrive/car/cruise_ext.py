@@ -29,26 +29,20 @@ V_CRUISE_MIN = 8
 V_CRUISE_MAX = 145
 V_CRUISE_UNSET = 255
 
-# Setpoint reconciliation for non-pcmCruiseSpeed (ICBM) cars. The car's own ECU keeps the
-# real set speed and steps it on wheel-button presses, while openpilot integrates the same
-# presses independently — the two drift whenever their stepping cadences differ (long-press
-# snaps to a grid, gas-override presses, the ECU applying a trailing long-press increment
-# right after release). The dash is the ECU's truth of the driver's setpoint, but only when
-# nothing is deliberately holding it away from v_cruise: while a limiter (SCC/SLA) is the
-# plan source or ICBM is mid-move, dash != v_cruise by design and adopting it would destroy
-# the driver's baseline. So: while the driver is pressing +/- and briefly after, adopt the
-# dash as the source of truth iff the plan source is cruise and ICBM is not actively stepping.
-# The settle time absorbs the ECU's trailing long-press increment (lands well inside 1 s on
-# a Mazda CX-5 2022; revalidate for other ICBM brands whose ECUs step differently).
+# Setpoint reconciliation for non-pcmCruiseSpeed (ICBM) cars. The stock ECU keeps the real
+# set speed and steps it on wheel presses while openpilot integrates the same presses, so
+# the two drift (grid-snapped long presses, gas-override presses, trailing increments).
+# Around a driver press the dash is the ECU's truth of the setpoint, but only when nothing
+# is deliberately holding it away from v_cruise: adopt it iff the plan source is cruise and
+# ICBM is not mid-move. The settle time absorbs the ECU's trailing long-press increment
+# (lands well inside 1 s on a CX-5 2022).
 RECONCILE_SETTLE_TIME = 1.0  # s after the last press
 RECONCILE_SETTLE_FRAMES = int(RECONCILE_SETTLE_TIME / DT_CTRL)
 RECONCILE_BUTTONS = (ButtonType.accelCruise, ButtonType.decelCruise)
-# The dash must have been at an intended resting value when the press started: the driver
-# setpoint (normal cruising, incl. small drift from dropped presses) or an active SLA
-# session's target (a settled re-anchor press). A dash in transit matches neither — e.g.
-# a press that aborts an SLA move mid-walk: the servo gets knocked idle and the plan
-# source snaps back to cruise on that same press, so without this latch the settle window
-# would adopt the half-walked dash and destroy the baseline the servo is about to restore.
+# The dash must also have been at rest when the press started: at the setpoint (normal
+# cruising, small drift) or at an active SLA session's target (settled re-anchor). A dash
+# in transit matches neither; adopting it would destroy the baseline the servo is about to
+# restore, since a press that aborts an SLA move knocks both regime gates idle on the spot.
 RECONCILE_AGREE_KPH = 2 * CV.MPH_TO_KPH
 
 
@@ -130,10 +124,9 @@ class VCruiseHelperSP:
       update_manual_button_timers(CS, self.enable_button_timers)
       button_pressed = any(self.enable_button_timers[k] > 0 for k in self.enable_button_timers)
 
-      # Ownership is decided at the press edge and holds for the whole press. The increment
-      # applies on the release edge, and by then SLA has usually already consumed the press
-      # and gone inactive — deciding at release would let an SLA-owned press (confirm,
-      # abort, re-anchor) leak through and bump the setpoint it was supposed to leave alone.
+      # Ownership is decided at the press edge and holds for the whole press: the increment
+      # applies at release, and by then SLA has usually consumed the press and gone
+      # inactive, which would let an SLA-owned press leak through as an increment.
       for b in RECONCILE_BUTTONS:
         if self.enable_button_timers[b] == 1:
           self._press_owned_by_sla = self.sla_state in SLA_ACTIVE_STATES
@@ -175,9 +168,8 @@ class VCruiseHelperSP:
     if not self.reconcile_allowed:
       return
 
-    # Per-frame regime gates: even a legitimate window must not adopt while a limiter is
-    # driving the plan or ICBM is stepping the dash — those are the moments the dash is
-    # deliberately somewhere else.
+    # even a legitimate window must not adopt while a limiter drives the plan or ICBM is
+    # stepping the dash
     if self.lp_source != LongitudinalPlanSource.cruise:
       return
     if self.icbm_state in (IcbmState.increasing, IcbmState.decreasing):
@@ -210,9 +202,7 @@ class VCruiseHelperSP:
 
   @property
   def speed_limit_assist_owns_buttons(self) -> bool:
-    # A press that started while SLA was active carries SLA semantics (abort a move in
-    # flight, or re-anchor to the dash once settled) — never a v_cruise increment. The dash
-    # keeps the ECU's response to the press; reconcile_setpoint_with_dash adopts it once
-    # the plan source is back to cruise and the servo is idle. Incrementing here as well
-    # would double-count the press against the ECU's own step.
+    # A press that started while SLA was active carries SLA semantics (abort in flight,
+    # re-anchor once settled), never a v_cruise increment; the ECU's step comes back via
+    # reconcile_setpoint_with_dash, so incrementing here would count the press twice.
     return self._press_owned_by_sla
