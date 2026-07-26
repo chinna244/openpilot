@@ -439,6 +439,31 @@ struct BackupManagerSP @0xf98d843bfd7004a3 {
 
 struct CarStateSP @0xb86e6369214c01c8 {
   speedLimit @0 :Float32;
+  cruiseSession @1 :CruiseSession;
+
+  # The card-side cruise arbiter's session, published at carState rate. On non-pcm
+  # (stock-ACC button) cars this is the authoritative SLA session: plannerd mirrors it
+  # into longitudinalPlanSP.speedLimit.assist for the UI, and the ICBM servo freezes
+  # while a confirm prompt is pending. Counters let 20 Hz consumers see 100 Hz
+  # transitions without sampling loss.
+  struct CruiseSession {
+    state @0 :LongitudinalPlanSP.SpeedLimit.AssistState;
+    # plan cap in m/s: the session target while active, the frozen hold while
+    # prompting, V_CRUISE_UNSET (255) otherwise
+    vCap @1 :Float32;
+    lastIntent @2 :CruiseIntent;
+    transitionCounter @3 :UInt32;   # bumps on every session state change
+    announceCounter @4 :UInt32;     # bumps when an activation must raise the alert
+
+    enum CruiseIntent {
+      none @0;
+      increment @1;
+      decrement @2;
+      confirm @3;
+      decline @4;
+      dismiss @5;
+    }
+  }
 }
 
 struct LiveMapDataSP @0xf416ec09499d9d19 {
