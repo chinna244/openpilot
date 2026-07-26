@@ -55,7 +55,12 @@ _PRESS_PROMPT = 2   # started while a confirm prompt was open: resolves at relea
 
 class CruiseArbiter:
   def __init__(self, CP, CP_SP):
-    self.applicable = bool(CP.pcmCruise and not CP_SP.pcmCruiseSpeed)
+    # everything the old non-pcm SLA machine served: stock-ACC button cars (ICBM,
+    # pcmCruise and not pcmCruiseSpeed) AND op-long ports without pcmCruise, where the
+    # buttons and setpoint are openpilot's own. Only pcm-op-long cars keep the plannerd
+    # machine. The dash-specific pieces (reconciler, servo freeze, card veto) gate
+    # themselves on the ICBM config independently.
+    self.applicable = not (CP.openpilotLongitudinalControl and CP.pcmCruise)
 
     # session
     self.state = SessionState.disabled

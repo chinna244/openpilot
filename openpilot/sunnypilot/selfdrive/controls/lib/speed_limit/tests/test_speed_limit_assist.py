@@ -473,3 +473,40 @@ class TestCruiseArbiterNonPcm:
     their wall-clock durations."""
     assert int(ARBITER_PROMPT_PERIOD / DT_CTRL) == 500   # 5 s at 100 Hz
     assert int(ARBITER_GUARD_PERIOD / DT_CTRL) == 50     # 0.5 s at 100 Hz
+
+  def test_applicability_matches_planner_selection(self):
+    """The arbiter must cover exactly the cars plannerd mirrors (everything that is not
+    pcm-op-long): stock-ACC button cars AND op-long ports without pcmCruise. A mismatch
+    leaves a car mirroring a permanently disabled session."""
+    CarInterface = interfaces[DEFAULT_CAR]
+    CP = CarInterface.get_non_essential_params(DEFAULT_CAR)
+    CP_SP = CarInterface.get_non_essential_params_sp(CP, DEFAULT_CAR)
+
+    for op_long, pcm_cruise, pcm_cruise_speed in [(False, True, False),  # ICBM (Mazda)
+                                                  (True, False, True),   # op-long, no pcmCruise (most ports)
+                                                  (True, True, True)]:   # pcm-op-long (plannerd machine)
+      CP.openpilotLongitudinalControl = op_long
+      CP.pcmCruise = pcm_cruise
+      CP_SP.pcmCruiseSpeed = pcm_cruise_speed
+      arb = CruiseArbiter(CP, CP_SP)
+      mirrored_by_plannerd = not (op_long and pcm_cruise)
+      assert arb.applicable == mirrored_by_plannerd, (op_long, pcm_cruise, pcm_cruise_speed)
+
+  def test_op_long_non_pcm_car_confirms(self):
+    """Op-long without pcmCruise (e.g. most Hyundai/Honda ports): buttons are
+    openpilot's own; the arbiter session and confirm flow must work there too."""
+    CarInterface = interfaces[DEFAULT_CAR]
+    CP = CarInterface.get_non_essential_params(DEFAULT_CAR)
+    CP_SP = CarInterface.get_non_essential_params_sp(CP, DEFAULT_CAR)
+    CP.openpilotLongitudinalControl = True
+    CP.pcmCruise = False
+    CP_SP.pcmCruiseSpeed = True
+    self.arb = CruiseArbiter(CP, CP_SP)
+    self.arb.read_params(self.params)
+    assert self.arb.applicable
+    self.v_cruise_kph = 40 * CV.MPH_TO_KPH
+
+    self.go_pre_active(cluster_mph=40, limit_mph=45)
+    self.press(ButtonType.accelCruise, 40, 45)
+    assert self.arb.state == SpeedLimitAssistState.active
+    assert round(self.v_cruise_kph * CV.KPH_TO_MPH) == 45
