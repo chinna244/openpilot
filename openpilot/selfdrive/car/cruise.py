@@ -116,7 +116,7 @@ class VCruiseHelper(VCruiseHelperSP):
     # A press the cruise arbiter classified as confirm or dismiss carries session
     # semantics, never a v_cruise increment; the ECU's own step comes back via dash
     # reconciliation, so incrementing here would count the press twice.
-    if self.cruise_arbiter.press_owned(button_type):
+    if self.press_owned(button_type):
       return
 
     long_press, v_cruise_delta = VCruiseHelperSP.update_v_cruise_delta(self, long_press, v_cruise_delta)

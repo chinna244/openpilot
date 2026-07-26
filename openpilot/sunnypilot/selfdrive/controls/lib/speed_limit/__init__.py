@@ -4,6 +4,8 @@ Copyright (c) 2021-, Haibin Wen, sunnypilot, and a number of other contributors.
 This file is part of sunnypilot and is licensed under the MIT License.
 See the LICENSE.md file in the root directory for more details.
 """
+from openpilot.cereal import custom
+
 LIMIT_ADAPT_ACC = -1.  # m/s^2 Ideal acceleration for the adapting (braking) phase when approaching speed limits.
 LIMIT_MAX_MAP_DATA_AGE = 10.  # s Maximum time to hold to map data, then consider it invalid inside limits controllers.
 
@@ -18,13 +20,9 @@ CONFIRM_SPEED_THRESHOLD = {
   False: 50,  # mph
 }
 
-
-def _session_states():
-  from openpilot.cereal import custom
-  s = custom.LongitudinalPlanSP.SpeedLimit.AssistState
-  active = (s.active, s.adapting)
-  return active, (s.preActive, s.pending, *active)
-
+V_CRUISE_UNSET = 255.
 
 # shared by the pcm machine (plannerd), the cruise arbiter (card), and the mirror
-ACTIVE_STATES, ENABLED_STATES = _session_states()
+_AssistState = custom.LongitudinalPlanSP.SpeedLimit.AssistState
+ACTIVE_STATES = (_AssistState.active, _AssistState.adapting)
+ENABLED_STATES = (_AssistState.preActive, _AssistState.pending, *ACTIVE_STATES)

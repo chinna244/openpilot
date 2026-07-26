@@ -213,7 +213,8 @@ class Car:
     if can_rcv_valid and REPLAY:
       self.can_log_mono_time = messaging.log_from_bytes(can_strs[0]).logMonoTime
 
-    self.v_cruise_helper.update_speed_limit_assist(self.is_metric, self.sm['longitudinalPlanSP'], self.sm['carControlSP'])
+    self.v_cruise_helper.update_speed_limit_assist(self.is_metric, self.sm['longitudinalPlanSP'], self.sm['carControlSP'],
+                                                   lp_updated=self.sm.updated['longitudinalPlanSP'])
     self.v_cruise_helper.update_v_cruise(CS, self.sm['carControl'].enabled, self.is_metric)
     if self.sm['carControl'].enabled and not self.CC_prev.enabled:
       # Use CarState w/ buttons from the step selfdrived enables on
@@ -285,10 +286,7 @@ class Car:
       # send car controls over can
       now_nanos = self.can_log_mono_time if REPLAY else int(time.monotonic() * 1e9)
       CC_SP_struct = convert_carControlSP(CC_SP)
-      # authoritative gate: selfdrived's ICBM freeze is one message hop stale, so a
-      # button frame could escape at prompt onset; card vetoes with same-frame state
-      if self.v_cruise_helper.cruise_arbiter.prompting:
-        CC_SP_struct.intelligentCruiseButtonManagement.sendButton = structs.IntelligentCruiseButtonManagement.SendButtonState.none
+      self.v_cruise_helper.cruise_arbiter.gate_send_button(CC_SP_struct)
       self.last_actuators_output, can_sends = self.CI.apply(CC, CC_SP_struct, now_nanos)
       self.pm.send('sendcan', can_list_to_can_capnp(can_sends, msgtype='sendcan', valid=CS.canValid))
 

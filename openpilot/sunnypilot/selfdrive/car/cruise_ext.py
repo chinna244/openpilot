@@ -12,7 +12,8 @@ from opendbc.car import structs
 from openpilot.common.constants import CV
 from openpilot.common.params import Params
 from openpilot.common.realtime import DT_CTRL
-from openpilot.sunnypilot.selfdrive.car.cruise_arbiter import CruiseArbiter, ACTIVE_STATES as SESSION_ACTIVE_STATES
+from openpilot.sunnypilot.selfdrive.car.cruise_arbiter import CruiseArbiter, V_CRUISE_MAX, V_CRUISE_UNSET, \
+  ACTIVE_STATES as SESSION_ACTIVE_STATES
 from openpilot.sunnypilot.selfdrive.car.intelligent_cruise_button_management.helpers import get_minimum_set_speed
 
 ButtonType = car.CarState.ButtonEvent.Type
@@ -23,9 +24,7 @@ CRUISE_BUTTON_TIMER = {ButtonType.decelCruise: 0, ButtonType.accelCruise: 0,
                        ButtonType.setCruise: 0, ButtonType.resumeCruise: 0,
                        ButtonType.cancel: 0, ButtonType.mainCruise: 0}
 
-V_CRUISE_MIN = 8
-V_CRUISE_MAX = 145
-V_CRUISE_UNSET = 255
+V_CRUISE_MIN = 8  # V_CRUISE_MAX / V_CRUISE_UNSET come from cruise_arbiter
 
 # Setpoint reconciliation for non-pcmCruiseSpeed (ICBM) cars. The stock ECU keeps the real
 # set speed and steps it on wheel presses while openpilot integrates the same presses, so
@@ -173,11 +172,16 @@ class VCruiseHelperSP:
       self.v_cruise_cluster_kph = self.v_cruise_kph
 
   def update_speed_limit_assist(self, is_metric, LP_SP: custom.LongitudinalPlanSP,
-                                CC_SP: custom.CarControlSP) -> None:
+                                CC_SP: custom.CarControlSP, lp_updated: bool = True) -> None:
     self.lp_source = LP_SP.longitudinalPlanSource
     self.icbm_state = CC_SP.intelligentCruiseButtonManagement.state
     self.cruise_arbiter.is_metric = is_metric
-    self.cruise_arbiter.update_limit(LP_SP)
+    if lp_updated:  # resolver values only change when the plan message does
+      self.cruise_arbiter.update_limit(LP_SP)
+
+  def press_owned(self, button_type) -> bool:
+    # a press the arbiter classified as confirm or dismiss never increments v_cruise
+    return self.cruise_arbiter.press_owned(button_type)
 
   def update_cruise_arbiter(self, CS: car.CarState, enabled: bool) -> None:
     if not self.cruise_arbiter.applicable:

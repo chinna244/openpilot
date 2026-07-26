@@ -230,14 +230,6 @@ EVENTS_SP: dict[int, dict[str, Alert | AlertCallbackType]] = {
     ET.WARNING: speed_limit_pre_active_alert,
   },
 
-  EventNameSP.speedLimitPending: {
-    ET.WARNING: Alert(
-      "Auto adjusting to last speed limit",
-      "",
-      AlertStatus.normal, AlertSize.small,
-      Priority.LOW, VisualAlert.none, AudibleAlertSP.promptSingleHigh, 5.),
-  },
-
   EventNameSP.e2eChime: {
     ET.PERMANENT: Alert(
       "",

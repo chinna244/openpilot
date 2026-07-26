@@ -11,10 +11,10 @@ That drive, recorded on the shipped build, contains every reported SLA jank in o
   t≈415.6  + confirm on a rising limit went active but stayed inert (min() select)
 
 This replays the recorded buttons, cluster, and resolver limits through the CURRENT
-CruiseArbiter (card-side session machine) and asserts the fixed behavior at each
-documented moment: activation transitions, announce-counter semantics (the alert
-channel), declines, and the frozen prompt cap. The arbiter is frame-based, so the
-replay is fully deterministic; no clock shimming.
+CruiseArbiter (card-side session machine, via replay_common) and asserts the fixed
+behavior at each documented moment: activation transitions, announce-counter semantics
+(the alert channel), declines, and the frozen prompt cap. The arbiter is frame-based,
+so the replay is fully deterministic.
 
 Full-loop behavior (setpoint adoption, ICBM walks) is covered closed-loop by
 test_icbm_sla_loop.py; here the recorded cluster is replayed as-is, so cluster-coupled
@@ -23,91 +23,38 @@ outcomes follow the OLD build's trajectory by construction.
 Run from repo root (venv active):
   python tools/mazda_long/icbm_sla/replay_drive_incidents.py [route_glob]
 """
-import glob
 import sys
 
-from openpilot.tools.lib.logreader import LogReader
 from openpilot.common.constants import CV
-from openpilot.common.params import Params
 from openpilot.cereal import custom
-from opendbc.car.structs import car
-from openpilot.sunnypilot.selfdrive.car.cruise_arbiter import CruiseArbiter
-from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.common import Mode
+from replay_common import arbiter_frames, make_arbiter, sorted_segments
 
 SessionState = custom.LongitudinalPlanSP.SpeedLimit.AssistState
-ButtonType = car.CarState.ButtonEvent.Type
 DEFAULT_GLOB = "tools/mazda_long/test_data/sla_drive_logs/0000000b--b039e84091--*/rlog.zst"
-
-BUTTON_MAP = {
-  'accelCruise': ButtonType.accelCruise,
-  'decelCruise': ButtonType.decelCruise,
-  'setCruise': ButtonType.setCruise,
-  'resumeCruise': ButtonType.resumeCruise,
-}
 
 
 def main(route_glob):
-  params = Params()
-  params.put("IsReleaseSpBranch", True, block=True)
-  params.put("SpeedLimitMode", int(Mode.assist), block=True)
-  params.put_bool("IsMetric", False, block=True)
-
-  CP = car.CarParams(pcmCruise=True, brand="mazda")
-  CP_SP = custom.CarParamsSP(pcmCruiseSpeed=False)
-  arb = CruiseArbiter(CP, CP_SP)
-  arb.read_params(params)
-  assert arb.applicable
-
-  paths = sorted(glob.glob(route_glob), key=lambda p: int(p.split('--')[-1].split('/')[0]))
+  arb = make_arbiter()
+  paths = sorted_segments(route_glob)
   assert paths, f"no rlogs match {route_glob}"
 
-  enabled = False
-  lp = custom.LongitudinalPlanSP()
   cs_count = 0
-  t0 = None
-
   transitions = []  # (t, from, to)
   announces = []    # t of each announce-counter bump (the alert channel)
   holds = []        # (t, v_cap) sampled while prompting
   last_announce = 0
 
   print(f"replaying {len(paths)} segments of {paths[0].split('/')[-2].rsplit('--', 1)[0]}")
-  for path in paths:
-    for msg in LogReader(path):
-      which = msg.which()
-      t_abs = msg.logMonoTime * 1e-9
-      if t0 is None:
-        t0 = t_abs
-      t = t_abs - t0
-
-      if which == 'carControl':
-        enabled = msg.carControl.enabled
-      elif which == 'longitudinalPlanSP':
-        r = msg.longitudinalPlanSP.speedLimit.resolver
-        lp = custom.LongitudinalPlanSP()
-        lp.speedLimit.resolver.speedLimit = r.speedLimit
-        lp.speedLimit.resolver.speedLimitFinalLast = r.speedLimitFinalLast
-        lp.speedLimit.resolver.speedLimitLastValid = r.speedLimitValid or r.speedLimitLastValid
-      elif which == 'carState':
-        cs = msg.carState
-        cs_count += 1
-
-        CS = car.CarState()
-        CS.buttonEvents = [car.CarState.ButtonEvent(type=BUTTON_MAP[str(b.type)], pressed=b.pressed)
-                           for b in cs.buttonEvents if str(b.type) in BUTTON_MAP]
-
-        arb.update_limit(lp)
-        prev_state = arb.state
-        arb.step(CS, enabled, cs.vCruise, cs.vCruiseCluster)
-
-        if arb.state != prev_state:
-          transitions.append((t, prev_state, arb.state))
-          print(f"  t={t:7.2f}s  {str(prev_state):9s} -> {arb.state}  (intent={arb.last_intent})")
-        if arb.announce_counter != last_announce:
-          announces.append(t)
-          last_announce = arb.announce_counter
-        if arb.prompting:
-          holds.append((t, arb.v_cap))
+  for t, prev_state, _ in arbiter_frames(arb, paths):
+    cs_count += 1
+    if arb.state != prev_state:
+      transitions.append((t, prev_state, arb.state))
+      print(f"  t={t:7.2f}s  {str(prev_state):9s} -> {arb.state}  (intent={arb.last_intent})")
+    if arb.announce_counter != last_announce:
+      announces.append(t)
+      last_announce = arb.announce_counter
+    if arb.prompting:
+      holds.append((t, arb.v_cap))
 
   def transitions_in(t_a, t_b, frm=None, to=None):
     return [x for x in transitions if t_a <= x[0] <= t_b

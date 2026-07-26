@@ -4,8 +4,8 @@ Copyright (c) 2021-, Haibin Wen, sunnypilot, and a number of other contributors.
 This file is part of sunnypilot and is licensed under the MIT License.
 See the LICENSE.md file in the root directory for more details.
 
-Cruise arbiter: single owner of button meaning and the SLA session on non-pcm
-(stock-ACC, pcmCruise and not pcmCruiseSpeed) cars.
+Cruise arbiter: single owner of button meaning and the SLA session on non-pcm cars
+(everything that is not pcm-op-long).
 
 Runs at 100 Hz inside card, in the same frame as the button events and the setpoint
 writer. Every +/- press is classified exactly once, into one intent, from the
@@ -15,33 +15,47 @@ published session instead of re-interpreting buttons. This replaces the previous
 arrangement where four modules independently interpreted the same press across three
 processes, bridged by wall-clock latches sized to the slowest consumer.
 
-The session is published on carStateSP.cruiseSession. Counters make 100 Hz
-transitions visible to 20 Hz consumers without sampling loss.
+The session is published on carStateSP.cruiseSession; announceCounter makes 100 Hz
+alert-worthy transitions visible to 20 Hz consumers without sampling loss.
+
+A pending confirm prompt freezes speed at three altitudes, each with a distinct job:
+  1. the session cap (v_cap) holds the old target, so the plan min() cannot release
+     the dash toward the baseline while the driver is deciding;
+  2. the ICBM servo parks (controller.prompt_frozen) with its restore patience held
+     at zero, so a decline/timeout still waits out a full quiet window;
+  3. card vetoes button emission with same-frame state (gate_send_button), because
+     the servo's view of the session is one message hop stale.
 """
+from dataclasses import dataclass
+
 import numpy as np
 
 from openpilot.cereal import custom
+from opendbc.car import structs
 from opendbc.car.structs import car
 from openpilot.common.constants import CV
 from openpilot.common.realtime import DT_CTRL
 from openpilot.sunnypilot.selfdrive.car.intelligent_cruise_button_management.helpers import get_minimum_set_speed
-from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit import ACTIVE_STATES, CONFIRM_SPEED_THRESHOLD
+from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit import ACTIVE_STATES
 from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.common import Mode
-from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.helpers import compare_cluster_target
+from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.helpers import compare_cluster_target, confirm_needed_for_change
 
 ButtonType = car.CarState.ButtonEvent.Type
 SessionState = custom.LongitudinalPlanSP.SpeedLimit.AssistState
 CruiseIntent = custom.CarStateSP.CruiseSession.CruiseIntent
 
+# canonical for the card-side SP stack (cruise_ext imports from here); a fourth home is
+# still one too many, but selfdrive.car.cruise cannot be imported without a cycle
 V_CRUISE_UNSET = 255.
-V_CRUISE_MAX = 145  # kph, mirrors selfdrive.car.cruise
+V_CRUISE_MAX = 145  # kph
 
 # All timers are 100 Hz frame counts (DT_CTRL).
 DISABLED_GUARD_PERIOD = 0.5   # s after engagement before the session may form
 PRE_ACTIVE_GUARD_PERIOD = 5.  # s a confirm prompt stays open
 # resolve a prompt press at long-press duration instead of waiting for release (the ECU
-# is already grid-stepping); one frame before cruise.py's first repeat tick so the tick
-# is already owned when it fires
+# is already grid-stepping); one frame before cruise.py's first repeat tick
+# (CRUISE_LONG_PRESS = 50, not importable here without a cycle) so the tick is already
+# owned when it fires
 LONG_PRESS_FRAMES = 50 - 1
 
 PLUS_BUTTONS = (ButtonType.accelCruise, ButtonType.resumeCruise)
@@ -51,6 +65,14 @@ MINUS_BUTTONS = (ButtonType.decelCruise, ButtonType.setCruise)
 _PRESS_NORMAL = 0   # plain increment/decrement press
 _PRESS_DISMISS = 1  # started while the session was active: owned, ends the session
 _PRESS_PROMPT = 2   # started while a confirm prompt was open: resolves at release/tick
+
+
+@dataclass
+class _Press:
+  cls: int
+  frames: int = 0
+  resolved: bool = False   # prompt press answered (confirm); owned from then on
+  released: bool = False   # kept through the release frame for press_owned, swept next
 
 
 class CruiseArbiter:
@@ -67,21 +89,19 @@ class CruiseArbiter:
     self.state_prev_frame = SessionState.disabled  # snapshot from before this frame's step
     self.v_cap = V_CRUISE_UNSET  # m/s; session target while active, frozen hold while prompting
     self.last_intent = CruiseIntent.none
-    self.transition_counter = 0
     self.announce_counter = 0
 
     # params, refreshed off the RT path (card params thread)
     self.enabled = False   # SpeedLimitMode == assist
     self.is_metric = False
 
-    # resolver inputs (from longitudinalPlanSP, ~20 Hz, sampled at 100 Hz)
+    # resolver inputs (from longitudinalPlanSP, updated at plan rate)
     self._speed_limit = 0.
     self._speed_limit_prev = 0.
     self._slf = 0.  # speedLimitFinalLast, m/s
     self._has_limit = False
 
     # machine state
-    self.long_enabled = False
     self.long_enabled_prev = False
     self.long_engaged_timer = 0
     self.pre_active_timer = 0
@@ -89,10 +109,9 @@ class CruiseArbiter:
     self._cluster_conv = 0
     self._cluster_conv_prev = 0
 
-    # press tracking: button -> [class, frames_held, resolved]
-    self._press: dict = {}
-    # buttons whose release this frame is owned (must not increment); rebuilt per frame
-    self._owned_releases: set = set()
+    # press tracking, keyed by raw enumerant int (capnp _DynamicEnum instances do not
+    # hash-match the raw ints cruise.py passes into press_owned)
+    self._press: dict[int, _Press] = {}
     # set for the frame an accel-confirm adopts the limit; consumed by the helper to
     # kill the reconcile window before the reconciler runs
     self.adopted_this_frame = False
@@ -104,7 +123,7 @@ class CruiseArbiter:
     self.enabled = params.get("SpeedLimitMode", return_default=True) == Mode.assist
     self.is_metric = params.get_bool("IsMetric")
 
-  # ---- resolver inputs (card 100 Hz, values change at plan rate) --------------------
+  # ---- resolver inputs (card, on longitudinalPlanSP updates) ------------------------
   def update_limit(self, LP_SP):
     if not self.applicable:
       return
@@ -143,19 +162,8 @@ class CruiseArbiter:
   def _limit_changed(self) -> bool:
     return self._has_limit and self._speed_limit != self._speed_limit_prev
 
-  @property
-  def _confirm_needed(self) -> bool:
-    # below the confirm-speed threshold a limit change always prompts; at/above it a
-    # new limit >= threshold applies without confirmation (upstream CST rule)
-    cst = CONFIRM_SPEED_THRESHOLD[self.is_metric]
-    if self._cluster_conv < cst:
-      return True
-    return self._target_conv() < cst
-
   def _set_state(self, state, announce=False):
-    if state != self.state:
-      self.state = state
-      self.transition_counter += 1
+    self.state = state
     if announce:
       self.announce_counter += 1
 
@@ -181,13 +189,13 @@ class CruiseArbiter:
 
     Returns v_cruise_kph, possibly raised by an upward confirm adoption."""
     self.adopted_this_frame = False
-    self._owned_releases.clear()
+    if self._press:
+      # releases stayed through their frame for press_owned; sweep them now
+      self._press = {btn: p for btn, p in self._press.items() if not p.released}
 
     for b in CS.buttonEvents:
       if b.type not in PLUS_BUTTONS and b.type not in MINUS_BUTTONS:
         continue
-      # keys are raw enumerant ints: capnp _DynamicEnum instances do not hash-match the
-      # raw ints cruise.py passes into press_owned
       btn = b.type.raw
 
       if b.pressed:
@@ -195,38 +203,41 @@ class CruiseArbiter:
           # a press on an active session dismisses it at the press edge; the whole
           # press is owned (its ECU step re-anchors via the reconciler, never counted
           # here). SLA re-arms on the next limit change.
-          self._press[btn] = [_PRESS_DISMISS, 0, False]
+          self._press[btn] = _Press(_PRESS_DISMISS)
           self._set_state(SessionState.inactive)
           self._driver_dismissed = True
           self.last_intent = CruiseIntent.dismiss
         elif self.state_prev_frame == SessionState.preActive:
-          self._press[btn] = [_PRESS_PROMPT, 0, False]
+          self._press[btn] = _Press(_PRESS_PROMPT)
         else:
-          self._press[btn] = [_PRESS_NORMAL, 0, False]
+          self._press[btn] = _Press(_PRESS_NORMAL)
 
       else:  # release
-        press = self._press.pop(btn, None)
+        press = self._press.get(btn)
         if press is None:
           continue
-        if press[0] == _PRESS_PROMPT and not press[2]:
+        if press.cls == _PRESS_PROMPT and not press.resolved:
           v_cruise_kph = self._resolve_prompt_press(btn, press, v_cruise_kph)
-        if press[0] == _PRESS_DISMISS or (press[0] == _PRESS_PROMPT and press[2]):
-          self._owned_releases.add(btn)
+        if press.cls == _PRESS_NORMAL and self.last_intent == CruiseIntent.none:
+          self.last_intent = CruiseIntent.increment if btn in PLUS_BUTTONS else CruiseIntent.decrement
+        press.released = True
 
     # long-press ticks: a prompt press that reaches long-press duration resolves at the
     # first tick instead of waiting for release (the ECU is already grid-stepping)
     for btn, press in self._press.items():
-      press[1] += 1
-      if press[0] == _PRESS_PROMPT and not press[2] and press[1] >= LONG_PRESS_FRAMES:
+      if press.released:
+        continue
+      press.frames += 1
+      if press.cls == _PRESS_PROMPT and not press.resolved and press.frames >= LONG_PRESS_FRAMES:
         v_cruise_kph = self._resolve_prompt_press(btn, press, v_cruise_kph)
 
     return v_cruise_kph
 
-  def _resolve_prompt_press(self, button, press, v_cruise_kph: float) -> float:
+  def _resolve_prompt_press(self, button: int, press: _Press, v_cruise_kph: float) -> float:
     if self.state != SessionState.preActive:
       # the prompt resolved some other way (timeout, dial-to-target) while the press was
       # in flight; treat as a plain press
-      press[0] = _PRESS_NORMAL
+      press.cls = _PRESS_NORMAL
       return v_cruise_kph
 
     req_plus, req_minus = compare_cluster_target(self._cluster_conv / self._conv, self._slf, self.is_metric)
@@ -236,7 +247,7 @@ class CruiseArbiter:
       # confirm. An upward confirm means "take me to the limit": raise the setpoint to
       # the target (never lower it: a baseline above the limit stays, and the active
       # session caps the plan instead).
-      press[2] = True
+      press.resolved = True
       self.last_intent = CruiseIntent.confirm
       if is_plus and self.target_kph > v_cruise_kph:
         v_cruise_kph = float(np.clip(round(self.target_kph, 1), get_minimum_set_speed(self.is_metric), V_CRUISE_MAX))
@@ -246,26 +257,22 @@ class CruiseArbiter:
       # a press against the confirm direction declines: the session ends at once so the
       # frozen hold releases and the prompt stops shadowing the driver's dialing. The
       # press still counts as a normal increment.
-      press[0] = _PRESS_NORMAL
+      press.cls = _PRESS_NORMAL
       self.last_intent = CruiseIntent.decline
       self._set_state(SessionState.inactive)
 
     return v_cruise_kph
 
-  def press_owned(self, button_type) -> bool:
+  def press_owned(self, button_type: int) -> bool:
     """True when this press must not increment v_cruise (confirm- or dismiss-owned).
-    Valid for release events and long-press repeat ticks in the same frame."""
-    if not self.applicable:
-      return False
-    btn = getattr(button_type, 'raw', button_type)
-    if btn in self._owned_releases:
-      return True
-    press = self._press.get(btn)
+    Takes the raw enumerant int (as cruise.py's button paths carry); valid for release
+    events and long-press repeat ticks in the same frame."""
+    press = self._press.get(button_type)
     if press is None:
       return False
-    if press[0] == _PRESS_DISMISS:
+    if press.cls == _PRESS_DISMISS:
       return True
-    return press[0] == _PRESS_PROMPT and press[2]
+    return press.cls == _PRESS_PROMPT and press.resolved
 
   # ---- main step (card 100 Hz) -------------------------------------------------------
   def step(self, CS, long_enabled: bool, v_cruise_kph: float, v_cruise_cluster_kph: float) -> float:
@@ -282,7 +289,6 @@ class CruiseArbiter:
       return v_cruise_kph
 
     self.state_prev_frame = self.state
-    self.long_enabled = long_enabled
     conv = CV.KPH_TO_MS * self._conv
     self._cluster_conv_prev = self._cluster_conv
     self._cluster_conv = round(v_cruise_cluster_kph * conv) if v_cruise_cluster_kph not in (V_CRUISE_UNSET, -1) else 0
@@ -294,13 +300,13 @@ class CruiseArbiter:
     self.pre_active_timer = max(0, self.pre_active_timer - 1)
 
     if self.state != SessionState.disabled:
-      if not self.long_enabled or not self.enabled:
+      if not long_enabled or not self.enabled:
         self._set_state(SessionState.disabled)
         self._driver_dismissed = False
 
       elif self.state in ACTIVE_STATES:
         # dismiss is handled at the press edge in classification
-        if self._limit_changed and self._confirm_needed:
+        if self._limit_changed and confirm_needed_for_change(self._cluster_conv, self._target_conv(), self.is_metric):
           self._enter_prompt()
         elif self._limit_changed and self._target_conv() != self._cluster_conv:
           # CST auto-apply: the new target takes over without confirmation; announce
@@ -325,7 +331,7 @@ class CruiseArbiter:
           self._activate(from_prompt=False)
 
     else:  # DISABLED
-      if self.long_enabled and self.enabled:
+      if long_enabled and self.enabled:
         if not self.long_enabled_prev or self._cluster_conv != self._cluster_conv_prev:
           self.long_engaged_timer = int(DISABLED_GUARD_PERIOD / DT_CTRL)
         elif self.long_engaged_timer <= 0:
@@ -343,10 +349,10 @@ class CruiseArbiter:
       self.v_cap = V_CRUISE_UNSET
 
     self._speed_limit_prev = self._speed_limit
-    self.long_enabled_prev = self.long_enabled
+    self.long_enabled_prev = long_enabled
     return v_cruise_kph
 
-  # ---- publishing --------------------------------------------------------------------
+  # ---- publishing / output gating ----------------------------------------------------
   def fill_msg(self, cs_sp) -> None:
     if not self.applicable:
       return
@@ -354,5 +360,11 @@ class CruiseArbiter:
     session.state = self.state
     session.vCap = float(self.v_cap)
     session.lastIntent = self.last_intent
-    session.transitionCounter = self.transition_counter
     session.announceCounter = self.announce_counter
+
+  def gate_send_button(self, CC_SP) -> None:
+    """Authoritative emission gate, called by card just before CI.apply: the servo's
+    own prompt freeze is one message hop stale, so a button frame could otherwise
+    escape at prompt onset."""
+    if self.applicable and self.prompting:
+      CC_SP.intelligentCruiseButtonManagement.sendButton = structs.IntelligentCruiseButtonManagement.SendButtonState.none

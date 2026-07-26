@@ -8,12 +8,15 @@ displayed alerts, engagement changes.
 """
 import sys
 import glob
-import warnings; warnings.filterwarnings("ignore")
+import warnings
+
+warnings.filterwarnings("ignore")
 import collections
 
 from openpilot.tools.lib.logreader import LogReader
+from openpilot.common.constants import CV
 
-MS_TO_MPH = 2.23694
+MS_TO_MPH = CV.MS_TO_MPH
 
 
 def run(seg_glob, t_start=None, t_end=None):
@@ -40,7 +43,7 @@ def run(seg_glob, t_start=None, t_end=None):
         r['v'] = round(cs.vEgo * MS_TO_MPH, 1)
         r['eng'] = int(cs.cruiseState.enabled)
         r['dash'] = round(cs.cruiseState.speedCluster * MS_TO_MPH, 1)
-        r['vCr'] = round(cs.vCruise / 1.609344, 1)  # kph -> mph
+        r['vCr'] = round(cs.vCruise * CV.KPH_TO_MPH, 1)
         for b in cs.buttonEvents:
           r.setdefault('btn', []).append(f"{str(b.type).replace('Cruise','')}{'v' if b.pressed else '^'}")
       elif w == 'carControlSP':
@@ -81,10 +84,10 @@ def run(seg_glob, t_start=None, t_end=None):
       btn = ','.join(r.get('btn', [])) if 'btn' in r else ''
       ev = r.get('evSP', '')
       alert = last.get('alert') if last.get('alert') != prev_watch.get('alert') else ''
-      print(f"t={t:8.2f} v={str(last.get('v')):5} dash={str(last.get('dash')):5} vCr={str(last.get('vCr')):5} "
-            f"eng={str(last.get('eng')):2} sla={str(last.get('sla')):9.9s} sl={str(last.get('sl')):5} slF={str(last.get('slF')):5} "
-            f"lps={str(last.get('lpsrc'))[:14]:14s} vT={str(last.get('vT')):5} icbm={str(last.get('icbm')):10.10s} "
-            f"iBtn={str(last.get('iBtn')):12.12s}"
+      line = f"t={t:8.2f} v={str(last.get('v')):5} dash={str(last.get('dash')):5} vCr={str(last.get('vCr')):5} eng={str(last.get('eng')):2}"
+      line += f" sla={str(last.get('sla')):9.9s} sl={str(last.get('sl')):5} slF={str(last.get('slF')):5} lps={str(last.get('lpsrc'))[:14]:14s}"
+      line += f" vT={str(last.get('vT')):5} icbm={str(last.get('icbm')):10.10s} iBtn={str(last.get('iBtn')):12.12s}"
+      print(line
             + (f" BTN={btn}" if btn else '')
             + (f" EV={ev}" if ev else '')
             + (f" ALERT[{alert}]" if alert else ''))

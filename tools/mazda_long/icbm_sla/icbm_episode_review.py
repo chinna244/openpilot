@@ -14,11 +14,14 @@ Run from repo root: python tools/mazda_long/icbm_sla/icbm_episode_review.py [rou
 """
 import glob
 import sys
-import warnings; warnings.filterwarnings("ignore")
+import warnings
+
+warnings.filterwarnings("ignore")
 
 from openpilot.tools.lib.logreader import LogReader
+from openpilot.common.constants import CV
 
-MS_MPH = 2.23694
+MS_MPH = CV.MS_TO_MPH
 DEFAULT_GLOB = "tools/mazda_long/test_data/sla_drive_logs/0000000b--b039e84091--*/rlog.zst"
 
 
@@ -69,8 +72,9 @@ def main(route_glob):
     episodes.append(cur)
 
   print(f"{len(episodes)} servo episodes\n")
-  print(f"{'t0':>7} {'dur_s':>6} {'dir':<4} {'dash':>9} {'tgt(final)':>10} {'resid':>6} "
-        f"{'steps':>5} {'holds':>6} {'taps':>5} {'rate mph/s':>10} {'pattern'}")
+  hdr = f"{'t0':>7} {'dur_s':>6} {'dir':<4} {'dash':>9} {'tgt(final)':>10} {'resid':>6}"
+  hdr += f" {'steps':>5} {'holds':>6} {'taps':>5} {'rate mph/s':>10} {'pattern'}"
+  print(hdr)
 
   hold_patterns = []
   churn_pairs = 0
@@ -81,13 +85,13 @@ def main(route_glob):
     tgt = sorted(ep['targets'])[-1] if ep['dir'] == 'increasing' else sorted(ep['targets'])[0]
     resid = ep['dash1'] - tgt
     # dash step timing within the episode
-    steps = [(t, d) for (t, d, _), (pt, pd, _) in zip(ep['frames'][1:], ep['frames']) if d != pd for t, d in [(t, d - pd)]]
+    steps = [(t, d) for (t, d, _), (pt, pd, _) in zip(ep['frames'][1:], ep['frames'], strict=False) if d != pd for t, d in [(t, d - pd)]]
     sizes = [d for _, d in steps]
     if ep['hold_frames'] > 5:
       if any(abs(s) >= 2 for s in sizes):
         pat = 'hold:SNAP(' + ','.join(str(s) for s in sizes) + ')'
       elif sizes:
-        gaps = [round(b - a, 2) for (a, _), (b, _) in zip(steps, steps[1:])]
+        gaps = [round(b - a, 2) for (a, _), (b, _) in zip(steps, steps[1:], strict=False)]
         pat = f'hold:paced x{len(sizes)}' + (f' gaps~{sorted(gaps)[len(gaps) // 2]}s' if gaps else '')
       else:
         pat = 'hold:no-movement'
@@ -95,9 +99,9 @@ def main(route_glob):
     else:
       pat = f'taps x{len(sizes)}'
     rate = abs(delta) / dur if dur > 0.2 else 0.
-    print(f"{ep['t0']:7.1f} {dur:6.2f} {ep['dir'][:3]:<4} {ep['dash0']:>4}->{ep['dash1']:<4} {tgt:>10} {resid:>6} "
-          f"{len(sizes):>5} {ep['hold_frames']:>6} {ep['tap_frames']:>5} {rate:>10.1f} {pat}"
-          + ('   [' + '/'.join(sorted(ep['lps'])) + ']' if len(ep['lps']) > 1 or 'cruise' not in ep['lps'] else ''))
+    line = f"{ep['t0']:7.1f} {dur:6.2f} {ep['dir'][:3]:<4} {ep['dash0']:>4}->{ep['dash1']:<4} {tgt:>10} {resid:>6}"
+    line += f" {len(sizes):>5} {ep['hold_frames']:>6} {ep['tap_frames']:>5} {rate:>10.1f} {pat}"
+    print(line + ('   [' + '/'.join(sorted(ep['lps'])) + ']' if len(ep['lps']) > 1 or 'cruise' not in ep['lps'] else ''))
 
     if last_ep is not None and ep['t0'] - last_ep['t1'] < 2.0 and ep['dir'] != last_ep['dir']:
       churn_pairs += 1

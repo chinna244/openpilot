@@ -17,13 +17,11 @@ whole window), speedLimitActive fires on announce-counter deltas — the counter
 bumped by card at 100 Hz and never un-bumps, so a 20 Hz reader cannot miss it.
 """
 from openpilot.cereal import custom
-from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit import ACTIVE_STATES, ENABLED_STATES
+from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit import ACTIVE_STATES, ENABLED_STATES, V_CRUISE_UNSET
 from openpilot.sunnypilot.selfdrive.selfdrived.events import EventsSP
 
 EventNameSP = custom.OnroadEventSP.EventName
 SessionState = custom.LongitudinalPlanSP.SpeedLimit.AssistState
-
-V_CRUISE_UNSET = 255.
 
 
 class SpeedLimitAssistMirror:
@@ -31,19 +29,20 @@ class SpeedLimitAssistMirror:
 
   def __init__(self, CP, CP_SP):
     self.state = SessionState.disabled
-    self.is_enabled = False
-    self.is_active = False
     self.output_v_target = V_CRUISE_UNSET
     self.output_a_target = 0.
     self._announce_seen: int | None = None  # sync on first update (plannerd restarts)
 
-  def update_car_state(self, CS) -> None:
-    pass  # buttons are card's business now
+  @property
+  def is_enabled(self) -> bool:
+    return self.state in ENABLED_STATES
+
+  @property
+  def is_active(self) -> bool:
+    return self.state in ACTIVE_STATES
 
   def update(self, session, a_ego: float, events_sp: EventsSP) -> None:
     self.state = session.state
-    self.is_enabled = self.state in ENABLED_STATES
-    self.is_active = self.state in ACTIVE_STATES
     self.output_v_target = float(session.vCap)
     self.output_a_target = a_ego
 
