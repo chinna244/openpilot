@@ -17,3 +17,14 @@ CONFIRM_SPEED_THRESHOLD = {
   True: 80,   # km/h
   False: 50,  # mph
 }
+
+
+def _session_states():
+  from openpilot.cereal import custom
+  s = custom.LongitudinalPlanSP.SpeedLimit.AssistState
+  active = (s.active, s.adapting)
+  return active, (s.preActive, s.pending, *active)
+
+
+# shared by the pcm machine (plannerd), the cruise arbiter (card), and the mirror
+ACTIVE_STATES, ENABLED_STATES = _session_states()

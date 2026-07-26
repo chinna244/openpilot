@@ -12,6 +12,7 @@ from openpilot.selfdrive.car.cruise import V_CRUISE_MAX
 from openpilot.sunnypilot.selfdrive.controls.lib.dec.dec import DynamicExperimentalController
 from openpilot.sunnypilot.selfdrive.controls.lib.e2e_alerts_helper import E2EAlertsHelper
 from openpilot.sunnypilot.selfdrive.controls.lib.smart_cruise_control.smart_cruise_control import SmartCruiseControl
+from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.assist_mirror import SpeedLimitAssistMirror
 from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.speed_limit_assist import SpeedLimitAssist
 from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.speed_limit_resolver import SpeedLimitResolver
 from openpilot.sunnypilot.selfdrive.selfdrived.events import EventsSP
@@ -28,7 +29,12 @@ class LongitudinalPlannerSP:
     self.dec = DynamicExperimentalController(CP, mpc)
     self.scc = SmartCruiseControl()
     self.resolver = SpeedLimitResolver()
-    self.sla = SpeedLimitAssist(CP, CP_SP)
+    # pcm-op-long cars run the SLA machine here; non-pcm cars run it in card (the
+    # cruise arbiter, next to the buttons and the setpoint) and get mirrored
+    if CP.openpilotLongitudinalControl and CP.pcmCruise:
+      self.sla = SpeedLimitAssist(CP, CP_SP)
+    else:
+      self.sla = SpeedLimitAssistMirror(CP, CP_SP)
     self.generation = int(model_bundle.generation) if (model_bundle := get_active_bundle()) else None
     self.source = LongitudinalPlanSource.cruise
     self.e2e_alerts_helper = E2EAlertsHelper()
@@ -58,9 +64,12 @@ class LongitudinalPlannerSP:
     self.resolver.update(v_ego, sm)
 
     # Speed Limit Assist
-    has_speed_limit = self.resolver.speed_limit_valid or self.resolver.speed_limit_last_valid
-    self.sla.update(long_enabled, long_override, v_ego, a_ego, v_cruise_cluster, self.resolver.speed_limit,
-                    self.resolver.speed_limit_final_last, has_speed_limit, self.resolver.distance, self.events_sp)
+    if self.sla.pcm_op_long:
+      has_speed_limit = self.resolver.speed_limit_valid or self.resolver.speed_limit_last_valid
+      self.sla.update(long_enabled, long_override, v_ego, a_ego, v_cruise_cluster, self.resolver.speed_limit,
+                      self.resolver.speed_limit_final_last, has_speed_limit, self.resolver.distance, self.events_sp)
+    else:
+      self.sla.update(sm['carStateSP'].cruiseSession, a_ego, self.events_sp)
 
     targets = {
       LongitudinalPlanSource.cruise: (v_cruise, a_ego),

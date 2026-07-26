@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
-"""Regression replay: the seg16 confirm bug (F1) against the current SLA machine.
+"""Regression replay: the seg16 confirm bug (F1) against the cruise arbiter.
 
 Replays the recorded carState/longitudinalPlanSP stream from the route where +/-
 confirmation self-destructed (952c07dea500f4e2/0000004f--fea08aad07/16, 65 mph zone,
-dash set 50, SLA target 70) through the CURRENT non-pcm SpeedLimitAssist and checks:
+dash set 50, SLA target 70) through the CURRENT card-side CruiseArbiter and checks:
 
   1. the driver's first matching press confirms (preActive -> active), and
   2. the session STAYS active until the next genuine driver press; on the shipped build
      it fell to inactive within one cycle because the confirm press's own cluster change
-     tripped the manual-override guard, while the cluster provably changed in that window.
+     tripped the manual-override guard. The arbiter classifies presses at their edges,
+     so only a dismiss-classified press may end a session.
 
 Run from repo root (venv active):
   python tools/mazda_long/icbm_sla/replay_sla_guard.py [path-to-rlog]
@@ -17,15 +18,13 @@ import sys
 from pathlib import Path
 
 from openpilot.tools.lib.logreader import LogReader
-from openpilot.common.constants import CV
 from openpilot.common.params import Params
 from openpilot.cereal import custom
 from opendbc.car.structs import car
+from openpilot.sunnypilot.selfdrive.car.cruise_arbiter import CruiseArbiter, CruiseIntent
 from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.common import Mode
-from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.speed_limit_assist import SpeedLimitAssist
-from openpilot.sunnypilot.selfdrive.selfdrived.events import EventsSP
 
-SlaState = custom.LongitudinalPlanSP.SpeedLimit.AssistState
+SessionState = custom.LongitudinalPlanSP.SpeedLimit.AssistState
 ButtonType = car.CarState.ButtonEvent.Type
 DEFAULT_LOG = Path.home() / "Desktop" / "952c07dea500f4e2_0000004f--fea08aad07--16--rlog.zst"
 
@@ -45,19 +44,15 @@ def main(log_path):
 
   CP = car.CarParams(pcmCruise=True, brand="mazda")
   CP_SP = custom.CarParamsSP(pcmCruiseSpeed=False)
-  sla = SpeedLimitAssist(CP, CP_SP)
+  arb = CruiseArbiter(CP, CP_SP)
+  arb.read_params(params)
 
-  events_sp = EventsSP()
   enabled = False
-  limit = 0.0
-  limit_valid = False
-  cluster_ms = 0.0
+  lp = custom.LongitudinalPlanSP()
   cs_count = 0
-
+  press_count = 0
   confirm_time = None
-  press_times = []
-  cluster_changes_after_confirm = 0
-  broke_without_press = None
+  bad_end = None
   t0 = None
 
   print(f"replaying {log_path}")
@@ -71,52 +66,37 @@ def main(log_path):
       enabled = msg.carControl.enabled
     elif which == 'longitudinalPlanSP':
       r = msg.longitudinalPlanSP.speedLimit.resolver
-      limit = r.speedLimitFinalLast
-      limit_valid = r.speedLimitValid or r.speedLimitLastValid
+      lp = custom.LongitudinalPlanSP()
+      lp.speedLimit.resolver.speedLimit = r.speedLimit
+      lp.speedLimit.resolver.speedLimitFinalLast = r.speedLimitFinalLast
+      lp.speedLimit.resolver.speedLimitLastValid = r.speedLimitValid or r.speedLimitLastValid
     elif which == 'carState':
       cs = msg.carState
       cs_count += 1
-      prev_cluster = cluster_ms
-      cluster_ms = cs.vCruiseCluster * CV.KPH_TO_MS
-
       CS = car.CarState()
-      evs = []
-      for b in cs.buttonEvents:
-        bt = BUTTON_MAP.get(str(b.type))
-        if bt is not None:
-          evs.append(car.CarState.ButtonEvent(type=bt, pressed=b.pressed))
-          if b.pressed and bt in (ButtonType.accelCruise, ButtonType.decelCruise):
-            press_times.append(t - t0)
-      CS.buttonEvents = evs
-      sla.update_car_state(CS)
+      CS.buttonEvents = [car.CarState.ButtonEvent(type=BUTTON_MAP[str(b.type)], pressed=b.pressed)
+                         for b in cs.buttonEvents if str(b.type) in BUTTON_MAP]
+      press_count += sum(1 for b in cs.buttonEvents if b.pressed and str(b.type) in ('accelCruise', 'decelCruise'))
 
-      if cs_count % 5 == 0:  # 20 Hz machine, as plannerd runs it
-        prev_state = sla.state
-        sla.update(enabled, False, cs.vEgo, cs.aEgo, cluster_ms, limit, limit, limit_valid, 0., events_sp)
-        events_sp.clear()
+      arb.update_limit(lp)
+      prev_state = arb.state
+      arb.step(CS, enabled, cs.vCruise, cs.vCruiseCluster)
 
-        if prev_state == SlaState.preActive and sla.state == SlaState.active and confirm_time is None:
-          confirm_time = t - t0
-          print(f"  t={confirm_time:7.2f}s  CONFIRMED (preActive -> active)")
-        if confirm_time is not None and sla.state == SlaState.active and abs(cluster_ms - prev_cluster) > 0.1:
-          cluster_changes_after_confirm += 1
-        if prev_state == SlaState.active and sla.state == SlaState.inactive:
-          last_press = max((p for p in press_times if p <= t - t0), default=None)
-          gap = (t - t0 - last_press) if last_press is not None else float('inf')
-          tag = f"driver press {gap*1000:.0f} ms earlier" if gap < 0.6 else "NO recent press  <-- would be the F1 bug"
-          print(f"  t={t - t0:7.2f}s  active -> inactive ({tag})")
-          if gap >= 0.6 and broke_without_press is None:
-            broke_without_press = t - t0
+      if prev_state == SessionState.preActive and arb.state == SessionState.active and confirm_time is None:
+        confirm_time = t - t0
+        print(f"  t={confirm_time:7.2f}s  CONFIRMED (preActive -> active, intent={arb.last_intent})")
+      if prev_state == SessionState.active and arb.state == SessionState.inactive:
+        driver = arb.last_intent == CruiseIntent.dismiss
+        tag = "driver dismiss press" if driver else "NO driver press  <-- would be the F1 bug"
+        print(f"  t={t - t0:7.2f}s  active -> inactive ({tag})")
+        if not driver and bad_end is None:
+          bad_end = t - t0
 
-  print(f"\n  {cs_count} carState frames, {len(press_times)} driver +/- presses")
-  # Informational only: in this recording the driver re-pressed (mashing at the old bug)
-  # before the cluster ever moved, so cluster robustness can't be shown open-loop here;
-  # the closed-loop harness (test_icbm_sla_loop.py) covers it.
-  print(f"  cluster changes observed while active: {cluster_changes_after_confirm}")
+  print(f"\n  {cs_count} carState frames, {press_count} driver +/- presses")
   assert confirm_time is not None, "FAIL: confirmation never happened in replay"
-  assert broke_without_press is None, \
-    f"FAIL: session deactivated without a driver press at t={broke_without_press:.2f}s (F1 regressed)"
-  print("  PASS: confirm fired at the documented moment; only genuine driver presses ended sessions")
+  assert bad_end is None, \
+    f"FAIL: session ended without a dismiss-classified press at t={bad_end:.2f}s (F1 regressed)"
+  print("  PASS: confirm fired at the documented moment; only dismiss-classified presses ended sessions")
 
 
 if __name__ == "__main__":

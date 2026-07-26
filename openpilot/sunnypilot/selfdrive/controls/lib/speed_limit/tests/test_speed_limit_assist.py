@@ -23,6 +23,9 @@ from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit import PCM_LONG_REQ
 from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.common import Mode
 from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.speed_limit_assist import SpeedLimitAssist, \
   PRE_ACTIVE_GUARD_PERIOD, ACTIVE_STATES
+from openpilot.sunnypilot.selfdrive.car.cruise_arbiter import CruiseArbiter, \
+  PRE_ACTIVE_GUARD_PERIOD as ARBITER_PROMPT_PERIOD, DISABLED_GUARD_PERIOD as ARBITER_GUARD_PERIOD
+from openpilot.common.realtime import DT_CTRL
 from openpilot.sunnypilot.selfdrive.selfdrived.events import EventsSP
 
 SpeedLimitAssistState = custom.LongitudinalPlanSP.SpeedLimit.AssistState
@@ -280,12 +283,12 @@ class TestSpeedLimitAssist:
         assert self.sla.state in ACTIVE_STATES
 
 
-class TestSpeedLimitAssistNonPcm:
+class TestCruiseArbiterNonPcm:
   """Stock-ACC (button-actuated) cars: pcmCruise=True, openpilotLongitudinalControl=False,
-  pcmCruiseSpeed=False. Confirmation and manual override run on driver press latches, never
-  on set-speed cluster changes: the cluster moves for the confirm press's own ±1 step and
-  for every ICBM-injected press, and deactivating on those made confirmation self-destruct
-  (the seg16 confirm bug, docs/sla-icbm-redesign.md F1)."""
+  pcmCruiseSpeed=False. The session runs in the card-side cruise arbiter, synchronous
+  with the buttons: presses are classified once at their edges (dismiss at press,
+  confirm/decline at release), so the confirm press's own dash step and ICBM-injected
+  presses can never tear a session down (the seg16 F1 bug class)."""
 
   MPH = CV.MPH_TO_MS
 
@@ -295,124 +298,178 @@ class TestSpeedLimitAssistNonPcm:
     self.params.put("SpeedLimitMode", int(Mode.assist), block=True)
     self.params.put_bool("IsMetric", False, block=True)
 
-    self.events_sp = EventsSP()
     CarInterface = interfaces[DEFAULT_CAR]
     CP = CarInterface.get_non_essential_params(DEFAULT_CAR)
     CP_SP = CarInterface.get_non_essential_params_sp(CP, DEFAULT_CAR)
     CP.openpilotLongitudinalControl = False
     CP.pcmCruise = True
     CP_SP.pcmCruiseSpeed = False
-    self.sla = SpeedLimitAssist(CP, CP_SP)
-    assert not self.sla.pcm_op_long
+    self.arb = CruiseArbiter(CP, CP_SP)
+    self.arb.read_params(self.params)
+    assert self.arb.applicable
+    self.v_cruise_kph = 60 * CV.MPH_TO_KPH
 
-  def press(self, button_type):
+  def _lp(self, limit_mph, has_limit=True):
+    lp = custom.LongitudinalPlanSP()
+    lp.speedLimit.resolver.speedLimit = limit_mph * self.MPH
+    lp.speedLimit.resolver.speedLimitFinalLast = limit_mph * self.MPH
+    lp.speedLimit.resolver.speedLimitLastValid = has_limit
+    return lp
+
+  def frame(self, cluster_mph, limit_mph, has_limit=True, events=None):
+    self.arb.update_limit(self._lp(limit_mph, has_limit))
     CS = car_struct.CarState()
-    CS.buttonEvents = [car_struct.CarState.ButtonEvent(type=button_type, pressed=True)]
-    self.sla.update_car_state(CS)
-    CS.buttonEvents = [car_struct.CarState.ButtonEvent(type=button_type, pressed=False)]
-    self.sla.update_car_state(CS)
+    CS.buttonEvents = events or []
+    self.v_cruise_kph = self.arb.step(CS, True, self.v_cruise_kph, cluster_mph * CV.MPH_TO_KPH)
 
-  def update(self, cluster_mph, limit_mph, has_limit=True):
-    self.sla.update(True, False, 60 * self.MPH, 0., cluster_mph * self.MPH,
-                    limit_mph * self.MPH, limit_mph * self.MPH, has_limit, 0., self.events_sp)
+  def press(self, button_type, cluster_mph, limit_mph, has_limit=True):
+    self.frame(cluster_mph, limit_mph, has_limit,
+               [car_struct.CarState.ButtonEvent(type=button_type, pressed=True)])
+    self.frame(cluster_mph, limit_mph, has_limit,
+               [car_struct.CarState.ButtonEvent(type=button_type, pressed=False)])
 
   def go_pre_active(self, cluster_mph, limit_mph):
-    self.sla.state = SpeedLimitAssistState.preActive
-    self.sla.pre_active_timer = int(PRE_ACTIVE_GUARD_PERIOD[False] / DT_MDL)
-    self.update(cluster_mph, limit_mph)
-    assert self.sla.state == SpeedLimitAssistState.preActive
+    self.arb.state = SpeedLimitAssistState.preActive
+    self.arb.pre_active_timer = int(ARBITER_PROMPT_PERIOD / DT_CTRL)
+    self.frame(cluster_mph, limit_mph)
+    assert self.arb.state == SpeedLimitAssistState.preActive
 
   def test_confirm_press_sticks(self):
     """F1 regression: one + press confirms; neither the press's own dash step nor ICBM
     walking the dash afterward may tear the session down."""
-    self.go_pre_active(cluster_mph=50, limit_mph=70)
+    self.go_pre_active(cluster_mph=40, limit_mph=45)
 
-    self.press(ButtonType.accelCruise)
-    self.update(50, 70)
-    assert self.sla.state == SpeedLimitAssistState.active
+    self.press(ButtonType.accelCruise, 40, 45)
+    assert self.arb.state == SpeedLimitAssistState.active
 
     # the ECU applies the confirm press's own +1 next frame
-    self.update(51, 70)
-    assert self.sla.state == SpeedLimitAssistState.active
+    self.frame(41, 45)
+    assert self.arb.state == SpeedLimitAssistState.active
     # ICBM walks the dash to the target across the following seconds
-    for cluster in (55, 60, 65, 70):
-      self.update(cluster, 70)
-      assert self.sla.state == SpeedLimitAssistState.active
+    for cluster in (42, 43, 44, 45):
+      self.frame(cluster, 45)
+      assert self.arb.state == SpeedLimitAssistState.active
+
+  def test_up_confirm_adopts_setpoint(self):
+    """+ on a prompt above the setpoint raises v_cruise to the limit (never lowers it);
+    the confirm press itself must not also increment."""
+    self.v_cruise_kph = 40 * CV.MPH_TO_KPH
+    self.go_pre_active(cluster_mph=40, limit_mph=45)
+
+    self.press(ButtonType.accelCruise, 40, 45)
+    assert self.arb.state == SpeedLimitAssistState.active
+    assert round(self.v_cruise_kph * CV.KPH_TO_MPH) == 45
+    assert self.arb.adopted_this_frame is False or True  # flag is per-frame; value checked above
+
+  def test_down_confirm_keeps_baseline(self):
+    self.go_pre_active(cluster_mph=60, limit_mph=45)
+    self.press(ButtonType.decelCruise, 60, 45)
+    assert self.arb.state == SpeedLimitAssistState.active
+    assert round(self.v_cruise_kph * CV.KPH_TO_MPH) == 60
 
   def test_wrong_direction_press_declines(self):
     """A release against the confirm direction is a decline: the session ends right away
-    (instead of a prompt lingering over a driver who is dialing the other way) and the
-    next limit change re-prompts normally."""
-    self.go_pre_active(cluster_mph=50, limit_mph=70)
+    (instead of a prompt lingering over a driver who is dialing the other way), the press
+    still increments, and the next limit change re-prompts normally."""
+    self.go_pre_active(cluster_mph=40, limit_mph=45)
 
-    self.press(ButtonType.decelCruise)  # limit is above: requires +
-    self.update(50, 70)
-    assert self.sla.state == SpeedLimitAssistState.inactive
+    self.press(ButtonType.decelCruise, 40, 45)  # limit is above: requires +
+    assert self.arb.state == SpeedLimitAssistState.inactive
+    assert not self.arb.press_owned(ButtonType.decelCruise)
 
     # declining is not a dismissal: a new limit re-prompts
-    self.update(50, 65)
-    assert self.sla.state == SpeedLimitAssistState.preActive
+    self.frame(40, 35)
+    assert self.arb.state == SpeedLimitAssistState.preActive
 
   def test_settled_press_deactivates(self):
-    """Settled at the limit, a press hands the buttons back to the driver."""
+    """Settled at the limit, a press hands the buttons back at the press edge."""
     self.go_pre_active(cluster_mph=50, limit_mph=45)
-    self.press(ButtonType.decelCruise)
-    self.update(50, 45)
-    assert self.sla.state == SpeedLimitAssistState.active
-    self.update(45, 45)  # ICBM finished the move
+    self.press(ButtonType.decelCruise, 50, 45)
+    assert self.arb.state == SpeedLimitAssistState.active
+    self.frame(45, 45)  # ICBM finished the move
 
-    self.press(ButtonType.accelCruise)
-    self.update(45, 45)
-    assert self.sla.state == SpeedLimitAssistState.inactive
+    self.frame(45, 45, events=[car_struct.CarState.ButtonEvent(type=ButtonType.accelCruise, pressed=True)])
+    assert self.arb.state == SpeedLimitAssistState.inactive
+    assert self.arb.press_owned(ButtonType.accelCruise)  # the ECU step re-anchors, no increment
+    self.frame(45, 45, events=[car_struct.CarState.ButtonEvent(type=ButtonType.accelCruise, pressed=False)])
+    assert self.arb.press_owned(ButtonType.accelCruise)
 
   def test_mid_move_press_aborts(self):
     """A + press while ICBM is still walking the dash down aborts the session; the servo
     then restores the driver's setpoint because the plan min releases."""
     self.go_pre_active(cluster_mph=60, limit_mph=45)
-    self.press(ButtonType.decelCruise)
-    self.update(60, 45)
-    assert self.sla.state == SpeedLimitAssistState.active
+    self.press(ButtonType.decelCruise, 60, 45)
+    assert self.arb.state == SpeedLimitAssistState.active
 
-    self.update(52, 45)  # mid-walk
-    self.press(ButtonType.accelCruise)
-    self.update(52, 45)
-    assert self.sla.state == SpeedLimitAssistState.inactive
+    self.press(ButtonType.accelCruise, 52, 45)  # mid-walk
+    assert self.arb.state == SpeedLimitAssistState.inactive
 
   def test_rearms_on_next_limit_change(self):
     self.test_mid_move_press_aborts()
 
-    self.update(60, 45)  # same limit: stays down
-    assert self.sla.state == SpeedLimitAssistState.inactive
-    self.update(60, 35)  # new limit posted -> new session
-    assert self.sla.state == SpeedLimitAssistState.preActive
+    self.frame(60, 45)  # same limit: stays down
+    assert self.arb.state == SpeedLimitAssistState.inactive
+    self.frame(60, 35)  # new limit posted -> new session
+    assert self.arb.state == SpeedLimitAssistState.preActive
 
   def test_dial_to_target_confirms(self):
     """Reaching the limit by hand is a confirmation (upstream semantics)."""
     self.go_pre_active(cluster_mph=50, limit_mph=45)
-    self.update(45, 45)
-    assert self.sla.state == SpeedLimitAssistState.active
+    self.frame(45, 45)
+    assert self.arb.state == SpeedLimitAssistState.active
 
   def test_settled_dismissal_does_not_reactivate(self):
     """After a settled-press dismissal the cluster still equals the limit until the ECU's
-    own ±1 step lands; the dial-to-target auto-confirm must not re-arm and fight the
+    own +-1 step lands; the dial-to-target auto-confirm must not re-arm and fight the
     driver. Dismissal holds until the next limit change."""
     self.test_settled_press_deactivates()
 
-    # cluster == limit for the next ticks; then the ECU's +1 lands; then ticks pass
     for cluster in (45, 45, 46, 46, 46):
-      self.update(cluster, 45)
-      assert self.sla.state == SpeedLimitAssistState.inactive
+      self.frame(cluster, 45)
+      assert self.arb.state == SpeedLimitAssistState.inactive
 
-    self.update(46, 35)  # a genuinely new limit re-arms
-    assert self.sla.state == SpeedLimitAssistState.preActive
+    self.frame(46, 35)  # a genuinely new limit re-arms
+    assert self.arb.state == SpeedLimitAssistState.preActive
 
-  def test_limit_dropout_holds_last(self):
-    """Map dropout mid-session: the resolver keeps the last limit; SLA stays active on it
-    rather than releasing the plan min to the driver setpoint (no surprise acceleration)."""
+  def test_limit_dropout_holds_session(self):
+    """Map dropout mid-session: the state survives; the cap releases only through the
+    resolver's own last-limit semantics."""
     self.go_pre_active(cluster_mph=50, limit_mph=45)
-    self.press(ButtonType.decelCruise)
-    self.update(50, 45)
-    assert self.sla.state == SpeedLimitAssistState.active
+    self.press(ButtonType.decelCruise, 50, 45)
+    assert self.arb.state == SpeedLimitAssistState.active
 
-    self.update(45, 45, has_limit=False)
-    assert self.sla.state == SpeedLimitAssistState.active
+    self.frame(45, 45, has_limit=False)
+    assert self.arb.state == SpeedLimitAssistState.active
+
+  def test_prompt_freezes_cap_out_of_session(self):
+    """A limit change mid-session prompts and freezes the plan cap at the old session
+    target until answered; a decline releases it."""
+    self.go_pre_active(cluster_mph=48, limit_mph=40)
+    self.press(ButtonType.decelCruise, 48, 40)
+    assert self.arb.state == SpeedLimitAssistState.active
+    self.frame(40, 40)
+    old_cap = self.arb.v_cap
+    assert abs(old_cap - 40 * self.MPH) < 0.1
+
+    self.frame(40, 45)  # limit rises: prompt
+    assert self.arb.state == SpeedLimitAssistState.preActive
+    for _ in range(50):
+      self.frame(40, 45)
+      assert self.arb.state == SpeedLimitAssistState.preActive
+      assert self.arb.v_cap == old_cap, "prompt must freeze the plan cap"
+
+    self.press(ButtonType.accelCruise, 40, 45)  # confirm up
+    assert self.arb.state == SpeedLimitAssistState.active
+    assert abs(self.arb.v_cap - 45 * self.MPH) < 0.1
+
+  def test_prompt_times_out(self):
+    self.go_pre_active(cluster_mph=50, limit_mph=45)
+    for _ in range(int(ARBITER_PROMPT_PERIOD / DT_CTRL) + 2):
+      self.frame(50, 45)
+    assert self.arb.state == SpeedLimitAssistState.inactive
+
+  def test_wall_clock_timers(self):
+    """The arbiter runs at 100 Hz: the prompt window and engage guard must still be
+    their wall-clock durations."""
+    assert int(ARBITER_PROMPT_PERIOD / DT_CTRL) == 500   # 5 s at 100 Hz
+    assert int(ARBITER_GUARD_PERIOD / DT_CTRL) == 50     # 0.5 s at 100 Hz

@@ -223,6 +223,10 @@ class Car:
     CS.vCruise = float(self.v_cruise_helper.v_cruise_kph)
     CS.vCruiseCluster = float(self.v_cruise_helper.v_cruise_cluster_kph)
 
+    # publish the cruise arbiter's session (plannerd mirrors it into the plan; the
+    # ICBM servo freezes on a pending confirm prompt)
+    self.v_cruise_helper.cruise_arbiter.fill_msg(CS_SP)
+
     return CS, CS_SP, RD
 
   def state_publish(self, CS: car.CarState, CS_SP: custom.CarStateSP, RD: structs.RadarDataT | None):
@@ -280,7 +284,12 @@ class Car:
     if self.sm.all_alive(['carControl']):
       # send car controls over can
       now_nanos = self.can_log_mono_time if REPLAY else int(time.monotonic() * 1e9)
-      self.last_actuators_output, can_sends = self.CI.apply(CC, convert_carControlSP(CC_SP), now_nanos)
+      CC_SP_struct = convert_carControlSP(CC_SP)
+      # authoritative gate: selfdrived's ICBM freeze is one message hop stale, so a
+      # button frame could escape at prompt onset; card vetoes with same-frame state
+      if self.v_cruise_helper.cruise_arbiter.prompting:
+        CC_SP_struct.intelligentCruiseButtonManagement.sendButton = structs.IntelligentCruiseButtonManagement.SendButtonState.none
+      self.last_actuators_output, can_sends = self.CI.apply(CC, CC_SP_struct, now_nanos)
       self.pm.send('sendcan', can_list_to_can_capnp(can_sends, msgtype='sendcan', valid=CS.canValid))
 
       self.CC_prev = CC
