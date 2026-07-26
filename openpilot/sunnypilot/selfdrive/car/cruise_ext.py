@@ -90,6 +90,7 @@ class VCruiseHelperSP:
     self.speed_limit_final_last_kph = 0.
     self.req_plus = False
     self.req_minus = False
+    self.is_metric = False
 
   def read_custom_set_speed_params(self) -> None:
     self.custom_acc_enabled = self.params.get_bool("CustomAccIncrementsEnabled")
@@ -188,6 +189,7 @@ class VCruiseHelperSP:
     self.sla_state = LP_SP.speedLimit.assist.state
     self.lp_source = LP_SP.longitudinalPlanSource
     self.icbm_state = CC_SP.intelligentCruiseButtonManagement.state
+    self.is_metric = is_metric
     self.req_plus, self.req_minus = compare_cluster_target(self.v_cruise_cluster_kph * CV.KPH_TO_MS,
                                                            self.speed_limit_final_last, is_metric)
 
@@ -196,6 +198,18 @@ class VCruiseHelperSP:
       if button_type == ButtonType.decelCruise and self.req_minus:
         return True
       if button_type == ButtonType.accelCruise and self.req_plus:
+        # An upward confirm means "take me to the limit": raise the setpoint to the SLA
+        # target (never lower it: a baseline above the limit stays and the active session
+        # caps the plan instead). min() source selection would otherwise leave an upward
+        # confirm inert: SLA active above the setpoint never wins the plan.
+        target_conv = round(self.speed_limit_final_last_kph * (1. if self.is_metric else CV.KPH_TO_MPH))
+        target_kph = target_conv * (1. if self.is_metric else CV.MPH_TO_KPH)
+        if target_kph > self.v_cruise_kph:
+          self.v_cruise_kph = float(np.clip(round(target_kph, 1), self.v_cruise_min, V_CRUISE_MAX))
+          self.v_cruise_cluster_kph = self.v_cruise_kph
+        # the ECU's own +1 step from this press must not be re-adopted over the target
+        self.reconcile_frames = 0
+        self.reconcile_allowed = False
         return True
 
     return False

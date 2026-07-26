@@ -92,11 +92,20 @@ class SpeedLimitAssist:
     self._plus_hold = 0.
     self._minus_hold = 0.
     self._press_deadline = 0.
+    self._press_started_pre_active = False
     self._last_carstate_ts = 0.
     # Set when the driver dismisses an active session with a +/- press; blocks the
     # dial-to-target auto-reactivation until the next limit change. The cluster still
     # equals the limit briefly after a settled press, and SLA must not fight the driver.
     self._driver_dismissed = False
+    # Set by a preActive release in the direction opposite the confirm: the driver
+    # declined the prompt and is dialing away; the session ends instead of lingering.
+    self._pre_active_declined = False
+    # While preActive the plan target is frozen here (m/s): a pending decision must not
+    # move the car. Entered from an active session it holds the session's last target so
+    # the servo cannot restore the dash toward the baseline before the driver answers
+    # the prompt; entered idle it holds the cluster, which is a no-op against cruise.
+    self._pre_active_hold = float(V_CRUISE_UNSET)
 
     # TODO-SP: SLA's own output_a_target for planner
     # Solution functions mapped to respective states
@@ -126,17 +135,33 @@ class SpeedLimitAssist:
     return bool(self.v_cruise_cluster_conv < CONFIRM_SPEED_THRESHOLD[self.is_metric])
 
   def update_active_event(self, events_sp: EventsSP) -> None:
-    if self.v_cruise_cluster_below_confirm_speed_threshold:
-      events_sp.add(EventNameSP.speedLimitChanged)
-    else:
+    if self.pcm_op_long:
+      if self.v_cruise_cluster_below_confirm_speed_threshold:
+        events_sp.add(EventNameSP.speedLimitChanged)
+      else:
+        events_sp.add(EventNameSP.speedLimitActive)
+      return
+
+    # Non-pcm: the alert means "SLA is changing your speed". Fire it when activation
+    # resolves a confirm prompt (the driver just asked for the limit) or when the target
+    # differs from the cluster (a walk is about to happen). Activating because the
+    # setpoint already matches the limit (engage, resume, dialing onto it) changes
+    # nothing and stays silent.
+    if self._state_prev == SpeedLimitAssistState.preActive or self.target_set_speed_conv != self.v_cruise_cluster_conv:
       events_sp.add(EventNameSP.speedLimitActive)
 
   def get_v_target_from_control(self) -> float:
-    if self._has_speed_limit:
-      if self.pcm_op_long and self.is_enabled:
+    if self.pcm_op_long:
+      if self._has_speed_limit and self.is_enabled:
         return self._speed_limit_final_last
-      if not self.pcm_op_long and self.is_active:
-        return self._speed_limit_final_last
+      return V_CRUISE_UNSET
+
+    # A pending confirm freezes the plan where it is: the servo must not restore the
+    # dash toward the baseline while the driver is being asked about the new limit.
+    if self.state == SpeedLimitAssistState.preActive:
+      return self._pre_active_hold
+    if self.is_active and self._has_speed_limit:
+      return self._speed_limit_final_last
 
     # Fallback
     return V_CRUISE_UNSET
@@ -159,30 +184,19 @@ class SpeedLimitAssist:
     # loop back into buttonEvents. Release edges arm the direction-aware confirm latches,
     # press edges arm one direction-less override latch, all held CRUISE_BUTTON_CONFIRM_HOLD
     # so the 20 Hz machine cannot miss a one-frame edge (this runs at carState rate).
+    # Confirm latches arm only for presses that both started and released during
+    # preActive: the engage press (or a press already in flight when the prompt appears)
+    # must not answer a prompt the driver never saw.
     for b in CS.buttonEvents:
       if b.type in CRUISE_BUTTONS_PLUS or b.type in CRUISE_BUTTONS_MINUS:
         if b.pressed:
           self._press_deadline = max(self._press_deadline, now + CRUISE_BUTTON_CONFIRM_HOLD)
-        elif b.type in CRUISE_BUTTONS_PLUS:
-          self._plus_hold = max(self._plus_hold, now + CRUISE_BUTTON_CONFIRM_HOLD)
-        else:
-          self._minus_hold = max(self._minus_hold, now + CRUISE_BUTTON_CONFIRM_HOLD)
-
-  def _get_button_release(self, req_plus: bool, req_minus: bool) -> bool:
-    now = time.monotonic()
-    if req_plus and now <= self._plus_hold:
-      self._plus_hold = 0.
-      return True
-    elif req_minus and now <= self._minus_hold:
-      self._minus_hold = 0.
-      return True
-
-    # expired
-    if now > self._plus_hold:
-      self._plus_hold = 0.
-    if now > self._minus_hold:
-      self._minus_hold = 0.
-    return False
+          self._press_started_pre_active = self.state == SpeedLimitAssistState.preActive
+        elif self._press_started_pre_active and self.state == SpeedLimitAssistState.preActive:
+          if b.type in CRUISE_BUTTONS_PLUS:
+            self._plus_hold = max(self._plus_hold, now + CRUISE_BUTTON_CONFIRM_HOLD)
+          else:
+            self._minus_hold = max(self._minus_hold, now + CRUISE_BUTTON_CONFIRM_HOLD)
 
   def update_calculations(self, v_cruise_cluster: float) -> None:
     speed_conv = CV.MS_TO_KPH if self.is_metric else CV.MS_TO_MPH
@@ -242,6 +256,9 @@ class SpeedLimitAssist:
 
   def _update_non_pcm_long_confirmed_state(self) -> bool:
     if self.target_set_speed_confirmed:
+      # a press that dialed the cluster onto the target must not double as a dismissal
+      # next cycle: it already got what it asked for
+      self._press_deadline = 0.
       return True
 
     if self.state != SpeedLimitAssistState.preActive:
@@ -249,11 +266,23 @@ class SpeedLimitAssist:
 
     req_plus, req_minus = compare_cluster_target(self.v_cruise_cluster, self._speed_limit_final_last, self.is_metric)
 
-    confirmed = self._get_button_release(req_plus, req_minus)
-    if confirmed:
+    now = time.monotonic()
+    plus_released = now <= self._plus_hold
+    minus_released = now <= self._minus_hold
+    self._plus_hold = 0.
+    self._minus_hold = 0.
+
+    if (req_plus and plus_released) or (req_minus and minus_released):
       # the confirm press must not double as a manual override next cycle
       self._press_deadline = 0.
-    return confirmed
+      return True
+
+    if plus_released or minus_released:
+      # a release against the confirm direction is a decline: end the session so the
+      # frozen plan hold releases and the prompt stops shadowing the driver's dialing
+      self._pre_active_declined = True
+      self._press_deadline = 0.
+    return False
 
   def update_state_machine_pcm_op_long(self):
     self.long_engaged_timer = max(0, self.long_engaged_timer - 1)
@@ -326,6 +355,16 @@ class SpeedLimitAssist:
 
     return enabled, active
 
+  def _enter_pre_active(self) -> None:
+    self.state = SpeedLimitAssistState.preActive
+    self.pre_active_timer = int(PRE_ACTIVE_GUARD_PERIOD[self.pcm_op_long] / DT_MDL)
+    self._pre_active_declined = False
+    # Freeze the plan for the length of the prompt. Out of an active session that is the
+    # session's last target (the dash stays put instead of restoring un-confirmed); idle
+    # it is the cluster, which loses no min() against cruise and changes nothing.
+    was_session = self._state_prev in ACTIVE_STATES or self.output_v_target < V_CRUISE_UNSET
+    self._pre_active_hold = float(self.output_v_target) if was_session else float(self.v_cruise_cluster)
+
   def update_state_machine_non_pcm_long(self):
     self.long_engaged_timer = max(0, self.long_engaged_timer - 1)
     self.pre_active_timer = max(0, self.pre_active_timer - 1)
@@ -350,13 +389,16 @@ class SpeedLimitAssist:
             self._driver_dismissed = True
 
           elif self.speed_limit_changed and self.apply_confirm_speed_threshold:
-            self.state = SpeedLimitAssistState.preActive
-            self.pre_active_timer = int(PRE_ACTIVE_GUARD_PERIOD[self.pcm_op_long] / DT_MDL)
+            self._enter_pre_active()
 
         # PRE_ACTIVE
         elif self.state == SpeedLimitAssistState.preActive:
           if self._update_non_pcm_long_confirmed_state():
             self.state = SpeedLimitAssistState.active
+          elif self._pre_active_declined:
+            # driver answered "no" by dialing the other way; release the hold and step aside
+            self._pre_active_declined = False
+            self.state = SpeedLimitAssistState.inactive
           elif self.pre_active_timer <= 0:
             # Timeout - session ended
             self.state = SpeedLimitAssistState.inactive
@@ -364,9 +406,8 @@ class SpeedLimitAssist:
         # INACTIVE
         elif self.state == SpeedLimitAssistState.inactive:
           if self.speed_limit_changed:
-            self.state = SpeedLimitAssistState.preActive
-            self.pre_active_timer = int(PRE_ACTIVE_GUARD_PERIOD[self.pcm_op_long] / DT_MDL)
             self._driver_dismissed = False
+            self._enter_pre_active()
           elif not self._driver_dismissed and self._update_non_pcm_long_confirmed_state():
             self.state = SpeedLimitAssistState.active
 
@@ -381,8 +422,7 @@ class SpeedLimitAssist:
           if self._update_non_pcm_long_confirmed_state():
             self.state = SpeedLimitAssistState.active
           elif self._has_speed_limit:
-            self.state = SpeedLimitAssistState.preActive
-            self.pre_active_timer = int(PRE_ACTIVE_GUARD_PERIOD[self.pcm_op_long] / DT_MDL)
+            self._enter_pre_active()
           else:
             self.state = SpeedLimitAssistState.inactive
 
@@ -395,8 +435,8 @@ class SpeedLimitAssist:
     if self.state == SpeedLimitAssistState.preActive:
       events_sp.add(EventNameSP.speedLimitPreActive)
 
-    if self.state == SpeedLimitAssistState.pending and self._state_prev != SpeedLimitAssistState.pending:
-      events_sp.add(EventNameSP.speedLimitPending)
+    # pending fires no alert: it is a waiting state (engaged, no limit known yet), and
+    # announcing "auto adjusting" on every engage reads as SLA acting when it is not
 
     if self.is_active:
       if self._state_prev not in ACTIVE_STATES:

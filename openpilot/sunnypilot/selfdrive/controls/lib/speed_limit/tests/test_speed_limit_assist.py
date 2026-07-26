@@ -339,11 +339,18 @@ class TestSpeedLimitAssistNonPcm:
       self.update(cluster, 70)
       assert self.sla.state == SpeedLimitAssistState.active
 
-  def test_wrong_direction_press_does_not_confirm(self):
+  def test_wrong_direction_press_declines(self):
+    """A release against the confirm direction is a decline: the session ends right away
+    (instead of a prompt lingering over a driver who is dialing the other way) and the
+    next limit change re-prompts normally."""
     self.go_pre_active(cluster_mph=50, limit_mph=70)
 
     self.press(ButtonType.decelCruise)  # limit is above: requires +
     self.update(50, 70)
+    assert self.sla.state == SpeedLimitAssistState.inactive
+
+    # declining is not a dismissal: a new limit re-prompts
+    self.update(50, 65)
     assert self.sla.state == SpeedLimitAssistState.preActive
 
   def test_settled_press_deactivates(self):

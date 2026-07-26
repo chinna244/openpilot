@@ -218,7 +218,11 @@ class IntelligentCruiseButtonManagement:
         elif self.state == State.holding:
           down_pending = self.v_cruise_cluster - self.v_target >= self.react_deadband
           up_pending = self.v_target - self.v_cruise_cluster >= self.react_deadband
-          up_allowed = (self.overshoot_mph > 0 or not self.profile.decel_needs_stable_setpoint
+          # The overshoot exemption only covers the overshoot command's own slow release
+          # (still limiter-sourced); residual overshoot after a source flip back to cruise
+          # must not bypass the quiet window into a full baseline restore.
+          up_allowed = ((self.overshoot_mph > 0 and self.limiter_active)
+                        or not self.profile.decel_needs_stable_setpoint
                         or self.restore_quiet_timer >= RESTORE_QUIET_FRAMES)
           if down_pending or (up_pending and up_allowed):
             self.pre_active_timer = int(REACT_TIMER / DT_CTRL)
