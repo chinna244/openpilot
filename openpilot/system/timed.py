@@ -4,24 +4,30 @@ import subprocess
 import time
 from typing import NoReturn
 
+from openpilot.cereal import log
 import openpilot.cereal.messaging as messaging
-from openpilot.common.time_helpers import min_date, MAX_DATE, system_time_valid
+from openpilot.common.time_helpers import (
+  HostTimeSource,
+  MAX_DATE,
+  mark_time_synced,
+  min_date,
+  set_system_time,
+  system_time_valid,
+)
+from openpilot.common.gps_time import ublox_gps_time_valid
 from openpilot.common.swaglog import cloudlog
 from openpilot.common.params import Params
 from openpilot.common.gps import get_gps_location_service
 
 
-def set_time(new_time):
-  diff = datetime.datetime.now() - new_time
-  if abs(diff) < datetime.timedelta(seconds=10):
-    cloudlog.debug(f"Time diff too small: {diff}")
-    return
+def set_time(new_time: datetime.datetime) -> bool:
+  cloudlog.debug(f"Setting time from trusted source: {new_time}")
 
-  cloudlog.debug(f"Setting time to {new_time}")
   try:
-    subprocess.run(f"TZ=UTC date -s '{new_time}'", shell=True, check=True)
-  except subprocess.CalledProcessError:
+    return set_system_time(new_time)
+  except (OSError, subprocess.CalledProcessError):
     cloudlog.exception("timed.failed_setting_time")
+    return False
 
 
 def main() -> NoReturn:
@@ -47,16 +53,27 @@ def main() -> NoReturn:
     pm.send('clocks', msg)
 
     gps = sm[gps_location_service]
-    gps_time = datetime.datetime.fromtimestamp(gps.unixTimestampMillis / 1000.)
+    gps_time = datetime.datetime.fromtimestamp(
+      gps.unixTimestampMillis / 1000.,
+      tz=datetime.UTC,
+    )
     if not sm.updated[gps_location_service] or (time.monotonic() - sm.logMonoTime[gps_location_service] / 1e9) > 2.0:
       continue
-    if not gps.hasFix:
-      continue
-    if gps_time < min_date() or gps_time > MAX_DATE:
+    if gps.source == log.GpsLocationData.SensorSource.ublox:
+      if not ublox_gps_time_valid(gps.flags):
+        continue
+    elif not gps.hasFix:
       continue
 
-    set_time(gps_time)
-    time.sleep(10)
+    minimum_time = min_date().replace(tzinfo=datetime.UTC)
+    maximum_time = MAX_DATE.replace(tzinfo=datetime.UTC)
+    if gps_time < minimum_time or gps_time > maximum_time:
+      continue
+
+    if set_time(gps_time):
+      if not mark_time_synced(HostTimeSource.RECEIVER_DERIVED):
+        cloudlog.warning("Failed to write trusted GPS time marker")
+      time.sleep(10)
 
 if __name__ == "__main__":
   main()

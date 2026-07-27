@@ -1,6 +1,7 @@
 import os
 import operator
 import platform
+import time
 
 from opendbc.car.structs import car
 from openpilot.cereal import custom
@@ -8,6 +9,7 @@ from openpilot.common.params import Params
 from openpilot.common.hardware import PC, TICI
 from openpilot.system.manager.process import PythonProcess, NativeProcess, DaemonProcess
 from openpilot.common.hardware.hw import Paths
+from openpilot.system.ubloxd.yuma_almanac_config import public_yuma_almanac_enabled
 
 from openpilot.sunnypilot.mapd.mapd_manager import MAPD_PATH
 
@@ -15,6 +17,11 @@ from openpilot.sunnypilot.models.helpers import get_active_model_runner
 from openpilot.sunnypilot.sunnylink.utils import sunnylink_need_register, sunnylink_ready, use_sunnylink_uploader
 
 WEBCAM = os.getenv("USE_WEBCAM") is not None
+
+GPS_OFFROAD_PREWARM_SECONDS = 5 * 60
+
+_ublox_offroad_prewarm_deadline = time.monotonic() + GPS_OFFROAD_PREWARM_SECONDS
+_ublox_last_started = False
 
 def driverview(started: bool, params: Params, CP: car.CarParams) -> bool:
   return started or params.get_bool("IsDriverViewEnabled")
@@ -33,10 +40,31 @@ def ublox_available() -> bool:
   return os.path.exists('/dev/ttyHS0') and not os.path.exists('/persist/comma/use-quectel-gps')
 
 def ublox(started: bool, params: Params, CP: car.CarParams) -> bool:
+  global _ublox_last_started, _ublox_offroad_prewarm_deadline
+
   use_ublox = ublox_available()
-  if use_ublox != params.get_bool("UbloxAvailable"):
-    params.put_bool("UbloxAvailable", use_ublox, block=True)
-  return started and use_ublox
+  if use_ublox != params.get_bool('UbloxAvailable'):
+    params.put_bool('UbloxAvailable', use_ublox, block=True)
+
+  now = time.monotonic()
+
+  # Start a new five-minute prewarm period whenever a drive ends.
+  if started != _ublox_last_started:
+    if _ublox_last_started and not started:
+      _ublox_offroad_prewarm_deadline = now + GPS_OFFROAD_PREWARM_SECONDS
+    _ublox_last_started = started
+
+  # The initial deadline provides five minutes of prewarming after manager starts.
+  prewarm_offroad = not started and now < _ublox_offroad_prewarm_deadline
+  return use_ublox and (started or prewarm_offroad)
+
+
+def yuma_almanac_refresh(started: bool, params: Params, CP: car.CarParams) -> bool:
+  return (
+    not started
+    and ublox_available()
+    and public_yuma_almanac_enabled(params)
+  )
 
 def joystick(started: bool, params: Params, CP: car.CarParams) -> bool:
   return started and params.get_bool("JoystickDebugMode")
@@ -126,7 +154,7 @@ procs = [
   PythonProcess("proclogd", "openpilot.system.proclogd", only_onroad, enabled=platform.system() != "Darwin"),
   PythonProcess("journald", "openpilot.system.journald", only_onroad, platform.system() != "Darwin"),
   PythonProcess("micd", "openpilot.system.micd", iscar),
-  PythonProcess("timed", "openpilot.system.timed", always_run, enabled=not PC),
+  PythonProcess("timed", "openpilot.system.timed", always_run, enabled=not PC, restart_if_crash=True),
 
   PythonProcess("modeld", "openpilot.selfdrive.modeld.modeld", and_(only_onroad, is_stock_model)),
   PythonProcess("dmonitoringmodeld", "openpilot.selfdrive.modeld.dmonitoringmodeld", driverview, enabled=(WEBCAM or not PC)),
@@ -149,7 +177,8 @@ procs = [
   PythonProcess("paramsd", "openpilot.selfdrive.locationd.paramsd", only_onroad),
   PythonProcess("lagd", "openpilot.selfdrive.locationd.lagd", only_onroad),
   PythonProcess("ubloxd", "openpilot.system.ubloxd.ubloxd", ublox, enabled=TICI),
-  PythonProcess("pigeond", "openpilot.system.ubloxd.pigeond", ublox, enabled=TICI),
+  PythonProcess("pigeond", "openpilot.system.ubloxd.pigeond", ublox, enabled=TICI, restart_if_crash=True),
+  PythonProcess("yumaalmanacd", "openpilot.system.ubloxd.yuma_almanacd", yuma_almanac_refresh, enabled=TICI, restart_if_crash=True),
   PythonProcess("plannerd", "openpilot.selfdrive.controls.plannerd", not_long_maneuver),
   PythonProcess("maneuversd", "openpilot.tools.longitudinal_maneuvers.maneuversd", long_maneuver),
   PythonProcess("lateral_maneuversd", "openpilot.tools.lateral_maneuvers.lateral_maneuversd", lat_maneuver),

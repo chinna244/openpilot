@@ -105,6 +105,7 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"OpenpilotEnabledToggle", {PERSISTENT | BACKUP, BOOL, "1"}},
     {"PandaHeartbeatLost", {CLEAR_ON_MANAGER_START | CLEAR_ON_OFFROAD_TRANSITION, BOOL}},
     {"PrimeType", {PERSISTENT, INT}},
+    {"PublicYumaAlmanacEnabled", {PERSISTENT, BOOL, "0"}},
     {"RecordAudio", {PERSISTENT | BACKUP, BOOL}},
     {"RecordAudioFeedback", {PERSISTENT | BACKUP, BOOL, "0"}},
     {"RecordFront", {PERSISTENT | BACKUP, BOOL}},

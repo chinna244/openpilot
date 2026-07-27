@@ -12,6 +12,11 @@ import openpilot.system.sentry as sentry
 from openpilot.common.utils import atomic_write
 from openpilot.common.params import Params, ParamKeyFlag
 from openpilot.common.text_window import TextWindow
+from openpilot.common.time_helpers import (
+  MAX_DATE,
+  min_date,
+  set_system_time,
+)
 from openpilot.common.hardware import HARDWARE, PC
 from openpilot.system.manager.helpers import unblock_stdout, save_bootlog
 from openpilot.system.manager.process import ensure_running
@@ -20,11 +25,64 @@ from openpilot.system.athena.registration import register, UNREGISTERED_DONGLE_I
 from openpilot.common.swaglog import cloudlog, add_file_handler
 from openpilot.common.version import get_build_metadata
 from openpilot.common.hardware.hw import Paths
+from openpilot.system.ubloxd.gps_assistance import (
+  GPS_ASSISTANCE_CACHE_PATH,
+  NavigationCacheStore,
+  load_cache,
+  read_rtc_counter_seconds,
+  select_rtc_estimate,
+)
 
 from openpilot.sunnypilot.system.params_migration import run_migration
 
 
+def restore_cached_gps_time() -> None:
+  """Move an invalid boot clock forward using the last trusted GPS UTC.
+
+  This cached value is only a lower-bound bootstrap. It intentionally does
+  not create the trusted-time marker; loggerd still waits for live GPS or NTP.
+  """
+  if PC:
+    return
+
+  try:
+    store = NavigationCacheStore(GPS_ASSISTANCE_CACHE_PATH, loader=load_cache)
+    inventory = store.inspect(None, None)
+    selected, _ = select_rtc_estimate(
+      inventory, read_rtc_counter_seconds(),
+    )
+    if selected is None:
+      print('GPS cached time unavailable: no valid fixed-file RTC anchor')
+      return
+
+    cached_time = selected.estimate.estimated_utc
+    current_time = datetime.datetime.now(datetime.UTC)
+    minimum_time = min_date().replace(tzinfo=datetime.UTC)
+    maximum_time = MAX_DATE.replace(tzinfo=datetime.UTC)
+
+    if not minimum_time < cached_time < maximum_time:
+      print(f'GPS cached time outside valid bounds: {cached_time}')
+      return
+
+    if cached_time - current_time <= datetime.timedelta(seconds=10):
+      print(
+        'GPS cached time is not meaningfully newer than the current clock; '
+        + 'leaving system time unchanged'
+      )
+      return
+
+    if set_system_time(cached_time):
+      print(
+        f'Restored system clock floor from GPS cache: {cached_time}, '
+        + f'generation={selected.generation}'
+      )
+  except Exception as exc:
+    # A time bootstrap failure must never prevent manager startup.
+    print(f'Failed to restore system clock from GPS cache: {exc}')
+
+
 def manager_init() -> None:
+  restore_cached_gps_time()
   save_bootlog()
 
   build_metadata = get_build_metadata()

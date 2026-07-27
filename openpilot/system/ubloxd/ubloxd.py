@@ -8,6 +8,7 @@ from dataclasses import dataclass
 
 from openpilot.cereal import log
 from openpilot.cereal import messaging
+from openpilot.common.gps_time import encode_ublox_gps_flags
 from openpilot.system.ubloxd.ubx import Ubx
 from openpilot.system.ubloxd.gps import Gps
 from openpilot.system.ubloxd.glonass import Glonass
@@ -178,7 +179,9 @@ class UbloxMsgParser:
     dat = messaging.new_message('gpsLocationExternal', valid=True)
     gps = dat.gpsLocationExternal
     gps.source = log.GpsLocationData.SensorSource.ublox
-    gps.flags = msg.flags
+    # Preserve the existing fix flags in the lower byte and expose the
+    # NAV-PVT validDate/validTime bits in the upper byte.
+    gps.flags = encode_ublox_gps_flags(msg.flags, msg.valid)
     gps.hasFix = (msg.flags % 2) == 1
     gps.latitude = msg.lat * 1e-07
     gps.longitude = msg.lon * 1e-07
