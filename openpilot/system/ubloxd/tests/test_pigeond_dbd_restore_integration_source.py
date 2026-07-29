@@ -75,14 +75,8 @@ def test_database_decision_runs_before_yuma_transmission() -> None:
     "yuma_feature.evaluate("
   )
 
-  assert (
-    "provisional_yuma_outcome = yuma_feature.evaluate_provisional(\n"
-    "      send_yuma_message,"
-  ) in segment
-  assert (
-    "yuma_outcome = yuma_feature.evaluate(\n"
-    "      send_yuma_message,"
-  ) in segment
+  assert "provisional_yuma_outcome = yuma_feature.evaluate_provisional(\n      send_yuma_message," in segment
+  assert "yuma_outcome = yuma_feature.evaluate(\n      send_yuma_message," in segment
   assert "navigation_database_runtime.note_yuma_sent()" not in segment
 
   helper = named_node(tree, "send_yuma_with_durable_claim")
@@ -211,3 +205,28 @@ def test_power_on_stop_precedes_baud_transition_and_transactions() -> None:
   initialize_segment = ast.get_source_segment(source, initialize)
   assert initialize_segment is not None
   assert initialize_segment.index("restore_navigation_assistance(") < (initialize_segment.index("send_time_assistance("))
+
+# COMMIT9_DBD_RUNTIME_BEFORE_RECEIVER_TEST
+
+
+def test_dbd_runtime_initialization_precedes_receiver_construction_and_io() -> None:
+  source, tree = source_tree(PIGEOND)
+  node = named_node(tree, "run_receiving")
+  segment = ast.get_source_segment(source, node)
+  assert segment is not None
+
+  runtime = segment.index(
+    "navigation_database_runtime = NavigationDatabaseRestoreRuntime("
+  )
+  pigeon = segment.index("pigeon = TTYPigeon(")
+  first_cycle = segment.index("initialize_receiver_cycle(")
+  assert runtime < pigeon < first_cycle
+
+  initialize = named_node(tree, "initialize_receiver_cycle")
+  initialize_segment = ast.get_source_segment(source, initialize)
+  assert initialize_segment is not None
+  fallback_runtime = initialize_segment.index(
+    "or NavigationDatabaseRestoreRuntime(receiver_fingerprint)"
+  )
+  receiver_start = initialize_segment.index("init(pigeon)")
+  assert fallback_runtime < receiver_start

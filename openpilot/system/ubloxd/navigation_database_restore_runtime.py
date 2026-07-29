@@ -13,7 +13,7 @@ import os
 from pathlib import Path
 import tempfile
 import time
-from typing import Any
+from typing import Any, cast
 
 from openpilot.system.ubloxd.gps_assistance import (
   CacheAgeEvidence,
@@ -55,6 +55,10 @@ NAVIGATION_DATABASE_RESTORE_STATE_PATH = Path("/data/gps_assistance/navigation_d
 
 class NavigationDatabaseRestoreStateError(ValueError):
   pass
+
+
+class NavigationDatabaseRestoreInitializationError(RuntimeError):
+  """Receiver startup cannot safely establish boot-scoped DBD ownership."""
 
 
 @dataclass(frozen=True)
@@ -185,14 +189,17 @@ class NavigationDatabaseRestoreCandidateIdentity:
       "database_digest",
     }:
       raise NavigationDatabaseRestoreStateError("candidate identity is invalid")
+    mapping = cast(dict[str, object], value)
     try:
-      saved_at = datetime.fromisoformat(value["saved_at_utc"])
+      saved_at = datetime.fromisoformat(
+        cast(str, mapping["saved_at_utc"])
+      )
     except (TypeError, ValueError) as exc:
       raise NavigationDatabaseRestoreStateError("candidate timestamp is invalid") from exc
     return cls(
-      generation=value["generation"],
+      generation=cast(str, mapping["generation"]),
       saved_at_utc=saved_at,
-      database_digest=value["database_digest"],
+      database_digest=cast(str, mapping["database_digest"]),
     )
 
 
@@ -323,6 +330,7 @@ class NavigationDatabaseRestoreBootState:
   def from_json_dict(cls, value: object) -> NavigationDatabaseRestoreBootState:
     if not isinstance(value, dict):
       raise NavigationDatabaseRestoreStateError("state root is invalid")
+    mapping = cast(dict[str, object], value)
     expected_keys = {
       "version",
       "boot_id",
@@ -336,9 +344,9 @@ class NavigationDatabaseRestoreBootState:
       "cache_generation",
       "cache_saved_at_utc",
     }
-    if set(value) != expected_keys:
+    if set(mapping) != expected_keys:
       raise NavigationDatabaseRestoreStateError("state keys are invalid")
-    saved_at_raw = value["cache_saved_at_utc"]
+    saved_at_raw = mapping["cache_saved_at_utc"]
     if saved_at_raw is None:
       saved_at = None
     elif isinstance(saved_at_raw, str):
@@ -349,23 +357,34 @@ class NavigationDatabaseRestoreBootState:
     else:
       raise NavigationDatabaseRestoreStateError("cache_saved_at_utc is invalid")
     try:
-      disposition = NavigationDatabaseRestoreDisposition(value["disposition"])
+      disposition = NavigationDatabaseRestoreDisposition(
+        cast(str, mapping["disposition"])
+      )
     except (TypeError, ValueError) as exc:
       raise NavigationDatabaseRestoreStateError("disposition is invalid") from exc
-    identities_raw = value["candidate_identities"]
+    identities_raw = mapping["candidate_identities"]
     if not isinstance(identities_raw, list):
       raise NavigationDatabaseRestoreStateError("candidate identities are invalid")
     return cls(
-      version=value["version"],
-      boot_id=value["boot_id"],
-      receiver_fingerprint=value["receiver_fingerprint"],
+      version=cast(int, mapping["version"]),
+      boot_id=cast(str, mapping["boot_id"]),
+      receiver_fingerprint=cast(str, mapping["receiver_fingerprint"]),
       disposition=disposition,
-      restore_attempted=value["restore_attempted"],
-      position_assistance_claimed=value["position_assistance_claimed"],
-      acquisition_started=value["acquisition_started"],
-      yuma_sent=value["yuma_sent"],
-      candidate_identities=tuple(NavigationDatabaseRestoreCandidateIdentity.from_json_dict(identity) for identity in identities_raw),
-      cache_generation=value["cache_generation"],
+      restore_attempted=cast(bool, mapping["restore_attempted"]),
+      position_assistance_claimed=cast(
+        bool,
+        mapping["position_assistance_claimed"],
+      ),
+      acquisition_started=cast(bool, mapping["acquisition_started"]),
+      yuma_sent=cast(bool, mapping["yuma_sent"]),
+      candidate_identities=tuple(
+        NavigationDatabaseRestoreCandidateIdentity.from_json_dict(identity)
+        for identity in identities_raw
+      ),
+      cache_generation=cast(
+        str | None,
+        mapping["cache_generation"],
+      ),
       cache_saved_at_utc=saved_at,
     )
 
@@ -564,22 +583,51 @@ class NavigationDatabaseRestoreRuntime:
 
     try:
       boot_id = boot_id_reader()
-    except Exception:
-      boot_id = None
-    self._boot_id = boot_id if isinstance(boot_id, str) and boot_id.strip() else None
-
+    except Exception as exc:
+      raise NavigationDatabaseRestoreInitializationError(
+        f"boot_state:boot_id_read_failed:{_bounded_error(exc)}"
+      ) from exc
+    self._boot_id = (
+      boot_id if isinstance(boot_id, str) and boot_id.strip() else None
+    )
     if self._boot_id is None:
-      self._fail_closed("boot_state:boot_id_unavailable")
+      raise NavigationDatabaseRestoreInitializationError(
+        "boot_state:boot_id_unavailable"
+      )
+
+    try:
+      persisted = state_loader(self._state_path)
+    except Exception as exc:
+      raise NavigationDatabaseRestoreInitializationError(
+        f"boot_state:state_load_failed:{_bounded_error(exc)}"
+      ) from exc
+    if persisted is not None and not isinstance(
+      persisted,
+      NavigationDatabaseRestoreBootState,
+    ):
+      raise NavigationDatabaseRestoreInitializationError(
+        "boot_state:state_load_returned_invalid_type"
+      )
+
+    valid_same_boot_state = (
+      persisted is not None
+      and persisted.boot_id == self._boot_id
+      and persisted.receiver_fingerprint == self._receiver_fingerprint
+    )
+    if valid_same_boot_state:
+      self._restore_persisted_state(persisted)
     else:
-      try:
-        persisted = state_loader(self._state_path)
-      except Exception as exc:
-        persisted = None
-        self._fail_closed(f"boot_state:{type(exc).__name__}:{exc}")
-      if self._controller.pending:
-        self._restore_persisted_state(persisted)
-      if persisted is None and self._controller.pending:
-        self._persist_state()
+      if (
+        persisted is not None
+        and persisted.boot_id == self._boot_id
+        and persisted.receiver_fingerprint != self._receiver_fingerprint
+      ):
+        self._fail_closed("boot_state:receiver_fingerprint_mismatch")
+      if not self._persist_state():
+        detail = self._state_persistence_error or "unknown"
+        raise NavigationDatabaseRestoreInitializationError(
+          f"boot_state:current_boot_baseline_persist_failed:{detail}"
+        )
 
     self._execution = self._build_execution()
 
@@ -877,11 +925,14 @@ class NavigationDatabaseRestoreRuntime:
       selected = matching[0]
       return selected, ages[selected.generation]
 
-    eligible = [
-      candidate
-      for candidate in candidates
-      if (ages[candidate.generation] is not None and 0.0 <= ages[candidate.generation] <= NAVIGATION_DATABASE_RESTORE_MAX_AGE_SECONDS)
-    ]
+    eligible: list[NavigationDatabaseRestoreSnapshot] = []
+    for candidate in candidates:
+      age = ages[candidate.generation]
+      if (
+        age is not None
+        and 0.0 <= age <= NAVIGATION_DATABASE_RESTORE_MAX_AGE_SECONDS
+      ):
+        eligible.append(candidate)
     if not eligible:
       valid_ages = [age for age in ages.values() if age is not None and age >= 0.0]
       if len(valid_ages) == len(candidates) and valid_ages:

@@ -103,7 +103,7 @@ def test_paused_gnss_acquisition_stays_stopped_after_failure(
   monkeypatch.setattr(pigeond.time, "sleep", lambda _delay: None)
 
   with pytest.raises(RuntimeError, match="simulated setup failure"):
-    with pigeond.paused_gnss_acquisition(pigeon):  # type: ignore[arg-type]
+    with pigeond.paused_gnss_acquisition(pigeon):  # type: ignore[arg-type, ty:invalid-argument-type]
       raise RuntimeError("simulated setup failure")
 
   assert pigeon.sent == [pigeond.CONTROLLED_GNSS_STOP_MESSAGE]
@@ -171,12 +171,12 @@ def test_configuration_traffic_closes_database_window_before_write(
   )
 
   result = pigeond.initialize_receiver_cycle(
-    pigeon,  # type: ignore[arg-type]
+    pigeon,  # type: ignore[arg-type, ty:invalid-argument-type]
     "receiver",
-    FakeDiagnostics(),  # type: ignore[arg-type]
+    FakeDiagnostics(),  # type: ignore[arg-type, ty:invalid-argument-type]
     "test",
-    time_authority=object(),  # type: ignore[arg-type]
-    time_provenance=FakeProvenance(),  # type: ignore[arg-type]
+    time_authority=object(),  # type: ignore[arg-type, ty:invalid-argument-type]
+    time_provenance=FakeProvenance(),  # type: ignore[arg-type, ty:invalid-argument-type]
     navigation_database_runtime=runtime,
   )
 
@@ -203,9 +203,9 @@ def test_bounded_wait_accepts_delayed_network_time() -> None:
     return evaluations.pop(0)
 
   observation, evaluation = pigeond.wait_for_current_independent_network_time(
-    object(),  # type: ignore[arg-type]
+    object(),  # type: ignore[arg-type, ty:invalid-argument-type]
     None,
-    SimpleNamespace(authorized_time=None),  # type: ignore[arg-type]
+    SimpleNamespace(authorized_time=None),  # type: ignore[arg-type, ty:invalid-argument-type]
     timeout_seconds=1.0,
     poll_seconds=0.25,
     observation_reader=lambda: None,
@@ -224,7 +224,7 @@ def test_yuma_claim_happens_before_receiver_write() -> None:
     claim_yuma_transmission=lambda: events.append("claim") or True
   )
   pigeond.send_yuma_with_durable_claim(
-    runtime,  # type: ignore[arg-type]
+    runtime,  # type: ignore[arg-type, ty:invalid-argument-type]
     lambda _message: events.append("write"),
     b"yuma",
   )
@@ -236,7 +236,7 @@ def test_failed_yuma_claim_performs_zero_receiver_writes() -> None:
   runtime = SimpleNamespace(claim_yuma_transmission=lambda: False)
   with pytest.raises(RuntimeError, match="YUMA claim persistence failed"):
     pigeond.send_yuma_with_durable_claim(
-      runtime,  # type: ignore[arg-type]
+      runtime,  # type: ignore[arg-type, ty:invalid-argument-type]
       lambda message: writes.append(message),
       b"yuma",
     )
@@ -256,7 +256,7 @@ def test_post_power_stop_precedes_boot_wait(
   )
   monkeypatch.setattr(pigeond.time, "sleep", lambda _delay: events.append("sleep"))
   monkeypatch.setattr(pigeond, "init_baudrate", lambda _pigeon: events.append("init_baudrate"))
-  pigeond.start_pigeon_transport(pigeon)  # type: ignore[arg-type]
+  pigeond.start_pigeon_transport(pigeon)  # type: ignore[arg-type, ty:invalid-argument-type]
   assert events.index("power_on") < events.index("gnss_stop")
   assert events.index("gnss_stop") < events.index("sleep", events.index("power_on"))
   assert events.index("gnss_stop") < events.index("init_baudrate")
@@ -317,12 +317,12 @@ def test_delayed_network_time_restores_before_gnss_start(
   monkeypatch.setattr(pigeond, "configure_assistnow_autonomous", lambda *_args: None)
 
   result = pigeond.initialize_receiver_cycle(
-    pigeon,  # type: ignore[arg-type]
+    pigeon,  # type: ignore[arg-type, ty:invalid-argument-type]
     "receiver",
-    FakeDiagnostics(),  # type: ignore[arg-type]
+    FakeDiagnostics(),  # type: ignore[arg-type, ty:invalid-argument-type]
     "test",
-    time_authority=object(),  # type: ignore[arg-type]
-    time_provenance=FakeProvenance(),  # type: ignore[arg-type]
+    time_authority=object(),  # type: ignore[arg-type, ty:invalid-argument-type]
+    time_provenance=FakeProvenance(),  # type: ignore[arg-type, ty:invalid-argument-type]
     navigation_database_runtime=runtime,
   )
 
@@ -400,23 +400,38 @@ def test_acquisition_dispatched_after_network_wait_blocks_dbd(tmp_path: Path, mo
   monkeypatch.setattr(pigeond, "start_pigeon_transport", lambda _pigeon: None)
   monkeypatch.setattr(pigeond, "read_host_time_observation", lambda: None)
   monkeypatch.setattr(pigeond, "evaluate_time_authority", lambda _authority, _observation: SimpleNamespace(authorized_time=None))
-  monkeypatch.setattr(pigeond, "wait_for_current_independent_network_time", lambda _authority, observation, _evaluation: (observation, SimpleNamespace(authorized_time=network_time())))
+  monkeypatch.setattr(
+    pigeond,
+    "wait_for_current_independent_network_time",
+    lambda _authority, observation, _evaluation: (
+      observation,
+      SimpleNamespace(authorized_time=network_time()),
+    ),
+  )
   monkeypatch.setattr(pigeond, "poll_mon_ver", lambda _pigeon: None)
   monkeypatch.setattr(pigeond, "configure_navx5_ack_aiding", lambda *_args: None)
   monkeypatch.setattr(pigeond, "log_navx5_ack_aiding_support", lambda _info: None)
-  monkeypatch.setattr(pigeond, "send_mga_with_strict_ack", lambda _pigeon, _message, **kwargs: database_indexes.append(kwargs["database_frame_index"]) if kwargs.get("database_frame_index") is not None else None)
+  monkeypatch.setattr(
+    pigeond,
+    "send_mga_with_strict_ack",
+    lambda _pigeon, _message, **kwargs: (
+      database_indexes.append(kwargs["database_frame_index"])
+      if kwargs.get("database_frame_index") is not None
+      else None
+    ),
+  )
   monkeypatch.setattr(pigeond, "send_time_assistance", lambda *_args, **_kwargs: False)
   monkeypatch.setattr(pigeond, "log_navigation_assistance_restore_result", lambda *_args, **_kwargs: None)
   monkeypatch.setattr(pigeond, "finish_pigeon_initialization", lambda _pigeon: None)
   monkeypatch.setattr(pigeond, "log_assistnow_autonomous_support", lambda _info: True)
   monkeypatch.setattr(pigeond, "configure_assistnow_autonomous", lambda *_args: None)
   result = pigeond.initialize_receiver_cycle(
-    pigeon,
+    pigeon,  # ty: ignore[invalid-argument-type]
     "receiver",
-    FakeDiagnostics(),
+    FakeDiagnostics(),  # ty: ignore[invalid-argument-type]
     "test",
-    time_authority=object(),
-    time_provenance=FakeProvenance(),
+    time_authority=object(),  # ty: ignore[invalid-argument-type]
+    time_provenance=FakeProvenance(),  # ty: ignore[invalid-argument-type]
     navigation_database_runtime=runtime,
   )
   assert events.index("rawx_dispatched") < events.index("gnss_start")
@@ -447,7 +462,7 @@ def test_frame_zero_transaction_drain_guard_blocks_receiver_write(tmp_path: Path
     reliable_fix_available=False,
     yuma_already_sent=False,
     send_database_message=lambda message, frame_index: pigeond.send_mga_with_strict_ack(
-      pigeon,
+      pigeon,  # ty: ignore[invalid-argument-type]
       message,
       database_frame_index=frame_index,
       before_send=lambda: runtime.validate_database_write_boundary(frame_index),

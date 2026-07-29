@@ -1621,7 +1621,7 @@ def paused_gnss_acquisition(pigeon: TTYPigeon) -> Iterator[None]:
   time.sleep(CONTROLLED_GNSS_TRANSITION_DELAY)
   try:
     yield
-  except BaseException:
+  except BaseException:  # noqa: TRY203
     # A failed pre-acquisition claim must leave GNSS stopped.
     raise
   else:

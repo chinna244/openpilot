@@ -12,6 +12,7 @@ from openpilot.system.ubloxd.navigation_database_restore_runtime import (
   NavigationDatabaseRestoreCandidateIdentity,
   NavigationDatabaseRestoreFrameFailureKind,
   NavigationDatabaseRestoreFrozenCaches,
+  NavigationDatabaseRestoreInitializationError,
   NavigationDatabaseRestoreRuntime,
   NavigationDatabaseRestoreSnapshot,
   load_navigation_database_restore_boot_state,
@@ -156,18 +157,21 @@ def test_state_round_trip(tmp_path: Path) -> None:
   assert load_navigation_database_restore_boot_state(path) == state
 
 
-def test_corrupt_state_fails_closed(tmp_path: Path) -> None:
+def test_corrupt_state_aborts_initialization(tmp_path: Path) -> None:
   path = tmp_path / "dbd_state.json"
   path.write_text("not-json", encoding="utf-8")
-  value = NavigationDatabaseRestoreRuntime(
-    "receiver",
-    snapshot_loader=lambda _fingerprint: snapshot(),
-    state_path=path,
-    boot_id_reader=lambda: BOOT_ID,
-    boottime_reader=lambda: TEST_BOOTTIME_SECONDS,
-  )
-  assert value.controller.disposition is NavigationDatabaseRestoreDisposition.SKIPPED_UNVERIFIED
-  assert value.send_position_once(lambda _message: None).position_assistance_attempted is False
+
+  with pytest.raises(
+    NavigationDatabaseRestoreInitializationError,
+    match="state_load_failed",
+  ):
+    NavigationDatabaseRestoreRuntime(
+      "receiver",
+      snapshot_loader=lambda _fingerprint: snapshot(),
+      state_path=path,
+      boot_id_reader=lambda: BOOT_ID,
+      boottime_reader=lambda: TEST_BOOTTIME_SECONDS,
+    )
 
 
 def test_new_linux_boot_discards_old_state(tmp_path: Path) -> None:
@@ -476,22 +480,20 @@ def test_persistence_failure_prevents_database_write(tmp_path: Path) -> None:
   assert writes == []
 
 
-def test_boot_id_unavailable_fails_closed(tmp_path: Path) -> None:
-  value = NavigationDatabaseRestoreRuntime(
-    "receiver",
-    snapshot_loader=lambda _fingerprint: snapshot(),
-    state_path=tmp_path / "state.json",
-    boot_id_reader=lambda: None,
-    boottime_reader=lambda: TEST_BOOTTIME_SECONDS,
-  )
-  writes = []
-  result = evaluate(
-    value,
-    authorized_time=network_time(),
-    send=lambda frame, index: writes.append((frame, index)),
-  )
-  assert result.disposition is NavigationDatabaseRestoreDisposition.SKIPPED_UNVERIFIED
-  assert writes == []
+def test_boot_id_unavailable_aborts_initialization(
+  tmp_path: Path,
+) -> None:
+  with pytest.raises(
+    NavigationDatabaseRestoreInitializationError,
+    match="boot_id_unavailable",
+  ):
+    NavigationDatabaseRestoreRuntime(
+      "receiver",
+      snapshot_loader=lambda _fingerprint: snapshot(),
+      state_path=tmp_path / "state.json",
+      boot_id_reader=lambda: None,
+      boottime_reader=lambda: TEST_BOOTTIME_SECONDS,
+    )
 
 
 @pytest.mark.parametrize(
@@ -506,7 +508,7 @@ def test_runtime_rejects_invalid_retry_delay(
     NavigationDatabaseRestoreRuntime(
       "receiver",
       snapshot_loader=lambda _fingerprint: snapshot(),
-      retry_delay_seconds=retry_delay_seconds,  # type: ignore[arg-type]
+      retry_delay_seconds=retry_delay_seconds,  # type: ignore[arg-type, ty:invalid-argument-type]
       state_path=tmp_path / "state.json",
       boot_id_reader=lambda: BOOT_ID,
       boottime_reader=lambda: TEST_BOOTTIME_SECONDS,
@@ -933,3 +935,227 @@ def test_failed_acquisition_persistence_cannot_reopen_after_restart(
     recovered.disposition
     is NavigationDatabaseRestoreDisposition.SKIPPED_UNVERIFIED
   )
+
+# COMMIT9_COMPLETE_DURABLE_BOOT_BASELINE_TESTS
+
+
+def test_boot_id_reader_exception_aborts_initialization(
+  tmp_path: Path,
+) -> None:
+  def fail_boot_id() -> str:
+    raise OSError("boot identity unavailable")
+
+  with pytest.raises(
+    NavigationDatabaseRestoreInitializationError,
+    match="boot_id_read_failed",
+  ):
+    NavigationDatabaseRestoreRuntime(
+      "receiver",
+      snapshot_loader=lambda _fingerprint: snapshot(),
+      state_path=tmp_path / "state.json",
+      boot_id_reader=fail_boot_id,
+      boottime_reader=lambda: TEST_BOOTTIME_SECONDS,
+    )
+
+
+def test_state_loader_exception_aborts_without_overwriting_state(
+  tmp_path: Path,
+) -> None:
+  path = tmp_path / "dbd_state.json"
+  path.write_text("unreadable-state-sentinel", encoding="utf-8")
+
+  def fail_load(_path: Path) -> NavigationDatabaseRestoreBootState | None:
+    raise OSError("state unavailable")
+
+  with pytest.raises(
+    NavigationDatabaseRestoreInitializationError,
+    match="state_load_failed",
+  ):
+    NavigationDatabaseRestoreRuntime(
+      "receiver",
+      snapshot_loader=lambda _fingerprint: snapshot(),
+      state_path=path,
+      boot_id_reader=lambda: BOOT_ID,
+      state_loader=fail_load,
+      boottime_reader=lambda: TEST_BOOTTIME_SECONDS,
+    )
+
+  assert path.read_text(encoding="utf-8") == "unreadable-state-sentinel"
+
+
+def test_invalid_state_loader_result_aborts_initialization(
+  tmp_path: Path,
+) -> None:
+  with pytest.raises(
+    NavigationDatabaseRestoreInitializationError,
+    match="state_load_returned_invalid_type",
+  ):
+    NavigationDatabaseRestoreRuntime(
+      "receiver",
+      snapshot_loader=lambda _fingerprint: snapshot(),
+      state_path=tmp_path / "state.json",
+      boot_id_reader=lambda: BOOT_ID,
+      state_loader=lambda _path: object(),  # type: ignore[arg-type, return-value, ty:invalid-argument-type]
+      boottime_reader=lambda: TEST_BOOTTIME_SECONDS,
+    )
+
+
+def test_missing_state_baseline_write_failure_aborts_initialization(
+  tmp_path: Path,
+) -> None:
+  path = tmp_path / "dbd_state.json"
+
+  def fail_write(
+    _state: NavigationDatabaseRestoreBootState,
+    _path: Path,
+  ) -> None:
+    raise OSError("storage unavailable")
+
+  with pytest.raises(
+    NavigationDatabaseRestoreInitializationError,
+    match="current_boot_baseline_persist_failed",
+  ):
+    NavigationDatabaseRestoreRuntime(
+      "receiver",
+      snapshot_loader=lambda _fingerprint: snapshot(),
+      state_path=path,
+      boot_id_reader=lambda: BOOT_ID,
+      state_storer=fail_write,
+      boottime_reader=lambda: TEST_BOOTTIME_SECONDS,
+    )
+
+  assert not path.exists()
+
+
+def test_previous_boot_replacement_failure_aborts_initialization(
+  tmp_path: Path,
+) -> None:
+  path = tmp_path / "dbd_state.json"
+  previous = NavigationDatabaseRestoreBootState(
+    version=2,
+    boot_id=OTHER_BOOT_ID,
+    receiver_fingerprint="receiver",
+    disposition=NavigationDatabaseRestoreDisposition.SKIPPED_EXPIRED,
+    restore_attempted=False,
+    position_assistance_claimed=True,
+    acquisition_started=True,
+    yuma_sent=True,
+  )
+  store_navigation_database_restore_boot_state(previous, path)
+
+  def fail_write(
+    _state: NavigationDatabaseRestoreBootState,
+    _path: Path,
+  ) -> None:
+    raise OSError("storage unavailable")
+
+  with pytest.raises(
+    NavigationDatabaseRestoreInitializationError,
+    match="current_boot_baseline_persist_failed",
+  ):
+    NavigationDatabaseRestoreRuntime(
+      "receiver",
+      snapshot_loader=lambda _fingerprint: snapshot(),
+      state_path=path,
+      boot_id_reader=lambda: BOOT_ID,
+      state_storer=fail_write,
+      boottime_reader=lambda: TEST_BOOTTIME_SECONDS,
+    )
+
+  assert load_navigation_database_restore_boot_state(path) == previous
+
+
+def test_storage_recovery_later_process_establishes_fresh_baseline(
+  tmp_path: Path,
+) -> None:
+  path = tmp_path / "dbd_state.json"
+  storage_available = False
+
+  def conditional_write(
+    state: NavigationDatabaseRestoreBootState,
+    state_path: Path,
+  ) -> None:
+    if not storage_available:
+      raise OSError("storage unavailable")
+    store_navigation_database_restore_boot_state(state, state_path)
+
+  with pytest.raises(NavigationDatabaseRestoreInitializationError):
+    NavigationDatabaseRestoreRuntime(
+      "receiver",
+      snapshot_loader=lambda _fingerprint: snapshot(),
+      state_path=path,
+      boot_id_reader=lambda: BOOT_ID,
+      state_storer=conditional_write,
+      boottime_reader=lambda: TEST_BOOTTIME_SECONDS,
+    )
+  assert not path.exists()
+
+  storage_available = True
+  recovered = NavigationDatabaseRestoreRuntime(
+    "receiver",
+    snapshot_loader=lambda _fingerprint: snapshot(),
+    state_path=path,
+    boot_id_reader=lambda: BOOT_ID,
+    state_storer=conditional_write,
+    boottime_reader=lambda: TEST_BOOTTIME_SECONDS,
+  )
+
+  assert recovered.controller.pending
+  persisted = load_navigation_database_restore_boot_state(path)
+  assert persisted is not None
+  assert persisted.boot_id == BOOT_ID
+  assert persisted.receiver_fingerprint == "receiver"
+  assert persisted.disposition is NavigationDatabaseRestoreDisposition.PENDING
+
+
+def test_previous_boot_replacement_succeeds_after_storage_recovers(
+  tmp_path: Path,
+) -> None:
+  path = tmp_path / "dbd_state.json"
+  previous = NavigationDatabaseRestoreBootState(
+    version=2,
+    boot_id=OTHER_BOOT_ID,
+    receiver_fingerprint="receiver",
+    disposition=NavigationDatabaseRestoreDisposition.SKIPPED_EXPIRED,
+    restore_attempted=False,
+    position_assistance_claimed=True,
+    acquisition_started=True,
+    yuma_sent=True,
+  )
+  store_navigation_database_restore_boot_state(previous, path)
+  storage_available = False
+
+  def conditional_write(
+    state: NavigationDatabaseRestoreBootState,
+    state_path: Path,
+  ) -> None:
+    if not storage_available:
+      raise OSError("storage unavailable")
+    store_navigation_database_restore_boot_state(state, state_path)
+
+  with pytest.raises(NavigationDatabaseRestoreInitializationError):
+    NavigationDatabaseRestoreRuntime(
+      "receiver",
+      snapshot_loader=lambda _fingerprint: snapshot(),
+      state_path=path,
+      boot_id_reader=lambda: BOOT_ID,
+      state_storer=conditional_write,
+      boottime_reader=lambda: TEST_BOOTTIME_SECONDS,
+    )
+  assert load_navigation_database_restore_boot_state(path) == previous
+
+  storage_available = True
+  recovered = NavigationDatabaseRestoreRuntime(
+    "receiver",
+    snapshot_loader=lambda _fingerprint: snapshot(),
+    state_path=path,
+    boot_id_reader=lambda: BOOT_ID,
+    state_storer=conditional_write,
+    boottime_reader=lambda: TEST_BOOTTIME_SECONDS,
+  )
+
+  assert recovered.controller.pending
+  persisted = load_navigation_database_restore_boot_state(path)
+  assert persisted is not None
+  assert persisted.boot_id == BOOT_ID
+  assert persisted.disposition is NavigationDatabaseRestoreDisposition.PENDING

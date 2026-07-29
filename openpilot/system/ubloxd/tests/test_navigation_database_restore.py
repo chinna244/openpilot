@@ -182,7 +182,7 @@ def evaluate(**overrides: object) -> NavigationDatabaseRestoreDecision:
     "gnss_acquisition_started": False,
   }
   arguments.update(overrides)
-  return evaluate_navigation_database_restore(**arguments)  # type: ignore[arg-type]
+  return evaluate_navigation_database_restore(**arguments)  # type: ignore[arg-type, ty:invalid-argument-type]
 
 
 def test_decision_action_values_are_stable() -> None:
@@ -379,7 +379,7 @@ def test_invalid_maximum_age_is_rejected(
       authorized_time=authorized_time(),
       cache_age_seconds=30.0,
       gnss_acquisition_started=False,
-      maximum_cache_age_seconds=maximum_cache_age_seconds,  # type: ignore[arg-type]
+      maximum_cache_age_seconds=maximum_cache_age_seconds,  # type: ignore[arg-type, ty:invalid-argument-type]
     )
 
 
@@ -404,7 +404,7 @@ def test_nonboolean_flags_are_rejected(
   }
   arguments[name] = value
   with pytest.raises(ValueError):
-    evaluate_navigation_database_restore(**arguments)  # type: ignore[arg-type]
+    evaluate_navigation_database_restore(**arguments)  # type: ignore[arg-type, ty:invalid-argument-type]
 
 
 def test_invalid_authorized_time_is_rejected() -> None:
