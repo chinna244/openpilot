@@ -111,6 +111,13 @@ from openpilot.system.ubloxd.gps_assistance import (
   navigation_quality_tier,
   validate_ubx_frame,
 )
+from openpilot.system.ubloxd.navigation_database_restore import (
+  NavigationDatabaseRestoreDisposition,
+)
+from openpilot.system.ubloxd.navigation_database_restore_runtime import (
+  NavigationDatabaseRestoreExecution,
+  NavigationDatabaseRestoreRuntime,
+)
 from openpilot.system.ubloxd.receiver_time_provenance import (
   ReceiverTimeProvenanceTracker,
   ReceiverUtcClassification,
@@ -2435,9 +2442,20 @@ class NavigationAssistanceRestoreResult:
   restored_satellites_used: int | None = None
   restored_gps_startup_ready: bool | None = None
   restored_gps_almanac_satellite_ids: tuple[int, ...] | None = None
+  captured_gps_almanac_available: int | None = None
+  captured_glonass_almanac_available: int | None = None
+  captured_satellites_used: int | None = None
+  captured_gps_almanac_satellite_ids: tuple[int, ...] | None = None
+  database_restore_disposition: NavigationDatabaseRestoreDisposition | None = None
+  database_frames_attempted_count: int = 0
+  database_restore_boot_id: str | None = None
+  database_restore_state_error: str | None = None
+  database_restore_recovered_interrupted_attempt: bool = False
 
   @property
   def usable(self) -> bool:
+    if self.database_restore_disposition is not None:
+      return self.database_restore_disposition.database_available
     return self.status in (
       NavigationAssistanceRestoreStatus.COMPLETE,
       NavigationAssistanceRestoreStatus.PARTIAL,
@@ -2462,6 +2480,8 @@ def format_navigation_assistance_restore_summary(
       "timeout_events=0",
       "failure_phase=none",
       "terminal_result=not_attempted",
+      "database_restore_disposition=not_attempted",
+      "database_frames_attempted=0",
       "database_terminal_ack_count_matched=not_applicable_per_frame_restore",
       f"time_assistance_source={time_assistance_source or 'none'}",
     )
@@ -2479,6 +2499,17 @@ def format_navigation_assistance_restore_summary(
     f"timeout_events={len(result.initially_timed_out_indexes) + len(result.permanently_timed_out_indexes)}",
     f"failure_phase={result.failure_phase.value if result.failure_phase is not None else 'none'}",
     f"terminal_result={result.status.value}",
+    "database_restore_disposition="
+    + (
+      result.database_restore_disposition.value
+      if result.database_restore_disposition is not None
+      else "legacy"
+    ),
+    f"database_frames_attempted={result.database_frames_attempted_count}",
+    f"database_restore_boot_id={result.database_restore_boot_id or 'none'}",
+    f"database_restore_state_error={result.database_restore_state_error or 'none'}",
+    "database_restore_recovered_interrupted_attempt="
+    + str(result.database_restore_recovered_interrupted_attempt).lower(),
     "database_terminal_ack_count_matched=not_applicable_per_frame_restore",
     f"time_assistance_source={time_assistance_source or 'unknown'}",
     f"restored_cache_generation={result.restored_cache_generation or 'none'}",
@@ -2489,6 +2520,10 @@ def format_navigation_assistance_restore_summary(
     f"captured_gps_ephemeris_available={result.captured_gps_ephemeris_available}",
     f"captured_glonass_ephemeris_available={result.captured_glonass_ephemeris_available}",
     f"captured_gps_startup_ready={result.captured_gps_startup_ready}",
+    f"captured_gps_almanac_available={result.captured_gps_almanac_available}",
+    f"captured_glonass_almanac_available={result.captured_glonass_almanac_available}",
+    f"captured_satellites_used={result.captured_satellites_used}",
+    f"captured_gps_almanac_satellite_ids={result.captured_gps_almanac_satellite_ids}",
     f"restored_gps_ephemeris_fresh={result.restored_gps_ephemeris_fresh}",
     f"restored_glonass_ephemeris_fresh={result.restored_glonass_ephemeris_fresh}",
     f"restored_quality_expiration_reasons={list(result.restored_quality_expiration_reasons)}",
@@ -2523,12 +2558,176 @@ def log_navigation_assistance_restore_result(
     diagnostic_context=diagnostic_context,
   )
 
-  if result.status is NavigationAssistanceRestoreStatus.COMPLETE:
+  if (
+    result.database_restore_disposition
+    is NavigationDatabaseRestoreDisposition.PENDING
+    or (
+      result.database_restore_disposition is not None
+      and result.database_restore_disposition.intentionally_skipped
+    )
+  ):
+    cloudlog.info(message)
+  elif result.status is NavigationAssistanceRestoreStatus.COMPLETE:
     cloudlog.info(message)
   elif result.status is NavigationAssistanceRestoreStatus.PARTIAL:
     cloudlog.warning(message)
   else:
     cloudlog.error(message)
+
+
+def navigation_assistance_result_from_database_execution(
+  execution: NavigationDatabaseRestoreExecution,
+) -> NavigationAssistanceRestoreResult:
+  disposition = execution.disposition
+  if disposition.database_available:
+    status = (
+      NavigationAssistanceRestoreStatus.COMPLETE
+      if execution.position_assistance_succeeded
+      else NavigationAssistanceRestoreStatus.PARTIAL
+    )
+    failure_phase = (
+      None
+      if execution.position_assistance_succeeded
+      else NavigationAssistanceRestoreFailurePhase.POSITION_ASSISTANCE_WRITE
+    )
+  elif execution.position_assistance_succeeded:
+    status = NavigationAssistanceRestoreStatus.PARTIAL
+    failure_phase = (
+      NavigationAssistanceRestoreFailurePhase.DATABASE_FRAME_RESTORE
+      if disposition.write_failed
+      else None
+    )
+  else:
+    status = NavigationAssistanceRestoreStatus.FAILED
+    failure_phase = (
+      NavigationAssistanceRestoreFailurePhase.POSITION_ASSISTANCE_WRITE
+      if execution.position_assistance_attempted
+      else NavigationAssistanceRestoreFailurePhase.CACHE_LOAD
+    )
+
+  evaluated_quality = execution.effective_quality
+  restored_quality = (
+    evaluated_quality if disposition.database_available else None
+  )
+  captured_quality = execution.captured_quality
+  return NavigationAssistanceRestoreResult(
+    status=status,
+    total_frame_count=execution.total_frame_count,
+    accepted_frame_count=execution.accepted_frame_count,
+    initially_timed_out_indexes=execution.initially_failed_indexes,
+    retry_accepted_indexes=execution.retry_accepted_indexes,
+    permanently_timed_out_indexes=execution.permanently_failed_indexes,
+    failure_phase=failure_phase,
+    cache_saved_at_utc=execution.cache_saved_at_utc,
+    restored_cache_generation=execution.cache_generation,
+    restored_cache_selection_reason=execution.cache_selection_reason,
+    restored_cache_age_seconds=execution.cache_age_seconds,
+    restored_cache_age_evidence=(
+      evaluated_quality.age_evidence.value
+      if evaluated_quality is not None
+      else None
+    ),
+    restored_cache_age_verified=(
+      evaluated_quality.age_verified
+      if evaluated_quality is not None
+      else False
+    ),
+    captured_gps_ephemeris_available=(
+      evaluated_quality.captured_gps_ephemeris_available
+      if evaluated_quality is not None
+      else None
+    ),
+    captured_glonass_ephemeris_available=(
+      evaluated_quality.captured_glonass_ephemeris_available
+      if evaluated_quality is not None
+      else None
+    ),
+    captured_gps_startup_ready=(
+      evaluated_quality.captured_gps_startup_ready
+      if evaluated_quality is not None
+      else None
+    ),
+    captured_gps_almanac_available=(
+      getattr(captured_quality, "gps_almanac_available", None)
+      if captured_quality is not None
+      else None
+    ),
+    captured_glonass_almanac_available=(
+      getattr(captured_quality, "glonass_almanac_available", None)
+      if captured_quality is not None
+      else None
+    ),
+    captured_satellites_used=(
+      getattr(captured_quality, "satellites_used", None)
+      if captured_quality is not None
+      else None
+    ),
+    captured_gps_almanac_satellite_ids=(
+      getattr(captured_quality, "gps_almanac_satellite_ids", None)
+      if captured_quality is not None
+      else None
+    ),
+    restored_gps_ephemeris_fresh=(
+      restored_quality.gps_ephemeris_fresh
+      if restored_quality is not None
+      else None
+    ),
+    restored_glonass_ephemeris_fresh=(
+      restored_quality.glonass_ephemeris_fresh
+      if restored_quality is not None
+      else None
+    ),
+    restored_quality_expiration_reasons=(
+      evaluated_quality.expiration_reasons
+      if evaluated_quality is not None
+      else ()
+    ),
+    restored_navigation_quality=restored_quality,
+    restored_gps_almanac_available=(
+      getattr(captured_quality, "gps_almanac_available", None)
+      if restored_quality is not None and captured_quality is not None
+      else None
+    ),
+    restored_glonass_almanac_available=(
+      getattr(captured_quality, "glonass_almanac_available", None)
+      if restored_quality is not None and captured_quality is not None
+      else None
+    ),
+    restored_gps_ephemeris_available=(
+      restored_quality.effective_gps_ephemeris_available
+      if restored_quality is not None
+      else None
+    ),
+    restored_glonass_ephemeris_available=(
+      restored_quality.effective_glonass_ephemeris_available
+      if restored_quality is not None
+      else None
+    ),
+    restored_satellites_used=(
+      getattr(captured_quality, "satellites_used", None)
+      if restored_quality is not None and captured_quality is not None
+      else None
+    ),
+    restored_gps_startup_ready=(
+      restored_quality.effective_gps_startup_ready
+      if restored_quality is not None
+      else None
+    ),
+    restored_gps_almanac_satellite_ids=(
+      getattr(captured_quality, "gps_almanac_satellite_ids", None)
+      if restored_quality is not None and captured_quality is not None
+      else None
+    ),
+    database_restore_disposition=disposition,
+    database_frames_attempted_count=(
+      execution.database_write_attempt_count
+    ),
+    database_restore_boot_id=execution.boot_id,
+    database_restore_state_error=execution.state_persistence_error,
+    database_restore_recovered_interrupted_attempt=(
+      execution.recovered_interrupted_attempt
+    ),
+  )
 
 
 def restore_navigation_assistance(
@@ -3263,6 +3462,7 @@ def initialize_receiver_cycle(
   collect_mon_ver_diagnostics: bool = False,
   time_authority: TimeAuthority | None = None,
   time_provenance: ReceiverTimeProvenanceTracker | None = None,
+  navigation_database_runtime: NavigationDatabaseRestoreRuntime | None = None,
 ) -> ReceiverCycleInitialization:
   cycle_started_at = time.monotonic()
   startup_diagnostics.start_cycle(
@@ -3361,26 +3561,46 @@ def initialize_receiver_cycle(
       attempt_started_at + TIME_SYNC_CHECK_INTERVAL
     )
 
-  navigation_assistance_restore_attempted = False
   assistnow_autonomous_configuration_attempted = False
+  database_runtime = (
+    navigation_database_runtime
+    or NavigationDatabaseRestoreRuntime(receiver_fingerprint)
+  )
+  database_runtime.prepare()
+  database_runtime.send_position_once(
+    lambda message: send_mga_with_strict_ack(pigeon, message)
+  )
+  database_execution = database_runtime.evaluate(
+    authorized_time=authorized_time,
+    reliable_fix_available=False,
+    yuma_already_sent=False,
+    send_database_message=(
+      lambda message, frame_index: send_mga_with_strict_ack(
+        pigeon,
+        message,
+        database_frame_index=frame_index,
+      )
+    ),
+  )
   navigation_assistance_restore_result = (
-    restore_navigation_assistance(
-      pigeon,
-      receiver_fingerprint,
-      diagnostic_context=diagnostic_context,
-      time_assistance_source=(
-        authorized_time.evidence.value
-        if authorized_time is not None
-        else None
-      ),
-      trusted_now=(
-        authorized_time.utc
-        if authorized_time is not None
-        else None
-      ),
+    navigation_assistance_result_from_database_execution(
+      database_execution
     )
   )
-  navigation_assistance_restore_attempted = True
+  navigation_assistance_restore_attempted = (
+    database_execution.position_assistance_attempted
+    or database_runtime.controller.restore_attempted
+    or database_runtime.controller.terminal
+  )
+  log_navigation_assistance_restore_result(
+    navigation_assistance_restore_result,
+    diagnostic_context,
+    (
+      authorized_time.evidence.value
+      if authorized_time is not None
+      else None
+    ),
+  )
 
   assistnow_autonomous_supported = log_assistnow_autonomous_support(
     mon_ver_info
@@ -3453,6 +3673,25 @@ def publish_ublox_raw(pm: messaging.PubMaster, data: bytes) -> None:
   pm.send("ubloxRaw", message)
 
 
+def receiver_frames_show_gnss_acquisition(
+  frames: list[bytes],
+) -> bool:
+  for frame in frames:
+    if len(frame) >= 8 and frame[2:4] == b"\x02\x15":
+      try:
+        if Ubx.RxmRawx.from_bytes(frame[6:-2]).num_meas > 0:
+          return True
+      except Exception:
+        pass
+    fix = parse_nav_pvt(frame)
+    if fix is not None and fix.fix_ok:
+      return True
+    nav_sat = parse_nav_sat(frame)
+    if nav_sat is not None and nav_sat.satellites_used > 0:
+      return True
+  return False
+
+
 def process_receiver_frames(
   frames: list[bytes],
   frame_time: float,
@@ -3508,10 +3747,15 @@ def yuma_database_restore_state(
 ) -> YumaDatabaseRestoreState:
   if result is None:
     return YumaDatabaseRestoreState.FAILED
-  try:
-    return YumaDatabaseRestoreState(result.status.value)
-  except (AttributeError, ValueError):
-    return YumaDatabaseRestoreState.FAILED
+  disposition = result.database_restore_disposition
+  if disposition is None:
+    try:
+      return YumaDatabaseRestoreState(result.status.value)
+    except (AttributeError, ValueError):
+      return YumaDatabaseRestoreState.FAILED
+  if disposition.database_available:
+    return YumaDatabaseRestoreState.COMPLETE
+  return YumaDatabaseRestoreState.FAILED
 
 
 def log_cross_boot_rtc_observation(
@@ -4285,6 +4529,23 @@ class YumaSupplementationFeature:
   def cycle_injection_consumed(self) -> bool:
     return self._cycle_injection_consumed
 
+  def update_navigation_assistance_restore_result(
+    self,
+    result: NavigationAssistanceRestoreResult,
+    now: float,
+  ) -> bool:
+    self._initialization = replace(
+      self._initialization,
+      navigation_assistance_restore_result=result,
+      navigation_assistance_restore_attempted=True,
+    )
+    if self._cycle_injection_consumed:
+      return False
+    self._runtime = None
+    self._next_param_check = 0.0
+    self._refresh_enabled(now, force=True)
+    return True
+
   def persist_provisional_telemetry(
     self,
     event: str,
@@ -4898,8 +5159,13 @@ def run_receiving(duration: int = 0):
   receiver_time_provenance = (
     ReceiverTimeProvenanceTracker()
   )
+  navigation_database_runtime = NavigationDatabaseRestoreRuntime(
+    receiver_fingerprint
+  )
 
   def dispatch_frames(frames: list[bytes]) -> None:
+    if receiver_frames_show_gnss_acquisition(frames):
+      navigation_database_runtime.note_acquisition_started()
     completed = process_receiver_frames(
       frames,
       time.monotonic(),
@@ -4930,6 +5196,7 @@ def run_receiving(duration: int = 0):
     collect_mon_ver_diagnostics=True,
     time_authority=time_authority,
     time_provenance=receiver_time_provenance,
+    navigation_database_runtime=navigation_database_runtime,
   )
   startup_diagnostics.initialization_complete(
     cycle_initialization.completed_at
@@ -5263,6 +5530,7 @@ def run_receiving(duration: int = 0):
         "no_data_watchdog",
         time_authority=time_authority,
         time_provenance=receiver_time_provenance,
+        navigation_database_runtime=navigation_database_runtime,
       )
       initialization_completed_at = (
         cycle_initialization.completed_at
@@ -5336,6 +5604,7 @@ def run_receiving(duration: int = 0):
           "all_zero_data",
           time_authority=time_authority,
           time_provenance=receiver_time_provenance,
+          navigation_database_runtime=navigation_database_runtime,
         )
         initialization_completed_at = (
           cycle_initialization.completed_at
@@ -5444,6 +5713,50 @@ def run_receiving(duration: int = 0):
           yuma_feature.note_cross_boot_validation(validation)
 
     stable_fix = fix_tracker.stable_fix(now)
+    previous_database_disposition = (
+      navigation_database_runtime.controller.disposition
+    )
+    database_execution = navigation_database_runtime.evaluate(
+      authorized_time=(
+        latest_authority_evaluation.authorized_time
+        if latest_authority_evaluation is not None
+        else None
+      ),
+      reliable_fix_available=stable_fix is not None,
+      yuma_already_sent=yuma_feature.cycle_injection_consumed,
+      send_database_message=(
+        lambda message, frame_index: send_mga_with_strict_ack(
+          pigeon,
+          message,
+          database_frame_index=frame_index,
+        )
+      ),
+    )
+    if (
+      navigation_database_runtime.controller.disposition
+      is not previous_database_disposition
+    ):
+      database_result = (
+        navigation_assistance_result_from_database_execution(
+          database_execution
+        )
+      )
+      log_navigation_assistance_restore_result(
+        database_result,
+        startup_diagnostics.time_assistance_context(now),
+        (
+          latest_authority_evaluation.authorized_time.evidence.value
+          if (
+            latest_authority_evaluation is not None
+            and latest_authority_evaluation.authorized_time is not None
+          )
+          else None
+        ),
+      )
+      yuma_feature.update_navigation_assistance_restore_result(
+        database_result,
+        now,
+      )
 
     provisional_yuma_outcome = yuma_feature.evaluate_provisional(
       lambda message: send_mga_with_strict_ack(
@@ -5454,6 +5767,8 @@ def run_receiving(duration: int = 0):
       reliable_fix_available=stable_fix is not None,
     )
     if provisional_yuma_outcome is not None:
+      if yuma_feature.cycle_injection_consumed:
+        navigation_database_runtime.note_yuma_sent()
       log_provisional_yuma_outcome(provisional_yuma_outcome)
       yuma_feature.persist_provisional_telemetry(
         "transmission",
@@ -5474,6 +5789,8 @@ def run_receiving(duration: int = 0):
       reliable_fix_available=stable_fix is not None,
     )
     if yuma_outcome is not None:
+      if yuma_feature.cycle_injection_consumed:
+        navigation_database_runtime.note_yuma_sent()
       log_yuma_supplementation_outcome(yuma_outcome)
       persist_yuma_supplementation_outcome(
         yuma_outcome,
