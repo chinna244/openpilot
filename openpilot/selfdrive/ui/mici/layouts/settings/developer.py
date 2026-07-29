@@ -188,8 +188,9 @@ class DeveloperLayoutMici(NavScroller):
 
   def _on_alpha_long_enabled(self, state: bool):
     def do_toggle(_state: bool):
+      # param only: card watches for the change and requests the onroad cycle
+      # itself, after any radar hand-back the brand needs
       ui_state.params.put_bool("AlphaLongitudinalEnabled", _state, block=True)
-      restart_needed_callback()
       self._update_toggles()
 
     if state:
