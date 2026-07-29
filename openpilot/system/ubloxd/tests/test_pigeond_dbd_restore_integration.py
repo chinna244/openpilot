@@ -26,6 +26,7 @@ from openpilot.system.ubloxd.trusted_time_authority import (
 
 BOOT_ID = "12345678-1234-5678-9234-567812345678"
 NOW = datetime(2026, 7, 29, 13, 0, tzinfo=UTC)
+TEST_BOOTTIME_SECONDS = 100.0
 
 
 class FakePigeon:
@@ -77,6 +78,7 @@ def network_time() -> AuthorizedTime:
     provenance=TimeProvenance.NETWORK_INDEPENDENT,
     independent=True,
     evidence=TimeAuthorizationEvidence.SYSTEM_SYNCHRONIZED,
+    observed_boottime_seconds=TEST_BOOTTIME_SECONDS,
   )
 
 
@@ -119,6 +121,7 @@ def test_configuration_traffic_closes_database_window_before_write(
     retry_delay_seconds=0.0,
     state_path=tmp_path / "dbd_state.json",
     boot_id_reader=lambda: BOOT_ID,
+    boottime_reader=lambda: TEST_BOOTTIME_SECONDS,
   )
   database_indexes: list[int] = []
 
@@ -271,6 +274,7 @@ def test_delayed_network_time_restores_before_gnss_start(
     retry_delay_seconds=0.0,
     state_path=tmp_path / "dbd_state.json",
     boot_id_reader=lambda: BOOT_ID,
+    boottime_reader=lambda: TEST_BOOTTIME_SECONDS,
   )
   database_indexes: list[int] = []
   monkeypatch.setattr(pigeond.time, "sleep", lambda _delay: None)
@@ -339,6 +343,7 @@ def test_pending_dbd_yuma_claim_survives_restart(
     retry_delay_seconds=0.0,
     state_path=tmp_path / "dbd_state.json",
     boot_id_reader=lambda: BOOT_ID,
+    boottime_reader=lambda: TEST_BOOTTIME_SECONDS,
   )
   yuma_writes: list[bytes] = []
   pigeond.send_yuma_with_durable_claim(
@@ -354,6 +359,7 @@ def test_pending_dbd_yuma_claim_survives_restart(
     retry_delay_seconds=0.0,
     state_path=tmp_path / "dbd_state.json",
     boot_id_reader=lambda: BOOT_ID,
+    boottime_reader=lambda: TEST_BOOTTIME_SECONDS,
   )
   database_writes: list[tuple[bytes, int]] = []
   result = second.evaluate(
@@ -369,3 +375,84 @@ def test_pending_dbd_yuma_claim_survives_restart(
     is NavigationDatabaseRestoreDisposition.SKIPPED_YUMA_ALREADY_SENT
   )
   assert database_writes == []
+
+# COMMIT7_DBD_LIVE_BOUNDARY_TESTS
+
+def test_acquisition_dispatched_after_network_wait_blocks_dbd(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+  events: list[str] = []
+  runtime = NavigationDatabaseRestoreRuntime(
+    "receiver",
+    snapshot_loader=lambda _fingerprint: snapshot(),
+    retry_delay_seconds=0.0,
+    state_path=tmp_path / "dbd_state.json",
+    boot_id_reader=lambda: BOOT_ID,
+    boottime_reader=lambda: TEST_BOOTTIME_SECONDS,
+  )
+  class DrainPigeon(FakePigeon):
+    def drain_before_transaction(self, operation: str) -> None:
+      events.append(operation)
+      if operation == "navigation_database_post_time_wait":
+        events.append("rawx_dispatched")
+        assert runtime.note_acquisition_started()
+  pigeon = DrainPigeon(events)
+  database_indexes: list[int] = []
+  monkeypatch.setattr(pigeond.time, "sleep", lambda _delay: None)
+  monkeypatch.setattr(pigeond, "start_pigeon_transport", lambda _pigeon: None)
+  monkeypatch.setattr(pigeond, "read_host_time_observation", lambda: None)
+  monkeypatch.setattr(pigeond, "evaluate_time_authority", lambda _authority, _observation: SimpleNamespace(authorized_time=None))
+  monkeypatch.setattr(pigeond, "wait_for_current_independent_network_time", lambda _authority, observation, _evaluation: (observation, SimpleNamespace(authorized_time=network_time())))
+  monkeypatch.setattr(pigeond, "poll_mon_ver", lambda _pigeon: None)
+  monkeypatch.setattr(pigeond, "configure_navx5_ack_aiding", lambda *_args: None)
+  monkeypatch.setattr(pigeond, "log_navx5_ack_aiding_support", lambda _info: None)
+  monkeypatch.setattr(pigeond, "send_mga_with_strict_ack", lambda _pigeon, _message, **kwargs: database_indexes.append(kwargs["database_frame_index"]) if kwargs.get("database_frame_index") is not None else None)
+  monkeypatch.setattr(pigeond, "send_time_assistance", lambda *_args, **_kwargs: False)
+  monkeypatch.setattr(pigeond, "log_navigation_assistance_restore_result", lambda *_args, **_kwargs: None)
+  monkeypatch.setattr(pigeond, "finish_pigeon_initialization", lambda _pigeon: None)
+  monkeypatch.setattr(pigeond, "log_assistnow_autonomous_support", lambda _info: True)
+  monkeypatch.setattr(pigeond, "configure_assistnow_autonomous", lambda *_args: None)
+  result = pigeond.initialize_receiver_cycle(
+    pigeon,
+    "receiver",
+    FakeDiagnostics(),
+    "test",
+    time_authority=object(),
+    time_provenance=FakeProvenance(),
+    navigation_database_runtime=runtime,
+  )
+  assert events.index("rawx_dispatched") < events.index("gnss_start")
+  assert runtime.controller.disposition is NavigationDatabaseRestoreDisposition.SKIPPED_ACQUISITION_ALREADY_STARTED
+  assert database_indexes == []
+  assert result.navigation_assistance_restore_attempted
+
+
+def test_frame_zero_transaction_drain_guard_blocks_receiver_write(tmp_path: Path) -> None:
+  runtime = NavigationDatabaseRestoreRuntime(
+    "receiver",
+    snapshot_loader=lambda _fingerprint: snapshot(),
+    retry_delay_seconds=0.0,
+    state_path=tmp_path / "dbd_state.json",
+    boot_id_reader=lambda: BOOT_ID,
+    boottime_reader=lambda: TEST_BOOTTIME_SECONDS,
+  )
+  receiver_writes: list[bytes] = []
+  class DrainPigeon:
+    def begin_response_transaction(self, message: bytes, _operation: str, before_send):
+      assert runtime.note_acquisition_started()
+      before_send()
+      receiver_writes.append(message)
+      raise AssertionError("DBD write guard returned after acquisition")
+  pigeon = DrainPigeon()
+  result = runtime.evaluate(
+    authorized_time=network_time(),
+    reliable_fix_available=False,
+    yuma_already_sent=False,
+    send_database_message=lambda message, frame_index: pigeond.send_mga_with_strict_ack(
+      pigeon,
+      message,
+      database_frame_index=frame_index,
+      before_send=lambda: runtime.validate_database_write_boundary(frame_index),
+    ),
+  )
+  assert result.disposition is NavigationDatabaseRestoreDisposition.WRITE_FAILED
+  assert receiver_writes == []
+  assert result.permanent_failures

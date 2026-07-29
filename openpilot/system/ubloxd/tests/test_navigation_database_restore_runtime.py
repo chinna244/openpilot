@@ -36,6 +36,7 @@ from openpilot.system.ubloxd.yuma_almanac_transmit import (
 NOW = datetime(2026, 7, 28, 20, 0, tzinfo=UTC)
 BOOT_ID = "12345678-1234-5678-9234-567812345678"
 OTHER_BOOT_ID = "87654321-4321-6789-9234-567812345678"
+TEST_BOOTTIME_SECONDS = 100.0
 FRAMES = (b"frame-0", b"frame-1")
 
 
@@ -65,6 +66,7 @@ def network_time() -> AuthorizedTime:
     provenance=TimeProvenance.NETWORK_INDEPENDENT,
     independent=True,
     evidence=TimeAuthorizationEvidence.SYSTEM_SYNCHRONIZED,
+    observed_boottime_seconds=TEST_BOOTTIME_SECONDS,
   )
 
 
@@ -105,6 +107,7 @@ def runtime(
     state_path=tmp_path / "dbd_state.json",
     boot_id_reader=lambda: boot_id,
     state_storer=state_storer,
+    boottime_reader=lambda: TEST_BOOTTIME_SECONDS,
   )
 
 
@@ -115,6 +118,7 @@ def no_cache_runtime(tmp_path: Path) -> NavigationDatabaseRestoreRuntime:
     retry_delay_seconds=0.0,
     state_path=tmp_path / "dbd_state.json",
     boot_id_reader=lambda: BOOT_ID,
+    boottime_reader=lambda: TEST_BOOTTIME_SECONDS,
   )
 
 
@@ -160,6 +164,7 @@ def test_corrupt_state_fails_closed(tmp_path: Path) -> None:
     snapshot_loader=lambda _fingerprint: snapshot(),
     state_path=path,
     boot_id_reader=lambda: BOOT_ID,
+    boottime_reader=lambda: TEST_BOOTTIME_SECONDS,
   )
   assert value.controller.disposition is NavigationDatabaseRestoreDisposition.SKIPPED_UNVERIFIED
   assert value.send_position_once(lambda _message: None).position_assistance_attempted is False
@@ -184,6 +189,7 @@ def test_new_linux_boot_discards_old_state(tmp_path: Path) -> None:
     retry_delay_seconds=0.0,
     state_path=path,
     boot_id_reader=lambda: BOOT_ID,
+    boottime_reader=lambda: TEST_BOOTTIME_SECONDS,
   )
   assert value.controller.pending
   assert not value.acquisition_started
@@ -204,6 +210,7 @@ def test_snapshot_is_loaded_only_once(tmp_path: Path) -> None:
     retry_delay_seconds=0.0,
     state_path=tmp_path / "state.json",
     boot_id_reader=lambda: BOOT_ID,
+    boottime_reader=lambda: TEST_BOOTTIME_SECONDS,
   )
   value.prepare()
   value.prepare()
@@ -311,6 +318,7 @@ def test_interrupted_attempt_recovers_as_write_failed(tmp_path: Path) -> None:
     retry_delay_seconds=0.0,
     state_path=path,
     boot_id_reader=lambda: BOOT_ID,
+    boottime_reader=lambda: TEST_BOOTTIME_SECONDS,
   )
   writes = []
   result = evaluate(
@@ -474,6 +482,7 @@ def test_boot_id_unavailable_fails_closed(tmp_path: Path) -> None:
     snapshot_loader=lambda _fingerprint: snapshot(),
     state_path=tmp_path / "state.json",
     boot_id_reader=lambda: None,
+    boottime_reader=lambda: TEST_BOOTTIME_SECONDS,
   )
   writes = []
   result = evaluate(
@@ -500,6 +509,7 @@ def test_runtime_rejects_invalid_retry_delay(
       retry_delay_seconds=retry_delay_seconds,  # type: ignore[arg-type]
       state_path=tmp_path / "state.json",
       boot_id_reader=lambda: BOOT_ID,
+      boottime_reader=lambda: TEST_BOOTTIME_SECONDS,
     )
 
 
@@ -529,6 +539,7 @@ def multi_runtime(
     retry_delay_seconds=0.0,
     state_path=tmp_path / "dbd_state.json",
     boot_id_reader=lambda: BOOT_ID,
+    boottime_reader=lambda: TEST_BOOTTIME_SECONDS,
   )
 
 
@@ -666,6 +677,7 @@ def test_retry_sleeper_failure_records_phase_and_error(tmp_path: Path) -> None:
     sleeper=lambda _delay: (_ for _ in ()).throw(RuntimeError("sleep failed")),
     state_path=tmp_path / "dbd_state.json",
     boot_id_reader=lambda: BOOT_ID,
+    boottime_reader=lambda: TEST_BOOTTIME_SECONDS,
   )
 
   result = evaluate(
@@ -778,6 +790,7 @@ def test_acquisition_claim_failure_is_reported_before_receiver_start(
     state_path=tmp_path / "dbd_state.json",
     boot_id_reader=lambda: BOOT_ID,
     state_storer=fail_claim,
+    boottime_reader=lambda: TEST_BOOTTIME_SECONDS,
   )
   assert not value.claim_acquisition_start()
   assert value.acquisition_started
@@ -796,3 +809,53 @@ def test_yuma_is_durably_claimed_before_restart(tmp_path: Path) -> None:
   )
   assert result.disposition is NavigationDatabaseRestoreDisposition.SKIPPED_YUMA_ALREADY_SENT
   assert writes == []
+
+# COMMIT7_DBD_FRAME_BOUNDARY_TESTS
+
+def test_missing_observation_boottime_fails_closed(tmp_path: Path) -> None:
+  writes: list[tuple[bytes, int]] = []
+  value = runtime(tmp_path)
+  authorized = AuthorizedTime(
+    utc=NOW,
+    uncertainty_seconds=1.0,
+    source=TrustedTimeSource.SYSTEM_SYNCHRONIZED,
+    provenance=TimeProvenance.NETWORK_INDEPENDENT,
+    independent=True,
+    evidence=TimeAuthorizationEvidence.SYSTEM_SYNCHRONIZED,
+    observed_boottime_seconds=None,
+  )
+  result = evaluate(value, authorized_time=authorized, send=lambda frame, index: writes.append((frame, index)))
+  assert result.disposition is NavigationDatabaseRestoreDisposition.SKIPPED_UNVERIFIED
+  assert writes == []
+
+
+def test_cache_age_is_rechecked_after_restore_claim_before_frame_zero(tmp_path: Path) -> None:
+  boottimes = [TEST_BOOTTIME_SECONDS, TEST_BOOTTIME_SECONDS + 2.0]
+  def read_boottime() -> float:
+    return boottimes.pop(0) if boottimes else TEST_BOOTTIME_SECONDS + 2.0
+  value = NavigationDatabaseRestoreRuntime(
+    "receiver",
+    snapshot_loader=lambda _fingerprint: snapshot(NAVIGATION_DATABASE_RESTORE_MAX_AGE_SECONDS - 1.0),
+    retry_delay_seconds=0.0,
+    state_path=tmp_path / "dbd_state.json",
+    boot_id_reader=lambda: BOOT_ID,
+    boottime_reader=read_boottime,
+  )
+  authorized = AuthorizedTime(
+    utc=NOW,
+    uncertainty_seconds=0.0,
+    source=TrustedTimeSource.SYSTEM_SYNCHRONIZED,
+    provenance=TimeProvenance.NETWORK_INDEPENDENT,
+    independent=True,
+    evidence=TimeAuthorizationEvidence.SYSTEM_SYNCHRONIZED,
+    observed_boottime_seconds=TEST_BOOTTIME_SECONDS,
+  )
+  receiver_writes: list[tuple[bytes, int]] = []
+  def guarded_send(frame: bytes, index: int) -> None:
+    value.validate_database_write_boundary(index)
+    receiver_writes.append((frame, index))
+  result = evaluate(value, authorized_time=authorized, send=guarded_send)
+  assert result.disposition is NavigationDatabaseRestoreDisposition.WRITE_FAILED
+  assert receiver_writes == []
+  assert result.permanent_failures
+  assert all(failure.kind is NavigationDatabaseRestoreFrameFailureKind.VALIDATION_ERROR for failure in result.permanent_failures)

@@ -445,8 +445,11 @@ class TTYPigeon:
     self,
     data: bytes,
     operation: str = "response_transaction",
+    before_send: Callable[[], None] | None = None,
   ) -> ResponseTransaction:
     self.drain_before_transaction(operation)
+    if before_send is not None:
+      before_send()
     parser = UbxStreamParser()
     self.send(data)
     sent_at = time.monotonic()
@@ -669,14 +672,17 @@ def _begin_response_transaction(
   pigeon: TTYPigeon,
   message: bytes,
   operation: str | None = None,
+  before_send: Callable[[], None] | None = None,
 ) -> ResponseTransaction:
   operation = operation or f"ubx_{message[2]:02x}_{message[3]:02x}"
   if hasattr(pigeon, "begin_response_transaction"):
-    return pigeon.begin_response_transaction(message, operation)
+    if before_send is None:
+      return pigeon.begin_response_transaction(message, operation)
+    return pigeon.begin_response_transaction(message, operation, before_send)
+  if before_send is not None:
+    before_send()
   pigeon.send(message)
-  return ResponseTransaction(
-    UbxStreamParser(), message, operation, time.monotonic(),
-  )
+  return ResponseTransaction(UbxStreamParser(), message, operation, time.monotonic())
 
 
 def build_mon_ver_poll_message() -> bytes:
@@ -2021,6 +2027,7 @@ def send_mga_with_strict_ack(
   message: bytes,
   timeout: float = GPS_ASSISTANCE_ACK_TIMEOUT,
   database_frame_index: int | None = None,
+  before_send: Callable[[], None] | None = None,
   time_provenance: ReceiverTimeProvenanceTracker | None = None,
   time_assistance_source: str = "mga_time_assistance",
 ) -> None:
@@ -2036,7 +2043,14 @@ def send_mga_with_strict_ack(
   )
 
   try:
-    transaction = _begin_response_transaction(pigeon, message)
+    if before_send is None:
+      transaction = _begin_response_transaction(pigeon, message)
+    else:
+      transaction = _begin_response_transaction(
+        pigeon,
+        message,
+        before_send=before_send,
+      )
     if (
       time_provenance is not None
       and is_mga_time_assistance_message(message)
@@ -2849,6 +2863,7 @@ def restore_navigation_assistance(
           pigeon,
           message,
           database_frame_index=frame_index,
+          before_send=lambda: navigation_database_runtime.validate_database_write_boundary(frame_index),
         )
       ),
     )
@@ -3587,6 +3602,12 @@ class ReceiverCycleInitialization:
   authority_evaluation: TimeAuthorityEvaluation | None = None
 
 
+def drain_receiver_before_database_restore(pigeon: TTYPigeon) -> None:
+  """Dispatch all buffered receiver input before the DBD restore decision."""
+  drain = getattr(pigeon, "drain_before_transaction", None)
+  if callable(drain):
+    drain("navigation_database_post_time_wait")
+
 def wait_for_current_independent_network_time(
   authority: TimeAuthority,
   host_time_observation: HostTimeObservation | None,
@@ -3732,6 +3753,8 @@ def initialize_receiver_cycle(
         )
       )
       authorized_time = authority_evaluation.authorized_time
+      if database_runtime.controller.pending:
+        drain_receiver_before_database_restore(pigeon)
     if (
       database_runtime.controller.pending
       and (

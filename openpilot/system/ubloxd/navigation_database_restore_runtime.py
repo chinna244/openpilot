@@ -818,32 +818,31 @@ class NavigationDatabaseRestoreRuntime:
   ) -> float | None:
     nominal_age = self._cache_age(snapshot, authorized_time.utc)
     uncertainty = authorized_time.uncertainty_seconds
+    observed_boottime = authorized_time.observed_boottime_seconds
     if (
       nominal_age is None
       or isinstance(uncertainty, bool)
       or not isinstance(uncertainty, (int, float))
       or not isfinite(float(uncertainty))
       or float(uncertainty) < 0.0
+      or isinstance(observed_boottime, bool)
+      or not isinstance(observed_boottime, (int, float))
+      or not isfinite(float(observed_boottime))
+      or float(observed_boottime) < 0.0
     ):
       return None
-    elapsed = 0.0
-    observed_boottime = authorized_time.observed_boottime_seconds
-    if observed_boottime is not None:
-      try:
-        current_boottime = self._boottime_reader()
-      except Exception:
-        return None
-      if (
-        isinstance(observed_boottime, bool)
-        or not isinstance(observed_boottime, (int, float))
-        or not isfinite(float(observed_boottime))
-        or isinstance(current_boottime, bool)
-        or not isinstance(current_boottime, (int, float))
-        or not isfinite(float(current_boottime))
-        or float(current_boottime) < float(observed_boottime)
-      ):
-        return None
-      elapsed = float(current_boottime) - float(observed_boottime)
+    try:
+      current_boottime = self._boottime_reader()
+    except Exception:
+      return None
+    if (
+      isinstance(current_boottime, bool)
+      or not isinstance(current_boottime, (int, float))
+      or not isfinite(float(current_boottime))
+      or float(current_boottime) < float(observed_boottime)
+    ):
+      return None
+    elapsed = float(current_boottime) - float(observed_boottime)
     effective_age = nominal_age + float(uncertainty) + elapsed
     return effective_age if isfinite(effective_age) else None
 
@@ -924,6 +923,25 @@ class NavigationDatabaseRestoreRuntime:
       selected,
       selection_reason=f"trusted_age:{selection.reason}",
     ), ages[selected.generation]
+
+  def validate_database_write_boundary(self, frame_index: int) -> None:
+    """Revalidate trusted age and acquisition after the UART pre-send drain."""
+    if isinstance(frame_index, bool) or not isinstance(frame_index, int) or frame_index < 0:
+      raise ValueError("database frame index must be a non-negative int")
+    if not self._controller.restore_attempted or self._controller.terminal:
+      raise CacheValidationError("DBD receiver write is outside an active restore attempt")
+    if self._controller.acquisition_started:
+      raise CacheValidationError("DBD receiver write blocked: GNSS acquisition already started")
+    snapshot = self._database_snapshot
+    authorized_time = self._last_authorized_time
+    if snapshot is None or authorized_time is None or not is_current_independent_network_time(authorized_time):
+      raise CacheValidationError("DBD receiver write blocked: trusted-age evidence is unavailable")
+    cache_age_seconds = self._effective_cache_age(snapshot, authorized_time)
+    self._last_cache_age_seconds = cache_age_seconds
+    if cache_age_seconds is None or cache_age_seconds < 0.0:
+      raise CacheValidationError("DBD receiver write blocked: trusted cache age is unverified")
+    if cache_age_seconds > NAVIGATION_DATABASE_RESTORE_MAX_AGE_SECONDS:
+      raise CacheValidationError("DBD receiver write blocked: trusted cache age expired")
 
   def evaluate(
     self,
