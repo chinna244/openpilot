@@ -114,6 +114,7 @@ from openpilot.system.ubloxd.gps_assistance import (
 )
 from openpilot.system.ubloxd.navigation_database_restore import (
   NavigationDatabaseRestoreDisposition,
+  is_current_independent_network_time,
 )
 from openpilot.system.ubloxd.navigation_database_restore_runtime import (
   NavigationDatabaseRestoreExecution,
@@ -211,6 +212,8 @@ PRE_TRANSACTION_DRAIN_MAX_BYTES = 64 * 1024
 CONTROLLED_GNSS_STOP_MESSAGE = b"\xB5\x62\x06\x04\x04\x00\x00\x00\x08\x00\x16\x74"
 CONTROLLED_GNSS_START_MESSAGE = b"\xB5\x62\x06\x04\x04\x00\x00\x00\x09\x00\x17\x76"
 CONTROLLED_GNSS_TRANSITION_DELAY = 0.05
+NAVIGATION_DATABASE_TRUSTED_TIME_WAIT_SECONDS = 5.0
+NAVIGATION_DATABASE_TRUSTED_TIME_POLL_SECONDS = 0.25
 # A validated MGA-DBD cache is capped at 64 KiB. Frequent dispatch between
 # transactions is the primary bound; these limits retain four cache volumes or
 # 512 small navigation frames if a dispatcher is temporarily unavailable.
@@ -1596,6 +1599,9 @@ def start_pigeon_transport(pigeon: TTYPigeon) -> None:
   set_power(False)
   time.sleep(0.1)
   set_power(True)
+  # STOP is the first possible receiver command after power-on. It is
+  # repeated by init_baudrate after the receiver boot interval.
+  pigeon.send(CONTROLLED_GNSS_STOP_MESSAGE)
   time.sleep(0.5)
   init_baudrate(pigeon)
 
@@ -1609,7 +1615,10 @@ def paused_gnss_acquisition(pigeon: TTYPigeon) -> Iterator[None]:
   time.sleep(CONTROLLED_GNSS_TRANSITION_DELAY)
   try:
     yield
-  finally:
+  except BaseException:
+    # A failed pre-acquisition claim must leave GNSS stopped.
+    raise
+  else:
     pigeon.send(CONTROLLED_GNSS_START_MESSAGE)
     time.sleep(CONTROLLED_GNSS_TRANSITION_DELAY)
 
@@ -3578,6 +3587,46 @@ class ReceiverCycleInitialization:
   authority_evaluation: TimeAuthorityEvaluation | None = None
 
 
+def wait_for_current_independent_network_time(
+  authority: TimeAuthority,
+  host_time_observation: HostTimeObservation | None,
+  authority_evaluation: TimeAuthorityEvaluation,
+  *,
+  timeout_seconds: float = NAVIGATION_DATABASE_TRUSTED_TIME_WAIT_SECONDS,
+  poll_seconds: float = NAVIGATION_DATABASE_TRUSTED_TIME_POLL_SECONDS,
+  observation_reader: Callable[[], HostTimeObservation | None] = read_host_time_observation,
+  evaluator: Callable[[TimeAuthority, HostTimeObservation | None], TimeAuthorityEvaluation] = evaluate_time_authority,
+  monotonic: Callable[[], float] = time.monotonic,
+  sleeper: Callable[[float], None] = time.sleep,
+) -> tuple[HostTimeObservation | None, TimeAuthorityEvaluation]:
+  authorized = authority_evaluation.authorized_time
+  if authorized is not None and is_current_independent_network_time(authorized):
+    return host_time_observation, authority_evaluation
+  deadline = monotonic() + timeout_seconds
+  latest_observation = host_time_observation
+  latest_evaluation = authority_evaluation
+  while True:
+    remaining = deadline - monotonic()
+    if remaining <= 0.0:
+      return latest_observation, latest_evaluation
+    sleeper(min(poll_seconds, remaining))
+    latest_observation = observation_reader()
+    latest_evaluation = evaluator(authority, latest_observation)
+    authorized = latest_evaluation.authorized_time
+    if authorized is not None and is_current_independent_network_time(authorized):
+      return latest_observation, latest_evaluation
+
+
+def send_yuma_with_durable_claim(
+  navigation_database_runtime: NavigationDatabaseRestoreRuntime,
+  send_message: Callable[[bytes], object],
+  message: bytes,
+) -> object:
+  if not navigation_database_runtime.claim_yuma_transmission():
+    raise RuntimeError("YUMA claim persistence failed")
+  return send_message(message)
+
+
 def initialize_receiver_cycle(
   pigeon: TTYPigeon,
   receiver_fingerprint: str,
@@ -3634,6 +3683,7 @@ def initialize_receiver_cycle(
     NavigationAssistanceRestoreResult | None
   ) = None
   navigation_assistance_restore_attempted = False
+  acquisition_start_claimed = False
   next_time_assistance_attempt = (
     cycle_started_at + TIME_SYNC_CHECK_INTERVAL
   )
@@ -3650,7 +3700,11 @@ def initialize_receiver_cycle(
     nonlocal diagnostic_context
     nonlocal navigation_assistance_restore_result
     nonlocal navigation_assistance_restore_attempted
+    nonlocal acquisition_start_claimed
     nonlocal next_time_assistance_attempt
+    nonlocal host_time_observation
+    nonlocal authority_evaluation
+    nonlocal authorized_time
 
     if collect_mon_ver_diagnostics:
       mon_ver_info = log_mon_ver_diagnostics(pigeon)
@@ -3663,7 +3717,30 @@ def initialize_receiver_cycle(
     log_navx5_ack_aiding_support(mon_ver_info)
     configure_navx5_ack_aiding(pigeon, mon_ver_info)
     ack_aiding_configuration_attempted = True
-
+    if (
+      database_runtime.controller.pending
+      and (
+        authorized_time is None
+        or not is_current_independent_network_time(authorized_time)
+      )
+    ):
+      host_time_observation, authority_evaluation = (
+        wait_for_current_independent_network_time(
+          authority,
+          host_time_observation,
+          authority_evaluation,
+        )
+      )
+      authorized_time = authority_evaluation.authorized_time
+    if (
+      database_runtime.controller.pending
+      and (
+        authorized_time is None
+        or not is_current_independent_network_time(authorized_time)
+      )
+    ):
+      if not database_runtime.close_restore_window_unverified():
+        raise RuntimeError("DBD timeout decision persistence failed")
     attempt_started_at = time.monotonic()
     if authorized_time is not None:
       yuma_time_anchor_utc = authorized_time.utc
@@ -3717,17 +3794,24 @@ def initialize_receiver_cycle(
         attempt_started_at + TIME_SYNC_CHECK_INTERVAL
       )
 
+    if not acquisition_start_claimed:
+      if not database_runtime.claim_acquisition_start():
+        raise RuntimeError("GNSS START claim persistence failed")
+      acquisition_start_claimed = True
   with install_pre_acquisition_initialization(
     pre_acquisition_initialization
   ) as initialization:
     init(pigeon)
 
   if not initialization.executed:
-    # A custom initialization implementation did not support the controlled
-    # pre-acquisition hook. Fail closed before evaluating the database.
+    # A custom initializer did not execute the controlled pre-acquisition
+    # hook. Production init() always executes it before GNSS START. This
+    # compatibility path sends no controlled START itself, so close the
+    # in-process DBD window before running the callback without treating
+    # unavailable test storage as a receiver-action persistence failure.
     database_runtime.note_acquisition_started()
+    acquisition_start_claimed = True
     initialization.run()
-
   provenance.enable_receiver_observations(time.monotonic())
 
   assistnow_autonomous_configuration_attempted = False
@@ -5289,7 +5373,8 @@ def run_receiving(duration: int = 0):
 
   def dispatch_frames(frames: list[bytes]) -> None:
     if receiver_frames_show_gnss_acquisition(frames):
-      navigation_database_runtime.note_acquisition_started()
+      if not navigation_database_runtime.note_acquisition_started():
+        raise RuntimeError("acquisition latch persistence failed")
     completed = process_receiver_frames(
       frames,
       time.monotonic(),
@@ -5308,6 +5393,16 @@ def run_receiving(duration: int = 0):
     lambda data: publish_ublox_raw(pm, data),
     dispatch_frames,
   )
+  def send_yuma_message(message: bytes) -> object:
+    return send_yuma_with_durable_claim(
+      navigation_database_runtime,
+      lambda claimed_message: send_mga_with_strict_ack(
+        pigeon, claimed_message
+      ),
+      message,
+    )
+  def reject_live_database_write(_message: bytes, _frame_index: int) -> None:
+    raise RuntimeError("DBD restore is restricted to pre-acquisition initialization")
   time_authority = TimeAuthority()
   rtc_observer = (
     time_authority.create_cross_boot_rtc_observer()
@@ -5848,13 +5943,7 @@ def run_receiving(duration: int = 0):
       ),
       reliable_fix_available=stable_fix is not None,
       yuma_already_sent=yuma_feature.cycle_injection_consumed,
-      send_database_message=(
-        lambda message, frame_index: send_mga_with_strict_ack(
-          pigeon,
-          message,
-          database_frame_index=frame_index,
-        )
-      ),
+      send_database_message=reject_live_database_write,
     )
     if (
       navigation_database_runtime.controller.disposition
@@ -5882,17 +5971,14 @@ def run_receiving(duration: int = 0):
         now,
       )
 
+    # Provisional YUMA deliberately has first YUMA priority; the shared
+    # wrapper durably consumes the DBD/YUMA boot choice before frame 0.
     provisional_yuma_outcome = yuma_feature.evaluate_provisional(
-      lambda message: send_mga_with_strict_ack(
-        pigeon,
-        message,
-      ),
+      send_yuma_message,
       now=now,
       reliable_fix_available=stable_fix is not None,
     )
     if provisional_yuma_outcome is not None:
-      if yuma_feature.cycle_injection_consumed:
-        navigation_database_runtime.note_yuma_sent()
       log_provisional_yuma_outcome(provisional_yuma_outcome)
       yuma_feature.persist_provisional_telemetry(
         "transmission",
@@ -5901,10 +5987,7 @@ def run_receiving(duration: int = 0):
       )
 
     yuma_outcome = yuma_feature.evaluate(
-      lambda message: send_mga_with_strict_ack(
-        pigeon,
-        message,
-      ),
+      send_yuma_message,
       now=now,
       nav_sat=capture_quality_tracker.latest_nav_sat,
       nav_sat_time=(
@@ -5913,8 +5996,6 @@ def run_receiving(duration: int = 0):
       reliable_fix_available=stable_fix is not None,
     )
     if yuma_outcome is not None:
-      if yuma_feature.cycle_injection_consumed:
-        navigation_database_runtime.note_yuma_sent()
       log_yuma_supplementation_outcome(yuma_outcome)
       persist_yuma_supplementation_outcome(
         yuma_outcome,

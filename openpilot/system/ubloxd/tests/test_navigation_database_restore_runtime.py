@@ -258,7 +258,7 @@ def test_expired_cache_performs_zero_database_writes(tmp_path: Path) -> None:
 def test_one_hour_boundary_restores_exactly_once(tmp_path: Path) -> None:
   value = runtime(
     tmp_path,
-    selected=snapshot(NAVIGATION_DATABASE_RESTORE_MAX_AGE_SECONDS),
+    selected=snapshot(NAVIGATION_DATABASE_RESTORE_MAX_AGE_SECONDS - 1.0),
   )
   writes = []
   result = evaluate(
@@ -581,11 +581,11 @@ def test_exactly_one_generation_on_one_hour_boundary_is_selected(
   value = multi_runtime(
     tmp_path,
     primary=snapshot(
-      NAVIGATION_DATABASE_RESTORE_MAX_AGE_SECONDS,
+      NAVIGATION_DATABASE_RESTORE_MAX_AGE_SECONDS - 1.0,
       generation="primary",
     ),
     previous=snapshot(
-      NAVIGATION_DATABASE_RESTORE_MAX_AGE_SECONDS + 0.001,
+      NAVIGATION_DATABASE_RESTORE_MAX_AGE_SECONDS,
       generation="previous",
     ),
   )
@@ -697,3 +697,102 @@ def test_acquisition_during_pre_database_configuration_closes_window(
   assert result.disposition is NavigationDatabaseRestoreDisposition.SKIPPED_ACQUISITION_ALREADY_STARTED
   assert writes == []
   assert value.controller.terminal
+
+
+# COMMIT6_DBD_SAFETY_TESTS
+
+def test_conservative_age_includes_uncertainty_and_elapsed_time(
+  tmp_path: Path,
+) -> None:
+  value = NavigationDatabaseRestoreRuntime(
+    "receiver",
+    snapshot_loader=lambda _fingerprint: snapshot(
+      NAVIGATION_DATABASE_RESTORE_MAX_AGE_SECONDS - 15.0
+    ),
+    retry_delay_seconds=0.0,
+    state_path=tmp_path / "dbd_state.json",
+    boot_id_reader=lambda: BOOT_ID,
+    boottime_reader=lambda: 105.0,
+  )
+  authorized = AuthorizedTime(
+    utc=NOW,
+    uncertainty_seconds=10.0,
+    source=TrustedTimeSource.SYSTEM_SYNCHRONIZED,
+    provenance=TimeProvenance.NETWORK_INDEPENDENT,
+    independent=True,
+    evidence=TimeAuthorizationEvidence.SYSTEM_SYNCHRONIZED,
+    observed_boottime_seconds=100.0,
+  )
+  result = evaluate(value, authorized_time=authorized)
+  assert result.disposition is NavigationDatabaseRestoreDisposition.RESTORED
+  assert result.cache_age_seconds == NAVIGATION_DATABASE_RESTORE_MAX_AGE_SECONDS
+
+
+def test_conservative_age_one_second_over_boundary_skips(
+  tmp_path: Path,
+) -> None:
+  writes: list[tuple[bytes, int]] = []
+  value = NavigationDatabaseRestoreRuntime(
+    "receiver",
+    snapshot_loader=lambda _fingerprint: snapshot(
+      NAVIGATION_DATABASE_RESTORE_MAX_AGE_SECONDS - 15.0
+    ),
+    retry_delay_seconds=0.0,
+    state_path=tmp_path / "dbd_state.json",
+    boot_id_reader=lambda: BOOT_ID,
+    boottime_reader=lambda: 106.0,
+  )
+  authorized = AuthorizedTime(
+    utc=NOW,
+    uncertainty_seconds=10.0,
+    source=TrustedTimeSource.SYSTEM_SYNCHRONIZED,
+    provenance=TimeProvenance.NETWORK_INDEPENDENT,
+    independent=True,
+    evidence=TimeAuthorizationEvidence.SYSTEM_SYNCHRONIZED,
+    observed_boottime_seconds=100.0,
+  )
+  result = evaluate(
+    value,
+    authorized_time=authorized,
+    send=lambda frame, index: writes.append((frame, index)),
+  )
+  assert result.disposition is NavigationDatabaseRestoreDisposition.SKIPPED_EXPIRED
+  assert result.cache_age_seconds == NAVIGATION_DATABASE_RESTORE_MAX_AGE_SECONDS + 1.0
+  assert writes == []
+
+
+def test_acquisition_claim_failure_is_reported_before_receiver_start(
+  tmp_path: Path,
+) -> None:
+  calls = 0
+  def fail_claim(state, path):
+    nonlocal calls
+    calls += 1
+    if calls >= 2:
+      raise OSError("disk failure")
+    store_navigation_database_restore_boot_state(state, path)
+
+  value = NavigationDatabaseRestoreRuntime(
+    "receiver",
+    snapshot_loader=lambda _fingerprint: None,
+    state_path=tmp_path / "dbd_state.json",
+    boot_id_reader=lambda: BOOT_ID,
+    state_storer=fail_claim,
+  )
+  assert not value.claim_acquisition_start()
+  assert value.acquisition_started
+  assert value.execution.state_persistence_error is not None
+
+
+def test_yuma_is_durably_claimed_before_restart(tmp_path: Path) -> None:
+  first = runtime(tmp_path)
+  assert first.claim_yuma_transmission()
+  second = runtime(tmp_path)
+  writes: list[tuple[bytes, int]] = []
+  result = evaluate(
+    second,
+    authorized_time=network_time(),
+    send=lambda frame, index: writes.append((frame, index)),
+  )
+  assert result.disposition is NavigationDatabaseRestoreDisposition.SKIPPED_YUMA_ALREADY_SENT
+  assert writes == []

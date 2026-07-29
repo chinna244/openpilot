@@ -64,9 +64,33 @@ def test_database_decision_runs_before_yuma_transmission() -> None:
   node = named_node(tree, "run_receiving")
   segment = ast.get_source_segment(source, node)
   assert segment is not None
-  assert segment.index("navigation_database_runtime.evaluate(") < segment.index("yuma_feature.evaluate_provisional(")
-  assert segment.index("navigation_database_runtime.evaluate(") < segment.index("yuma_feature.evaluate(")
-  assert segment.count("navigation_database_runtime.note_yuma_sent()") == 2
+
+  database_decision = segment.index(
+    "navigation_database_runtime.evaluate("
+  )
+  assert database_decision < segment.index(
+    "yuma_feature.evaluate_provisional("
+  )
+  assert database_decision < segment.index(
+    "yuma_feature.evaluate("
+  )
+
+  assert (
+    "provisional_yuma_outcome = yuma_feature.evaluate_provisional(\n"
+    "      send_yuma_message,"
+  ) in segment
+  assert (
+    "yuma_outcome = yuma_feature.evaluate(\n"
+    "      send_yuma_message,"
+  ) in segment
+  assert "navigation_database_runtime.note_yuma_sent()" not in segment
+
+  helper = named_node(tree, "send_yuma_with_durable_claim")
+  helper_segment = ast.get_source_segment(source, helper)
+  assert helper_segment is not None
+  assert helper_segment.index(
+    "navigation_database_runtime.claim_yuma_transmission()"
+  ) < helper_segment.index("send_message(message)")
 
 
 def test_skipped_database_never_populates_restored_quality_fields() -> None:
@@ -162,11 +186,15 @@ def test_controlled_stop_start_brackets_pre_database_window() -> None:
   node = named_node(tree, "paused_gnss_acquisition")
   segment = ast.get_source_segment(source, node)
   assert segment is not None
-  assert "pigeon.send(CONTROLLED_GNSS_STOP_MESSAGE)" in segment
-  assert "finally:" in segment
-  assert "pigeon.send(CONTROLLED_GNSS_START_MESSAGE)" in segment
-  assert segment.index("CONTROLLED_GNSS_STOP_MESSAGE") < segment.index("yield")
-  assert segment.index("yield") < segment.index("CONTROLLED_GNSS_START_MESSAGE")
+
+  stop = segment.index("pigeon.send(CONTROLLED_GNSS_STOP_MESSAGE)")
+  yielded = segment.index("yield")
+  failure_path = segment.index("except BaseException:")
+  success_path = segment.index("else:")
+  start = segment.index("pigeon.send(CONTROLLED_GNSS_START_MESSAGE)")
+
+  assert stop < yielded < failure_path < success_path < start
+  assert "raise" in segment[failure_path:success_path]
 
 
 def test_power_on_stop_precedes_baud_transition_and_transactions() -> None:

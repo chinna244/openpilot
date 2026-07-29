@@ -37,7 +37,10 @@ from openpilot.system.ubloxd.navigation_database_restore import (
   evaluate_navigation_database_restore,
   is_current_independent_network_time,
 )
-from openpilot.system.ubloxd.trusted_time_anchor import read_boot_id
+from openpilot.system.ubloxd.trusted_time_anchor import (
+  read_boot_id,
+  read_boottime_seconds,
+)
 from openpilot.system.ubloxd.trusted_time_authority import AuthorizedTime
 from openpilot.system.ubloxd.yuma_almanac_transmit import (
   MgaReceiverNackError,
@@ -500,6 +503,7 @@ class NavigationDatabaseRestoreRuntime:
     sleeper: Callable[[float], None] = time.sleep,
     state_path: Path = NAVIGATION_DATABASE_RESTORE_STATE_PATH,
     boot_id_reader: Callable[[], str | None] = read_boot_id,
+    boottime_reader: Callable[[], float | None] = read_boottime_seconds,
     state_loader: Callable[[Path], NavigationDatabaseRestoreBootState | None] = load_navigation_database_restore_boot_state,
     state_storer: Callable[[NavigationDatabaseRestoreBootState, Path], None] = store_navigation_database_restore_boot_state,
   ) -> None:
@@ -509,6 +513,7 @@ class NavigationDatabaseRestoreRuntime:
       ("snapshot_loader", snapshot_loader),
       ("sleeper", sleeper),
       ("boot_id_reader", boot_id_reader),
+      ("boottime_reader", boottime_reader),
       ("state_loader", state_loader),
       ("state_storer", state_storer),
     ):
@@ -529,6 +534,7 @@ class NavigationDatabaseRestoreRuntime:
     self._retry_delay_seconds = float(retry_delay_seconds)
     self._sleeper = sleeper
     self._state_path = state_path
+    self._boottime_reader = boottime_reader
     self._state_storer = state_storer
     self._controller = NavigationDatabaseRestoreBootController()
     self._caches_loaded = False
@@ -554,6 +560,7 @@ class NavigationDatabaseRestoreRuntime:
     self._last_failure_phase: str | None = None
     self._last_accepted_frame_count = 0
     self._last_write_attempt_count = 0
+    self._last_cache_age_seconds: float | None = None
 
     try:
       boot_id = boot_id_reader()
@@ -751,19 +758,47 @@ class NavigationDatabaseRestoreRuntime:
     self._execution = self._build_execution()
     return self._execution
 
-  def note_acquisition_started(self) -> None:
-    if self._controller.acquisition_started:
-      return
-    self._controller.note_acquisition_started()
-    self._persist_state()
+  def close_restore_window_unverified(self) -> bool:
+    """Persist a terminal timeout skip while GNSS remains stopped."""
+    if self._controller.pending and not self._controller.restore_attempted:
+      self._controller.skip(
+        NavigationDatabaseRestoreDisposition.SKIPPED_UNVERIFIED
+      )
+    persisted = self._persist_state()
     self._execution = self._build_execution(self._last_authorized_time)
+    return persisted
 
-  def note_yuma_sent(self) -> None:
-    if self._yuma_sent:
-      return
-    self._yuma_sent = True
-    self._persist_state()
+  def claim_acquisition_start(self) -> bool:
+    """Durably close the DBD window before sending GNSS START."""
+    if self._controller.acquisition_started:
+      return self._state_persistence_error is None
+    if self._controller.pending and not self._controller.restore_attempted:
+      self._controller.skip(
+        NavigationDatabaseRestoreDisposition.SKIPPED_ACQUISITION_ALREADY_STARTED
+      )
+    self._controller.note_acquisition_started()
+    persisted = self._persist_state()
     self._execution = self._build_execution(self._last_authorized_time)
+    return persisted
+
+  def note_acquisition_started(self) -> bool:
+    return self.claim_acquisition_start()
+
+  def claim_yuma_transmission(self) -> bool:
+    """Durably consume the boot's YUMA/DBD choice before receiver I/O."""
+    if self._yuma_sent:
+      return self._state_persistence_error is None
+    self._yuma_sent = True
+    if self._controller.pending and not self._controller.restore_attempted:
+      self._controller.skip(
+        NavigationDatabaseRestoreDisposition.SKIPPED_YUMA_ALREADY_SENT
+      )
+    persisted = self._persist_state()
+    self._execution = self._build_execution(self._last_authorized_time)
+    return persisted
+
+  def note_yuma_sent(self) -> bool:
+    return self.claim_yuma_transmission()
 
   @staticmethod
   def _cache_age(
@@ -776,6 +811,42 @@ class NavigationDatabaseRestoreRuntime:
       return None
     return float(age) if isfinite(age) else None
 
+  def _effective_cache_age(
+    self,
+    snapshot: NavigationDatabaseRestoreSnapshot,
+    authorized_time: AuthorizedTime,
+  ) -> float | None:
+    nominal_age = self._cache_age(snapshot, authorized_time.utc)
+    uncertainty = authorized_time.uncertainty_seconds
+    if (
+      nominal_age is None
+      or isinstance(uncertainty, bool)
+      or not isinstance(uncertainty, (int, float))
+      or not isfinite(float(uncertainty))
+      or float(uncertainty) < 0.0
+    ):
+      return None
+    elapsed = 0.0
+    observed_boottime = authorized_time.observed_boottime_seconds
+    if observed_boottime is not None:
+      try:
+        current_boottime = self._boottime_reader()
+      except Exception:
+        return None
+      if (
+        isinstance(observed_boottime, bool)
+        or not isinstance(observed_boottime, (int, float))
+        or not isfinite(float(observed_boottime))
+        or isinstance(current_boottime, bool)
+        or not isinstance(current_boottime, (int, float))
+        or not isfinite(float(current_boottime))
+        or float(current_boottime) < float(observed_boottime)
+      ):
+        return None
+      elapsed = float(current_boottime) - float(observed_boottime)
+    effective_age = nominal_age + float(uncertainty) + elapsed
+    return effective_age if isfinite(effective_age) else None
+
   def _select_database_snapshot(
     self,
     authorized_time: AuthorizedTime,
@@ -783,7 +854,10 @@ class NavigationDatabaseRestoreRuntime:
     assert is_current_independent_network_time(authorized_time)
     assert self._frozen_caches is not None
     candidates = self._frozen_caches.database_candidates
-    ages = {candidate.generation: self._cache_age(candidate, authorized_time.utc) for candidate in candidates}
+    ages = {
+      candidate.generation: self._effective_cache_age(candidate, authorized_time)
+      for candidate in candidates
+    }
 
     if self._persisted_cache_generation is not None:
       matching = [
@@ -874,6 +948,7 @@ class NavigationDatabaseRestoreRuntime:
         self._database_snapshot = selected
         self._persisted_cache_generation = selected.generation
         self._persisted_cache_saved_at_utc = selected.saved_at_utc
+      self._last_cache_age_seconds = cache_age_seconds
 
     decision = evaluate_navigation_database_restore(
       reliable_fix_available=reliable_fix_available,
@@ -978,13 +1053,13 @@ class NavigationDatabaseRestoreRuntime:
     authorized_time: AuthorizedTime | None = None,
   ) -> NavigationDatabaseRestoreExecution:
     snapshot = self._database_snapshot
-    cache_age_seconds = None
+    cache_age_seconds = self._last_cache_age_seconds
     effective_quality = None
     if snapshot is not None:
       current_network_time = authorized_time if (authorized_time is not None and is_current_independent_network_time(authorized_time)) else None
       age_evidence = CacheAgeEvidence.TRUSTED_UTC if current_network_time is not None else CacheAgeEvidence.UNVERIFIED
       if current_network_time is not None:
-        cache_age_seconds = self._cache_age(snapshot, current_network_time.utc)
+        cache_age_seconds = self._effective_cache_age(snapshot, current_network_time)
       effective_quality = effective_restored_navigation_quality(
         snapshot.quality,
         snapshot.saved_at_utc,

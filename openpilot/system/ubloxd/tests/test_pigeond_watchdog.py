@@ -75,11 +75,15 @@ def test_init_raises_when_receiver_configuration_fails(
     lambda _pigeon: False,
   )
 
+  class Pigeon:
+    def send(self, _message: bytes) -> None:
+      pass
+
   with pytest.raises(
     RuntimeError,
     match="Failed to initialize pigeon",
   ):
-    pigeond.init(object())
+    pigeond.init(Pigeon())
 
 
 def test_zero_prefixed_ublox_payload_is_not_all_zero():
