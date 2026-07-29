@@ -641,7 +641,15 @@ class NavigationDatabaseRestoreRuntime:
         self._controller.finish_restore(state.disposition)
     elif state.disposition.intentionally_skipped:
       self._controller.skip(state.disposition)
-    elif state.disposition is not NavigationDatabaseRestoreDisposition.PENDING:
+    elif state.disposition is NavigationDatabaseRestoreDisposition.PENDING:
+      # A same-boot PENDING state belongs to an earlier process. The prior
+      # process may have observed acquisition but failed before durably
+      # recording the latch, so never reopen the DBD window after restart.
+      self._controller.skip(
+        NavigationDatabaseRestoreDisposition.SKIPPED_UNVERIFIED
+      )
+      self._persist_state()
+    else:
       self._fail_closed("boot_state:invalid_terminal_state")
       self._persist_state()
 

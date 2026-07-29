@@ -607,7 +607,9 @@ def test_exactly_one_generation_on_one_hour_boundary_is_selected(
   assert result.cache_generation == "primary"
 
 
-def test_frozen_candidate_set_survives_process_restart(tmp_path: Path) -> None:
+def test_recovered_same_boot_pending_state_fails_closed(
+  tmp_path: Path,
+) -> None:
   first = multi_runtime(
     tmp_path,
     primary=snapshot(generation="primary"),
@@ -620,15 +622,27 @@ def test_frozen_candidate_set_survives_process_restart(tmp_path: Path) -> None:
     primary=snapshot(generation="primary"),
     previous=snapshot(45 * 60, generation="previous"),
   )
-  assert second.controller.pending
-
-  changed = multi_runtime(
-    tmp_path,
-    primary=snapshot(generation="primary"),
-    previous=snapshot(46 * 60, generation="previous"),
+  writes: list[tuple[bytes, int]] = []
+  result = evaluate(
+    second,
+    authorized_time=network_time(),
+    send=lambda frame, index: writes.append((frame, index)),
   )
-  changed.prepare()
-  assert changed.controller.disposition is NavigationDatabaseRestoreDisposition.SKIPPED_UNVERIFIED
+
+  assert (
+    result.disposition
+    is NavigationDatabaseRestoreDisposition.SKIPPED_UNVERIFIED
+  )
+  assert writes == []
+
+  persisted = load_navigation_database_restore_boot_state(
+    tmp_path / "dbd_state.json"
+  )
+  assert persisted is not None
+  assert (
+    persisted.disposition
+    is NavigationDatabaseRestoreDisposition.SKIPPED_UNVERIFIED
+  )
 
 
 def test_candidate_identity_round_trip() -> None:
@@ -859,3 +873,63 @@ def test_cache_age_is_rechecked_after_restore_claim_before_frame_zero(tmp_path: 
   assert receiver_writes == []
   assert result.permanent_failures
   assert all(failure.kind is NavigationDatabaseRestoreFrameFailureKind.VALIDATION_ERROR for failure in result.permanent_failures)
+
+# COMMIT8_DBD_PENDING_RESTART_TEST
+
+def test_failed_acquisition_persistence_cannot_reopen_after_restart(
+  tmp_path: Path,
+) -> None:
+  path = tmp_path / "dbd_state.json"
+
+  def fail_acquisition_state(
+    state: NavigationDatabaseRestoreBootState,
+    state_path: Path,
+  ) -> None:
+    if state.acquisition_started:
+      raise OSError("disk failure")
+    store_navigation_database_restore_boot_state(state, state_path)
+
+  first = NavigationDatabaseRestoreRuntime(
+    "receiver",
+    snapshot_loader=lambda _fingerprint: snapshot(),
+    retry_delay_seconds=0.0,
+    state_path=path,
+    boot_id_reader=lambda: BOOT_ID,
+    state_storer=fail_acquisition_state,
+    boottime_reader=lambda: TEST_BOOTTIME_SECONDS,
+  )
+  assert not first.claim_acquisition_start()
+  assert first.acquisition_started
+
+  stale = load_navigation_database_restore_boot_state(path)
+  assert stale is not None
+  assert stale.disposition is NavigationDatabaseRestoreDisposition.PENDING
+  assert not stale.acquisition_started
+
+  writes: list[tuple[bytes, int]] = []
+  second = NavigationDatabaseRestoreRuntime(
+    "receiver",
+    snapshot_loader=lambda _fingerprint: snapshot(),
+    retry_delay_seconds=0.0,
+    state_path=path,
+    boot_id_reader=lambda: BOOT_ID,
+    boottime_reader=lambda: TEST_BOOTTIME_SECONDS,
+  )
+  result = evaluate(
+    second,
+    authorized_time=network_time(),
+    send=lambda frame, index: writes.append((frame, index)),
+  )
+
+  assert (
+    result.disposition
+    is NavigationDatabaseRestoreDisposition.SKIPPED_UNVERIFIED
+  )
+  assert writes == []
+
+  recovered = load_navigation_database_restore_boot_state(path)
+  assert recovered is not None
+  assert (
+    recovered.disposition
+    is NavigationDatabaseRestoreDisposition.SKIPPED_UNVERIFIED
+  )
