@@ -1,8 +1,23 @@
+from datetime import UTC, datetime
+
 import pytest
 
 from openpilot.system.ubloxd.navigation_database_restore import (
+  NAVIGATION_DATABASE_RESTORE_MAX_AGE_SECONDS,
   NavigationDatabaseRestoreBootController,
+  NavigationDatabaseRestoreDecision,
+  NavigationDatabaseRestoreDecisionAction,
   NavigationDatabaseRestoreDisposition,
+  evaluate_navigation_database_restore,
+  is_current_independent_network_time,
+)
+from openpilot.system.ubloxd.trusted_time_anchor import (
+  TimeProvenance,
+  TrustedTimeSource,
+)
+from openpilot.system.ubloxd.trusted_time_authority import (
+  AuthorizedTime,
+  TimeAuthorizationEvidence,
 )
 
 
@@ -136,3 +151,277 @@ def test_terminal_state_remains_on_same_controller_instance() -> None:
   assert same_controller.restore_attempted
   assert not same_controller.begin_restore_attempt()
   assert same_controller.disposition is NavigationDatabaseRestoreDisposition.RESTORED
+
+
+NOW = datetime(2026, 7, 28, tzinfo=UTC)
+
+
+def authorized_time(
+  *,
+  source: TrustedTimeSource = TrustedTimeSource.SYSTEM_SYNCHRONIZED,
+  provenance: TimeProvenance = TimeProvenance.NETWORK_INDEPENDENT,
+  independent: bool = True,
+  evidence: TimeAuthorizationEvidence = (TimeAuthorizationEvidence.SYSTEM_SYNCHRONIZED),
+) -> AuthorizedTime:
+  return AuthorizedTime(
+    utc=NOW,
+    uncertainty_seconds=1.0,
+    source=source,
+    provenance=provenance,
+    independent=independent,
+    evidence=evidence,
+  )
+
+
+def evaluate(**overrides: object) -> NavigationDatabaseRestoreDecision:
+  arguments: dict[str, object] = {
+    "reliable_fix_available": False,
+    "yuma_already_sent": False,
+    "authorized_time": authorized_time(),
+    "cache_age_seconds": 30.0 * 60.0,
+    "gnss_acquisition_started": False,
+  }
+  arguments.update(overrides)
+  return evaluate_navigation_database_restore(**arguments)  # type: ignore[arg-type]
+
+
+def test_decision_action_values_are_stable() -> None:
+  assert {item.name: item.value for item in NavigationDatabaseRestoreDecisionAction} == {
+    "WAIT": "wait",
+    "RESTORE": "restore",
+    "SKIP": "skip",
+  }
+
+
+@pytest.mark.parametrize(
+  ("action", "disposition"),
+  (
+    (
+      NavigationDatabaseRestoreDecisionAction.WAIT,
+      NavigationDatabaseRestoreDisposition.SKIPPED_EXPIRED,
+    ),
+    (
+      NavigationDatabaseRestoreDecisionAction.RESTORE,
+      NavigationDatabaseRestoreDisposition.SKIPPED_EXPIRED,
+    ),
+    (NavigationDatabaseRestoreDecisionAction.SKIP, None),
+    (
+      NavigationDatabaseRestoreDecisionAction.SKIP,
+      NavigationDatabaseRestoreDisposition.RESTORED,
+    ),
+  ),
+)
+def test_decision_rejects_inconsistent_state(
+  action: NavigationDatabaseRestoreDecisionAction,
+  disposition: NavigationDatabaseRestoreDisposition | None,
+) -> None:
+  with pytest.raises(ValueError):
+    NavigationDatabaseRestoreDecision(action, disposition)
+
+
+def test_current_independent_network_time_is_explicit() -> None:
+  assert is_current_independent_network_time(authorized_time())
+  assert not is_current_independent_network_time(
+    authorized_time(
+      independent=False,
+      evidence=TimeAuthorizationEvidence.SAME_BOOT_BOOTTIME,
+    )
+  )
+  assert not is_current_independent_network_time(
+    authorized_time(
+      source=TrustedTimeSource.RECEIVER_UTC_UNASSISTED_GNSS,
+      provenance=TimeProvenance.GNSS_INDEPENDENT,
+      evidence=(TimeAuthorizationEvidence.RECEIVER_UTC_UNASSISTED_GNSS),
+    )
+  )
+
+
+@pytest.mark.parametrize(
+  (
+    "reliable_fix_available",
+    "yuma_already_sent",
+    "time_kind",
+    "acquisition_started",
+    "cache_age_seconds",
+    "expected_action",
+    "expected_disposition",
+  ),
+  (
+    (
+      True,
+      True,
+      "receiver",
+      True,
+      30.0,
+      "skip",
+      NavigationDatabaseRestoreDisposition.SKIPPED_RELIABLE_FIX,
+    ),
+    (
+      False,
+      True,
+      "receiver",
+      True,
+      30.0,
+      "skip",
+      NavigationDatabaseRestoreDisposition.SKIPPED_YUMA_ALREADY_SENT,
+    ),
+    (
+      False,
+      False,
+      "receiver",
+      True,
+      30.0,
+      "skip",
+      NavigationDatabaseRestoreDisposition.SKIPPED_LATE_RECEIVER_TIME,
+    ),
+    (
+      False,
+      False,
+      "none",
+      True,
+      None,
+      "skip",
+      NavigationDatabaseRestoreDisposition.SKIPPED_ACQUISITION_ALREADY_STARTED,
+    ),
+    (False, False, "none", False, None, "wait", None),
+    (
+      False,
+      False,
+      "same_boot",
+      False,
+      None,
+      "skip",
+      NavigationDatabaseRestoreDisposition.SKIPPED_UNVERIFIED,
+    ),
+    (
+      False,
+      False,
+      "network",
+      False,
+      None,
+      "skip",
+      NavigationDatabaseRestoreDisposition.SKIPPED_UNVERIFIED,
+    ),
+    (
+      False,
+      False,
+      "network",
+      False,
+      3600.001,
+      "skip",
+      NavigationDatabaseRestoreDisposition.SKIPPED_EXPIRED,
+    ),
+    (False, False, "network", False, 1800.0, "restore", None),
+  ),
+)
+def test_policy_precedence_matrix(
+  reliable_fix_available: bool,
+  yuma_already_sent: bool,
+  time_kind: str,
+  acquisition_started: bool,
+  cache_age_seconds: float | None,
+  expected_action: str,
+  expected_disposition: NavigationDatabaseRestoreDisposition | None,
+) -> None:
+  times = {
+    "none": None,
+    "network": authorized_time(),
+    "same_boot": authorized_time(
+      independent=False,
+      evidence=TimeAuthorizationEvidence.SAME_BOOT_BOOTTIME,
+    ),
+    "receiver": authorized_time(
+      source=TrustedTimeSource.RECEIVER_UTC_UNASSISTED_GNSS,
+      provenance=TimeProvenance.GNSS_INDEPENDENT,
+      evidence=(TimeAuthorizationEvidence.RECEIVER_UTC_UNASSISTED_GNSS),
+    ),
+  }
+  decision = evaluate(
+    reliable_fix_available=reliable_fix_available,
+    yuma_already_sent=yuma_already_sent,
+    authorized_time=times[time_kind],
+    cache_age_seconds=cache_age_seconds,
+    gnss_acquisition_started=acquisition_started,
+  )
+  assert decision.action.value == expected_action
+  assert decision.skip_disposition is expected_disposition
+
+
+@pytest.mark.parametrize(
+  "cache_age_seconds",
+  (None, -1.0, float("nan"), float("inf"), True),
+)
+def test_invalid_cache_age_is_unverified_skip(
+  cache_age_seconds: object,
+) -> None:
+  decision = evaluate(cache_age_seconds=cache_age_seconds)
+  assert decision.skip_disposition is NavigationDatabaseRestoreDisposition.SKIPPED_UNVERIFIED
+
+
+def test_cache_age_boundary_is_inclusive() -> None:
+  assert evaluate(cache_age_seconds=NAVIGATION_DATABASE_RESTORE_MAX_AGE_SECONDS).should_restore
+  assert (
+    evaluate(cache_age_seconds=(NAVIGATION_DATABASE_RESTORE_MAX_AGE_SECONDS + 0.001)).skip_disposition is NavigationDatabaseRestoreDisposition.SKIPPED_EXPIRED
+  )
+
+
+@pytest.mark.parametrize(
+  "maximum_cache_age_seconds",
+  (-1.0, float("nan"), float("inf"), True),
+)
+def test_invalid_maximum_age_is_rejected(
+  maximum_cache_age_seconds: object,
+) -> None:
+  with pytest.raises(ValueError):
+    evaluate_navigation_database_restore(
+      reliable_fix_available=False,
+      yuma_already_sent=False,
+      authorized_time=authorized_time(),
+      cache_age_seconds=30.0,
+      gnss_acquisition_started=False,
+      maximum_cache_age_seconds=maximum_cache_age_seconds,  # type: ignore[arg-type]
+    )
+
+
+@pytest.mark.parametrize(
+  ("name", "value"),
+  (
+    ("reliable_fix_available", 1),
+    ("yuma_already_sent", 1),
+    ("gnss_acquisition_started", 1),
+  ),
+)
+def test_nonboolean_flags_are_rejected(
+  name: str,
+  value: object,
+) -> None:
+  arguments: dict[str, object] = {
+    "reliable_fix_available": False,
+    "yuma_already_sent": False,
+    "authorized_time": None,
+    "cache_age_seconds": None,
+    "gnss_acquisition_started": False,
+  }
+  arguments[name] = value
+  with pytest.raises(ValueError):
+    evaluate_navigation_database_restore(**arguments)  # type: ignore[arg-type]
+
+
+def test_invalid_authorized_time_is_rejected() -> None:
+  with pytest.raises(ValueError):
+    evaluate(authorized_time="network")
+
+
+def test_controller_applies_wait_restore_and_skip() -> None:
+  waiting = NavigationDatabaseRestoreBootController()
+  assert not waiting.apply_decision(evaluate(authorized_time=None, cache_age_seconds=None))
+  assert waiting.pending
+
+  restoring = NavigationDatabaseRestoreBootController()
+  assert restoring.apply_decision(evaluate())
+  assert restoring.restore_attempted
+  assert restoring.pending
+
+  skipped = NavigationDatabaseRestoreBootController()
+  assert skipped.apply_decision(evaluate(cache_age_seconds=7200.0))
+  assert skipped.disposition is NavigationDatabaseRestoreDisposition.SKIPPED_EXPIRED
