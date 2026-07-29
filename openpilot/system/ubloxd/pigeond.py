@@ -7,7 +7,8 @@ from openpilot.common.serial import Serial
 import requests
 import urllib.parse
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, UTC
 from enum import StrEnum
@@ -116,6 +117,7 @@ from openpilot.system.ubloxd.navigation_database_restore import (
 )
 from openpilot.system.ubloxd.navigation_database_restore_runtime import (
   NavigationDatabaseRestoreExecution,
+  NavigationDatabaseRestoreFrameFailureKind,
   NavigationDatabaseRestoreRuntime,
 )
 from openpilot.system.ubloxd.receiver_time_provenance import (
@@ -206,6 +208,9 @@ GPS_ASSISTANCE_CAPTURE_RETRY_INTERVAL = 60.0
 GPS_ASSISTANCE_QUALIFIED_UPGRADE_COOLDOWN = 5.0 * 60.0
 GPS_ACQUISITION_STATUS_INTERVAL = 30.0
 PRE_TRANSACTION_DRAIN_MAX_BYTES = 64 * 1024
+CONTROLLED_GNSS_STOP_MESSAGE = b"\xB5\x62\x06\x04\x04\x00\x00\x00\x08\x00\x16\x74"
+CONTROLLED_GNSS_START_MESSAGE = b"\xB5\x62\x06\x04\x04\x00\x00\x00\x09\x00\x17\x76"
+CONTROLLED_GNSS_TRANSITION_DELAY = 0.05
 # A validated MGA-DBD cache is capped at 64 KiB. Frequent dispatch between
 # transactions is the primary bound; these limits retain four cache volumes or
 # 512 small navigation frames if a dispatcher is temporarily unavailable.
@@ -1263,8 +1268,12 @@ def wait_for_aop_idle(
   return AopCaptureState.UNKNOWN
 
 def init_baudrate(pigeon: TTYPigeon):
-  # ublox default setting on startup is 9600 baudrate
+  # ublox default setting on startup is 9600 baudrate. Stop GNSS before
+  # changing baud so no synchronous startup transaction can race the
+  # trusted-age database decision.
   pigeon.set_baud(9600)
+  pigeon.send(CONTROLLED_GNSS_STOP_MESSAGE)
+  time.sleep(CONTROLLED_GNSS_TRANSITION_DELAY)
 
   # $PUBX,41,1,0007,0003,460800,0*15\r\n
   pigeon.send(b"\x24\x50\x55\x42\x58\x2C\x34\x31\x2C\x31\x2C\x30\x30\x30\x37\x2C\x30\x30\x30\x33\x2C\x34\x36\x30\x38\x30\x30\x2C\x30\x2A\x31\x35\x0D\x0A")
@@ -1542,27 +1551,81 @@ def init_pigeon(pigeon: TTYPigeon) -> bool:
 def deinitialize_and_exit(pigeon: TTYPigeon | None):
   if pigeon is not None:
     # controlled GNSS stop
-    pigeon.send(b"\xB5\x62\x06\x04\x04\x00\x00\x00\x08\x00\x16\x74")
+    pigeon.send(CONTROLLED_GNSS_STOP_MESSAGE)
 
   # turn off power and exit cleanly
   set_power(False)
   sys.exit(0)
 
-def init(pigeon: TTYPigeon) -> None:
-  # register exit handler
-  signal.signal(signal.SIGINT, lambda sig, frame: deinitialize_and_exit(pigeon))
+@dataclass
+class PreAcquisitionInitialization:
+  callback: Callable[[], None]
+  executed: bool = False
 
-  # power cycle ublox
+  def run(self) -> None:
+    if self.executed:
+      return
+    self.executed = True
+    self.callback()
+
+
+_ACTIVE_PRE_ACQUISITION_INITIALIZATION: (
+  PreAcquisitionInitialization | None
+) = None
+
+
+@contextmanager
+def install_pre_acquisition_initialization(
+  callback: Callable[[], None],
+) -> Iterator[PreAcquisitionInitialization]:
+  global _ACTIVE_PRE_ACQUISITION_INITIALIZATION
+  if _ACTIVE_PRE_ACQUISITION_INITIALIZATION is not None:
+    raise RuntimeError("pre-acquisition initialization is already active")
+  state = PreAcquisitionInitialization(callback)
+  _ACTIVE_PRE_ACQUISITION_INITIALIZATION = state
+  try:
+    yield state
+  finally:
+    _ACTIVE_PRE_ACQUISITION_INITIALIZATION = None
+
+
+def start_pigeon_transport(pigeon: TTYPigeon) -> None:
+  signal.signal(signal.SIGINT, lambda sig, frame: deinitialize_and_exit(pigeon))
   if hasattr(pigeon, "_stream_parser"):
     pigeon.reset_response_state()
   set_power(False)
   time.sleep(0.1)
   set_power(True)
   time.sleep(0.5)
-
   init_baudrate(pigeon)
+
+
+@contextmanager
+def paused_gnss_acquisition(pigeon: TTYPigeon) -> Iterator[None]:
+  # UBX-CFG-RST resetMode 0x08/0x09 stops/starts GNSS tasks without
+  # clearing the hot-start BBR data. Newer firmware does not ACK these
+  # commands, so the transition is bounded by a short deterministic delay.
+  pigeon.send(CONTROLLED_GNSS_STOP_MESSAGE)
+  time.sleep(CONTROLLED_GNSS_TRANSITION_DELAY)
+  try:
+    yield
+  finally:
+    pigeon.send(CONTROLLED_GNSS_START_MESSAGE)
+    time.sleep(CONTROLLED_GNSS_TRANSITION_DELAY)
+
+
+def finish_pigeon_initialization(pigeon: TTYPigeon) -> None:
   if not init_pigeon(pigeon):
     raise RuntimeError("Failed to initialize pigeon")
+
+
+def init(pigeon: TTYPigeon) -> None:
+  start_pigeon_transport(pigeon)
+  initialization = _ACTIVE_PRE_ACQUISITION_INITIALIZATION
+  if initialization is not None:
+    with paused_gnss_acquisition(pigeon):
+      initialization.run()
+  finish_pigeon_initialization(pigeon)
 
 
 def send_time_assistance(
@@ -2451,6 +2514,10 @@ class NavigationAssistanceRestoreResult:
   database_restore_boot_id: str | None = None
   database_restore_state_error: str | None = None
   database_restore_recovered_interrupted_attempt: bool = False
+  database_restore_initial_failure_kinds: tuple[str, ...] = ()
+  database_restore_permanent_failure_kinds: tuple[str, ...] = ()
+  database_restore_execution_error: str | None = None
+  database_restore_runtime_phase: str | None = None
 
   @property
   def usable(self) -> bool:
@@ -2510,6 +2577,14 @@ def format_navigation_assistance_restore_summary(
     f"database_restore_state_error={result.database_restore_state_error or 'none'}",
     "database_restore_recovered_interrupted_attempt="
     + str(result.database_restore_recovered_interrupted_attempt).lower(),
+    "database_restore_initial_failure_kinds="
+    + str(list(result.database_restore_initial_failure_kinds)),
+    "database_restore_permanent_failure_kinds="
+    + str(list(result.database_restore_permanent_failure_kinds)),
+    "database_restore_execution_error="
+    + (result.database_restore_execution_error or "none"),
+    "database_restore_runtime_phase="
+    + (result.database_restore_runtime_phase or "none"),
     "database_terminal_ack_count_matched=not_applicable_per_frame_restore",
     f"time_assistance_source={time_assistance_source or 'unknown'}",
     f"restored_cache_generation={result.restored_cache_generation or 'none'}",
@@ -2558,21 +2633,12 @@ def log_navigation_assistance_restore_result(
     diagnostic_context=diagnostic_context,
   )
 
-  if (
-    result.database_restore_disposition
-    is NavigationDatabaseRestoreDisposition.PENDING
-    or (
-      result.database_restore_disposition is not None
-      and result.database_restore_disposition.intentionally_skipped
-    )
-  ):
-    cloudlog.info(message)
-  elif result.status is NavigationAssistanceRestoreStatus.COMPLETE:
-    cloudlog.info(message)
+  if result.status is NavigationAssistanceRestoreStatus.FAILED:
+    cloudlog.error(message)
   elif result.status is NavigationAssistanceRestoreStatus.PARTIAL:
     cloudlog.warning(message)
   else:
-    cloudlog.error(message)
+    cloudlog.info(message)
 
 
 def navigation_assistance_result_from_database_execution(
@@ -2614,9 +2680,21 @@ def navigation_assistance_result_from_database_execution(
     status=status,
     total_frame_count=execution.total_frame_count,
     accepted_frame_count=execution.accepted_frame_count,
-    initially_timed_out_indexes=execution.initially_failed_indexes,
+    initially_rejected_indexes=execution.initial_indexes(
+      NavigationDatabaseRestoreFrameFailureKind.REJECTED,
+      NavigationDatabaseRestoreFrameFailureKind.VALIDATION_ERROR,
+    ),
+    initially_timed_out_indexes=execution.initial_indexes(
+      NavigationDatabaseRestoreFrameFailureKind.TIMED_OUT,
+    ),
     retry_accepted_indexes=execution.retry_accepted_indexes,
-    permanently_timed_out_indexes=execution.permanently_failed_indexes,
+    permanently_rejected_indexes=execution.permanent_indexes(
+      NavigationDatabaseRestoreFrameFailureKind.REJECTED,
+      NavigationDatabaseRestoreFrameFailureKind.VALIDATION_ERROR,
+    ),
+    permanently_timed_out_indexes=execution.permanent_indexes(
+      NavigationDatabaseRestoreFrameFailureKind.TIMED_OUT,
+    ),
     failure_phase=failure_phase,
     cache_saved_at_utc=execution.cache_saved_at_utc,
     restored_cache_generation=execution.cache_generation,
@@ -2727,6 +2805,16 @@ def navigation_assistance_result_from_database_execution(
     database_restore_recovered_interrupted_attempt=(
       execution.recovered_interrupted_attempt
     ),
+    database_restore_initial_failure_kinds=tuple(
+      f"{failure.frame_index}:{failure.kind.value}"
+      for failure in execution.initial_failures
+    ),
+    database_restore_permanent_failure_kinds=tuple(
+      f"{failure.frame_index}:{failure.kind.value}"
+      for failure in execution.permanent_failures
+    ),
+    database_restore_execution_error=execution.execution_error,
+    database_restore_runtime_phase=execution.failure_phase,
   )
 
 
@@ -2736,7 +2824,43 @@ def restore_navigation_assistance(
   diagnostic_context: str | None = None,
   time_assistance_source: str | None = None,
   trusted_now: datetime | None = None,
+  *,
+  navigation_database_runtime: NavigationDatabaseRestoreRuntime | None = None,
+  authorized_time: AuthorizedTime | None = None,
+  allow_legacy_direct_restore: bool = False,
 ) -> NavigationAssistanceRestoreResult:
+  if navigation_database_runtime is not None:
+    navigation_database_runtime.prepare()
+    execution = navigation_database_runtime.evaluate(
+      authorized_time=authorized_time,
+      reliable_fix_available=False,
+      yuma_already_sent=False,
+      send_database_message=(
+        lambda message, frame_index: send_mga_with_strict_ack(
+          pigeon,
+          message,
+          database_frame_index=frame_index,
+        )
+      ),
+    )
+    if not navigation_database_runtime.acquisition_started:
+      navigation_database_runtime.send_position_once(
+        lambda message: send_mga_with_strict_ack(pigeon, message)
+      )
+      execution = navigation_database_runtime.execution
+    result = navigation_assistance_result_from_database_execution(execution)
+    log_navigation_assistance_restore_result(
+      result,
+      diagnostic_context,
+      time_assistance_source,
+    )
+    return result
+
+  if not allow_legacy_direct_restore:
+    raise RuntimeError(
+      "live navigation assistance restore requires a boot-scoped runtime"
+    )
+
   if trusted_now is None:
     host_time = read_host_time_observation()
     if host_time is not None and host_time.independent:
@@ -3465,14 +3589,8 @@ def initialize_receiver_cycle(
   navigation_database_runtime: NavigationDatabaseRestoreRuntime | None = None,
 ) -> ReceiverCycleInitialization:
   cycle_started_at = time.monotonic()
-  startup_diagnostics.start_cycle(
-    reason,
-    cycle_started_at,
-  )
-  provenance = (
-    time_provenance
-    or ReceiverTimeProvenanceTracker()
-  )
+  startup_diagnostics.start_cycle(reason, cycle_started_at)
+  provenance = time_provenance or ReceiverTimeProvenanceTracker()
   cycle_id = getattr(
     startup_diagnostics,
     "cycle_number",
@@ -3489,31 +3607,6 @@ def initialize_receiver_cycle(
     pigeon.time_provenance = provenance
   except (AttributeError, TypeError):
     pass
-  init(pigeon)
-  provenance.enable_receiver_observations(
-    time.monotonic()
-  )
-
-  if collect_mon_ver_diagnostics:
-    mon_ver_info = log_mon_ver_diagnostics(pigeon)
-  else:
-    try:
-      mon_ver_info = poll_mon_ver(pigeon)
-    except Exception:
-      cloudlog.exception("GPS MON-VER compatibility poll failed")
-      mon_ver_info = None
-  log_navx5_ack_aiding_support(mon_ver_info)
-  configure_navx5_ack_aiding(pigeon, mon_ver_info)
-  ack_aiding_configuration_attempted = True
-
-  attempt_started_at = time.monotonic()
-  trusted_time_assistance_sent = False
-  time_assistance_source = None
-  time_assistance_utc = None
-  yuma_time_anchor_utc = None
-  yuma_time_anchor_source = None
-  yuma_time_anchor_monotonic = None
-  diagnostic_context = None
 
   authority = time_authority or TimeAuthority()
   host_time_observation = read_host_time_observation()
@@ -3522,86 +3615,122 @@ def initialize_receiver_cycle(
     host_time_observation,
   )
   authorized_time = authority_evaluation.authorized_time
-  if authorized_time is not None:
-    time_assistance_utc = authorized_time.utc
-    yuma_time_anchor_utc = authorized_time.utc
-    yuma_time_anchor_source = authorized_time.evidence.value
-    yuma_time_anchor_monotonic = time.monotonic()
-    diagnostic_context = (
-      startup_diagnostics.time_assistance_context(
-        yuma_time_anchor_monotonic
-      )
-    )
-    trusted_time_assistance_sent = send_time_assistance(
-      pigeon,
-      assistance_time=authorized_time.utc,
-      accuracy_seconds=(
-        authorized_time.mga_accuracy_seconds
-      ),
-      source=authorized_time.evidence.value,
-      diagnostic_context=diagnostic_context,
-      time_provenance=provenance,
-      assistance_boottime_seconds=getattr(
-        authorized_time,
-        "observed_boottime_seconds",
-        None,
-      ),
-      independent=authorized_time.independent,
-      source_provenance=authorized_time.provenance,
-    )
-    if trusted_time_assistance_sent:
-      time_assistance_source = (
-        authorized_time.evidence.value
-      )
-    next_time_assistance_attempt = (
-      attempt_started_at + TIME_ASSISTANCE_RETRY_INTERVAL
-    )
-  else:
-    next_time_assistance_attempt = (
-      attempt_started_at + TIME_SYNC_CHECK_INTERVAL
-    )
-
-  assistnow_autonomous_configuration_attempted = False
   database_runtime = (
     navigation_database_runtime
     or NavigationDatabaseRestoreRuntime(receiver_fingerprint)
   )
   database_runtime.prepare()
-  database_runtime.send_position_once(
-    lambda message: send_mga_with_strict_ack(pigeon, message)
-  )
-  database_execution = database_runtime.evaluate(
-    authorized_time=authorized_time,
-    reliable_fix_available=False,
-    yuma_already_sent=False,
-    send_database_message=(
-      lambda message, frame_index: send_mga_with_strict_ack(
-        pigeon,
-        message,
-        database_frame_index=frame_index,
-      )
-    ),
-  )
-  navigation_assistance_restore_result = (
-    navigation_assistance_result_from_database_execution(
-      database_execution
-    )
-  )
-  navigation_assistance_restore_attempted = (
-    database_execution.position_assistance_attempted
-    or database_runtime.controller.restore_attempted
-    or database_runtime.controller.terminal
-  )
-  log_navigation_assistance_restore_result(
-    navigation_assistance_restore_result,
-    diagnostic_context,
-    (
-      authorized_time.evidence.value
-      if authorized_time is not None
-      else None
-    ),
+
+  mon_ver_info: MonVerInfo | None = None
+  ack_aiding_configuration_attempted = False
+  trusted_time_assistance_sent = False
+  time_assistance_source = None
+  time_assistance_utc = None
+  yuma_time_anchor_utc = None
+  yuma_time_anchor_source = None
+  yuma_time_anchor_monotonic = None
+  diagnostic_context = None
+  navigation_assistance_restore_result: (
+    NavigationAssistanceRestoreResult | None
+  ) = None
+  navigation_assistance_restore_attempted = False
+  next_time_assistance_attempt = (
+    cycle_started_at + TIME_SYNC_CHECK_INTERVAL
   )
 
+  def pre_acquisition_initialization() -> None:
+    nonlocal mon_ver_info
+    nonlocal ack_aiding_configuration_attempted
+    nonlocal trusted_time_assistance_sent
+    nonlocal time_assistance_source
+    nonlocal time_assistance_utc
+    nonlocal yuma_time_anchor_utc
+    nonlocal yuma_time_anchor_source
+    nonlocal yuma_time_anchor_monotonic
+    nonlocal diagnostic_context
+    nonlocal navigation_assistance_restore_result
+    nonlocal navigation_assistance_restore_attempted
+    nonlocal next_time_assistance_attempt
+
+    if collect_mon_ver_diagnostics:
+      mon_ver_info = log_mon_ver_diagnostics(pigeon)
+    else:
+      try:
+        mon_ver_info = poll_mon_ver(pigeon)
+      except Exception:
+        cloudlog.exception("GPS MON-VER compatibility poll failed")
+        mon_ver_info = None
+    log_navx5_ack_aiding_support(mon_ver_info)
+    configure_navx5_ack_aiding(pigeon, mon_ver_info)
+    ack_aiding_configuration_attempted = True
+
+    attempt_started_at = time.monotonic()
+    if authorized_time is not None:
+      yuma_time_anchor_utc = authorized_time.utc
+      yuma_time_anchor_source = authorized_time.evidence.value
+      yuma_time_anchor_monotonic = time.monotonic()
+      diagnostic_context = startup_diagnostics.time_assistance_context(
+        yuma_time_anchor_monotonic
+      )
+
+    navigation_assistance_restore_result = restore_navigation_assistance(
+      pigeon,
+      receiver_fingerprint,
+      diagnostic_context=diagnostic_context,
+      time_assistance_source=(
+        authorized_time.evidence.value
+        if authorized_time is not None
+        else None
+      ),
+      trusted_now=(
+        authorized_time.utc if authorized_time is not None else None
+      ),
+      navigation_database_runtime=database_runtime,
+      authorized_time=authorized_time,
+    )
+    navigation_assistance_restore_attempted = True
+
+    if authorized_time is not None:
+      time_assistance_utc = authorized_time.utc
+      trusted_time_assistance_sent = send_time_assistance(
+        pigeon,
+        assistance_time=authorized_time.utc,
+        accuracy_seconds=authorized_time.mga_accuracy_seconds,
+        source=authorized_time.evidence.value,
+        diagnostic_context=diagnostic_context,
+        time_provenance=provenance,
+        assistance_boottime_seconds=getattr(
+          authorized_time,
+          "observed_boottime_seconds",
+          None,
+        ),
+        independent=authorized_time.independent,
+        source_provenance=authorized_time.provenance,
+      )
+      if trusted_time_assistance_sent:
+        time_assistance_source = authorized_time.evidence.value
+      next_time_assistance_attempt = (
+        attempt_started_at + TIME_ASSISTANCE_RETRY_INTERVAL
+      )
+    else:
+      next_time_assistance_attempt = (
+        attempt_started_at + TIME_SYNC_CHECK_INTERVAL
+      )
+
+  with install_pre_acquisition_initialization(
+    pre_acquisition_initialization
+  ) as initialization:
+    init(pigeon)
+
+  if not initialization.executed:
+    # A custom initialization implementation did not support the controlled
+    # pre-acquisition hook. Fail closed before evaluating the database.
+    database_runtime.note_acquisition_started()
+    initialization.run()
+
+  provenance.enable_receiver_observations(time.monotonic())
+
+  assistnow_autonomous_configuration_attempted = False
   assistnow_autonomous_supported = log_assistnow_autonomous_support(
     mon_ver_info
   )
@@ -3612,31 +3741,28 @@ def initialize_receiver_cycle(
     configure_assistnow_autonomous(pigeon, mon_ver_info)
     assistnow_autonomous_configuration_attempted = True
   else:
-    cloudlog.info("GPS AssistNow Autonomous configuration deferred: reason=absolute_time_unavailable")
+    cloudlog.info(
+      "GPS AssistNow Autonomous configuration deferred: "
+      + "reason=absolute_time_unavailable"
+    )
 
   if collect_mon_ver_diagnostics:
     try:
       log_acquisition_configuration_diagnostics(pigeon, mon_ver_info)
     except Exception:
-      cloudlog.exception("GPS acquisition configuration diagnostics failed")
+      cloudlog.exception(
+        "GPS acquisition configuration diagnostics failed"
+      )
 
   return ReceiverCycleInitialization(
-    trusted_time_assistance_sent=(
-      trusted_time_assistance_sent
-    ),
-    next_time_assistance_attempt=(
-      next_time_assistance_attempt
-    ),
+    trusted_time_assistance_sent=trusted_time_assistance_sent,
+    next_time_assistance_attempt=next_time_assistance_attempt,
     navigation_assistance_restore_attempted=(
       navigation_assistance_restore_attempted
     ),
     mon_ver_info=mon_ver_info,
-    ack_aiding_configuration_attempted=(
-      ack_aiding_configuration_attempted
-    ),
-    assistnow_autonomous_supported=(
-      assistnow_autonomous_supported
-    ),
+    ack_aiding_configuration_attempted=ack_aiding_configuration_attempted,
+    assistnow_autonomous_supported=assistnow_autonomous_supported,
     assistnow_autonomous_configuration_attempted=(
       assistnow_autonomous_configuration_attempted
     ),
@@ -3645,14 +3771,10 @@ def initialize_receiver_cycle(
       navigation_assistance_restore_result
     ),
     time_assistance_utc=(
-      time_assistance_utc
-      if trusted_time_assistance_sent
-      else None
+      time_assistance_utc if trusted_time_assistance_sent else None
     ),
     time_assistance_source=(
-      time_assistance_source
-      if trusted_time_assistance_sent
-      else None
+      time_assistance_source if trusted_time_assistance_sent else None
     ),
     yuma_time_anchor_utc=yuma_time_anchor_utc,
     yuma_time_anchor_source=yuma_time_anchor_source,
@@ -3753,6 +3875,8 @@ def yuma_database_restore_state(
       return YumaDatabaseRestoreState(result.status.value)
     except (AttributeError, ValueError):
       return YumaDatabaseRestoreState.FAILED
+  if disposition is NavigationDatabaseRestoreDisposition.PENDING:
+    return YumaDatabaseRestoreState.PENDING
   if disposition.database_available:
     return YumaDatabaseRestoreState.COMPLETE
   return YumaDatabaseRestoreState.FAILED

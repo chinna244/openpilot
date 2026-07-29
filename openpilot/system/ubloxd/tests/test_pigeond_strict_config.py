@@ -38,12 +38,7 @@ def network_host_observation():
 
 
 def ubx_frame(message_class: int, message_id: int, payload: bytes) -> bytes:
-  return add_ubx_checksum(
-    b"\xb5\x62"
-    + bytes((message_class, message_id))
-    + len(payload).to_bytes(2, "little")
-    + payload
-  )
+  return add_ubx_checksum(b"\xb5\x62" + bytes((message_class, message_id)) + len(payload).to_bytes(2, "little") + payload)
 
 
 def cfg_ack(message_id: int, *, accepted: bool = True) -> bytes:
@@ -68,11 +63,7 @@ def cfg_rate_frame(
   navigation_rate: int = 1,
   time_reference: int = 0,
 ) -> bytes:
-  payload = (
-    measurement_period_ms.to_bytes(2, "little")
-    + navigation_rate.to_bytes(2, "little")
-    + time_reference.to_bytes(2, "little")
-  )
+  payload = measurement_period_ms.to_bytes(2, "little") + navigation_rate.to_bytes(2, "little") + time_reference.to_bytes(2, "little")
   return ubx_frame(0x06, 0x08, payload)
 
 
@@ -120,7 +111,9 @@ def cfg_msg_frame(message_class: int, message_id: int, uart1_rate: int = 1) -> b
 
 def sos_frame(command: int, response: int) -> bytes:
   return ubx_frame(
-    0x09, 0x14, bytes((command, 0, 0, 0, response, 0, 0, 0)),
+    0x09,
+    0x14,
+    bytes((command, 0, 0, 0, response, 0, 0, 0)),
   )
 
 
@@ -222,10 +215,13 @@ def test_cfg_ack_like_bytes_inside_another_frame_do_not_match():
   assert pigeon.receive_normal() == (b"", [outer])
 
 
-@pytest.mark.parametrize(("responses", "expected"), [
-  (lambda: cfg_ack(0x08) + cfg_ack(0x08, accepted=False), True),
-  (lambda: cfg_ack(0x08, accepted=False) + cfg_ack(0x08), False),
-])
+@pytest.mark.parametrize(
+  ("responses", "expected"),
+  [
+    (lambda: cfg_ack(0x08) + cfg_ack(0x08, accepted=False), True),
+    (lambda: cfg_ack(0x08, accepted=False) + cfg_ack(0x08), False),
+  ],
+)
 def test_cfg_ack_and_nak_in_one_read_follow_frame_order(responses, expected):
   pigeon = ScriptedPigeon((responses(),))
   transaction = pigeon.begin_response_transaction(cfg_write(0x08))
@@ -266,16 +262,30 @@ def test_delayed_same_key_ack_cannot_satisfy_next_receiver_cycle():
   pigeon = ScriptedPigeon((b"", b""))
 
   first = pigeon.begin_response_transaction(cfg_write(0x08, b"first"))
-  assert pigeond.wait_for_cfg_ack(
-    pigeon, first, 0x06, 0x08, timeout=0.005,
-  ) is None
+  assert (
+    pigeond.wait_for_cfg_ack(
+      pigeon,
+      first,
+      0x06,
+      0x08,
+      timeout=0.005,
+    )
+    is None
+  )
 
   pigeon.available.append(acknowledgment)
   pigeon.reset_response_state()
   second = pigeon.begin_response_transaction(cfg_write(0x08, b"second"))
-  assert pigeond.wait_for_cfg_ack(
-    pigeon, second, 0x06, 0x08, timeout=0.005,
-  ) is None
+  assert (
+    pigeond.wait_for_cfg_ack(
+      pigeon,
+      second,
+      0x06,
+      0x08,
+      timeout=0.005,
+    )
+    is None
+  )
   assert pigeon.published == [acknowledgment]
   assert pigeon.receive_normal() == (b"", [acknowledgment])
 
@@ -291,17 +301,31 @@ def test_same_key_ack_after_official_response_window_is_not_reused(monkeypatch):
   pigeon = ScriptedPigeon((b"", b""))
 
   first = pigeon.begin_response_transaction(cfg_write(0x08, b"first"))
-  assert pigeond.wait_for_cfg_ack(
-    pigeon, first, 0x06, 0x08, timeout=pigeond.CFG_ACK_TIMEOUT,
-  ) is None
+  assert (
+    pigeond.wait_for_cfg_ack(
+      pigeon,
+      first,
+      0x06,
+      0x08,
+      timeout=pigeond.CFG_ACK_TIMEOUT,
+    )
+    is None
+  )
   assert clock.now > 1.1
 
   pigeon.available.append(cfg_ack(0x08))
   pigeon.reset_response_state()
   second = pigeon.begin_response_transaction(cfg_write(0x08, b"second"))
-  assert pigeond.wait_for_cfg_ack(
-    pigeon, second, 0x06, 0x08, timeout=0.005,
-  ) is None
+  assert (
+    pigeond.wait_for_cfg_ack(
+      pigeon,
+      second,
+      0x06,
+      0x08,
+      timeout=0.005,
+    )
+    is None
+  )
 
 
 def test_consecutive_cfg_prt_polls_correlate_same_message_id_by_payload():
@@ -340,27 +364,32 @@ def test_cfg_prt_wrong_port_id_fails():
     pigeond.poll_cfg_prt(pigeon, 1, timeout=0.005)
 
 
-@pytest.mark.parametrize(("port_id", "field", "fails"), [
-  (1, "baud_rate", True),
-  (1, "mode", True),
-  (1, "input_protocol_mask", True),
-  (1, "output_protocol_mask", True),
-  (1, "flags", True),
-  (0, "baud_rate", False),
-  (0, "flags", True),
-  (3, "baud_rate", False),
-  (3, "mode", False),
-  (3, "input_protocol_mask", True),
-  (3, "flags", False),
-  (4, "baud_rate", False),
-  (4, "flags", True),
-])
+@pytest.mark.parametrize(
+  ("port_id", "field", "fails"),
+  [
+    (1, "baud_rate", True),
+    (1, "mode", True),
+    (1, "input_protocol_mask", True),
+    (1, "output_protocol_mask", True),
+    (1, "flags", True),
+    (0, "baud_rate", False),
+    (0, "flags", True),
+    (3, "baud_rate", False),
+    (3, "mode", False),
+    (3, "input_protocol_mask", True),
+    (3, "flags", False),
+    (4, "baud_rate", False),
+    (4, "flags", True),
+  ],
+)
 def test_cfg_prt_verifies_only_fields_explicit_for_port(port_id, field, fails):
   expected = expected_port_config(port_id)
-  actual = expected.__class__(**{
-    **expected.__dict__,
-    field: getattr(expected, field) ^ 1,
-  })
+  actual = expected.__class__(
+    **{
+      **expected.__dict__,
+      field: getattr(expected, field) ^ 1,
+    }
+  )
   if fails:
     with pytest.raises(pigeond.ReceiverConfigurationError, match="CFG-PRT"):
       pigeond.verify_cfg_prt_config(actual, expected)
@@ -613,11 +642,13 @@ def test_pending_frames_dispatch_between_mga_dbd_restore_frames(monkeypatch):
   )
   nav = nav_pvt_frame()
   rawx = rawx_frame()
-  pigeon = ScriptedPigeon((
-    mga_ack(position, accepted=True),
-    nav + mga_ack(database_frames[0], accepted=True),
-    rawx + mga_ack(database_frames[1], accepted=True),
-  ))
+  pigeon = ScriptedPigeon(
+    (
+      mga_ack(position, accepted=True),
+      nav + mga_ack(database_frames[0], accepted=True),
+      rawx + mga_ack(database_frames[1], accepted=True),
+    )
+  )
   dispatched = []
   pigeon._frame_dispatcher = lambda frames: dispatched.extend(frames)
   cache = SimpleNamespace(
@@ -633,7 +664,7 @@ def test_pending_frames_dispatch_between_mga_dbd_restore_frames(monkeypatch):
   monkeypatch.setattr(pigeond, "read_host_time_observation", lambda: None)
   monkeypatch.setattr(pigeond, "load_cache", lambda *args, **kwargs: cache)
 
-  result = pigeond.restore_navigation_assistance(pigeon, "receiver")
+  result = pigeond.restore_navigation_assistance(pigeon, "receiver", allow_legacy_direct_restore=True)
   assert result.status is pigeond.NavigationAssistanceRestoreStatus.COMPLETE
   assert result.accepted_frame_count == 2
   assert dispatched == [nav, rawx]
@@ -787,13 +818,11 @@ def test_queue_overflow_during_mga_restore_returns_failed_result(monkeypatch):
   monkeypatch.setattr(pigeond, "read_host_time_observation", lambda: None)
   monkeypatch.setattr(pigeond, "load_cache", lambda *args, **kwargs: cache)
 
-  result = pigeond.restore_navigation_assistance(pigeon, "receiver")
+  result = pigeond.restore_navigation_assistance(pigeon, "receiver", allow_legacy_direct_restore=True)
   assert result.status is pigeond.NavigationAssistanceRestoreStatus.FAILED
   assert result.accepted_frame_count == 0
   assert result.failure_phase is pigeond.NavigationAssistanceRestoreFailurePhase.POSITION_ASSISTANCE_WRITE
   assert len(pigeon._pending_frames) == 2
-
-
 
 
 def test_cfg_ack_between_half_and_one_second_is_accepted(monkeypatch):
@@ -876,7 +905,9 @@ def test_init_pigeon_retries_after_matching_nak(monkeypatch, failures):
     pigeond,
     "poll_cfg_msg",
     lambda _pigeon, message_class, message_id: MessageRateConfig(
-      message_class, message_id, (0, 1, 0, 0, 0, 0),
+      message_class,
+      message_id,
+      (0, 1, 0, 0, 0, 0),
     ),
   )
   monkeypatch.setattr(pigeond, "Params", lambda: type("Params", (), {"get": lambda self, key: None})())
@@ -912,7 +943,9 @@ def test_init_pigeon_timeout_then_successful_retry(monkeypatch):
     pigeond,
     "poll_cfg_msg",
     lambda _pigeon, message_class, message_id: MessageRateConfig(
-      message_class, message_id, (0, 1, 0, 0, 0, 0),
+      message_class,
+      message_id,
+      (0, 1, 0, 0, 0, 0),
     ),
   )
   monkeypatch.setattr(pigeond, "Params", lambda: type("Params", (), {"get": lambda self, key: None})())
@@ -1031,16 +1064,9 @@ def test_end_to_end_hpg_1_40_protocol_20_30_initialization(monkeypatch):
   pigeon = ScriptedPigeon(responses)
 
   assert pigeond.init_pigeon(pigeon)
-  cfg_prt_polls = [
-    message for message in pigeon.sent
-    if message[2:4] == b"\x06\x00" and message[4:6] == b"\x01\x00"
-  ]
-  assert cfg_prt_polls == [
-    pigeond.build_cfg_prt_poll_message(port) for port in (0, 1, 3, 4)
-  ]
-  assert not any(
-    message[2:6] == b"\x06\x00\x00\x00" for message in pigeon.sent
-  )
+  cfg_prt_polls = [message for message in pigeon.sent if message[2:4] == b"\x06\x00" and message[4:6] == b"\x01\x00"]
+  assert cfg_prt_polls == [pigeond.build_cfg_prt_poll_message(port) for port in (0, 1, 3, 4)]
+  assert not any(message[2:6] == b"\x06\x00\x00\x00" for message in pigeon.sent)
   assert not pigeon.responses
   assert not pigeon.available
 
@@ -1070,11 +1096,14 @@ def test_cfg_odo_other_documented_low_flag_bits_fail(flags):
     )
 
 
-@pytest.mark.parametrize(("acknowledgment", "time_assistance_expected"), [
-  (pigeond.MgaAck(True, 1, 0, 0, 0x40, b"\x10\x00\x00\x80"), True),
-  (pigeond.MgaAck(False, 0, 0, 1, 0x40, b"\x10\x00\x00\x80"), False),
-  (None, False),
-])
+@pytest.mark.parametrize(
+  ("acknowledgment", "time_assistance_expected"),
+  [
+    (pigeond.MgaAck(True, 1, 0, 0, 0x40, b"\x10\x00\x00\x80"), True),
+    (pigeond.MgaAck(False, 0, 0, 1, 0x40, b"\x10\x00\x00\x80"), False),
+    (None, False),
+  ],
+)
 def test_cache_restore_is_independent_of_time_assistance_ack(
   monkeypatch,
   acknowledgment,
@@ -1104,7 +1133,10 @@ def test_cache_restore_is_independent_of_time_assistance_ack(
   monkeypatch.setattr(pigeond, "configure_assistnow_autonomous", lambda *args: None)
 
   result = pigeond.initialize_receiver_cycle(
-    ScriptedPigeon(), "receiver", Diagnostics(), "process_start",
+    ScriptedPigeon(),
+    "receiver",
+    Diagnostics(),
+    "process_start",
   )
   assert result.trusted_time_assistance_sent is time_assistance_expected
   assert result.navigation_assistance_restore_attempted is True
@@ -1130,10 +1162,12 @@ def test_time_assistance_observation_failure_is_not_success(monkeypatch):
 def test_real_mga_rejection_then_later_checksum_valid_acceptance():
   assistance_time = datetime(2026, 7, 10, tzinfo=UTC)
   message = pigeond.build_time_assistance_message(assistance_time)
-  pigeon = ScriptedPigeon((
-    mga_ack(message, accepted=False),
-    mga_ack(message, accepted=True),
-  ))
+  pigeon = ScriptedPigeon(
+    (
+      mga_ack(message, accepted=False),
+      mga_ack(message, accepted=True),
+    )
+  )
 
   assert not pigeond.send_time_assistance(pigeon, assistance_time=assistance_time)
   assert pigeond.send_time_assistance(pigeon, assistance_time=assistance_time)
@@ -1145,7 +1179,9 @@ def test_real_mga_timeout_then_later_checksum_valid_acceptance():
   pigeon = ScriptedPigeon((b"", mga_ack(message, accepted=True)))
 
   assert not pigeond.send_time_assistance(
-    pigeon, assistance_time=assistance_time, ack_timeout=0.005,
+    pigeon,
+    assistance_time=assistance_time,
+    ack_timeout=0.005,
   )
   assert pigeond.send_time_assistance(pigeon, assistance_time=assistance_time)
 

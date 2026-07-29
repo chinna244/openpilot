@@ -28,11 +28,7 @@ def network_host_observation():
 
 def database_frame() -> bytes:
   payload = b"database"
-  return add_ubx_checksum(
-    b"\xB5\x62\x13\x80"
-    + len(payload).to_bytes(2, "little")
-    + payload
-  )
+  return add_ubx_checksum(b"\xb5\x62\x13\x80" + len(payload).to_bytes(2, "little") + payload)
 
 
 def test_restore_result_exposes_selected_cache_timestamp(
@@ -95,12 +91,10 @@ def test_restore_result_exposes_selected_cache_timestamp(
     "receiver",
     trusted_now=datetime(2026, 7, 21, 12, tzinfo=UTC),
     time_assistance_source="synchronized",
+    allow_legacy_direct_restore=True,
   )
 
-  assert (
-    result.status
-    is pigeond.NavigationAssistanceRestoreStatus.COMPLETE
-  )
+  assert result.status is pigeond.NavigationAssistanceRestoreStatus.COMPLETE
   assert result.cache_saved_at_utc == SAVED_AT
   assert result.restored_cache_generation == "primary"
   assert result.restored_cache_selection_reason == "test_selection"
@@ -112,9 +106,7 @@ def test_restore_result_exposes_selected_cache_timestamp(
   assert result.captured_gps_startup_ready is False
   assert result.restored_gps_ephemeris_fresh
   assert not result.restored_glonass_ephemeris_fresh
-  assert result.restored_quality_expiration_reasons == (
-    "glonass_ephemeris_expired",
-  )
+  assert result.restored_quality_expiration_reasons == ("glonass_ephemeris_expired",)
   assert result.restored_navigation_quality is not None
   assert result.restored_gps_almanac_available == 10
   assert result.restored_glonass_almanac_available == 9
@@ -147,10 +139,7 @@ def test_restore_result_exposes_selected_cache_timestamp(
       yuma_time_anchor_monotonic=None,
     )
   )
-  assert (
-    runtime.restored_navigation_quality
-    is result.restored_navigation_quality
-  )
+  assert runtime.restored_navigation_quality is result.restored_navigation_quality
 
 
 def test_restore_result_downgrades_stale_captured_startup_quality(
@@ -213,6 +202,7 @@ def test_restore_result_downgrades_stale_captured_startup_quality(
     "receiver",
     trusted_now=SAVED_AT + timedelta(hours=16, minutes=47),
     time_assistance_source="network_synchronized",
+    allow_legacy_direct_restore=True,
   )
 
   assert result.captured_gps_ephemeris_available == 5
@@ -292,10 +282,7 @@ def test_initialize_receiver_cycle_preserves_restore_result(
     "process_start",
   )
 
-  assert (
-    initialization.navigation_assistance_restore_result
-    is restore_result
-  )
+  assert initialization.navigation_assistance_restore_result is restore_result
 
 
 def _stub_receiver_initialization_dependencies(
@@ -326,6 +313,23 @@ def _stub_receiver_initialization_dependencies(
     pigeond,
     "send_time_assistance",
     lambda *args, **kwargs: send_time_result,
+  )
+  authorized = (
+    SimpleNamespace(
+      utc=datetime(2026, 7, 23, 13, 0, tzinfo=UTC),
+      evidence=SimpleNamespace(value="system_synchronized"),
+      mga_accuracy_seconds=30,
+      independent=True,
+      provenance=SimpleNamespace(value="network_independent"),
+      observed_boottime_seconds=100.0,
+    )
+    if trusted_time
+    else None
+  )
+  monkeypatch.setattr(
+    pigeond,
+    "evaluate_time_authority",
+    lambda *_args, **_kwargs: SimpleNamespace(authorized_time=authorized),
   )
   monkeypatch.setattr(
     pigeond,
@@ -477,22 +481,17 @@ def test_capture_tracker_exposes_latest_nav_sat_and_time():
   assert tracker.latest_nav_sat is None
   assert tracker.latest_nav_sat_time is None
 
+
 def _mga_message() -> bytes:
   payload = bytes((0x01, 0x00, 0x00, 0x00))
-  return add_ubx_checksum(
-    b"\xB5\x62\x13\x40"
-    + len(payload).to_bytes(2, "little")
-    + payload
-  )
+  return add_ubx_checksum(b"\xb5\x62\x13\x40" + len(payload).to_bytes(2, "little") + payload)
 
 
 def test_strict_mga_ack_classifies_receiver_write_failure(monkeypatch):
   monkeypatch.setattr(
     pigeond,
     "_begin_response_transaction",
-    lambda pigeon, message: (_ for _ in ()).throw(
-      OSError("injected write failure")
-    ),
+    lambda pigeon, message: (_ for _ in ()).throw(OSError("injected write failure")),
   )
 
   with pytest.raises(pigeond.MgaWriteError):
@@ -508,11 +507,7 @@ def test_strict_mga_ack_classifies_transaction_failure(monkeypatch):
   monkeypatch.setattr(
     pigeond,
     "wait_for_matching_mga_ack",
-    lambda *args, **kwargs: (_ for _ in ()).throw(
-      pigeond.ResponseTransactionError(
-        "injected transaction failure"
-      )
-    ),
+    lambda *args, **kwargs: (_ for _ in ()).throw(pigeond.ResponseTransactionError("injected transaction failure")),
   )
 
   with pytest.raises(pigeond.MgaTransactionError):
@@ -525,9 +520,7 @@ def test_strict_mga_ack_does_not_wrap_programming_type_error(
   monkeypatch.setattr(
     pigeond,
     "_begin_response_transaction",
-    lambda pigeon, message: (_ for _ in ()).throw(
-      TypeError("injected programming failure")
-    ),
+    lambda pigeon, message: (_ for _ in ()).throw(TypeError("injected programming failure")),
   )
 
   with pytest.raises(TypeError, match="programming failure"):
@@ -559,9 +552,7 @@ def test_strict_mga_ack_preserves_raised_timeout(monkeypatch):
   monkeypatch.setattr(
     pigeond,
     "wait_for_matching_mga_ack",
-    lambda *args, **kwargs: (_ for _ in ()).throw(
-      TimeoutError("injected ACK timeout")
-    ),
+    lambda *args, **kwargs: (_ for _ in ()).throw(TimeoutError("injected ACK timeout")),
   )
 
   with pytest.raises(TimeoutError, match="injected ACK timeout"):
@@ -596,7 +587,7 @@ def test_strict_mga_ack_keeps_malformed_message_nonretryable():
     pigeond.CacheValidationError,
     match="truncated",
   ) as raised:
-    pigeond.send_mga_with_strict_ack(object(), b"\xB5\x62")
+    pigeond.send_mga_with_strict_ack(object(), b"\xb5\x62")
 
   assert not isinstance(
     raised.value,

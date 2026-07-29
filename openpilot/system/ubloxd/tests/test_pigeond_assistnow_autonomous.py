@@ -44,9 +44,16 @@ def expected_port_config(port_id: int) -> pigeond.PortConfig:
     3: pigeond.PortConfig(3, 0, 0, 0, 1, 1, 0),
     4: pigeond.PortConfig(4, 0, 0, 0, 0, 0, 0),
   }[port_id]
+
+
 LEGACY_NAVX5_MESSAGE = bytes.fromhex("b56206232800000000040000000000000000000000000001000000000000000000000000000000000000000000005624")
 NAVX5_RESERVED_RANGES = (
-  (8, 10), (13, 14), (15, 17), (21, 26), (28, 30), (32, 39),
+  (8, 10),
+  (13, 14),
+  (15, 17),
+  (21, 26),
+  (28, 30),
+  (32, 39),
 )
 
 
@@ -88,41 +95,36 @@ def autonomous_supported(monkeypatch):
   )
 
 
-@pytest.mark.parametrize(("software_version", "supported"), [
-  ("EXT CORE 3.01", True),
-  ("EXT CORE 3.01 (db0c89)", True),
-  ("EXT CORE 3.01 (BUILD_2026-07.14)", True),
-  ("EXT CORE 3.010", False),
-  ("EXT CORE 3.01beta", False),
-  ("EXT CORE 3.01 arbitrary text", False),
-  ("EXT CORE 3.01 ()", False),
-  ("EXT CORE 3.01 (db0c89", False),
-  (f"EXT CORE 3.01 ({'a' * 33})", False),
-])
+@pytest.mark.parametrize(
+  ("software_version", "supported"),
+  [
+    ("EXT CORE 3.01", True),
+    ("EXT CORE 3.01 (db0c89)", True),
+    ("EXT CORE 3.01 (BUILD_2026-07.14)", True),
+    ("EXT CORE 3.010", False),
+    ("EXT CORE 3.01beta", False),
+    ("EXT CORE 3.01 arbitrary text", False),
+    ("EXT CORE 3.01 ()", False),
+    ("EXT CORE 3.01 (db0c89", False),
+    (f"EXT CORE 3.01 ({'a' * 33})", False),
+  ],
+)
 def test_navx5_ack_aiding_software_version_compatibility(software_version, supported):
   actual, _ = pigeond.navx5_ack_aiding_compatibility(mon_ver(software_version))
   assert actual is supported
 
 
 def test_valid_software_with_wrong_protocol_is_rejected():
-  assert pigeond.navx5_ack_aiding_compatibility(
-    mon_ver("EXT CORE 3.01 (db0c89)", protocol_version="PROTVER=20.20")
-  ) == (False, "unsupported_protocol_version")
+  assert pigeond.navx5_ack_aiding_compatibility(mon_ver("EXT CORE 3.01 (db0c89)", protocol_version="PROTVER=20.20")) == (False, "unsupported_protocol_version")
 
 
 def test_valid_software_with_wrong_firmware_is_rejected():
-  assert pigeond.navx5_ack_aiding_compatibility(
-    mon_ver("EXT CORE 3.01 (db0c89)", firmware_version="FWVER=HPG 1.40")
-  ) == (False, "unsupported_firmware_version")
+  assert pigeond.navx5_ack_aiding_compatibility(mon_ver("EXT CORE 3.01 (db0c89)", firmware_version="FWVER=HPG 1.40")) == (False, "unsupported_firmware_version")
 
 
 def test_exact_hpg_receiver_has_separate_feature_compatibility():
-  assert pigeond.navx5_ack_aiding_compatibility(
-    HPG_1_40_ROVER_MON_VER
-  ) == (True, "m8_hpg_1_40_protver_20_30")
-  assert pigeond.assistnow_autonomous_compatibility(
-    HPG_1_40_ROVER_MON_VER
-  ) == (
+  assert pigeond.navx5_ack_aiding_compatibility(HPG_1_40_ROVER_MON_VER) == (True, "m8_hpg_1_40_protver_20_30")
+  assert pigeond.assistnow_autonomous_compatibility(HPG_1_40_ROVER_MON_VER) == (
     False,
     "hpg_1_40_rover_assistnow_autonomous_unsupported",
   )
@@ -136,9 +138,7 @@ def test_startup_support_logging_separates_ack_aiding_and_autonomous(monkeypatch
 
   assert pigeond.log_navx5_ack_aiding_support(HPG_1_40_ROVER_MON_VER)
   assert not pigeond.log_assistnow_autonomous_support(HPG_1_40_ROVER_MON_VER)
-  assert pigeond.configure_assistnow_autonomous(
-    object(), HPG_1_40_ROVER_MON_VER
-  ) is pigeond.AssistNowAutonomousConfigurationResult.UNSUPPORTED
+  assert pigeond.configure_assistnow_autonomous(object(), HPG_1_40_ROVER_MON_VER) is pigeond.AssistNowAutonomousConfigurationResult.UNSUPPORTED
 
   assert info_logs == [
     "GPS NAVX5 ACK aiding support, supported=true, reason=m8_hpg_1_40_protver_20_30",
@@ -150,11 +150,14 @@ def test_startup_support_logging_separates_ack_aiding_and_autonomous(monkeypatch
   assert all("verification failed" not in message for message in warning_logs)
 
 
-@pytest.mark.parametrize("info", [
-  None,
-  MonVerInfo("EXT CORE 3.01", "00080000", ("FWVER=HPG 1.40ROV",)),
-  MonVerInfo("EXT CORE 3.01", "00080000", ("FWVER=SPG 3.01", "PROTVER=20.30")),
-])
+@pytest.mark.parametrize(
+  "info",
+  [
+    None,
+    MonVerInfo("EXT CORE 3.01", "00080000", ("FWVER=HPG 1.40ROV",)),
+    MonVerInfo("EXT CORE 3.01", "00080000", ("FWVER=SPG 3.01", "PROTVER=20.30")),
+  ],
+)
 def test_unknown_receiver_is_not_assumed_autonomous_supported(info):
   assert not pigeond.assistnow_autonomous_compatibility(info)[0]
 
@@ -246,17 +249,18 @@ def test_ack_aiding_configuration_acknowledged_and_verified(monkeypatch):
 def test_ack_aiding_already_enabled_does_not_write(monkeypatch):
   monkeypatch.setattr(pigeond, "poll_navx5_config", lambda pigeon: navx5_config(ack_aiding=True))
   pigeon = type("Pigeon", (), {"send": lambda self, message: pytest.fail("must not write NAVX5")})()
-  assert pigeond.configure_navx5_ack_aiding(pigeon, HPG_1_40_ROVER_MON_VER) is (
-    pigeond.Navx5AckAidingConfigurationResult.ALREADY_ENABLED
-  )
+  assert pigeond.configure_navx5_ack_aiding(pigeon, HPG_1_40_ROVER_MON_VER) is (pigeond.Navx5AckAidingConfigurationResult.ALREADY_ENABLED)
 
 
-@pytest.mark.parametrize(("ack", "readback", "expected"), [
-  (False, None, pigeond.Navx5AckAidingConfigurationResult.WRITE_REJECTED),
-  (None, None, pigeond.Navx5AckAidingConfigurationResult.WRITE_TIMED_OUT),
-  (True, None, pigeond.Navx5AckAidingConfigurationResult.READBACK_UNAVAILABLE),
-  (True, navx5_config(ack_aiding=False), pigeond.Navx5AckAidingConfigurationResult.READBACK_ACK_AIDING_FALSE),
-])
+@pytest.mark.parametrize(
+  ("ack", "readback", "expected"),
+  [
+    (False, None, pigeond.Navx5AckAidingConfigurationResult.WRITE_REJECTED),
+    (None, None, pigeond.Navx5AckAidingConfigurationResult.WRITE_TIMED_OUT),
+    (True, None, pigeond.Navx5AckAidingConfigurationResult.READBACK_UNAVAILABLE),
+    (True, navx5_config(ack_aiding=False), pigeond.Navx5AckAidingConfigurationResult.READBACK_ACK_AIDING_FALSE),
+  ],
+)
 def test_ack_aiding_failure_results_are_distinct(monkeypatch, ack, readback, expected):
   configs = iter((navx5_config(), readback))
   monkeypatch.setattr(pigeond, "poll_navx5_config", lambda pigeon: next(configs))
@@ -267,61 +271,55 @@ def test_ack_aiding_failure_results_are_distinct(monkeypatch, ack, readback, exp
 
 def test_ack_aiding_navx5_poll_unavailable_is_distinct(monkeypatch):
   monkeypatch.setattr(pigeond, "poll_navx5_config", lambda pigeon: None)
-  assert pigeond.configure_navx5_ack_aiding(
-    object(), HPG_1_40_ROVER_MON_VER
-  ) is pigeond.Navx5AckAidingConfigurationResult.POLL_UNAVAILABLE
+  assert pigeond.configure_navx5_ack_aiding(object(), HPG_1_40_ROVER_MON_VER) is pigeond.Navx5AckAidingConfigurationResult.POLL_UNAVAILABLE
 
 
 def test_aop_navx5_poll_unavailable_is_distinct(monkeypatch, autonomous_supported):
   monkeypatch.setattr(pigeond, "poll_navx5_config", lambda pigeon: None)
-  assert pigeond.configure_assistnow_autonomous(
-    object(), HPG_1_40_ROVER_MON_VER
-  ) is pigeond.AssistNowAutonomousConfigurationResult.POLL_UNAVAILABLE
+  assert pigeond.configure_assistnow_autonomous(object(), HPG_1_40_ROVER_MON_VER) is pigeond.AssistNowAutonomousConfigurationResult.POLL_UNAVAILABLE
 
 
 def test_ack_aiding_unsupported_navx5_version_is_distinct(monkeypatch):
   monkeypatch.setattr(pigeond, "poll_navx5_config", lambda pigeon: navx5_config(version=0))
-  assert pigeond.configure_navx5_ack_aiding(
-    object(), HPG_1_40_ROVER_MON_VER
-  ) is pigeond.Navx5AckAidingConfigurationResult.UNSUPPORTED_NAVX5_VERSION
+  assert pigeond.configure_navx5_ack_aiding(object(), HPG_1_40_ROVER_MON_VER) is pigeond.Navx5AckAidingConfigurationResult.UNSUPPORTED_NAVX5_VERSION
 
 
 def test_aop_unsupported_navx5_version_is_distinct(monkeypatch, autonomous_supported):
   monkeypatch.setattr(pigeond, "poll_navx5_config", lambda pigeon: navx5_config(version=0))
-  assert pigeond.configure_assistnow_autonomous(
-    object(), HPG_1_40_ROVER_MON_VER
-  ) is pigeond.AssistNowAutonomousConfigurationResult.UNSUPPORTED_NAVX5_VERSION
+  assert pigeond.configure_assistnow_autonomous(object(), HPG_1_40_ROVER_MON_VER) is pigeond.AssistNowAutonomousConfigurationResult.UNSUPPORTED_NAVX5_VERSION
 
 
-@pytest.mark.parametrize("info", [
-  None,
-  MonVerInfo("EXT CORE 3.01", "00080000", ("FWVER=HPG 1.40ROV",)),
-  MonVerInfo("EXT CORE 3.01", "00080000", ("FWVER=SPG 3.01", "PROTVER=20.30")),
-])
+@pytest.mark.parametrize(
+  "info",
+  [
+    None,
+    MonVerInfo("EXT CORE 3.01", "00080000", ("FWVER=HPG 1.40ROV",)),
+    MonVerInfo("EXT CORE 3.01", "00080000", ("FWVER=SPG 3.01", "PROTVER=20.30")),
+  ],
+)
 def test_unsupported_or_unknown_receiver_skips(monkeypatch, info):
   monkeypatch.setattr(pigeond, "poll_navx5_config", lambda pigeon: pytest.fail("must not poll NAVX5"))
   result = pigeond.configure_assistnow_autonomous(object(), info)
   assert result is pigeond.AssistNowAutonomousConfigurationResult.UNSUPPORTED
 
 
-@pytest.mark.parametrize("info", [
-  None,
-  MonVerInfo("EXT CORE 3.01", "00080000", ("FWVER=HPG 1.40ROV",)),
-  MonVerInfo("EXT CORE 3.01", "00080000", ("FWVER=SPG 3.01", "PROTVER=20.30")),
-])
+@pytest.mark.parametrize(
+  "info",
+  [
+    None,
+    MonVerInfo("EXT CORE 3.01", "00080000", ("FWVER=HPG 1.40ROV",)),
+    MonVerInfo("EXT CORE 3.01", "00080000", ("FWVER=SPG 3.01", "PROTVER=20.30")),
+  ],
+)
 def test_unsupported_or_unknown_receiver_skips_ack_aiding(monkeypatch, info):
   monkeypatch.setattr(pigeond, "poll_navx5_config", lambda pigeon: pytest.fail("must not poll NAVX5"))
-  assert pigeond.configure_navx5_ack_aiding(object(), info) is (
-    pigeond.Navx5AckAidingConfigurationResult.UNSUPPORTED
-  )
+  assert pigeond.configure_navx5_ack_aiding(object(), info) is (pigeond.Navx5AckAidingConfigurationResult.UNSUPPORTED)
 
 
 def test_hpg_autonomous_skip_performs_no_navx5_poll_write_or_readback(monkeypatch):
   monkeypatch.setattr(pigeond, "poll_navx5_config", lambda pigeon: pytest.fail("must not poll NAVX5"))
   pigeon = type("Pigeon", (), {"send": lambda self, message: pytest.fail("must not write NAVX5")})()
-  assert pigeond.configure_assistnow_autonomous(
-    pigeon, HPG_1_40_ROVER_MON_VER
-  ) is pigeond.AssistNowAutonomousConfigurationResult.UNSUPPORTED
+  assert pigeond.configure_assistnow_autonomous(pigeon, HPG_1_40_ROVER_MON_VER) is pigeond.AssistNowAutonomousConfigurationResult.UNSUPPORTED
 
 
 def test_hpg_autonomous_compatibility_decision_does_not_modify_cache(monkeypatch, tmp_path):
@@ -331,16 +329,17 @@ def test_hpg_autonomous_compatibility_decision_does_not_modify_cache(monkeypatch
   monkeypatch.setattr(pigeond, "GPS_ASSISTANCE_CACHE_PATH", cache_path)
   monkeypatch.setattr(pigeond, "poll_navx5_config", lambda pigeon: pytest.fail("must not poll NAVX5"))
 
-  assert pigeond.configure_assistnow_autonomous(
-    object(), HPG_1_40_ROVER_MON_VER
-  ) is pigeond.AssistNowAutonomousConfigurationResult.UNSUPPORTED
+  assert pigeond.configure_assistnow_autonomous(object(), HPG_1_40_ROVER_MON_VER) is pigeond.AssistNowAutonomousConfigurationResult.UNSUPPORTED
   assert cache_path.read_bytes() == original
 
 
-@pytest.mark.parametrize(("ack", "expected"), [
-  (False, pigeond.AssistNowAutonomousConfigurationResult.WRITE_REJECTED),
-  (None, pigeond.AssistNowAutonomousConfigurationResult.WRITE_TIMED_OUT),
-])
+@pytest.mark.parametrize(
+  ("ack", "expected"),
+  [
+    (False, pigeond.AssistNowAutonomousConfigurationResult.WRITE_REJECTED),
+    (None, pigeond.AssistNowAutonomousConfigurationResult.WRITE_TIMED_OUT),
+  ],
+)
 def test_aop_configuration_rejected_or_timed_out(monkeypatch, autonomous_supported, ack, expected):
   current = navx5_config()
   sent = []
@@ -364,10 +363,13 @@ def test_aop_configuration_acknowledged_and_verified(monkeypatch, autonomous_sup
   assert parse_navx5(sent[0]).use_aop
 
 
-@pytest.mark.parametrize(("readback", "expected"), [
-  (None, pigeond.AssistNowAutonomousConfigurationResult.READBACK_UNAVAILABLE),
-  (navx5_config(use_aop=False), pigeond.AssistNowAutonomousConfigurationResult.READBACK_USE_AOP_FALSE),
-])
+@pytest.mark.parametrize(
+  ("readback", "expected"),
+  [
+    (None, pigeond.AssistNowAutonomousConfigurationResult.READBACK_UNAVAILABLE),
+    (navx5_config(use_aop=False), pigeond.AssistNowAutonomousConfigurationResult.READBACK_USE_AOP_FALSE),
+  ],
+)
 def test_aop_readback_failure_results_are_distinct(monkeypatch, autonomous_supported, readback, expected):
   configs = iter((navx5_config(use_aop=False), readback))
   monkeypatch.setattr(pigeond, "poll_navx5_config", lambda pigeon: next(configs))
@@ -387,9 +389,7 @@ def test_aop_configuration_rejects_unrelated_verification_change(monkeypatch, au
   monkeypatch.setattr(pigeond, "wait_for_cfg_ack", lambda *args: True)
   pigeon = type("Pigeon", (), {"send": lambda self, message: None})()
   result = pigeond.configure_assistnow_autonomous(pigeon, HPG_1_40_ROVER_MON_VER)
-  assert result is (
-    pigeond.AssistNowAutonomousConfigurationResult.READBACK_UNRELATED_FIELDS_CHANGED
-  )
+  assert result is (pigeond.AssistNowAutonomousConfigurationResult.READBACK_UNRELATED_FIELDS_CHANGED)
 
 
 def test_aop_configuration_reports_changed_threshold_distinctly(monkeypatch, autonomous_supported):
@@ -512,7 +512,11 @@ def test_cache_capture_continues_when_aop_status_unavailable(monkeypatch):
   pigeon = type("Pigeon", (), {"send": lambda self, message: events.append(("send", message))})()
   state = pigeond.NavigationCaptureState(capture_reason="onroad")
   result = pigeond.request_navigation_database_capture(
-    pigeon, collector, state, 12.0, assistnow_autonomous_supported=True,
+    pigeon,
+    collector,
+    state,
+    12.0,
+    assistnow_autonomous_supported=True,
   )
   assert result is pigeond.AopCaptureState.UNKNOWN
   assert events == [("start", 12.0), ("send", pigeond.build_database_poll_message())]
@@ -572,11 +576,22 @@ def test_startup_orders_ack_aiding_before_time_and_autonomous_skip_after_restore
   monkeypatch.setattr(pigeond, "restore_navigation_assistance", lambda *args, **kwargs: events.append("restore"))
   monkeypatch.setattr(pigeond, "configure_assistnow_autonomous", lambda *args: events.append("configure"))
   result = pigeond.initialize_receiver_cycle(
-    object(), "receiver", Diagnostics(), "process_start", collect_mon_ver_diagnostics=True,
+    object(),
+    "receiver",
+    Diagnostics(),
+    "process_start",
+    collect_mon_ver_diagnostics=True,
   )
   assert events == [
-    "cycle", "init", "mon_ver", "ack_support", "ack_aiding",
-    "time", "restore", "aop_support", "configure",
+    "cycle",
+    "init",
+    "mon_ver",
+    "ack_support",
+    "ack_aiding",
+    "restore",
+    "time",
+    "aop_support",
+    "configure",
   ]
   assert result.ack_aiding_configuration_attempted
   assert result.navigation_assistance_restore_attempted
@@ -592,11 +607,14 @@ def test_autonomous_configuration_never_requires_online_token(monkeypatch, auton
   assert result is pigeond.AssistNowAutonomousConfigurationResult.ALREADY_ENABLED
 
 
-@pytest.mark.parametrize(("token", "online_error"), [
-  (None, False),
-  ("online-token", False),
-  ("online-token", True),
-])
+@pytest.mark.parametrize(
+  ("token", "online_error"),
+  [
+    (None, False),
+    ("online-token", False),
+    ("online-token", True),
+  ],
+)
 def test_legacy_assistnow_online_path_is_unchanged(monkeypatch, token, online_error):
   online_calls = []
 
@@ -635,7 +653,9 @@ def test_legacy_assistnow_online_path_is_unchanged(monkeypatch, token, online_er
     pigeond,
     "poll_cfg_msg",
     lambda _pigeon, message_class, message_id: pigeond.MessageRateConfig(
-      message_class, message_id, (0, 1, 0, 0, 0, 0),
+      message_class,
+      message_id,
+      (0, 1, 0, 0, 0, 0),
     ),
   )
   pigeon = Pigeon()
@@ -699,8 +719,14 @@ def test_receiver_recovery_cycle_does_not_retry_aop_transaction(monkeypatch):
     assert not result.assistnow_autonomous_supported
     assert result.assistnow_autonomous_configuration_attempted
   assert events == [
-    "init", "ack", "time", "restore",
-    "init", "ack", "time", "restore",
+    "init",
+    "ack",
+    "restore",
+    "time",
+    "init",
+    "ack",
+    "restore",
+    "time",
   ]
 
 
@@ -724,8 +750,12 @@ def test_navx5_poll_failure_does_not_block_normal_startup(monkeypatch):
   monkeypatch.setattr(pigeond, "restore_navigation_assistance", lambda *args, **kwargs: events.append("restore"))
   monkeypatch.setattr(pigeond, "poll_navx5_config", lambda pigeon: None)
   result = pigeond.initialize_receiver_cycle(
-    object(), "receiver", Diagnostics(), "process_start", collect_mon_ver_diagnostics=True,
+    object(),
+    "receiver",
+    Diagnostics(),
+    "process_start",
+    collect_mon_ver_diagnostics=True,
   )
-  assert events == ["cycle", "init", "ack_aiding", "time", "restore"]
+  assert events == ["cycle", "init", "ack_aiding", "restore", "time"]
   assert result.navigation_assistance_restore_attempted
   assert result.assistnow_autonomous_configuration_attempted

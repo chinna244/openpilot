@@ -290,8 +290,8 @@ def test_current_independent_network_time_is_explicit() -> None:
       "same_boot",
       False,
       None,
-      "skip",
-      NavigationDatabaseRestoreDisposition.SKIPPED_UNVERIFIED,
+      "wait",
+      None,
     ),
     (
       False,

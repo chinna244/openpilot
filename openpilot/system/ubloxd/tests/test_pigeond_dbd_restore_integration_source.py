@@ -26,12 +26,17 @@ def calls(node: ast.AST, name: str) -> list[ast.Call]:
   ]
 
 
-def test_initialize_receiver_cycle_has_no_legacy_restore_fallback() -> None:
+def test_initialize_receiver_cycle_uses_boot_scoped_runtime_adapter() -> None:
   source, tree = source_tree(PIGEOND)
   node = named_node(tree, "initialize_receiver_cycle")
-  assert not calls(node, "restore_navigation_assistance")
-  assert calls(node, "NavigationDatabaseRestoreRuntime")
-  assert "navigation_database_runtime: NavigationDatabaseRestoreRuntime | None = None" in source
+  restore_calls = calls(node, "restore_navigation_assistance")
+  assert len(restore_calls) == 1
+  keywords = {keyword.arg for keyword in restore_calls[0].keywords}
+  assert "navigation_database_runtime" in keywords
+  assert "authorized_time" in keywords
+  segment = ast.get_source_segment(source, node)
+  assert segment is not None
+  assert "allow_legacy_direct_restore" not in segment
 
 
 def test_live_loop_reuses_one_runtime_for_all_receiver_cycles() -> None:
@@ -78,13 +83,48 @@ def test_skipped_database_never_populates_restored_quality_fields() -> None:
   assert "captured_gps_almanac_satellite_ids=" in segment
 
 
-def test_yuma_database_state_uses_terminal_disposition() -> None:
+def test_yuma_database_state_preserves_pending_disposition() -> None:
   source, tree = source_tree(PIGEOND)
   node = named_node(tree, "yuma_database_restore_state")
   segment = ast.get_source_segment(source, node)
   assert segment is not None
   assert "disposition = result.database_restore_disposition" in segment
+  assert "if disposition is NavigationDatabaseRestoreDisposition.PENDING" in segment
+  assert "return YumaDatabaseRestoreState.PENDING" in segment
   assert "if disposition.database_available" in segment
+
+
+def test_initial_dbd_decision_precedes_time_and_normal_configuration() -> None:
+  source, tree = source_tree(PIGEOND)
+  init_node = named_node(tree, "init")
+  init_segment = ast.get_source_segment(source, init_node)
+  assert init_segment is not None
+  assert init_segment.index("start_pigeon_transport(pigeon)") < init_segment.index("initialization.run()")
+  assert init_segment.index("initialization.run()") < init_segment.index("finish_pigeon_initialization(pigeon)")
+
+  node = named_node(tree, "initialize_receiver_cycle")
+  segment = ast.get_source_segment(source, node)
+  assert segment is not None
+  restore = segment.index("restore_navigation_assistance(")
+  time_assistance = segment.index("send_time_assistance(")
+  observations = segment.index("provenance.enable_receiver_observations(")
+  assert restore < time_assistance < observations
+  assert "install_pre_acquisition_initialization(" in segment
+
+
+def test_pre_database_setup_does_not_ignore_acquisition_frames() -> None:
+  source, tree = source_tree(PIGEOND)
+  initialize = named_node(tree, "initialize_receiver_cycle")
+  segment = ast.get_source_segment(source, initialize)
+  assert segment is not None
+  assert "poll_mon_ver(pigeon)" in segment
+  assert "configure_navx5_ack_aiding(pigeon, mon_ver_info)" in segment
+
+  unrelated = named_node(tree, "_queue_unrelated_frames")
+  unrelated_segment = ast.get_source_segment(source, unrelated)
+  assert unrelated_segment is not None
+  assert "pigeon.queue_pending_frames(" in unrelated_segment
+  assert "pigeon.dispatch_pending_frames()" in unrelated_segment
 
 
 def test_new_runtime_does_not_power_cycle_or_reinitialize_receiver() -> None:
@@ -115,3 +155,31 @@ def test_pigeond_change_does_not_add_direct_power_cycle_call() -> None:
     "run_receiving",
   ):
     assert not calls(named_node(tree, name), "set_power")
+
+
+def test_controlled_stop_start_brackets_pre_database_window() -> None:
+  source, tree = source_tree(PIGEOND)
+  node = named_node(tree, "paused_gnss_acquisition")
+  segment = ast.get_source_segment(source, node)
+  assert segment is not None
+  assert "pigeon.send(CONTROLLED_GNSS_STOP_MESSAGE)" in segment
+  assert "finally:" in segment
+  assert "pigeon.send(CONTROLLED_GNSS_START_MESSAGE)" in segment
+  assert segment.index("CONTROLLED_GNSS_STOP_MESSAGE") < segment.index("yield")
+  assert segment.index("yield") < segment.index("CONTROLLED_GNSS_START_MESSAGE")
+
+
+def test_power_on_stop_precedes_baud_transition_and_transactions() -> None:
+  source, tree = source_tree(PIGEOND)
+  baud = named_node(tree, "init_baudrate")
+  segment = ast.get_source_segment(source, baud)
+  assert segment is not None
+  power_on_baud = segment.index("pigeon.set_baud(9600)")
+  stop = segment.index("pigeon.send(CONTROLLED_GNSS_STOP_MESSAGE)")
+  baud_transition = segment.index(r'pigeon.send(b"\x24\x50\x55\x42\x58')
+  assert power_on_baud < stop < baud_transition
+
+  initialize = named_node(tree, "initialize_receiver_cycle")
+  initialize_segment = ast.get_source_segment(source, initialize)
+  assert initialize_segment is not None
+  assert initialize_segment.index("restore_navigation_assistance(") < (initialize_segment.index("send_time_assistance("))

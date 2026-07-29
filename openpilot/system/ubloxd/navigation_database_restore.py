@@ -212,13 +212,8 @@ def evaluate_navigation_database_restore(
       NavigationDatabaseRestoreDecisionAction.SKIP,
       NavigationDatabaseRestoreDisposition.SKIPPED_ACQUISITION_ALREADY_STARTED,
     )
-  if authorized_time is None:
+  if authorized_time is None or not is_current_independent_network_time(authorized_time):
     return NavigationDatabaseRestoreDecision(NavigationDatabaseRestoreDecisionAction.WAIT)
-  if not is_current_independent_network_time(authorized_time):
-    return NavigationDatabaseRestoreDecision(
-      NavigationDatabaseRestoreDecisionAction.SKIP,
-      NavigationDatabaseRestoreDisposition.SKIPPED_UNVERIFIED,
-    )
   if (
     isinstance(cache_age_seconds, bool)
     or not isinstance(cache_age_seconds, (int, float))

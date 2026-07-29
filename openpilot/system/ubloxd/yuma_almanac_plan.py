@@ -9,6 +9,7 @@ from openpilot.system.ubloxd.gps_assistance import (
 
 
 class YumaDatabaseRestoreState(StrEnum):
+  PENDING = "pending"
   COMPLETE = "complete"
   PARTIAL = "partial"
   FAILED = "failed"
@@ -33,6 +34,7 @@ class YumaSupplementationReason(StrEnum):
   VISIBLE_GPS_ALMANAC_COMPLETE = "visible_gps_almanac_complete"
   MISSING_VISIBLE_GPS_ALMANAC = "missing_visible_gps_almanac"
   MISSING_VISIBLE_PRNS_NOT_IN_YUMA = "missing_visible_prns_not_in_yuma"
+  WAITING_FOR_DATABASE_RESTORE = "waiting_for_database_restore"
   DATABASE_RESTORE_INCOMPLETE = "database_restore_incomplete"
   RESTORED_GPS_ALMANAC_INCOMPLETE = "restored_gps_almanac_incomplete"
   RESTORED_GPS_ALMANAC_UNKNOWN = "restored_gps_almanac_unknown"
@@ -62,15 +64,8 @@ def _validated_age(
 ) -> float | None:
   if value is None:
     return None
-  if (
-    isinstance(value, bool)
-    or not isinstance(value, (int, float))
-    or not isfinite(value)
-    or value < 0
-  ):
-    raise ValueError(
-      f"{field} must be a non-negative finite number or None"
-    )
+  if isinstance(value, bool) or not isinstance(value, (int, float)) or not isfinite(value) or value < 0:
+    raise ValueError(f"{field} must be a non-negative finite number or None")
   return float(value)
 
 
@@ -80,14 +75,8 @@ def _validated_optional_count(
 ) -> int | None:
   if value is None:
     return None
-  if (
-    isinstance(value, bool)
-    or not isinstance(value, int)
-    or not 0 <= value <= 32
-  ):
-    raise ValueError(
-      f"{field} must be an integer from 0 through 32 or None"
-    )
+  if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 32:
+    raise ValueError(f"{field} must be an integer from 0 through 32 or None")
   return value
 
 
@@ -110,18 +99,10 @@ def _validated_optional_prns(
     return None
   if not isinstance(satellite_ids, tuple):
     raise ValueError(f"{field} must be a tuple or None")
-  if (
-    satellite_ids != tuple(sorted(set(satellite_ids)))
-    or any(
-      isinstance(satellite_id, bool)
-      or not isinstance(satellite_id, int)
-      or not 1 <= satellite_id <= 32
-      for satellite_id in satellite_ids
-    )
+  if satellite_ids != tuple(sorted(set(satellite_ids))) or any(
+    isinstance(satellite_id, bool) or not isinstance(satellite_id, int) or not 1 <= satellite_id <= 32 for satellite_id in satellite_ids
   ):
-    raise ValueError(
-      f"{field} must contain unique sorted integers from 1 through 32"
-    )
+    raise ValueError(f"{field} must contain unique sorted integers from 1 through 32")
   return satellite_ids
 
 
@@ -131,18 +112,9 @@ def _validated_prns(
   if satellite_ids is None:
     return None
   if not isinstance(satellite_ids, frozenset):
-    raise ValueError(
-      "yuma_satellite_ids must be a frozenset or None"
-    )
-  if any(
-    isinstance(satellite_id, bool)
-    or not isinstance(satellite_id, int)
-    or not 1 <= satellite_id <= 32
-    for satellite_id in satellite_ids
-  ):
-    raise ValueError(
-      "YUMA satellite IDs must be integers from 1 through 32"
-    )
+    raise ValueError("yuma_satellite_ids must be a frozenset or None")
+  if any(isinstance(satellite_id, bool) or not isinstance(satellite_id, int) or not 1 <= satellite_id <= 32 for satellite_id in satellite_ids):
+    raise ValueError("YUMA satellite IDs must be integers from 1 through 32")
   return satellite_ids
 
 
@@ -163,9 +135,7 @@ def plan_yuma_supplementation(
   restored_gps_almanac_satellite_ids: tuple[int, ...] | None = None,
 ) -> YumaSupplementationPlan:
   if not isinstance(database_state, YumaDatabaseRestoreState):
-    raise ValueError(
-      "database_state must be a YumaDatabaseRestoreState"
-    )
+    raise ValueError("database_state must be a YumaDatabaseRestoreState")
   if not isinstance(trusted_time_wait_expired, bool):
     raise ValueError("trusted_time_wait_expired must be a bool")
   if not isinstance(cache_wait_expired, bool):
@@ -189,14 +159,8 @@ def plan_yuma_supplementation(
     restored_gps_almanac_satellite_ids,
     "restored_gps_almanac_satellite_ids",
   )
-  if (
-    restored_almanac_ids is not None
-    and restored_gps_almanac is not None
-    and len(restored_almanac_ids) > restored_gps_almanac
-  ):
-    raise ValueError(
-      "restored GPS almanac PRN count exceeds restored availability"
-    )
+  if restored_almanac_ids is not None and restored_gps_almanac is not None and len(restored_almanac_ids) > restored_gps_almanac:
+    raise ValueError("restored GPS almanac PRN count exceeds restored availability")
   yuma_reference_age = _validated_age(
     yuma_reference_age_seconds,
     "yuma_reference_age_seconds",
@@ -225,6 +189,12 @@ def plan_yuma_supplementation(
       YumaSupplementationReason.WAITING_FOR_YUMA_CACHE,
     )
 
+  if database_state is YumaDatabaseRestoreState.PENDING:
+    return YumaSupplementationPlan(
+      YumaSupplementationAction.WAIT,
+      YumaSupplementationReason.WAITING_FOR_DATABASE_RESTORE,
+    )
+
   if database_state in (
     YumaDatabaseRestoreState.FAILED,
     YumaDatabaseRestoreState.PARTIAL,
@@ -235,11 +205,7 @@ def plan_yuma_supplementation(
       satellite_ids=yuma_prns,
     )
 
-  if (
-    database_age is not None
-    and database_age > CACHE_TIER_FRESHNESS_WINDOW_SECONDS
-    and yuma_reference_age <= database_age
-  ):
+  if database_age is not None and database_age > CACHE_TIER_FRESHNESS_WINDOW_SECONDS and yuma_reference_age <= database_age:
     return YumaSupplementationPlan(
       YumaSupplementationAction.SEND_ALL,
       YumaSupplementationReason.STALE_DATABASE_WITH_NEWER_YUMA,
@@ -312,11 +278,7 @@ def plan_yuma_supplementation(
       missing_prns = healthy_prns - nav_sat.gps_almanac_satellite_ids
       if missing_prns:
         unavailable_prns = missing_prns - yuma_prns
-        if (
-          restored_gps_almanac is None
-          or restored_gps_almanac < len(yuma_prns)
-          or restored_startup_ready is not True
-        ):
+        if restored_gps_almanac is None or restored_gps_almanac < len(yuma_prns) or restored_startup_ready is not True:
           return YumaSupplementationPlan(
             YumaSupplementationAction.SEND_ALL,
             YumaSupplementationReason.RESTORED_GPS_ALMANAC_UNKNOWN,

@@ -9,6 +9,9 @@ from openpilot.system.ubloxd.navigation_database_restore import (
 )
 from openpilot.system.ubloxd.navigation_database_restore_runtime import (
   NavigationDatabaseRestoreBootState,
+  NavigationDatabaseRestoreCandidateIdentity,
+  NavigationDatabaseRestoreFrameFailureKind,
+  NavigationDatabaseRestoreFrozenCaches,
   NavigationDatabaseRestoreRuntime,
   NavigationDatabaseRestoreSnapshot,
   load_navigation_database_restore_boot_state,
@@ -21,6 +24,12 @@ from openpilot.system.ubloxd.trusted_time_anchor import (
 from openpilot.system.ubloxd.trusted_time_authority import (
   AuthorizedTime,
   TimeAuthorizationEvidence,
+)
+
+from openpilot.system.ubloxd.yuma_almanac_transmit import (
+  MgaReceiverNackError,
+  MgaTransactionError,
+  MgaWriteError,
 )
 
 
@@ -128,7 +137,7 @@ def evaluate(
 def test_state_round_trip(tmp_path: Path) -> None:
   path = tmp_path / "state.json"
   state = NavigationDatabaseRestoreBootState(
-    version=1,
+    version=2,
     boot_id=BOOT_ID,
     receiver_fingerprint="receiver",
     disposition=NavigationDatabaseRestoreDisposition.SKIPPED_EXPIRED,
@@ -159,7 +168,7 @@ def test_corrupt_state_fails_closed(tmp_path: Path) -> None:
 def test_new_linux_boot_discards_old_state(tmp_path: Path) -> None:
   path = tmp_path / "dbd_state.json"
   old = NavigationDatabaseRestoreBootState(
-    version=1,
+    version=2,
     boot_id=OTHER_BOOT_ID,
     receiver_fingerprint="receiver",
     disposition=NavigationDatabaseRestoreDisposition.SKIPPED_EXPIRED,
@@ -284,7 +293,7 @@ def test_restored_terminal_state_survives_process_restart(tmp_path: Path) -> Non
 def test_interrupted_attempt_recovers_as_write_failed(tmp_path: Path) -> None:
   path = tmp_path / "dbd_state.json"
   interrupted = NavigationDatabaseRestoreBootState(
-    version=1,
+    version=2,
     boot_id=BOOT_ID,
     receiver_fingerprint="receiver",
     disposition=NavigationDatabaseRestoreDisposition.PENDING,
@@ -326,7 +335,7 @@ def test_receiver_time_performs_zero_database_writes(tmp_path: Path) -> None:
   assert writes == []
 
 
-def test_same_boot_continuity_performs_zero_database_writes(tmp_path: Path) -> None:
+def test_same_boot_continuity_keeps_restore_pending(tmp_path: Path) -> None:
   value = runtime(tmp_path)
   writes = []
   result = evaluate(
@@ -334,8 +343,16 @@ def test_same_boot_continuity_performs_zero_database_writes(tmp_path: Path) -> N
     authorized_time=same_boot_time(),
     send=lambda frame, index: writes.append((frame, index)),
   )
-  assert result.disposition is NavigationDatabaseRestoreDisposition.SKIPPED_UNVERIFIED
+  assert result.disposition is NavigationDatabaseRestoreDisposition.PENDING
   assert writes == []
+
+  result = evaluate(
+    value,
+    authorized_time=network_time(),
+    send=lambda frame, index: writes.append((frame, index)),
+  )
+  assert result.disposition is NavigationDatabaseRestoreDisposition.RESTORED
+  assert writes == [(FRAMES[0], 0), (FRAMES[1], 1)]
 
 
 def test_acquisition_latch_survives_process_restart(tmp_path: Path) -> None:
@@ -484,3 +501,199 @@ def test_runtime_rejects_invalid_retry_delay(
       state_path=tmp_path / "state.json",
       boot_id_reader=lambda: BOOT_ID,
     )
+
+
+def frozen_caches(
+  *,
+  primary: NavigationDatabaseRestoreSnapshot | None,
+  previous: NavigationDatabaseRestoreSnapshot | None,
+  position: NavigationDatabaseRestoreSnapshot | None = None,
+) -> NavigationDatabaseRestoreFrozenCaches:
+  return NavigationDatabaseRestoreFrozenCaches(
+    position_snapshot=position or primary or previous,
+    primary_snapshot=primary,
+    previous_snapshot=previous,
+  )
+
+
+def multi_runtime(
+  tmp_path: Path,
+  *,
+  primary: NavigationDatabaseRestoreSnapshot | None,
+  previous: NavigationDatabaseRestoreSnapshot | None,
+) -> NavigationDatabaseRestoreRuntime:
+  value = frozen_caches(primary=primary, previous=previous)
+  return NavigationDatabaseRestoreRuntime(
+    "receiver",
+    snapshot_loader=lambda _fingerprint: value,
+    retry_delay_seconds=0.0,
+    state_path=tmp_path / "dbd_state.json",
+    boot_id_reader=lambda: BOOT_ID,
+  )
+
+
+def test_newer_eligible_primary_wins_over_expired_higher_quality_previous(
+  tmp_path: Path,
+) -> None:
+  primary = snapshot(30 * 60, generation="primary")
+  previous = snapshot(2 * 60 * 60, generation="previous")
+  value = multi_runtime(tmp_path, primary=primary, previous=previous)
+
+  result = evaluate(value, authorized_time=network_time())
+
+  assert result.disposition is NavigationDatabaseRestoreDisposition.RESTORED
+  assert result.cache_generation == "primary"
+  assert result.cache_selection_reason == "trusted_age_only_eligible:primary"
+
+
+def test_future_primary_falls_back_to_valid_previous(tmp_path: Path) -> None:
+  primary = snapshot(-30.0, generation="primary")
+  previous = snapshot(30 * 60, generation="previous")
+  value = multi_runtime(tmp_path, primary=primary, previous=previous)
+
+  result = evaluate(value, authorized_time=network_time())
+
+  assert result.disposition is NavigationDatabaseRestoreDisposition.RESTORED
+  assert result.cache_generation == "previous"
+
+
+def test_both_generations_expired_skip_without_writes(tmp_path: Path) -> None:
+  value = multi_runtime(
+    tmp_path,
+    primary=snapshot(2 * 60 * 60, generation="primary"),
+    previous=snapshot(3 * 60 * 60, generation="previous"),
+  )
+  writes = []
+
+  result = evaluate(
+    value,
+    authorized_time=network_time(),
+    send=lambda frame, index: writes.append((frame, index)),
+  )
+
+  assert result.disposition is NavigationDatabaseRestoreDisposition.SKIPPED_EXPIRED
+  assert writes == []
+
+
+def test_exactly_one_generation_on_one_hour_boundary_is_selected(
+  tmp_path: Path,
+) -> None:
+  value = multi_runtime(
+    tmp_path,
+    primary=snapshot(
+      NAVIGATION_DATABASE_RESTORE_MAX_AGE_SECONDS,
+      generation="primary",
+    ),
+    previous=snapshot(
+      NAVIGATION_DATABASE_RESTORE_MAX_AGE_SECONDS + 0.001,
+      generation="previous",
+    ),
+  )
+
+  result = evaluate(value, authorized_time=network_time())
+
+  assert result.disposition is NavigationDatabaseRestoreDisposition.RESTORED
+  assert result.cache_generation == "primary"
+
+
+def test_frozen_candidate_set_survives_process_restart(tmp_path: Path) -> None:
+  first = multi_runtime(
+    tmp_path,
+    primary=snapshot(generation="primary"),
+    previous=snapshot(45 * 60, generation="previous"),
+  )
+  first.prepare()
+
+  second = multi_runtime(
+    tmp_path,
+    primary=snapshot(generation="primary"),
+    previous=snapshot(45 * 60, generation="previous"),
+  )
+  assert second.controller.pending
+
+  changed = multi_runtime(
+    tmp_path,
+    primary=snapshot(generation="primary"),
+    previous=snapshot(46 * 60, generation="previous"),
+  )
+  changed.prepare()
+  assert changed.controller.disposition is NavigationDatabaseRestoreDisposition.SKIPPED_UNVERIFIED
+
+
+def test_candidate_identity_round_trip() -> None:
+  identity = NavigationDatabaseRestoreCandidateIdentity.from_snapshot(snapshot())
+  assert NavigationDatabaseRestoreCandidateIdentity.from_json_dict(identity.to_json_dict()) == identity
+
+
+@pytest.mark.parametrize(
+  ("exception", "kind", "retried"),
+  (
+    (MgaReceiverNackError("nack"), NavigationDatabaseRestoreFrameFailureKind.REJECTED, False),
+    (TimeoutError("timeout"), NavigationDatabaseRestoreFrameFailureKind.TIMED_OUT, True),
+    (MgaWriteError("write"), NavigationDatabaseRestoreFrameFailureKind.WRITE_ERROR, True),
+    (MgaTransactionError("transaction"), NavigationDatabaseRestoreFrameFailureKind.TRANSACTION_ERROR, True),
+    (ValueError("unexpected"), NavigationDatabaseRestoreFrameFailureKind.UNEXPECTED_ERROR, False),
+  ),
+)
+def test_typed_frame_failure_and_retry_policy(
+  tmp_path: Path,
+  exception: Exception,
+  kind: NavigationDatabaseRestoreFrameFailureKind,
+  retried: bool,
+) -> None:
+  value = runtime(tmp_path)
+  attempts = 0
+
+  def send(_frame: bytes, index: int) -> None:
+    nonlocal attempts
+    if index != 0:
+      return
+    attempts += 1
+    raise exception
+
+  result = evaluate(value, authorized_time=network_time(), send=send)
+
+  assert result.disposition is NavigationDatabaseRestoreDisposition.WRITE_FAILED
+  assert result.initial_failures[0].kind is kind
+  assert attempts == (2 if retried else 1)
+
+
+def test_retry_sleeper_failure_records_phase_and_error(tmp_path: Path) -> None:
+  value = NavigationDatabaseRestoreRuntime(
+    "receiver",
+    snapshot_loader=lambda _fingerprint: snapshot(),
+    retry_delay_seconds=0.25,
+    sleeper=lambda _delay: (_ for _ in ()).throw(RuntimeError("sleep failed")),
+    state_path=tmp_path / "dbd_state.json",
+    boot_id_reader=lambda: BOOT_ID,
+  )
+
+  result = evaluate(
+    value,
+    authorized_time=network_time(),
+    send=lambda _frame, _index: (_ for _ in ()).throw(TimeoutError("timeout")),
+  )
+
+  assert result.disposition is NavigationDatabaseRestoreDisposition.WRITE_FAILED
+  assert result.failure_phase == "retry_delay"
+  assert result.execution_error == "RuntimeError:sleep failed"
+
+
+def test_acquisition_during_pre_database_configuration_closes_window(
+  tmp_path: Path,
+) -> None:
+  value = runtime(tmp_path)
+  writes: list[tuple[bytes, int]] = []
+
+  # Models RAWX/NAV-SAT dispatched by a synchronous MON-VER or NAVX5
+  # transaction before initialize_receiver_cycle reaches its DBD decision.
+  value.note_acquisition_started()
+  result = evaluate(
+    value,
+    authorized_time=network_time(),
+    send=lambda frame, index: writes.append((frame, index)),
+  )
+
+  assert result.disposition is NavigationDatabaseRestoreDisposition.SKIPPED_ACQUISITION_ALREADY_STARTED
+  assert writes == []
+  assert value.controller.terminal

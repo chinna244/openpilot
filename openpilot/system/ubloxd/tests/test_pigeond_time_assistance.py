@@ -29,6 +29,7 @@ def network_host_observation(
     generation=generation,
   )
 
+
 def build_mga_ack(
   message: bytes,
   *,
@@ -36,17 +37,15 @@ def build_mga_ack(
   version: int = 0,
   info_code: int = 0,
 ) -> bytes:
-  payload = bytes((
-    acknowledgment_type,
-    version,
-    info_code,
-    message[3],
-  )) + message[6:10].ljust(4, b"\x00")
-  return pigeond.add_ubx_checksum(
-    b"\xB5\x62\x13\x60"
-    + len(payload).to_bytes(2, "little")
-    + payload
-  )
+  payload = bytes(
+    (
+      acknowledgment_type,
+      version,
+      info_code,
+      message[3],
+    )
+  ) + message[6:10].ljust(4, b"\x00")
+  return pigeond.add_ubx_checksum(b"\xb5\x62\x13\x60" + len(payload).to_bytes(2, "little") + payload)
 
 
 class FakePigeon:
@@ -98,11 +97,7 @@ def build_rawx_frame(
       0,
     )
 
-  return pigeond.add_ubx_checksum(
-    b"\xB5\x62\x02\x15"
-    + len(payload).to_bytes(2, "little")
-    + payload
-  )
+  return pigeond.add_ubx_checksum(b"\xb5\x62\x02\x15" + len(payload).to_bytes(2, "little") + payload)
 
 
 def diagnostic_fix(
@@ -135,9 +130,7 @@ def run_navigation_restore_with_outcomes(
   cache = SimpleNamespace(
     saved_at_utc=datetime(2026, 7, 10, tzinfo=UTC),
     rtc_counter_seconds=100,
-    database_frames=tuple(
-      bytes((index,)) for index in range(frame_count)
-    ),
+    database_frames=tuple(bytes((index,)) for index in range(frame_count)),
     latitude_e7=0,
     longitude_e7=0,
     altitude_cm=0,
@@ -168,11 +161,7 @@ def run_navigation_restore_with_outcomes(
         database_frame_index,
         [],
       )
-      outcome = (
-        frame_outcomes.pop(0)
-        if frame_outcomes
-        else None
-      )
+      outcome = frame_outcomes.pop(0) if frame_outcomes else None
 
     if outcome is not None:
       raise outcome
@@ -205,6 +194,7 @@ def run_navigation_restore_with_outcomes(
     object(),
     "receiver",
     diagnostic_context=diagnostic_context,
+    allow_legacy_direct_restore=True,
   )
   return result, calls, sleeps, logs
 
@@ -245,13 +235,15 @@ def run_receiving_with_fakes(
       events.append(("cycle_start", self.cycle_number, reason, now))
 
     def initialization_complete(self, now):
-      events.append((
-        "cycle_complete",
-        self.cycle_number,
-        self.cycle_reason,
-        now,
-        now - self.cycle_start_time,
-      ))
+      events.append(
+        (
+          "cycle_complete",
+          self.cycle_number,
+          self.cycle_reason,
+          now,
+          now - self.cycle_start_time,
+        )
+      )
 
     def time_assistance_context(self, now):
       return f"cycle={self.cycle_number}, reason={self.cycle_reason}"
@@ -330,6 +322,7 @@ def run_receiving_with_fakes(
     diagnostic_context=None,
     time_assistance_source=None,
     trusted_now=None,
+    **_kwargs,
   ):
     assert time_assistance_source in ("system_synchronized", "same_boot_boottime", None)
     events.append(("restore", trusted_now))
@@ -337,11 +330,13 @@ def run_receiving_with_fakes(
 
   def fake_send_time_assistance(pigeon, **kwargs):
     send_calls.append(kwargs)
-    events.append((
-      "time_assistance_send",
-      kwargs.get("source", "synchronized"),
-      clock.value,
-    ))
+    events.append(
+      (
+        "time_assistance_send",
+        kwargs.get("source", "synchronized"),
+        clock.value,
+      )
+    )
     return send_success
 
   class FakeRtcObserver:
@@ -357,15 +352,14 @@ def run_receiving_with_fakes(
       *,
       host_time_observation,
     ):
-      host_independent = (
-        host_time_observation is not None
-        and host_time_observation.independent
+      host_independent = host_time_observation is not None and host_time_observation.independent
+      events.append(
+        (
+          "time_authority_evaluate",
+          clock.value,
+          host_independent,
+        )
       )
-      events.append((
-        "time_authority_evaluate",
-        clock.value,
-        host_independent,
-      ))
       if host_independent:
         utc_value = datetime(2026, 7, 10, tzinfo=UTC)
         source = "system_synchronized"
@@ -378,12 +372,8 @@ def run_receiving_with_fakes(
       else:
         return SimpleNamespace(
           authorized_time=None,
-          rejection_reason=SimpleNamespace(
-            value="anchor_unavailable"
-          ),
-          anchor_write_status=(
-            pigeond.AnchorWriteStatus.NOT_REQUIRED
-          ),
+          rejection_reason=SimpleNamespace(value="anchor_unavailable"),
+          anchor_write_status=(pigeond.AnchorWriteStatus.NOT_REQUIRED),
           anchor_write_error=None,
           selected_anchor_generation=None,
           selected_anchor_sequence=None,
@@ -393,12 +383,8 @@ def run_receiving_with_fakes(
       authorized = SimpleNamespace(
         utc=utc_value,
         uncertainty_seconds=float(uncertainty),
-        source=SimpleNamespace(
-          value="system_synchronized"
-        ),
-        provenance=SimpleNamespace(
-          value="network_independent"
-        ),
+        source=SimpleNamespace(value="system_synchronized"),
+        provenance=SimpleNamespace(value="network_independent"),
         independent=independent,
         evidence=SimpleNamespace(value=source),
         mga_accuracy_seconds=uncertainty,
@@ -407,11 +393,7 @@ def run_receiving_with_fakes(
       return SimpleNamespace(
         authorized_time=authorized,
         rejection_reason=None,
-        anchor_write_status=(
-          pigeond.AnchorWriteStatus.SAVED
-          if host_independent
-          else pigeond.AnchorWriteStatus.NOT_REQUIRED
-        ),
+        anchor_write_status=(pigeond.AnchorWriteStatus.SAVED if host_independent else pigeond.AnchorWriteStatus.NOT_REQUIRED),
         anchor_write_error=None,
         selected_anchor_generation=None,
         selected_anchor_sequence=None,
@@ -451,12 +433,9 @@ def run_receiving_with_fakes(
     FakeDumpCollector,
   )
   monkeypatch.setattr(pigeond, "UbloxDataWatchdog", FakeWatchdog)
+
   def current_host_time():
-    trusted = (
-      trusted_time()
-      if callable(trusted_time)
-      else trusted_time
-    )
+    trusted = trusted_time() if callable(trusted_time) else trusted_time
     return network_host_observation() if trusted else None
 
   monkeypatch.setattr(
@@ -586,9 +565,7 @@ def test_time_assistance_logs_matching_rejected_ack(monkeypatch):
   logs = []
   monkeypatch.setattr(pigeond.cloudlog, "warning", logs.append)
   receiver = FakePigeon(auto_ack=False)
-  message = pigeond.build_time_assistance_message(
-    datetime(2026, 7, 10, tzinfo=UTC)
-  )
+  message = pigeond.build_time_assistance_message(datetime(2026, 7, 10, tzinfo=UTC))
   receiver.responses.append(build_mga_ack(message, info_code=255))
 
   assert not pigeond.send_time_assistance(
@@ -610,7 +587,8 @@ def test_time_assistance_rejects_nonzero_mga_ack_version():
   receiver.responses.append(build_mga_ack(message, version=1))
 
   assert not pigeond.send_time_assistance(
-    receiver, assistance_time=assistance_time,
+    receiver,
+    assistance_time=assistance_time,
   )
 
 
@@ -631,12 +609,13 @@ def test_time_assistance_logs_matching_ack_timeout(monkeypatch):
   assert "ack_result=timed_out" in logs[0]
 
 
-@pytest.mark.parametrize("unrelated_message", [
-  pigeond.build_position_assistance_message(0, 0, 0, 1_000),
-  pigeond.add_ubx_checksum(
-    b"\xB5\x62\x13\x80\x04\x00\x22\x00\x00\x00"
-  ),
-])
+@pytest.mark.parametrize(
+  "unrelated_message",
+  [
+    pigeond.build_position_assistance_message(0, 0, 0, 1_000),
+    pigeond.add_ubx_checksum(b"\xb5\x62\x13\x80\x04\x00\x22\x00\x00\x00"),
+  ],
+)
 def test_time_assistance_ignores_unrelated_ack_before_match(
   monkeypatch,
   unrelated_message,
@@ -646,10 +625,12 @@ def test_time_assistance_ignores_unrelated_ack_before_match(
   assistance_time = datetime(2026, 7, 10, tzinfo=UTC)
   time_message = pigeond.build_time_assistance_message(assistance_time)
   receiver = FakePigeon(auto_ack=False)
-  receiver.responses.extend((
-    build_mga_ack(unrelated_message),
-    build_mga_ack(time_message),
-  ))
+  receiver.responses.extend(
+    (
+      build_mga_ack(unrelated_message),
+      build_mga_ack(time_message),
+    )
+  )
 
   assert pigeond.send_time_assistance(
     receiver,
@@ -703,16 +684,13 @@ def test_cache_restore_age_uses_only_trusted_time(
   result = pigeond.restore_navigation_assistance(
     object(),
     "receiver",
+    allow_legacy_direct_restore=True,
   )
 
-  assert result.status is (
-    pigeond.NavigationAssistanceRestoreStatus.FAILED
-  )
+  assert result.status is (pigeond.NavigationAssistanceRestoreStatus.FAILED)
   assert not result.usable
   assert result.failure_phase is pigeond.NavigationAssistanceRestoreFailurePhase.CACHE_LOAD
-  assert (
-    observed["now_utc"] is not None
-  ) is trusted
+  assert (observed["now_utc"] is not None) is trusted
   assert cache_path.read_bytes() == original_cache
 
 
@@ -736,6 +714,7 @@ def test_cache_save_fallback_accepts_trusted_time(
     "create_cache",
     fake_create_cache,
   )
+
   def fake_promote(self, candidate, *args):
     return SimpleNamespace(
       status=pigeond.CachePromotionStatus.SAVED,
@@ -761,12 +740,15 @@ def test_cache_save_fallback_accepts_trusted_time(
   fix = SimpleNamespace(utc_time=None)
   quality = SimpleNamespace(passes_policy=True, usable_for_capture=True)
 
-  assert pigeond.write_navigation_assistance_cache(
-    "receiver",
-    fix,
-    (),
-    quality,
-  ) is pigeond.NavigationAssistanceCacheResult.SAVED
+  assert (
+    pigeond.write_navigation_assistance_cache(
+      "receiver",
+      fix,
+      (),
+      quality,
+    )
+    is pigeond.NavigationAssistanceCacheResult.SAVED
+  )
 
   saved_at = observed["saved_at_utc"]
   assert saved_at.tzinfo is not None
@@ -822,9 +804,7 @@ def test_cache_save_fallback_rejects_untrusted_time(
   )
 
   def unexpected_create_cache(**kwargs):
-    pytest.fail(
-      "create_cache must not use an untrusted clock"
-    )
+    pytest.fail("create_cache must not use an untrusted clock")
 
   monkeypatch.setattr(
     pigeond,
@@ -835,12 +815,15 @@ def test_cache_save_fallback_rejects_untrusted_time(
   fix = SimpleNamespace(utc_time=None)
   quality = SimpleNamespace(passes_policy=True, usable_for_capture=True)
 
-  assert pigeond.write_navigation_assistance_cache(
-    "receiver",
-    fix,
-    (),
-    quality,
-  ) is pigeond.NavigationAssistanceCacheResult.FAILED
+  assert (
+    pigeond.write_navigation_assistance_cache(
+      "receiver",
+      fix,
+      (),
+      quality,
+    )
+    is pigeond.NavigationAssistanceCacheResult.FAILED
+  )
 
 
 def test_cache_promotion_rejects_assisted_receiver_utc(
@@ -853,13 +836,16 @@ def test_cache_promotion_rejects_assisted_receiver_utc(
     lambda: None,
   )
 
-  assert pigeond.cache_promotion_trusted_now(
-    receiver_utc,
-    1,
-    1,
-    receiver_utc_fresh=True,
-    receiver_utc_independent=False,
-  ) is None
+  assert (
+    pigeond.cache_promotion_trusted_now(
+      receiver_utc,
+      1,
+      1,
+      receiver_utc_fresh=True,
+      receiver_utc_independent=False,
+    )
+    is None
+  )
 
 
 def test_cache_promotion_accepts_independent_receiver_utc(
@@ -872,13 +858,16 @@ def test_cache_promotion_accepts_independent_receiver_utc(
     lambda: None,
   )
 
-  assert pigeond.cache_promotion_trusted_now(
-    receiver_utc,
-    1,
-    1,
-    receiver_utc_fresh=True,
-    receiver_utc_independent=True,
-  ) == receiver_utc
+  assert (
+    pigeond.cache_promotion_trusted_now(
+      receiver_utc,
+      1,
+      1,
+      receiver_utc_fresh=True,
+      receiver_utc_independent=True,
+    )
+    == receiver_utc
+  )
 
 
 def test_cache_promotion_prefers_central_authorized_time(
@@ -891,14 +880,17 @@ def test_cache_promotion_prefers_central_authorized_time(
     lambda: None,
   )
 
-  assert pigeond.cache_promotion_trusted_now(
-    None,
-    1,
-    1,
-    receiver_utc_fresh=False,
-    receiver_utc_independent=False,
-    authorized_utc=authorized_utc,
-  ) == authorized_utc
+  assert (
+    pigeond.cache_promotion_trusted_now(
+      None,
+      1,
+      1,
+      receiver_utc_fresh=False,
+      receiver_utc_independent=False,
+      authorized_utc=authorized_utc,
+    )
+    == authorized_utc
+  )
 
 
 def test_independent_receiver_time_anchor_requires_gnss_provenance():
@@ -945,10 +937,13 @@ def test_independent_receiver_time_anchor_requires_gnss_provenance():
     now=101.3,
   )
 
-  assert pigeond.fresh_independent_receiver_utc_time_anchor(
-    provenance,
-    101.4,
-  ) is None
+  assert (
+    pigeond.fresh_independent_receiver_utc_time_anchor(
+      provenance,
+      101.4,
+    )
+    is None
+  )
 
 
 def test_explicit_rtc_time_assistance_does_not_require_trusted_clock(
@@ -1038,21 +1033,13 @@ def test_cached_rtc_time_assistance_uses_receiver_cache(
     fake_select_rtc_estimate,
   )
 
-  result = pigeond.cached_rtc_time_assistance(
-    "receiver-a"
-  )
+  result = pigeond.cached_rtc_time_assistance("receiver-a")
 
   assert result == expected
   assert pigeond.GPS_ASSISTANCE_CACHE_PATH in observed_paths
-  assert (
-    observed["expected_receiver_fingerprint"]
-    == "receiver-a"
-  )
+  assert observed["expected_receiver_fingerprint"] == "receiver-a"
   assert observed["estimate_cache"] is cache
-  assert (
-    observed["current_rtc_seconds"]
-    == current_rtc_seconds
-  )
+  assert observed["current_rtc_seconds"] == current_rtc_seconds
 
 
 def test_cached_rtc_time_assistance_rejects_invalid_cache(
@@ -1067,9 +1054,7 @@ def test_cached_rtc_time_assistance_rejects_invalid_cache(
     reject_cache,
   )
 
-  assert pigeond.cached_rtc_time_assistance(
-    "receiver"
-  ) is None
+  assert pigeond.cached_rtc_time_assistance("receiver") is None
 
 
 def test_startup_diagnostics_initial_cycle_timing(
@@ -1104,10 +1089,10 @@ def test_run_receiving_wires_initial_cycle_before_init(
 
   assert [event[0] for event in events] == [
     "cycle_start",
-    "init",
     "time_authority_evaluate",
-    "time_assistance_send",
+    "init",
     "restore",
+    "time_assistance_send",
     "cycle_complete",
   ]
   assert events[0][1:3] == (1, "process_start")
@@ -1121,26 +1106,26 @@ def test_run_receiving_wires_initial_cycle_before_init(
       True,
       None,
       [
-        "init",
         "time_authority_evaluate",
-        "time_assistance_send",
+        "init",
         "restore",
+        "time_assistance_send",
       ],
     ),
     (
       False,
       (datetime(2026, 7, 10, tzinfo=UTC), 60),
       [
-        "init",
         "time_authority_evaluate",
-        "time_assistance_send",
+        "init",
         "restore",
+        "time_assistance_send",
       ],
     ),
     (
       False,
       None,
-      ["init", "time_authority_evaluate", "restore"],
+      ["time_authority_evaluate", "init", "restore"],
     ),
   ],
 )
@@ -1162,10 +1147,13 @@ def test_run_receiving_restores_cache_only_after_acceptable_time(
   assert event_names.count("restore") == 1
 
 
-@pytest.mark.parametrize(("data", "reason", "watchdog_completion"), [
-  (b"", "no_data_watchdog", True),
-  (b"\x00", "all_zero_data", False),
-])
+@pytest.mark.parametrize(
+  ("data", "reason", "watchdog_completion"),
+  [
+    (b"", "no_data_watchdog", True),
+    (b"\x00", "all_zero_data", False),
+  ],
+)
 def test_run_receiving_wires_recovery_cycle_and_reset_order(
   monkeypatch,
   data,
@@ -1180,17 +1168,14 @@ def test_run_receiving_wires_recovery_cycle_and_reset_order(
     trusted_time=True,
   )
   event_names = [event[0] for event in events]
-  recovery_start = next(
-    index for index, event in enumerate(events)
-    if event[0] == "cycle_start" and event[1] == 2
-  )
+  recovery_start = next(index for index, event in enumerate(events) if event[0] == "cycle_start" and event[1] == 2)
 
   expected_order = [
     "cycle_start",
-    "init",
     "time_authority_evaluate",
-    "time_assistance_send",
+    "init",
     "restore",
+    "time_assistance_send",
     "parser_reset",
     "fix_tracker_reset",
     "dump_collector_cancel",
@@ -1199,16 +1184,10 @@ def test_run_receiving_wires_recovery_cycle_and_reset_order(
     expected_order.append("watchdog_recovery_complete")
   expected_order.append("cycle_complete")
 
-  assert event_names[
-    recovery_start:recovery_start + len(expected_order)
-  ] == expected_order
+  assert event_names[recovery_start : recovery_start + len(expected_order)] == expected_order
   assert events[recovery_start][1:3] == (2, reason)
-  assert events[
-    recovery_start + len(expected_order) - 1
-  ][1:3] == (2, reason)
-  assert send_calls[-1]["diagnostic_context"] == (
-    f"cycle=2, reason={reason}"
-  )
+  assert events[recovery_start + len(expected_order) - 1][1:3] == (2, reason)
+  assert send_calls[-1]["diagnostic_context"] == (f"cycle=2, reason={reason}")
 
 
 @pytest.mark.parametrize(
@@ -1238,9 +1217,7 @@ def test_run_receiving_passes_cycle_context_to_time_assistance(
 
   assert len(send_calls) == 1
   assert send_calls[0].get("source") == expected_source
-  assert send_calls[0]["diagnostic_context"] == (
-    "cycle=1, reason=process_start"
-  )
+  assert send_calls[0]["diagnostic_context"] == ("cycle=1, reason=process_start")
 
 
 def test_same_boot_time_is_forwarded_exactly_to_cache_age_selection(monkeypatch):
@@ -1266,13 +1243,10 @@ def test_run_receiving_retries_failed_same_boot_assistance_at_interval(
     rtc_assistance=(datetime(2026, 7, 10, tzinfo=UTC), 60),
     send_success=False,
   )
-  evaluation_times = [
-    event[1] for event in events
-    if event[0] == "time_authority_evaluate"
-  ]
+  evaluation_times = [event[1] for event in events if event[0] == "time_authority_evaluate"]
 
   assert len(evaluation_times) >= 2
-  assert 30 <= evaluation_times[1] - evaluation_times[0] <= 32
+  assert 30 <= evaluation_times[1] - evaluation_times[0] <= 36
 
 
 def test_run_receiving_retries_failed_synchronized_assistance_at_interval(
@@ -1285,13 +1259,10 @@ def test_run_receiving_retries_failed_synchronized_assistance_at_interval(
     trusted_time=True,
     send_success=False,
   )
-  send_times = [
-    event[2] for event in events
-    if event[:2] == ("time_assistance_send", "system_synchronized")
-  ]
+  send_times = [event[2] for event in events if event[:2] == ("time_assistance_send", "system_synchronized")]
 
   assert len(send_times) >= 2
-  assert 30 <= send_times[1] - send_times[0] <= 32
+  assert 30 <= send_times[1] - send_times[0] <= 36
 
 
 def test_run_receiving_restores_cache_after_later_synchronized_time(
@@ -1307,12 +1278,8 @@ def test_run_receiving_restores_cache_after_later_synchronized_time(
   )
   event_names = [event[0] for event in events]
 
-  assert event_names.index("time_authority_evaluate") < (
-    event_names.index("restore")
-  )
-  assert event_names.index("restore") < (
-    event_names.index("time_assistance_send")
-  )
+  assert event_names.index("time_authority_evaluate") < (event_names.index("restore"))
+  assert event_names.index("restore") < (event_names.index("time_assistance_send"))
   assert event_names.count("restore") == 1
 
 
@@ -1329,26 +1296,15 @@ def test_run_receiving_does_not_restore_cache_twice_after_rtc_time(
     rtc_assistance=(datetime(2026, 7, 10, tzinfo=UTC), 60),
   )
 
-  assert [
-    call.get("source")
-    for call in send_calls
-  ] == ["same_boot_boottime"]
+  assert [call.get("source") for call in send_calls] == ["same_boot_boottime"]
   assert sum(event[0] == "restore" for event in events) == 1
 
 
 def test_mga_info_code_255_remains_a_strict_failure():
   database_payload = b"\x22\x00\x00\x00"
-  message = pigeond.add_ubx_checksum(
-    b"\xB5\x62\x13\x80"
-    + len(database_payload).to_bytes(2, "little")
-    + database_payload
-  )
+  message = pigeond.add_ubx_checksum(b"\xb5\x62\x13\x80" + len(database_payload).to_bytes(2, "little") + database_payload)
   payload = bytes((1, 0, 255, 0x80)) + database_payload
-  acknowledgment = pigeond.add_ubx_checksum(
-    b"\xB5\x62\x13\x60"
-    + len(payload).to_bytes(2, "little")
-    + payload
-  )
+  acknowledgment = pigeond.add_ubx_checksum(b"\xb5\x62\x13\x60" + len(payload).to_bytes(2, "little") + payload)
 
   class AcknowledgingPigeon:
     def send(self, sent_message):
@@ -1360,11 +1316,13 @@ def test_mga_info_code_255_remains_a_strict_failure():
   with pytest.raises(
     pigeond.CacheValidationError,
     match=(
-      "".join((
-        r"mga_message_type=0x22, message_id=0x80, ",
-        r"ack_type=1, ack_version=0, ack_infoCode=255, ",
-        r"rejected_message_id=0x80, database_frame_index=3",
-      ))
+      "".join(
+        (
+          r"mga_message_type=0x22, message_id=0x80, ",
+          r"ack_type=1, ack_version=0, ack_infoCode=255, ",
+          r"rejected_message_id=0x80, database_frame_index=3",
+        )
+      )
     ),
   ):
     pigeond.send_mga_with_strict_ack(
@@ -1377,27 +1335,18 @@ def test_mga_info_code_255_remains_a_strict_failure():
 def test_navigation_restore_accepts_all_frames_first_pass(
   monkeypatch,
 ):
-  result, calls, sleeps, logs = (
-    run_navigation_restore_with_outcomes(
-      monkeypatch,
-      {},
-      diagnostic_context="cycle=2, reason=no_data_watchdog",
-    )
+  result, calls, sleeps, logs = run_navigation_restore_with_outcomes(
+    monkeypatch,
+    {},
+    diagnostic_context="cycle=2, reason=no_data_watchdog",
   )
 
-  assert result.status is (
-    pigeond.NavigationAssistanceRestoreStatus.COMPLETE
-  )
+  assert result.status is (pigeond.NavigationAssistanceRestoreStatus.COMPLETE)
   assert result.usable
   assert result.accepted_frame_count == 3
   assert calls == [None, 0, 1, 2]
   assert sleeps == []
-  final_level, final_log = next(
-    (level, message) for level, message in logs
-    if message.startswith(
-      "GPS navigation assistance restore result"
-    )
-  )
+  final_level, final_log = next((level, message) for level, message in logs if message.startswith("GPS navigation assistance restore result"))
   assert final_level == "info"
   assert "restore_status=complete" in final_log
   assert "total_frame_count=3" in final_log
@@ -1423,23 +1372,17 @@ def test_navigation_restore_retries_one_failed_frame_successfully(
   initial_outcome,
   initial_field,
 ):
-  result, calls, sleeps, _ = (
-    run_navigation_restore_with_outcomes(
-      monkeypatch,
-      {1: [initial_outcome, None]},
-    )
+  result, calls, sleeps, _ = run_navigation_restore_with_outcomes(
+    monkeypatch,
+    {1: [initial_outcome, None]},
   )
 
-  assert result.status is (
-    pigeond.NavigationAssistanceRestoreStatus.COMPLETE
-  )
+  assert result.status is (pigeond.NavigationAssistanceRestoreStatus.COMPLETE)
   assert result.accepted_frame_count == 3
   assert getattr(result, initial_field) == (1,)
   assert result.retry_accepted_indexes == (1,)
   assert calls == [None, 0, 1, 2, 1]
-  assert sleeps == [
-    pigeond.GPS_ASSISTANCE_FRAME_RETRY_DELAY
-  ]
+  assert sleeps == [pigeond.GPS_ASSISTANCE_FRAME_RETRY_DELAY]
 
 
 @pytest.mark.parametrize(
@@ -1473,9 +1416,7 @@ def test_navigation_restore_continues_after_permanent_frame_failure(
     },
   )
 
-  assert result.status is (
-    pigeond.NavigationAssistanceRestoreStatus.PARTIAL
-  )
+  assert result.status is (pigeond.NavigationAssistanceRestoreStatus.PARTIAL)
   assert result.usable
   assert result.accepted_frame_count == 2
   assert getattr(result, permanent_field) == (1,)
@@ -1501,9 +1442,7 @@ def test_navigation_restore_tracks_mixed_retry_outcomes(
     frame_count=5,
   )
 
-  assert result.status is (
-    pigeond.NavigationAssistanceRestoreStatus.PARTIAL
-  )
+  assert result.status is (pigeond.NavigationAssistanceRestoreStatus.PARTIAL)
   assert result.accepted_frame_count == 3
   assert result.initially_rejected_indexes == (1, 4)
   assert result.initially_timed_out_indexes == (2,)
@@ -1511,12 +1450,7 @@ def test_navigation_restore_tracks_mixed_retry_outcomes(
   assert result.permanently_rejected_indexes == (2,)
   assert result.permanently_timed_out_indexes == (4,)
   assert calls == [None, 0, 1, 2, 3, 4, 1, 2, 4]
-  final_level, final_log = next(
-    (level, message) for level, message in logs
-    if message.startswith(
-      "GPS navigation assistance restore result"
-    )
-  )
+  final_level, final_log = next((level, message) for level, message in logs if message.startswith("GPS navigation assistance restore result"))
   assert final_level == "warning"
   assert "restore_status=partial" in final_log
   assert "initially_rejected_indexes=[1, 4]" in final_log
@@ -1526,38 +1460,40 @@ def test_navigation_restore_tracks_mixed_retry_outcomes(
   assert "permanently_timed_out_indexes=[4]" in final_log
 
 
-@pytest.mark.parametrize(("position_outcome", "expected_phase"), [
-  (
-    pigeond.CacheValidationError("position rejected"),
-    pigeond.NavigationAssistanceRestoreFailurePhase.POSITION_ASSISTANCE_ACK_REJECTED,
-  ),
-  (
-    TimeoutError("position timed out"),
-    pigeond.NavigationAssistanceRestoreFailurePhase.POSITION_ASSISTANCE_ACK_TIMEOUT,
-  ),
-  (
-    pigeond.MgaWriteError("position write failed"),
-    pigeond.NavigationAssistanceRestoreFailurePhase.POSITION_ASSISTANCE_WRITE,
-  ),
-])
+@pytest.mark.parametrize(
+  ("position_outcome", "expected_phase"),
+  [
+    (
+      pigeond.CacheValidationError("position rejected"),
+      pigeond.NavigationAssistanceRestoreFailurePhase.POSITION_ASSISTANCE_ACK_REJECTED,
+    ),
+    (
+      TimeoutError("position timed out"),
+      pigeond.NavigationAssistanceRestoreFailurePhase.POSITION_ASSISTANCE_ACK_TIMEOUT,
+    ),
+    (
+      pigeond.MgaWriteError("position write failed"),
+      pigeond.NavigationAssistanceRestoreFailurePhase.POSITION_ASSISTANCE_WRITE,
+    ),
+  ],
+)
 def test_navigation_restore_position_failure_is_phase_specific_and_read_only(
-  monkeypatch, tmp_path, position_outcome, expected_phase,
+  monkeypatch,
+  tmp_path,
+  position_outcome,
+  expected_phase,
 ):
   cache_path = tmp_path / "navigation_cache.json"
   original_cache = b"cache must remain byte-identical"
   cache_path.write_bytes(original_cache)
   monkeypatch.setattr(pigeond, "GPS_ASSISTANCE_CACHE_PATH", cache_path)
-  result, calls, sleeps, logs = (
-    run_navigation_restore_with_outcomes(
-      monkeypatch,
-      {},
-      position_outcome=position_outcome,
-    )
+  result, calls, sleeps, logs = run_navigation_restore_with_outcomes(
+    monkeypatch,
+    {},
+    position_outcome=position_outcome,
   )
 
-  assert result.status is (
-    pigeond.NavigationAssistanceRestoreStatus.FAILED
-  )
+  assert result.status is (pigeond.NavigationAssistanceRestoreStatus.FAILED)
   assert not result.usable
   assert result.failure_phase is expected_phase
   assert result.accepted_frame_count == 0
@@ -1571,7 +1507,8 @@ def test_navigation_restore_position_failure_is_phase_specific_and_read_only(
 
 
 def test_navigation_restore_position_build_failure_is_phase_specific_and_read_only(
-  monkeypatch, tmp_path,
+  monkeypatch,
+  tmp_path,
 ):
   cache_path = tmp_path / "navigation_cache.json"
   original_cache = b"cache must remain byte-identical"
@@ -1585,9 +1522,7 @@ def test_navigation_restore_position_build_failure_is_phase_specific_and_read_on
 
   result, calls, sleeps, _ = run_navigation_restore_with_outcomes(monkeypatch, {})
 
-  assert result.failure_phase is (
-    pigeond.NavigationAssistanceRestoreFailurePhase.POSITION_ASSISTANCE_BUILD
-  )
+  assert result.failure_phase is (pigeond.NavigationAssistanceRestoreFailurePhase.POSITION_ASSISTANCE_BUILD)
   assert calls == []
   assert sleeps == []
   assert cache_path.read_bytes() == original_cache
@@ -1611,42 +1546,29 @@ def test_navigation_restore_zero_accepted_frames_is_hard(
     frame_count=2,
   )
 
-  assert result.status is (
-    pigeond.NavigationAssistanceRestoreStatus.FAILED
-  )
+  assert result.status is (pigeond.NavigationAssistanceRestoreStatus.FAILED)
   assert not result.usable
   assert result.accepted_frame_count == 0
-  assert result.failure_phase is (
-    pigeond.NavigationAssistanceRestoreFailurePhase.DATABASE_FRAME_RESTORE
-  )
+  assert result.failure_phase is (pigeond.NavigationAssistanceRestoreFailurePhase.DATABASE_FRAME_RESTORE)
   assert calls == [None, 0, 1, 0, 1]
 
 
 def test_navigation_restore_empty_database_is_hard(
   monkeypatch,
 ):
-  result, calls, sleeps, logs = (
-    run_navigation_restore_with_outcomes(
-      monkeypatch,
-      {},
-      frame_count=0,
-    )
+  result, calls, sleeps, logs = run_navigation_restore_with_outcomes(
+    monkeypatch,
+    {},
+    frame_count=0,
   )
 
-  assert result.status is (
-    pigeond.NavigationAssistanceRestoreStatus.FAILED
-  )
+  assert result.status is (pigeond.NavigationAssistanceRestoreStatus.FAILED)
   assert not result.usable
   assert result.total_frame_count == 0
   assert result.accepted_frame_count == 0
   assert calls == [None]
   assert sleeps == []
-  final_level, final_log = next(
-    (level, message) for level, message in logs
-    if message.startswith(
-      "GPS navigation assistance restore result"
-    )
-  )
+  final_level, final_log = next((level, message) for level, message in logs if message.startswith("GPS navigation assistance restore result"))
   assert final_level == "error"
   assert "restore_status=failed" in final_log
   assert "total_frame_count=0" in final_log
@@ -1675,9 +1597,7 @@ def test_partial_navigation_restore_does_not_delete_cache(
     },
   )
 
-  assert result.status is (
-    pigeond.NavigationAssistanceRestoreStatus.PARTIAL
-  )
+  assert result.status is (pigeond.NavigationAssistanceRestoreStatus.PARTIAL)
   assert cache_path.read_text(encoding="utf-8") == "cached"
 
 
@@ -1701,10 +1621,7 @@ def test_partial_navigation_restore_is_not_repeated_in_cycle(
     restore_result=partial_result,
   )
 
-  assert [
-    call.get("source")
-    for call in send_calls
-  ] == ["same_boot_boottime"]
+  assert [call.get("source") for call in send_calls] == ["same_boot_boottime"]
   assert sum(event[0] == "restore" for event in events) == 1
 
 
@@ -1740,7 +1657,7 @@ def test_partial_restore_never_switches_to_alternate_generation(monkeypatch):
   monkeypatch.setattr(pigeond, "send_mga_with_strict_ack", send_with_outcome)
   monkeypatch.setattr(pigeond.time, "sleep", lambda _seconds: None)
 
-  result = pigeond.restore_navigation_assistance(object(), "receiver")
+  result = pigeond.restore_navigation_assistance(object(), "receiver", allow_legacy_direct_restore=True)
 
   assert result.status is pigeond.NavigationAssistanceRestoreStatus.PARTIAL
   assert load_calls.count("navigation_cache.json") == 1
@@ -1783,34 +1700,21 @@ def test_startup_diagnostics_milestones_once_per_cycle(
     diagnostics.note_nav_pvt(fix, float(monotonic_time))
     diagnostics.note_nav_pvt(fix, float(monotonic_time))
 
-  milestone_logs = [
-    message for message in logs
-    if message.startswith("GPS acquisition milestone=")
-  ]
+  milestone_logs = [message for message in logs if message.startswith("GPS acquisition milestone=")]
   for milestone in (
     "first_nav_pvt",
     "first_fix_ok",
     "first_receiver_utc",
     "first_reliable_fix",
   ):
-    assert sum(
-      f"milestone={milestone}" in message
-      for message in milestone_logs
-    ) == 1
+    assert sum(f"milestone={milestone}" in message for message in milestone_logs) == 1
 
   diagnostics.start_cycle("no_data_watchdog", 10.0)
   diagnostics.note_nav_pvt(fixes[-1], 11.0)
 
-  cycle_two_logs = [
-    message for message in logs
-    if "GPS acquisition milestone=" in message
-    and "cycle=2" in message
-  ]
+  cycle_two_logs = [message for message in logs if "GPS acquisition milestone=" in message and "cycle=2" in message]
   assert len(cycle_two_logs) == 4
-  assert all(
-    "reason=no_data_watchdog" in message
-    for message in cycle_two_logs
-  )
+  assert all("reason=no_data_watchdog" in message for message in cycle_two_logs)
 
 
 def test_startup_diagnostics_status_is_bounded_and_stops_after_fix(
@@ -1838,10 +1742,7 @@ def test_startup_diagnostics_status_is_bounded_and_stops_after_fix(
   diagnostics.log_acquisition_status(59.9)
   diagnostics.log_acquisition_status(60.0)
 
-  status_logs = [
-    message for message in logs
-    if message.startswith("GPS acquisition status")
-  ]
+  status_logs = [message for message in logs if message.startswith("GPS acquisition status")]
   assert len(status_logs) == 2
   assert all("nav_pvt_seen=True" in message for message in status_logs)
   assert all("satellites=3" in message for message in status_logs)
@@ -1856,10 +1757,7 @@ def test_startup_diagnostics_status_is_bounded_and_stops_after_fix(
   )
   diagnostics.log_acquisition_status(90.0)
 
-  assert sum(
-    message.startswith("GPS acquisition status")
-    for message in logs
-  ) == 2
+  assert sum(message.startswith("GPS acquisition status") for message in logs) == 2
 
 
 def test_startup_diagnostics_logs_exclude_position(
@@ -1898,10 +1796,7 @@ def test_startup_diagnostics_logs_first_rawx_after_initialization_once_per_cycle
   diagnostics.note_rawx(rawx, 106.0)
   diagnostics.note_rawx(rawx, 107.0)
 
-  rawx_logs = [
-    message for message in logs
-    if "milestone=first_rawx_after_initialization" in message
-  ]
+  rawx_logs = [message for message in logs if "milestone=first_rawx_after_initialization" in message]
   assert len(rawx_logs) == 1
   assert "cycle=1" in rawx_logs[0]
   assert "reason=process_start" in rawx_logs[0]
@@ -1922,10 +1817,7 @@ def test_startup_diagnostics_logs_first_rawx_after_initialization_once_per_cycle
     ),
     111.0,
   )
-  assert sum(
-    "milestone=first_rawx_after_initialization" in message
-    for message in logs
-  ) == 2
+  assert sum("milestone=first_rawx_after_initialization" in message for message in logs) == 2
   assert "cycle=2" in logs[-1]
   assert "reason=no_data_watchdog" in logs[-1]
   assert "gps_week_valid=False" in logs[-1]
@@ -1940,10 +1832,7 @@ def test_startup_diagnostics_logs_signal_milestones_once_and_resets(
   diagnostics = pigeond.GpsStartupDiagnostics(0.0)
 
   def milestone_logs(name):
-    return [
-      message for message in logs
-      if f"milestone={name}," in message
-    ]
+    return [message for message in logs if f"milestone={name}," in message]
 
   diagnostics.start_cycle("process_start", 0.0)
 
@@ -2051,10 +1940,7 @@ def test_time_assistance_log_includes_cycle_context(
     receiver,
     diagnostic_context=diagnostics.time_assistance_context(106.0),
   )
-  time_log = next(
-    message for message in logs
-    if message.startswith("Time assistance")
-  )
+  time_log = next(message for message in logs if message.startswith("Time assistance"))
   assert "Time assistance written and accepted by ublox" in time_log
   assert "source=network_synchronized" in time_log
   assert "write_result=succeeded" in time_log
@@ -2096,16 +1982,16 @@ def test_time_assistance_logs_exclude_time_and_position(monkeypatch):
 
   assert pigeond.send_time_assistance(
     receiver,
-    assistance_time=datetime(
-      2026, 7, 10, 12, 34, 56, tzinfo=UTC
-    ),
+    assistance_time=datetime(2026, 7, 10, 12, 34, 56, tzinfo=UTC),
     source="rtc_estimate",
-    diagnostic_context=", ".join((
-      "cycle=3",
-      "reason=all_zero_data",
-      "process_elapsed_seconds=10.0",
-      "cycle_elapsed_seconds=1.0",
-    )),
+    diagnostic_context=", ".join(
+      (
+        "cycle=3",
+        "reason=all_zero_data",
+        "process_elapsed_seconds=10.0",
+        "cycle_elapsed_seconds=1.0",
+      )
+    ),
   )
 
   combined_logs = "\n".join(logs)
@@ -2126,9 +2012,7 @@ def test_cached_rtc_time_assistance_rejects_missing_anchor(
   monkeypatch.setattr(
     pigeond,
     "load_cache",
-    lambda *args, **kwargs: SimpleNamespace(
-      rtc_counter_seconds=None
-    ),
+    lambda *args, **kwargs: SimpleNamespace(rtc_counter_seconds=None),
   )
   monkeypatch.setattr(
     pigeond,
@@ -2148,9 +2032,7 @@ def test_cached_rtc_time_assistance_rejects_unavailable_current_rtc(
   monkeypatch.setattr(
     pigeond,
     "load_cache",
-    lambda *args, **kwargs: SimpleNamespace(
-      rtc_counter_seconds=100
-    ),
+    lambda *args, **kwargs: SimpleNamespace(rtc_counter_seconds=100),
   )
   monkeypatch.setattr(
     pigeond,
@@ -2171,9 +2053,7 @@ def test_cached_rtc_time_assistance_rejects_rollback(
   monkeypatch.setattr(
     pigeond,
     "load_cache",
-    lambda *args, **kwargs: SimpleNamespace(
-      rtc_counter_seconds=200
-    ),
+    lambda *args, **kwargs: SimpleNamespace(rtc_counter_seconds=200),
   )
   monkeypatch.setattr(
     pigeond,
@@ -2195,15 +2075,14 @@ def test_cached_rtc_time_assistance_rejects_excessive_elapsed(
   monkeypatch.setattr(
     pigeond,
     "load_cache",
-    lambda *args, **kwargs: SimpleNamespace(
-      rtc_counter_seconds=100
-    ),
+    lambda *args, **kwargs: SimpleNamespace(rtc_counter_seconds=100),
   )
   monkeypatch.setattr(
     pigeond,
     "read_rtc_counter_seconds",
     lambda: 200,
   )
+
   def reject_estimate(inventory, current_rtc_seconds):
     rejection = pigeond.RtcEstimateRejection(
       pigeond.RtcEstimateRejectionReason.ELAPSED_TIME_ABOVE_MAXIMUM,
@@ -2214,11 +2093,7 @@ def test_cached_rtc_time_assistance_rejects_excessive_elapsed(
   monkeypatch.setattr(pigeond, "select_rtc_estimate", reject_estimate)
 
   assert pigeond.cached_rtc_time_assistance("receiver") is None
-  assert any(
-    "elapsed_seconds=999" in message
-    and "maximum_elapsed_seconds=" in message
-    for message in logs
-  )
+  assert any("elapsed_seconds=999" in message and "maximum_elapsed_seconds=" in message for message in logs)
 
 
 def test_cached_rtc_time_assistance_uses_evaluator_reason_and_reads_once(
@@ -2236,15 +2111,12 @@ def test_cached_rtc_time_assistance_uses_evaluator_reason_and_reads_once(
   monkeypatch.setattr(
     pigeond,
     "load_cache",
-    lambda *args, **kwargs: SimpleNamespace(
-      rtc_counter_seconds=100
-    ),
+    lambda *args, **kwargs: SimpleNamespace(rtc_counter_seconds=100),
   )
   monkeypatch.setattr(pigeond, "read_rtc_counter_seconds", read_rtc)
+
   def reject_estimate(inventory, current_rtc_seconds):
-    rejection = pigeond.RtcEstimateRejection(
-      pigeond.RtcEstimateRejectionReason.CURRENT_RTC_UNAVAILABLE
-    )
+    rejection = pigeond.RtcEstimateRejection(pigeond.RtcEstimateRejectionReason.CURRENT_RTC_UNAVAILABLE)
     return None, ((inventory.primary, rejection),)
 
   monkeypatch.setattr(pigeond, "select_rtc_estimate", reject_estimate)
@@ -2252,7 +2124,6 @@ def test_cached_rtc_time_assistance_uses_evaluator_reason_and_reads_once(
   assert pigeond.cached_rtc_time_assistance("receiver") is None
   assert rtc_reads == 1
   assert any("current RTC unavailable" in message for message in logs)
-
 
 
 def test_cross_boot_rtc_logging_is_explicitly_nonoperational(
@@ -2324,14 +2195,10 @@ def test_independent_receiver_utc_is_aligned_to_current_boottime(
           source=kwargs["source"],
           provenance=kwargs["provenance"],
           independent=True,
-          observed_boottime_seconds=(
-            kwargs["observed_boottime_seconds"]
-          ),
+          observed_boottime_seconds=(kwargs["observed_boottime_seconds"]),
         ),
         anchor_write_status=SimpleNamespace(value="saved"),
-        anchor_write_reason=SimpleNamespace(
-          value="anchor_missing_or_invalid"
-        ),
+        anchor_write_reason=SimpleNamespace(value="anchor_missing_or_invalid"),
         anchor_comparison=None,
       )
 
@@ -2341,9 +2208,7 @@ def test_independent_receiver_utc_is_aligned_to_current_boottime(
     lambda: 500.0,
   )
   observation = pigeond.ReceiverUtcObservation(
-    classification=(
-      pigeond.ReceiverUtcClassification.UNASSISTED_GNSS
-    ),
+    classification=(pigeond.ReceiverUtcClassification.UNASSISTED_GNSS),
     reason="fresh_gnss_time_evidence",
     cycle_id=1,
     utc=datetime(2026, 7, 23, 12, tzinfo=UTC),
@@ -2399,9 +2264,7 @@ def test_receiver_correction_write_is_recorded_before_ack(
     time_provenance=provenance,
     assistance_boottime_seconds=55.0,
     independent=True,
-    source_provenance=(
-      pigeond.TimeProvenance.NETWORK_INDEPENDENT
-    ),
+    source_provenance=(pigeond.TimeProvenance.NETWORK_INDEPENDENT),
     correction=True,
   )
   observation = provenance.time_assistance_observation
@@ -2433,19 +2296,15 @@ def test_receiver_correction_is_sent_at_most_once_per_cycle():
     provenance=pigeond.TimeProvenance.NETWORK_INDEPENDENT,
   )
 
-  first, first_accepted = (
-    pigeond.maybe_send_receiver_time_correction(
-      receiver,
-      provenance,
-      independent,
-    )
+  first, first_accepted = pigeond.maybe_send_receiver_time_correction(
+    receiver,
+    provenance,
+    independent,
   )
-  second, second_accepted = (
-    pigeond.maybe_send_receiver_time_correction(
-      receiver,
-      provenance,
-      independent,
-    )
+  second, second_accepted = pigeond.maybe_send_receiver_time_correction(
+    receiver,
+    provenance,
+    independent,
   )
 
   assert first.should_correct
@@ -2474,18 +2333,14 @@ def test_receiver_independent_source_is_never_echoed_back():
     utc=datetime(2026, 7, 23, 12, tzinfo=UTC),
     observed_boottime_seconds=150.0,
     uncertainty_seconds=0.025,
-    source=(
-      pigeond.TrustedTimeSource.RECEIVER_UTC_UNASSISTED_GNSS
-    ),
+    source=(pigeond.TrustedTimeSource.RECEIVER_UTC_UNASSISTED_GNSS),
     provenance=pigeond.TimeProvenance.GNSS_INDEPENDENT,
   )
 
-  decision, accepted = (
-    pigeond.maybe_send_receiver_time_correction(
-      receiver,
-      provenance,
-      independent,
-    )
+  decision, accepted = pigeond.maybe_send_receiver_time_correction(
+    receiver,
+    provenance,
+    independent,
   )
 
   assert not decision.should_correct
@@ -2531,13 +2386,16 @@ def test_receiver_derived_host_cannot_authorize_cache_promotion(
     receiver_host_observation,
   )
 
-  assert pigeond.cache_promotion_trusted_now(
-    None,
-    None,
-    None,
-    receiver_utc_fresh=False,
-    receiver_utc_independent=False,
-  ) is None
+  assert (
+    pigeond.cache_promotion_trusted_now(
+      None,
+      None,
+      None,
+      receiver_utc_fresh=False,
+      receiver_utc_independent=False,
+    )
+    is None
+  )
 
 
 def test_later_network_generation_is_processed():

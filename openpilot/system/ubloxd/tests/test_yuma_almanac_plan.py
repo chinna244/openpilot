@@ -370,3 +370,11 @@ def test_31_restored_almanacs_with_wrong_prn_set_sends_missing():
 def test_invalid_restored_prn_metadata_is_rejected():
   with pytest.raises(ValueError, match="unique sorted"):
     plan(restored_gps_almanac_satellite_ids=(2, 1))
+
+
+def test_pending_database_restore_waits_without_yuma_transmission():
+  result = plan(database_state=YumaDatabaseRestoreState.PENDING)
+
+  assert result.action is YumaSupplementationAction.WAIT
+  assert result.reason is YumaSupplementationReason.WAITING_FOR_DATABASE_RESTORE
+  assert result.satellite_ids == frozenset()
