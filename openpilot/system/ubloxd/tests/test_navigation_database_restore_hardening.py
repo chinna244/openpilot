@@ -346,11 +346,14 @@ def test_terminal_boundary_clears_previously_queued_retries(
 def test_terminal_boundary_stops_remaining_retry_frames(
   tmp_path: Path,
 ) -> None:
+  def start_acquisition_after_retry_delay(_delay: float) -> None:
+    value.note_acquisition_started()
+
   value = NavigationDatabaseRestoreRuntime(
     "receiver",
     snapshot_loader=lambda _fingerprint: snapshot(frame_count=2),
     retry_delay_seconds=0.25,
-    sleeper=lambda _delay: value.note_acquisition_started(),
+    sleeper=start_acquisition_after_retry_delay,
     state_path=tmp_path / "dbd_state.json",
     boot_id_reader=lambda: BOOT_ID,
     boottime_reader=lambda: TEST_BOOTTIME_SECONDS,
