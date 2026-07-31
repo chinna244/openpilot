@@ -212,7 +212,10 @@ PRE_TRANSACTION_DRAIN_MAX_BYTES = 64 * 1024
 CONTROLLED_GNSS_STOP_MESSAGE = b"\xB5\x62\x06\x04\x04\x00\x00\x00\x08\x00\x16\x74"
 CONTROLLED_GNSS_START_MESSAGE = b"\xB5\x62\x06\x04\x04\x00\x00\x00\x09\x00\x17\x76"
 CONTROLLED_GNSS_TRANSITION_DELAY = 0.05
-NAVIGATION_DATABASE_TRUSTED_TIME_WAIT_SECONDS = 5.0
+# C4 independent network time commonly becomes available after the original
+# five-second window. Keep the pre-acquisition wait bounded while allowing
+# current network UTC to authorize DBD cache age before GNSS START.
+NAVIGATION_DATABASE_TRUSTED_TIME_WAIT_SECONDS = 40.0
 NAVIGATION_DATABASE_TRUSTED_TIME_POLL_SECONDS = 0.25
 # A validated MGA-DBD cache is capped at 64 KiB. Frequent dispatch between
 # transactions is the primary bound; these limits retain four cache volumes or

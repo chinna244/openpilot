@@ -218,6 +218,83 @@ def test_bounded_wait_accepts_delayed_network_time() -> None:
   assert sleeps == [0.25, 0.25]
 
 
+
+def test_default_wait_covers_observed_c4_network_sync_delay() -> None:
+  clock = [0.0]
+  sleeps: list[float] = []
+
+  def monotonic() -> float:
+    return clock[0]
+
+  def sleeper(delay: float) -> None:
+    sleeps.append(delay)
+    clock[0] += delay
+
+  def evaluator(_authority, _observation):
+    return SimpleNamespace(
+      authorized_time=network_time() if clock[0] >= 32.5 else None
+    )
+
+  observation, evaluation = (
+    pigeond.wait_for_current_independent_network_time(
+      object(),  # type: ignore[arg-type]
+      None,
+      SimpleNamespace(authorized_time=None),  # type: ignore[arg-type]
+      observation_reader=lambda: None,
+      evaluator=evaluator,  # type: ignore[arg-type]
+      monotonic=monotonic,
+      sleeper=sleeper,
+    )
+  )
+
+  assert (
+    pigeond.NAVIGATION_DATABASE_TRUSTED_TIME_WAIT_SECONDS
+    == 40.0
+  )
+  assert observation is None
+  assert evaluation.authorized_time == network_time()
+  assert clock[0] == pytest.approx(32.5)
+  assert sum(sleeps) == pytest.approx(32.5)
+
+
+def test_default_wait_remains_bounded_without_network_time() -> None:
+  clock = [0.0]
+  sleeps: list[float] = []
+
+  def monotonic() -> float:
+    return clock[0]
+
+  def sleeper(delay: float) -> None:
+    sleeps.append(delay)
+    clock[0] += delay
+
+  observation, evaluation = (
+    pigeond.wait_for_current_independent_network_time(
+      object(),  # type: ignore[arg-type]
+      None,
+      SimpleNamespace(authorized_time=None),  # type: ignore[arg-type]
+      observation_reader=lambda: None,
+      evaluator=lambda _authority, _observation: (
+        SimpleNamespace(authorized_time=None)
+      ),
+      monotonic=monotonic,
+      sleeper=sleeper,
+    )
+  )
+
+  assert observation is None
+  assert evaluation.authorized_time is None
+  assert clock[0] == pytest.approx(40.0)
+  assert sum(sleeps) == pytest.approx(40.0)
+  assert sleeps
+  assert all(
+    0.0 < delay
+    <= pigeond.NAVIGATION_DATABASE_TRUSTED_TIME_POLL_SECONDS
+    for delay in sleeps
+  )
+
+
+
 def test_yuma_claim_happens_before_receiver_write() -> None:
   events: list[str] = []
   runtime = SimpleNamespace(
