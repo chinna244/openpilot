@@ -57,6 +57,12 @@ class NavigationDatabaseRestoreStateError(ValueError):
   pass
 
 
+class NavigationDatabaseRestoreStateContentError(
+  NavigationDatabaseRestoreStateError
+):
+  """Persistent state was readable, but its contents are invalid."""
+
+
 class NavigationDatabaseRestoreInitializationError(RuntimeError):
   """Receiver startup cannot safely establish boot-scoped DBD ownership."""
 
@@ -112,6 +118,12 @@ class NavigationDatabaseRestoreFrozenCaches:
   @property
   def database_candidates(self) -> tuple[NavigationDatabaseRestoreSnapshot, ...]:
     return tuple(snapshot for snapshot in (self.primary_snapshot, self.previous_snapshot) if snapshot is not None and snapshot.database_frames)
+
+
+class NavigationDatabaseRestoreTerminalBoundaryError(
+  CacheValidationError
+):
+  """The active DBD restore can no longer safely send any frame."""
 
 
 class NavigationDatabaseRestoreFrameFailureKind(StrEnum):
@@ -396,13 +408,87 @@ def load_navigation_database_restore_boot_state(
     raw = path.read_text(encoding="utf-8")
   except FileNotFoundError:
     return None
+  except UnicodeDecodeError as exc:
+    raise NavigationDatabaseRestoreStateContentError(
+      "state encoding is invalid"
+    ) from exc
   except OSError as exc:
     raise NavigationDatabaseRestoreStateError("state read failed") from exc
+
   try:
     value = json.loads(raw)
-  except json.JSONDecodeError as exc:
-    raise NavigationDatabaseRestoreStateError("state JSON is invalid") from exc
-  return NavigationDatabaseRestoreBootState.from_json_dict(value)
+  except (ValueError, RecursionError) as exc:
+    raise NavigationDatabaseRestoreStateContentError(
+      "state JSON is invalid"
+    ) from exc
+
+  try:
+    return NavigationDatabaseRestoreBootState.from_json_dict(value)
+  except NavigationDatabaseRestoreStateError as exc:
+    raise NavigationDatabaseRestoreStateContentError(
+      str(exc)
+    ) from exc
+
+
+def _navigation_database_restore_quarantine_prefix(
+  path: Path,
+  boot_id: str,
+) -> str:
+  if not isinstance(path, Path):
+    raise NavigationDatabaseRestoreStateError("state path is invalid")
+  if not isinstance(boot_id, str) or not boot_id.strip():
+    raise NavigationDatabaseRestoreStateError("boot_id is invalid")
+
+  boot_digest = sha256(boot_id.encode("utf-8")).hexdigest()[:16]
+  return f"{path.name}.invalid-{boot_digest}-"
+
+
+def navigation_database_restore_state_quarantine_exists(
+  path: Path,
+  boot_id: str,
+) -> bool:
+  prefix = _navigation_database_restore_quarantine_prefix(
+    path,
+    boot_id,
+  )
+
+  try:
+    with os.scandir(path.parent) as entries:
+      return any(entry.name.startswith(prefix) for entry in entries)
+  except FileNotFoundError:
+    return False
+  except OSError as exc:
+    raise NavigationDatabaseRestoreStateError(
+      "state quarantine probe failed"
+    ) from exc
+
+
+def quarantine_navigation_database_restore_boot_state(
+  path: Path,
+  boot_id: str,
+) -> Path:
+  prefix = _navigation_database_restore_quarantine_prefix(
+    path,
+    boot_id,
+  )
+  quarantine_path = path.with_name(
+    f"{prefix}{time.time_ns()}-{os.getpid()}"
+  )
+
+  try:
+    os.replace(path, quarantine_path)
+
+    directory_descriptor = os.open(path.parent, os.O_RDONLY)
+    try:
+      os.fsync(directory_descriptor)
+    finally:
+      os.close(directory_descriptor)
+  except OSError as exc:
+    raise NavigationDatabaseRestoreStateError(
+      "state quarantine failed"
+    ) from exc
+
+  return quarantine_path
 
 
 def store_navigation_database_restore_boot_state(
@@ -524,6 +610,7 @@ class NavigationDatabaseRestoreRuntime:
     boot_id_reader: Callable[[], str | None] = read_boot_id,
     boottime_reader: Callable[[], float | None] = read_boottime_seconds,
     state_loader: Callable[[Path], NavigationDatabaseRestoreBootState | None] = load_navigation_database_restore_boot_state,
+    state_quarantiner: Callable[[Path, str], Path] = quarantine_navigation_database_restore_boot_state,
     state_storer: Callable[[NavigationDatabaseRestoreBootState, Path], None] = store_navigation_database_restore_boot_state,
   ) -> None:
     if not isinstance(receiver_fingerprint, str):
@@ -534,6 +621,7 @@ class NavigationDatabaseRestoreRuntime:
       ("boot_id_reader", boot_id_reader),
       ("boottime_reader", boottime_reader),
       ("state_loader", state_loader),
+      ("state_quarantiner", state_quarantiner),
       ("state_storer", state_storer),
     ):
       if not callable(dependency):
@@ -595,12 +683,59 @@ class NavigationDatabaseRestoreRuntime:
         "boot_state:boot_id_unavailable"
       )
 
+    quarantine_closed = False
+
     try:
-      persisted = state_loader(self._state_path)
+      quarantine_exists = (
+        navigation_database_restore_state_quarantine_exists(
+          self._state_path,
+          self._boot_id,
+        )
+      )
     except Exception as exc:
       raise NavigationDatabaseRestoreInitializationError(
-        f"boot_state:state_load_failed:{_bounded_error(exc)}"
+        f"boot_state:state_quarantine_probe_failed:{_bounded_error(exc)}"
       ) from exc
+
+    if quarantine_exists:
+      self._fail_closed("boot_state:invalid_state_quarantined")
+      if not self._persist_state():
+        detail = self._state_persistence_error or "unknown"
+        raise NavigationDatabaseRestoreInitializationError(
+          f"boot_state:terminal_state_persist_failed:{detail}"
+        )
+      persisted = None
+      quarantine_closed = True
+    else:
+      try:
+        persisted = state_loader(self._state_path)
+      except NavigationDatabaseRestoreStateContentError as exc:
+        try:
+          state_quarantiner(
+            self._state_path,
+            self._boot_id,
+          )
+        except Exception as quarantine_exc:
+          raise NavigationDatabaseRestoreInitializationError(
+            f"boot_state:state_quarantine_failed:{_bounded_error(quarantine_exc)}"
+          ) from quarantine_exc
+
+        self._fail_closed(
+          f"boot_state:invalid_state_quarantined:{_bounded_error(exc)}"
+        )
+        if not self._persist_state():
+          detail = self._state_persistence_error or "unknown"
+          raise NavigationDatabaseRestoreInitializationError(
+            f"boot_state:terminal_state_persist_failed:{detail}"
+          ) from exc
+
+        persisted = None
+        quarantine_closed = True
+      except Exception as exc:
+        raise NavigationDatabaseRestoreInitializationError(
+          f"boot_state:state_load_failed:{_bounded_error(exc)}"
+        ) from exc
+
     if persisted is not None and not isinstance(
       persisted,
       NavigationDatabaseRestoreBootState,
@@ -614,7 +749,10 @@ class NavigationDatabaseRestoreRuntime:
       and persisted.boot_id == self._boot_id
       and persisted.receiver_fingerprint == self._receiver_fingerprint
     )
-    if valid_same_boot_state:
+
+    if quarantine_closed:
+      pass
+    elif valid_same_boot_state:
       self._restore_persisted_state(persisted)
     else:
       if (
@@ -623,6 +761,7 @@ class NavigationDatabaseRestoreRuntime:
         and persisted.receiver_fingerprint != self._receiver_fingerprint
       ):
         self._fail_closed("boot_state:receiver_fingerprint_mismatch")
+
       if not self._persist_state():
         detail = self._state_persistence_error or "unknown"
         raise NavigationDatabaseRestoreInitializationError(
@@ -984,23 +1123,33 @@ class NavigationDatabaseRestoreRuntime:
     ), ages[selected.generation]
 
   def validate_database_write_boundary(self, frame_index: int) -> None:
-    """Revalidate trusted age and acquisition after the UART pre-send drain."""
+    """Revalidate trusted age and acquisition at each receiver-write boundary."""
     if isinstance(frame_index, bool) or not isinstance(frame_index, int) or frame_index < 0:
       raise ValueError("database frame index must be a non-negative int")
     if not self._controller.restore_attempted or self._controller.terminal:
-      raise CacheValidationError("DBD receiver write is outside an active restore attempt")
+      raise NavigationDatabaseRestoreTerminalBoundaryError(
+        "DBD receiver write is outside an active restore attempt"
+      )
     if self._controller.acquisition_started:
-      raise CacheValidationError("DBD receiver write blocked: GNSS acquisition already started")
+      raise NavigationDatabaseRestoreTerminalBoundaryError(
+        "DBD receiver write blocked: GNSS acquisition already started"
+      )
     snapshot = self._database_snapshot
     authorized_time = self._last_authorized_time
     if snapshot is None or authorized_time is None or not is_current_independent_network_time(authorized_time):
-      raise CacheValidationError("DBD receiver write blocked: trusted-age evidence is unavailable")
+      raise NavigationDatabaseRestoreTerminalBoundaryError(
+        "DBD receiver write blocked: trusted-age evidence is unavailable"
+      )
     cache_age_seconds = self._effective_cache_age(snapshot, authorized_time)
     self._last_cache_age_seconds = cache_age_seconds
     if cache_age_seconds is None or cache_age_seconds < 0.0:
-      raise CacheValidationError("DBD receiver write blocked: trusted cache age is unverified")
+      raise NavigationDatabaseRestoreTerminalBoundaryError(
+        "DBD receiver write blocked: trusted cache age is unverified"
+      )
     if cache_age_seconds > NAVIGATION_DATABASE_RESTORE_MAX_AGE_SECONDS:
-      raise CacheValidationError("DBD receiver write blocked: trusted cache age expired")
+      raise NavigationDatabaseRestoreTerminalBoundaryError(
+        "DBD receiver write blocked: trusted cache age expired"
+      )
 
   def evaluate(
     self,
@@ -1069,9 +1218,13 @@ class NavigationDatabaseRestoreRuntime:
 
     try:
       failure_phase = "initial_pass"
+      terminal_boundary_failed = False
       for index, frame in enumerate(snapshot.database_frames):
-        write_attempts += 1
         try:
+          # Cheap pre-drain guard. The sender retains the post-drain guard
+          # immediately before the UART write to close the acquisition race.
+          self.validate_database_write_boundary(index)
+          write_attempts += 1
           send_database_message(frame, index)
           accepted.add(index)
         except Exception as exc:
@@ -1083,20 +1236,29 @@ class NavigationDatabaseRestoreRuntime:
             error=_bounded_error(exc),
           )
           initial_failures.append(failure)
+          if isinstance(
+            exc,
+            NavigationDatabaseRestoreTerminalBoundaryError,
+          ):
+            permanent_failures.append(failure)
+            retry_frames.clear()
+            terminal_boundary_failed = True
+            break
           if kind.retryable:
             retry_frames.append((index, frame))
           else:
             permanent_failures.append(failure)
 
-      if retry_frames:
+      if retry_frames and not terminal_boundary_failed:
         if self._retry_delay_seconds:
           failure_phase = "retry_delay"
           self._sleeper(self._retry_delay_seconds)
 
         failure_phase = "retry_pass"
         for index, frame in retry_frames:
-          write_attempts += 1
           try:
+            self.validate_database_write_boundary(index)
+            write_attempts += 1
             send_database_message(frame, index)
             accepted.add(index)
             retry_accepted.append(index)
@@ -1109,6 +1271,11 @@ class NavigationDatabaseRestoreRuntime:
                 error=_bounded_error(exc),
               )
             )
+            if isinstance(
+              exc,
+              NavigationDatabaseRestoreTerminalBoundaryError,
+            ):
+              break
     except Exception as exc:
       execution_error = _bounded_error(exc)
     succeeded = execution_error is None and bool(snapshot.database_frames) and len(accepted) == len(snapshot.database_frames) and not permanent_failures

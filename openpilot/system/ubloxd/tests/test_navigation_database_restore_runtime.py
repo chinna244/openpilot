@@ -157,21 +157,35 @@ def test_state_round_trip(tmp_path: Path) -> None:
   assert load_navigation_database_restore_boot_state(path) == state
 
 
-def test_corrupt_state_aborts_initialization(tmp_path: Path) -> None:
+def test_corrupt_state_is_quarantined_and_fails_closed(
+  tmp_path: Path,
+) -> None:
   path = tmp_path / "dbd_state.json"
   path.write_text("not-json", encoding="utf-8")
 
-  with pytest.raises(
-    NavigationDatabaseRestoreInitializationError,
-    match="state_load_failed",
-  ):
-    NavigationDatabaseRestoreRuntime(
-      "receiver",
-      snapshot_loader=lambda _fingerprint: snapshot(),
-      state_path=path,
-      boot_id_reader=lambda: BOOT_ID,
-      boottime_reader=lambda: TEST_BOOTTIME_SECONDS,
-    )
+  value = NavigationDatabaseRestoreRuntime(
+    "receiver",
+    snapshot_loader=lambda _fingerprint: snapshot(),
+    state_path=path,
+    boot_id_reader=lambda: BOOT_ID,
+    boottime_reader=lambda: TEST_BOOTTIME_SECONDS,
+  )
+
+  assert (
+    value.controller.disposition
+    is NavigationDatabaseRestoreDisposition.SKIPPED_UNVERIFIED
+  )
+
+  persisted = load_navigation_database_restore_boot_state(path)
+  assert persisted is not None
+  assert (
+    persisted.disposition
+    is NavigationDatabaseRestoreDisposition.SKIPPED_UNVERIFIED
+  )
+
+  quarantined = list(tmp_path.glob(f"{path.name}.invalid-*"))
+  assert len(quarantined) == 1
+  assert quarantined[0].read_text(encoding="utf-8") == "not-json"
 
 
 def test_new_linux_boot_discards_old_state(tmp_path: Path) -> None:
