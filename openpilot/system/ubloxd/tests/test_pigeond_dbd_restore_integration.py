@@ -167,6 +167,24 @@ def test_startup_timeline_formats_correlated_fields() -> None:
   )
 
 
+def test_startup_timeline_rejects_incomplete_time_stub() -> None:
+  incomplete = SimpleNamespace(
+    utc=NOW,
+    evidence=SimpleNamespace(value="system_synchronized"),
+    mga_accuracy_seconds=30,
+    independent=True,
+    provenance=SimpleNamespace(value="network_independent"),
+    observed_boottime_seconds=100.0,
+  )
+
+  assert not pigeond._startup_timeline_has_current_network_time(
+    incomplete
+  )
+  assert pigeond._startup_timeline_has_current_network_time(
+    network_time()
+  )
+
+
 def test_paused_acquisition_records_start_timestamp(
   monkeypatch: pytest.MonkeyPatch,
 ) -> None:

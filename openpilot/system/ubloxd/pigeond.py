@@ -3621,6 +3621,15 @@ def _startup_timeline_elapsed(
   return f"{value - cycle_started_at:.3f}"
 
 
+def _startup_timeline_has_current_network_time(
+  authorized_time: object | None,
+) -> bool:
+  return (
+    isinstance(authorized_time, AuthorizedTime)
+    and is_current_independent_network_time(authorized_time)
+  )
+
+
 def format_gps_startup_timeline(
   *,
   cycle: int,
@@ -3860,9 +3869,8 @@ def initialize_receiver_cycle(
   authority_evaluated_at = time.monotonic()
   independent_network_time_seen_at = (
     authority_evaluated_at
-    if (
-      authorized_time is not None
-      and is_current_independent_network_time(authorized_time)
+    if _startup_timeline_has_current_network_time(
+      authorized_time
     )
     else None
   )
@@ -3945,8 +3953,9 @@ def initialize_receiver_cycle(
       authorized_time = authority_evaluation.authorized_time
       if (
         independent_network_time_seen_at is None
-        and authorized_time is not None
-        and is_current_independent_network_time(authorized_time)
+        and _startup_timeline_has_current_network_time(
+          authorized_time
+        )
       ):
         independent_network_time_seen_at = (
           trusted_time_wait_completed_at
