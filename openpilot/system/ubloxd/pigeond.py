@@ -124,6 +124,11 @@ from openpilot.system.ubloxd.navigation_database_restore_runtime import (
   PositionAssistanceFailureKind,
   PositionAssistanceWriteStatus,
 )
+from openpilot.system.ubloxd.position_assistance_retry import (
+  PositionAssistanceRetryResult,
+  PositionAssistanceRetryRuntime,
+  PositionAssistanceRetryState,
+)
 from openpilot.system.ubloxd.receiver_time_provenance import (
   ReceiverTimeProvenanceTracker,
   ReceiverUtcClassification,
@@ -1575,8 +1580,10 @@ def deinitialize_and_exit(pigeon: TTYPigeon | None):
 @dataclass
 class PreAcquisitionInitialization:
   callback: Callable[[], None]
+  gnss_start_callback: Callable[[float], None] | None = None
   executed: bool = False
   gnss_start_sent_at: float | None = None
+  pre_gnss_start_drain_required: bool = False
 
   def run(self) -> None:
     if self.executed:
@@ -1586,6 +1593,11 @@ class PreAcquisitionInitialization:
 
   def note_gnss_start_sent(self, now: float) -> None:
     self.gnss_start_sent_at = now
+    if self.gnss_start_callback is not None:
+      self.gnss_start_callback(now)
+
+  def require_pre_gnss_start_drain(self) -> None:
+    self.pre_gnss_start_drain_required = True
 
 
 _ACTIVE_PRE_ACQUISITION_INITIALIZATION: (
@@ -1596,11 +1608,12 @@ _ACTIVE_PRE_ACQUISITION_INITIALIZATION: (
 @contextmanager
 def install_pre_acquisition_initialization(
   callback: Callable[[], None],
+  gnss_start_callback: Callable[[float], None] | None = None,
 ) -> Iterator[PreAcquisitionInitialization]:
   global _ACTIVE_PRE_ACQUISITION_INITIALIZATION
   if _ACTIVE_PRE_ACQUISITION_INITIALIZATION is not None:
     raise RuntimeError("pre-acquisition initialization is already active")
-  state = PreAcquisitionInitialization(callback)
+  state = PreAcquisitionInitialization(callback, gnss_start_callback)
   _ACTIVE_PRE_ACQUISITION_INITIALIZATION = state
   try:
     yield state
@@ -1635,8 +1648,15 @@ def paused_gnss_acquisition(pigeon: TTYPigeon) -> Iterator[None]:
     # A failed pre-acquisition claim must leave GNSS stopped.
     raise
   else:
-    pigeon.send(CONTROLLED_GNSS_START_MESSAGE)
     initialization = _ACTIVE_PRE_ACQUISITION_INITIALIZATION
+    if (
+      initialization is not None
+      and initialization.pre_gnss_start_drain_required
+    ):
+      drain = getattr(pigeon, "drain_before_transaction", None)
+      if callable(drain):
+        drain("position_assistance_pre_gnss_start_boundary")
+    pigeon.send(CONTROLLED_GNSS_START_MESSAGE)
     if initialization is not None:
       initialization.note_gnss_start_sent(time.monotonic())
     time.sleep(CONTROLLED_GNSS_TRANSITION_DELAY)
@@ -3955,6 +3975,189 @@ class GpsStartupDiagnostics:
     self.next_status_time = now + self.status_interval
 
 
+def format_position_assistance_retry_state(
+  state: PositionAssistanceRetryState,
+  *,
+  trigger: str,
+  receiver_cycle: int | None,
+  gnss_start_sent_at: float | None,
+  nav_pvt_observed_at: float | None,
+  persistence_error: str | None,
+) -> str:
+  def optional(value: object | None) -> str:
+    return "none" if value is None else str(value)
+
+  return ", ".join((
+    "GPS position assistance post-start retry",
+    f"position_assistance_retry_trigger={trigger}",
+    "position_assistance_initial_attempted="
+    + str(state.initial_attempted).lower(),
+    "position_assistance_initial_write_status="
+    + state.initial_write_status.value,
+    "position_assistance_initial_ack_status="
+    + state.initial_ack_status.value,
+    "position_assistance_initial_ack_info_code="
+    + optional(state.initial_ack_info_code),
+    "position_assistance_retry_armed="
+    + str(state.retry_armed).lower(),
+    "position_assistance_retry_claimed="
+    + str(state.retry_claimed).lower(),
+    "position_assistance_retry_completed="
+    + str(state.retry_completed).lower(),
+    "position_assistance_retry_result="
+    + state.retry_result.value,
+    "position_assistance_retry_write_status="
+    + state.retry_write_status.value,
+    "position_assistance_retry_ack_status="
+    + state.retry_ack_status.value,
+    "position_assistance_retry_ack_info_code="
+    + optional(state.retry_ack_info_code),
+    "position_assistance_retry_error_type="
+    + optional(state.retry_error_type),
+    "position_assistance_retry_error="
+    + optional(state.retry_error),
+    "position_assistance_retry_receiver_cycle="
+    + optional(receiver_cycle),
+    "position_assistance_retry_triggered_at="
+    + optional(state.retry_triggered_at),
+    "gnss_start_sent_at_monotonic="
+    + optional(gnss_start_sent_at),
+    "nav_pvt_observed_at_monotonic="
+    + optional(nav_pvt_observed_at),
+    "position_assistance_retry_state_error="
+    + optional(persistence_error),
+  ))
+
+
+def log_position_assistance_retry_state(
+  state: PositionAssistanceRetryState,
+  *,
+  trigger: str,
+  receiver_cycle: int | None,
+  gnss_start_sent_at: float | None,
+  nav_pvt_observed_at: float | None,
+  persistence_error: str | None,
+) -> None:
+  message = format_position_assistance_retry_state(
+    state,
+    trigger=trigger,
+    receiver_cycle=receiver_cycle,
+    gnss_start_sent_at=gnss_start_sent_at,
+    nav_pvt_observed_at=nav_pvt_observed_at,
+    persistence_error=persistence_error,
+  )
+  if state.retry_result in (
+    PositionAssistanceRetryResult.REJECTED,
+    PositionAssistanceRetryResult.TIMED_OUT,
+    PositionAssistanceRetryResult.ACK_OBSERVATION_FAILED,
+    PositionAssistanceRetryResult.WRITE_FAILED,
+    PositionAssistanceRetryResult.CLAIM_PERSIST_FAILED,
+  ):
+    cloudlog.warning(message)
+  else:
+    cloudlog.info(message)
+
+
+@dataclass
+class PositionAssistancePostStartRetryController:
+  runtime: PositionAssistanceRetryRuntime | None
+  receiver_cycle: int | None = None
+  gnss_start_sent_at: float | None = None
+  first_post_start_nav_pvt_consumed: bool = False
+  retry_ready: bool = False
+  nav_pvt_observed_at: float | None = None
+
+  def begin_receiver_cycle(
+    self,
+    receiver_cycle: int,
+    gnss_start_sent_at: float | None,
+  ) -> None:
+    self.receiver_cycle = receiver_cycle
+    self.gnss_start_sent_at = gnss_start_sent_at
+    self.first_post_start_nav_pvt_consumed = False
+    self.retry_ready = False
+    self.nav_pvt_observed_at = None
+
+  def cancel_receiver_cycle(self, now: float) -> None:
+    if self.runtime is not None and self.runtime.state.pending:
+      state = self.runtime.cancel(
+        PositionAssistanceRetryResult.CANCELLED_RECEIVER_CYCLE_CHANGED,
+        now,
+      )
+      log_position_assistance_retry_state(
+        state,
+        trigger="receiver_cycle_changed",
+        receiver_cycle=self.receiver_cycle,
+        gnss_start_sent_at=self.gnss_start_sent_at,
+        nav_pvt_observed_at=self.nav_pvt_observed_at,
+        persistence_error=self.runtime.persistence_error,
+      )
+    self.receiver_cycle = None
+    self.gnss_start_sent_at = None
+    self.first_post_start_nav_pvt_consumed = True
+    self.retry_ready = False
+    self.nav_pvt_observed_at = None
+
+  def observe_frames(
+    self,
+    frames: list[bytes],
+    observed_at: float,
+    receiver_cycle: int,
+  ) -> None:
+    if (
+      self.runtime is None
+      or self.first_post_start_nav_pvt_consumed
+      or not self.runtime.state.pending
+      or self.receiver_cycle != receiver_cycle
+      or self.gnss_start_sent_at is None
+      or observed_at <= self.gnss_start_sent_at
+    ):
+      return
+
+    for frame in frames:
+      fix = parse_nav_pvt(frame)
+      if fix is None:
+        continue
+      self.first_post_start_nav_pvt_consumed = True
+      self.nav_pvt_observed_at = observed_at
+      if not fix.fix_ok:
+        self.retry_ready = True
+        return
+      state = self.runtime.cancel(
+        PositionAssistanceRetryResult.CANCELLED_EXISTING_FIX,
+        observed_at,
+      )
+      log_position_assistance_retry_state(
+        state,
+        trigger="first_post_start_nav_pvt",
+        receiver_cycle=receiver_cycle,
+        gnss_start_sent_at=self.gnss_start_sent_at,
+        nav_pvt_observed_at=observed_at,
+        persistence_error=self.runtime.persistence_error,
+      )
+      return
+
+  def execute_ready(
+    self,
+    send_message: Callable[[bytes], object],
+  ) -> None:
+    if self.runtime is None or not self.retry_ready:
+      return
+    observed_at = self.nav_pvt_observed_at
+    receiver_cycle = self.receiver_cycle
+    self.retry_ready = False
+    if observed_at is None or not self.runtime.state.pending:
+      return
+    state = self.runtime.retry_once(send_message, observed_at)
+    log_position_assistance_retry_state(
+      state,
+      trigger="first_post_start_nav_pvt",
+      receiver_cycle=receiver_cycle,
+      gnss_start_sent_at=self.gnss_start_sent_at,
+      nav_pvt_observed_at=observed_at,
+      persistence_error=self.runtime.persistence_error,
+    )
+
 @dataclass(frozen=True)
 class ReceiverCycleInitialization:
   trusted_time_assistance_sent: bool
@@ -4298,6 +4501,7 @@ def initialize_receiver_cycle(
   time_authority: TimeAuthority | None = None,
   time_provenance: ReceiverTimeProvenanceTracker | None = None,
   navigation_database_runtime: NavigationDatabaseRestoreRuntime | None = None,
+  position_assistance_retry: PositionAssistancePostStartRetryController | None = None,
 ) -> ReceiverCycleInitialization:
   cycle_started_at = time.monotonic()
   startup_diagnostics.start_cycle(reason, cycle_started_at)
@@ -4466,6 +4670,30 @@ def initialize_receiver_cycle(
     )
     navigation_assistance_restore_attempted = True
 
+    if position_assistance_retry is not None:
+      retry_runtime = position_assistance_retry.runtime
+      if retry_runtime is not None:
+        retry_runtime.arm_from_initial(
+          database_runtime.execution,
+          database_runtime.position_assistance_message,
+        )
+        if retry_runtime.state.pending:
+          initialization.require_pre_gnss_start_drain()
+        if (
+          retry_runtime.state.pending
+          or retry_runtime.state.retry_result
+          is PositionAssistanceRetryResult.CLAIM_PERSIST_FAILED
+          or retry_runtime.persistence_error is not None
+        ):
+          log_position_assistance_retry_state(
+            retry_runtime.state,
+            trigger="armed_initial_info_code_5",
+            receiver_cycle=getattr(pigeon, "receiver_cycle", 0),
+            gnss_start_sent_at=None,
+            nav_pvt_observed_at=None,
+            persistence_error=retry_runtime.persistence_error,
+          )
+
     if authorized_time is not None:
       time_assistance_utc = authorized_time.utc
       trusted_time_assistance_sent = send_time_assistance(
@@ -4499,8 +4727,16 @@ def initialize_receiver_cycle(
         raise RuntimeError("GNSS START claim persistence failed")
       acquisition_start_claimed = True
       acquisition_start_claimed_at = time.monotonic()
+  def note_gnss_start_sent(now: float) -> None:
+    if position_assistance_retry is not None:
+      position_assistance_retry.begin_receiver_cycle(
+        getattr(pigeon, "receiver_cycle", 0),
+        now,
+      )
+
   with install_pre_acquisition_initialization(
-    pre_acquisition_initialization
+    pre_acquisition_initialization,
+    note_gnss_start_sent,
   ) as initialization:
     init(pigeon)
 
@@ -6136,14 +6372,30 @@ def run_receiving(duration: int = 0):
   navigation_database_runtime = NavigationDatabaseRestoreRuntime(
     receiver_fingerprint
   )
+  try:
+    position_assistance_retry_runtime = (
+      PositionAssistanceRetryRuntime(receiver_fingerprint)
+    )
+  except Exception:
+    cloudlog.exception(
+      "GPS position assistance retry state unavailable"
+    )
+    position_assistance_retry_runtime = None
+  position_assistance_retry = (
+    PositionAssistancePostStartRetryController(
+      position_assistance_retry_runtime
+    )
+  )
+  pigeon: TTYPigeon
 
   def dispatch_frames(frames: list[bytes]) -> None:
     if receiver_frames_show_gnss_acquisition(frames):
       if not navigation_database_runtime.note_acquisition_started():
         raise RuntimeError("acquisition latch persistence failed")
+    frame_time = time.monotonic()
     completed = process_receiver_frames(
       frames,
-      time.monotonic(),
+      frame_time,
       startup_diagnostics,
       fix_tracker,
       capture_quality_tracker,
@@ -6154,11 +6406,23 @@ def run_receiving(duration: int = 0):
     )
     if completed is not None:
       completed_databases.append(completed)
+    position_assistance_retry.observe_frames(
+      frames,
+      frame_time,
+      getattr(pigeon, "receiver_cycle", 0),
+    )
 
   pigeon = TTYPigeon(
     lambda data: publish_ublox_raw(pm, data),
     dispatch_frames,
   )
+
+  def execute_position_assistance_retry() -> None:
+    position_assistance_retry.execute_ready(
+      lambda message: send_mga_with_strict_ack(pigeon, message),
+    )
+
+
   def send_yuma_message(message: bytes) -> object:
     return send_yuma_with_durable_claim(
       navigation_database_runtime,
@@ -6182,7 +6446,9 @@ def run_receiving(duration: int = 0):
     time_authority=time_authority,
     time_provenance=receiver_time_provenance,
     navigation_database_runtime=navigation_database_runtime,
+    position_assistance_retry=position_assistance_retry,
   )
+  execute_position_assistance_retry()
   startup_diagnostics.initialization_complete(
     cycle_initialization.completed_at
   )
@@ -6511,6 +6777,7 @@ def run_receiving(duration: int = 0):
 
       cloudlog.error("No data from ublox for 10 seconds; power-cycling and reinitializing receiver")
 
+      position_assistance_retry.cancel_receiver_cycle(now)
       cycle_initialization = initialize_receiver_cycle(
         pigeon,
         receiver_fingerprint,
@@ -6519,7 +6786,9 @@ def run_receiving(duration: int = 0):
         time_authority=time_authority,
         time_provenance=receiver_time_provenance,
         navigation_database_runtime=navigation_database_runtime,
+        position_assistance_retry=position_assistance_retry,
       )
+      execute_position_assistance_retry()
       initialization_completed_at = (
         cycle_initialization.completed_at
       )
@@ -6585,6 +6854,7 @@ def run_receiving(duration: int = 0):
           "received all-zero data from ublox, re-initing!"
         )
 
+        position_assistance_retry.cancel_receiver_cycle(now)
         cycle_initialization = initialize_receiver_cycle(
           pigeon,
           receiver_fingerprint,
@@ -6593,7 +6863,9 @@ def run_receiving(duration: int = 0):
           time_authority=time_authority,
           time_provenance=receiver_time_provenance,
           navigation_database_runtime=navigation_database_runtime,
+          position_assistance_retry=position_assistance_retry,
         )
+        execute_position_assistance_retry()
         initialization_completed_at = (
           cycle_initialization.completed_at
         )
@@ -6654,6 +6926,7 @@ def run_receiving(duration: int = 0):
         publish_ublox_raw(pm, data)
 
     dispatch_frames(received_frames)
+    execute_position_assistance_retry()
     completed_database = (
       completed_databases.popleft()
       if completed_databases

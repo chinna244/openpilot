@@ -681,6 +681,7 @@ class NavigationDatabaseRestoreRuntime:
     self._position_claimed = False
     self._position_attempted = False
     self._position_succeeded = False
+    self._position_message: bytes | None = None
     self._position_message_id: int | None = None
     self._position_message_type: int | None = None
     self._position_write_status = PositionAssistanceWriteStatus.NOT_ATTEMPTED
@@ -825,6 +826,10 @@ class NavigationDatabaseRestoreRuntime:
   @property
   def execution(self) -> NavigationDatabaseRestoreExecution:
     return self._execution
+
+  @property
+  def position_assistance_message(self) -> bytes | None:
+    return self._position_message
 
   def _fail_closed(self, reason: str) -> None:
     self._position_claimed = True
@@ -986,6 +991,7 @@ class NavigationDatabaseRestoreRuntime:
       self._position_error = _bounded_error(exc)
       self._position_succeeded = False
     else:
+      self._position_message = message
       self._position_message_id = message[3] if len(message) > 3 else None
       payload_length = int.from_bytes(message[4:6], "little") if len(message) >= 6 else 0
       self._position_message_type = (
