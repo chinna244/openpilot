@@ -1,7 +1,19 @@
 #!/usr/bin/env bash
 
-# Define the service name
-SERVICE_NAME="actions.runner.sunnypilot.$(uname -n)"
+# The unit name carries the org the runner was registered to
+# (actions.runner.<org>.<hostname>), so prefer the name svc.sh recorded at install
+# time and only fall back to the sunnypilot default.
+if mountpoint -q /data/media; then
+    RUNNER_DIR="/data/media/0/github/runner"
+else
+    RUNNER_DIR="/data/github/runner"
+fi
+
+if [[ -f "${RUNNER_DIR}/.service" ]]; then
+    SERVICE_NAME="$(cat "${RUNNER_DIR}/.service")"
+else
+    SERVICE_NAME="actions.runner.sunnypilot.$(uname -n)"
+fi
 
 # Function to control the service
 control_service() {
