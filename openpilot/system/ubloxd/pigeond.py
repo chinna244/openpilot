@@ -5915,11 +5915,7 @@ def log_yuma_supplementation_outcome(
   outcome: YumaSupplementationRuntimeOutcome,
 ) -> None:
   def optional(value: object | None) -> str:
-    if value is None:
-      return "none"
-    if isinstance(value, bool):
-      return str(value).lower()
-    return str(value)
+    return "none" if value is None else str(value)
 
   def timestamp(value: datetime | None) -> str:
     return "none" if value is None else value.isoformat()

@@ -685,7 +685,9 @@ def test_yuma_log_labels_captured_and_effective_quality(
   assert "effective_glonass_ephemeris_available=8" in message
   assert "gnss_start_sent_at_monotonic=1.31" in message
   assert "completion_monotonic=2.757" in message
-  assert "completed_before_gnss_start=false" in message
+  assert "captured_gps_startup_ready=True" in message
+  assert "effective_gps_startup_ready=True" in message
+  assert "completed_before_gnss_start=False" in message
 
 
 def test_receiver_utc_anchor_accepts_fresh_unreliable_nav_pvt():
