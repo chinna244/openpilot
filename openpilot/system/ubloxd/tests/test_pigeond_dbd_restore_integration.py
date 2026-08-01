@@ -237,11 +237,11 @@ def test_default_wait_covers_observed_c4_network_sync_delay() -> None:
 
   observation, evaluation = (
     pigeond.wait_for_current_independent_network_time(
-      object(),  # type: ignore[arg-type]
+      object(),  # type: ignore[arg-type, ty:invalid-argument-type]
       None,
-      SimpleNamespace(authorized_time=None),  # type: ignore[arg-type]
+      SimpleNamespace(authorized_time=None),  # type: ignore[arg-type, ty:invalid-argument-type]
       observation_reader=lambda: None,
-      evaluator=evaluator,  # type: ignore[arg-type]
+      evaluator=evaluator,  # type: ignore[arg-type, ty:invalid-argument-type]
       monotonic=monotonic,
       sleeper=sleeper,
     )
@@ -268,15 +268,16 @@ def test_default_wait_remains_bounded_without_network_time() -> None:
     sleeps.append(delay)
     clock[0] += delay
 
+  def evaluator(_authority, _observation):
+    return SimpleNamespace(authorized_time=None)
+
   observation, evaluation = (
     pigeond.wait_for_current_independent_network_time(
-      object(),  # type: ignore[arg-type]
+      object(),  # type: ignore[arg-type, ty:invalid-argument-type]
       None,
-      SimpleNamespace(authorized_time=None),  # type: ignore[arg-type]
+      SimpleNamespace(authorized_time=None),  # type: ignore[arg-type, ty:invalid-argument-type]
       observation_reader=lambda: None,
-      evaluator=lambda _authority, _observation: (
-        SimpleNamespace(authorized_time=None)
-      ),
+      evaluator=evaluator,  # type: ignore[arg-type, ty:invalid-argument-type]
       monotonic=monotonic,
       sleeper=sleeper,
     )
