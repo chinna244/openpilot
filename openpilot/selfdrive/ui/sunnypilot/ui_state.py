@@ -11,6 +11,7 @@ from opendbc.car.structs import car
 from openpilot.common.params import Params
 from openpilot.selfdrive.ui.sunnypilot.layouts.settings.display import OnroadBrightness
 from openpilot.sunnypilot.sunnylink.sunnylink_state import SunnylinkState
+from openpilot.sunnypilot.selfdrive.ui.offroad_mode import request_offroad_mode
 from openpilot.system.ui.lib.application import gui_app
 
 OpenpilotState = log.SelfdriveState.OpenpilotState
@@ -227,8 +228,7 @@ class UIStateSP:
 class DeviceSP:
   def _set_awake(self, on: bool, _ui_state=None):
     if _ui_state.boot_offroad_mode == 1 and not on:
-      # deferred: card runs the stock-ECU hand-back, then grants OffroadMode
-      _ui_state.params.put_bool("OffroadModeRequested", True)
+      request_offroad_mode(_ui_state.params, True)
 
   @staticmethod
   def set_onroad_brightness(_ui_state, awake: bool, cur_brightness: float) -> float:
