@@ -198,10 +198,14 @@ class UIStateSP:
       if not CP.enableBsm:
         self.params.remove("AutoLaneChangeBsmDelay")
     else:
-      # No CarParams: clear all car-dependent params as safety default
-      self.params.remove("EnforceTorqueControl")
-      self.params.remove("NeuralNetworkLateralControl")
-      self.params.remove("AlphaLongitudinalEnabled")
+      # No CarParams: clear all car-dependent params as safety default. Never while
+      # onroad: on a fresh install's first drive, card seeds car-dependent defaults
+      # (e.g. the Mazda torque-control stack) during init, before CarParamsPersistent
+      # is written, and this wipe would race it and silently undo the seed.
+      if not self.started:
+        self.params.remove("EnforceTorqueControl")
+        self.params.remove("NeuralNetworkLateralControl")
+        self.params.remove("AlphaLongitudinalEnabled")
 
     # No longitudinal control: no experimental mode or DEC
     if not has_long:
