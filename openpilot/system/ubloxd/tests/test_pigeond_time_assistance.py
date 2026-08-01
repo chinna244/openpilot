@@ -1921,6 +1921,123 @@ def test_startup_diagnostics_logs_signal_milestones_once_and_resets(
     assert "maximum_cno_by_gnss={0: 34, 6: 31}" in matching_logs[-1]
 
 
+def test_time_assistance_rejection_and_later_acceptance_are_separate(
+  monkeypatch,
+):
+  acknowledgments = iter((
+    SimpleNamespace(
+      accepted=False,
+      acknowledgment_type=0,
+      version=0,
+      info_code=5,
+      message_id=0x40,
+    ),
+    SimpleNamespace(
+      accepted=True,
+      acknowledgment_type=1,
+      version=0,
+      info_code=0,
+      message_id=0x40,
+    ),
+  ))
+  sent_at = iter((10.1, 40.1))
+  monotonic_values = iter((10.0, 10.2, 40.0, 40.2))
+  attempts = []
+
+  monkeypatch.setattr(
+    pigeond,
+    "_begin_response_transaction",
+    lambda _pigeon, _message: SimpleNamespace(
+      sent_at=next(sent_at)
+    ),
+  )
+  monkeypatch.setattr(
+    pigeond,
+    "wait_for_matching_mga_ack",
+    lambda *_args, **_kwargs: next(acknowledgments),
+  )
+
+  first = pigeond.send_time_assistance(
+    object(),
+    assistance_time=datetime(2026, 7, 10, tzinfo=UTC),
+    source="system_synchronized",
+    diagnostic_context="cycle=1, reason=process_start",
+    diagnostic_callback=attempts.append,
+    monotonic=lambda: next(monotonic_values),
+  )
+  second = pigeond.send_time_assistance(
+    object(),
+    assistance_time=datetime(2026, 7, 10, tzinfo=UTC),
+    source="system_synchronized",
+    diagnostic_context="cycle=1, reason=runtime_retry",
+    diagnostic_callback=attempts.append,
+    monotonic=lambda: next(monotonic_values),
+  )
+
+  assert not first
+  assert second
+  assert len(attempts) == 2
+
+  rejected, accepted = attempts
+  assert rejected.attempted_at == 10.0
+  assert rejected.written_at == 10.1
+  assert rejected.ack_observed_at == 10.2
+  assert (
+    rejected.write_status
+    is pigeond.TimeAssistanceWriteStatus.SUCCEEDED
+  )
+  assert (
+    rejected.ack_status
+    is pigeond.TimeAssistanceAckStatus.REJECTED
+  )
+  assert rejected.ack_info_code == 5
+  assert rejected.accepted_at is None
+  assert rejected.message_id == 0x40
+  assert rejected.message_type == 0x10
+  assert (
+    rejected.diagnostic_context
+    == "cycle=1, reason=process_start"
+  )
+
+  assert accepted.attempted_at == 40.0
+  assert accepted.written_at == 40.1
+  assert accepted.ack_observed_at == 40.2
+  assert (
+    accepted.ack_status
+    is pigeond.TimeAssistanceAckStatus.ACCEPTED
+  )
+  assert accepted.ack_info_code == 0
+  assert accepted.accepted_at == 40.2
+  assert (
+    accepted.diagnostic_context
+    == "cycle=1, reason=runtime_retry"
+  )
+
+
+def test_time_assistance_diagnostic_callback_is_fail_open(
+  monkeypatch,
+):
+  callback_errors = []
+  monkeypatch.setattr(
+    pigeond.cloudlog,
+    "exception",
+    callback_errors.append,
+  )
+
+  def fail_callback(_diagnostic):
+    raise RuntimeError("diagnostic sink failed")
+
+  assert pigeond.send_time_assistance(
+    FakePigeon(),
+    assistance_time=datetime(2026, 7, 10, tzinfo=UTC),
+    source="system_synchronized",
+    diagnostic_callback=fail_callback,
+  )
+  assert callback_errors == [
+    "GPS time assistance diagnostic callback failed"
+  ]
+
+
 def test_time_assistance_log_includes_cycle_context(
   monkeypatch,
 ):

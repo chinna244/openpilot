@@ -11,8 +11,12 @@ from openpilot.system.ubloxd.navigation_database_restore import (
   NavigationDatabaseRestoreDisposition,
 )
 from openpilot.system.ubloxd.navigation_database_restore_runtime import (
+  NavigationDatabaseRestoreExecution,
   NavigationDatabaseRestoreRuntime,
   NavigationDatabaseRestoreSnapshot,
+  PositionAssistanceAckStatus,
+  PositionAssistanceFailureKind,
+  PositionAssistanceWriteStatus,
 )
 from openpilot.system.ubloxd.trusted_time_anchor import (
   TimeProvenance,
@@ -96,6 +100,157 @@ def snapshot() -> NavigationDatabaseRestoreSnapshot:
   )
 
 
+@pytest.mark.parametrize(
+  ("failure_kind", "expected_phase"),
+  (
+    (
+      PositionAssistanceFailureKind.BUILD,
+      pigeond.NavigationAssistanceRestoreFailurePhase.POSITION_ASSISTANCE_BUILD,
+    ),
+    (
+      PositionAssistanceFailureKind.WRITE,
+      pigeond.NavigationAssistanceRestoreFailurePhase.POSITION_ASSISTANCE_WRITE,
+    ),
+    (
+      PositionAssistanceFailureKind.ACK_REJECTED,
+      pigeond.NavigationAssistanceRestoreFailurePhase.POSITION_ASSISTANCE_ACK_REJECTED,
+    ),
+    (
+      PositionAssistanceFailureKind.ACK_TIMEOUT,
+      pigeond.NavigationAssistanceRestoreFailurePhase.POSITION_ASSISTANCE_ACK_TIMEOUT,
+    ),
+  ),
+)
+def test_position_failure_kind_survives_runtime_result_mapping(
+  failure_kind: PositionAssistanceFailureKind,
+  expected_phase: pigeond.NavigationAssistanceRestoreFailurePhase,
+) -> None:
+  execution = NavigationDatabaseRestoreExecution(
+    disposition=NavigationDatabaseRestoreDisposition.RESTORED,
+    total_frame_count=70,
+    accepted_frame_count=70,
+    database_write_attempt_count=70,
+    position_assistance_attempted=True,
+    position_assistance_succeeded=False,
+    position_assistance_message_id=0x40,
+    position_assistance_message_type=0x01,
+    position_assistance_write_status=(
+      PositionAssistanceWriteStatus.SUCCEEDED
+      if failure_kind in (
+        PositionAssistanceFailureKind.ACK_REJECTED,
+        PositionAssistanceFailureKind.ACK_TIMEOUT,
+      )
+      else PositionAssistanceWriteStatus.FAILED
+    ),
+    position_assistance_ack_status=(
+      PositionAssistanceAckStatus.REJECTED
+      if failure_kind is PositionAssistanceFailureKind.ACK_REJECTED
+      else (
+        PositionAssistanceAckStatus.TIMED_OUT
+        if failure_kind is PositionAssistanceFailureKind.ACK_TIMEOUT
+        else PositionAssistanceAckStatus.NOT_ATTEMPTED
+      )
+    ),
+    position_assistance_ack_info_code=(
+      5
+      if failure_kind is PositionAssistanceFailureKind.ACK_REJECTED
+      else None
+    ),
+    position_assistance_failure_kind=failure_kind,
+    position_assistance_error_type="InjectedPositionError",
+    position_assistance_error="InjectedPositionError:receiver detail",
+  )
+
+  result = (
+    pigeond.navigation_assistance_result_from_database_execution(
+      execution
+    )
+  )
+  summary = pigeond.format_navigation_assistance_restore_summary(
+    result,
+    attempted=True,
+    time_assistance_source="system_synchronized",
+  )
+
+  assert result.failure_phase is expected_phase
+  assert result.position_assistance_attempted
+  assert not result.position_assistance_succeeded
+  assert result.position_assistance_message_id == 0x40
+  assert result.position_assistance_message_type == 0x01
+  assert (
+    result.position_assistance_error_type
+    == "InjectedPositionError"
+  )
+  assert (
+    result.position_assistance_error
+    == "InjectedPositionError:receiver detail"
+  )
+  assert f"failure_phase={expected_phase.value}" in summary
+  assert "position_assistance_attempted=true" in summary
+  assert "position_assistance_succeeded=false" in summary
+  assert "position_assistance_message_id=0x40" in summary
+  assert "position_assistance_message_type=0x01" in summary
+  assert (
+    "position_assistance_error_type=InjectedPositionError"
+    in summary
+  )
+  assert (
+    "position_assistance_error=InjectedPositionError:receiver detail"
+    in summary
+  )
+
+
+def test_position_nack_ack_detail_survives_restore_log() -> None:
+  execution = NavigationDatabaseRestoreExecution(
+    disposition=NavigationDatabaseRestoreDisposition.RESTORED,
+    total_frame_count=70,
+    accepted_frame_count=70,
+    database_write_attempt_count=70,
+    position_assistance_attempted=True,
+    position_assistance_succeeded=False,
+    position_assistance_message_id=0x40,
+    position_assistance_message_type=0x01,
+    position_assistance_write_status=(
+      PositionAssistanceWriteStatus.SUCCEEDED
+    ),
+    position_assistance_ack_status=(
+      PositionAssistanceAckStatus.REJECTED
+    ),
+    position_assistance_ack_info_code=5,
+    position_assistance_failure_kind=(
+      PositionAssistanceFailureKind.ACK_REJECTED
+    ),
+    position_assistance_error_type="MgaReceiverNackError",
+    position_assistance_error=(
+      "MgaReceiverNackError:u-blox rejected MGA message: ack_infoCode=5"
+    ),
+  )
+
+  result = (
+    pigeond.navigation_assistance_result_from_database_execution(
+      execution
+    )
+  )
+  summary = pigeond.format_navigation_assistance_restore_summary(
+    result,
+    attempted=True,
+    time_assistance_source="system_synchronized",
+  )
+
+  assert (
+    result.failure_phase
+    is pigeond.NavigationAssistanceRestoreFailurePhase.POSITION_ASSISTANCE_ACK_REJECTED
+  )
+  assert (
+    result.position_assistance_ack_status
+    is PositionAssistanceAckStatus.REJECTED
+  )
+  assert result.position_assistance_ack_info_code == 5
+  assert "position_assistance_ack_status=rejected" in summary
+  assert "position_assistance_ack_info_code=5" in summary
+  assert "ack_infoCode=5" in summary
+
+
 def test_startup_timeline_formats_correlated_fields() -> None:
   restore = pigeond.NavigationAssistanceRestoreResult(
     status=pigeond.NavigationAssistanceRestoreStatus.PARTIAL,
@@ -115,6 +270,21 @@ def test_startup_timeline_formats_correlated_fields() -> None:
     database_frames_attempted_count=3,
   )
 
+  time_attempt = pigeond.TimeAssistanceAttemptDiagnostic(
+    attempted_at=44.6,
+    written_at=44.7,
+    ack_observed_at=44.8,
+    write_status=pigeond.TimeAssistanceWriteStatus.SUCCEEDED,
+    ack_status=pigeond.TimeAssistanceAckStatus.REJECTED,
+    ack_info_code=5,
+    accepted_at=None,
+    message_id=0x40,
+    message_type=0x10,
+    source="system_synchronized",
+    correction=False,
+    diagnostic_context="cycle=2, reason=process_start",
+  )
+
   message = pigeond.format_gps_startup_timeline(
     cycle=2,
     reason="process_start",
@@ -126,6 +296,7 @@ def test_startup_timeline_formats_correlated_fields() -> None:
     gnss_start_sent_at=45.1,
     restore_result=restore,
     authorized_time=network_time(),
+    time_assistance_attempts=(time_attempt,),
   )
 
   assert "GPS startup timeline" in message
@@ -156,6 +327,20 @@ def test_startup_timeline_formats_correlated_fields() -> None:
   assert "database_frames_accepted=2" in message
   assert "database_frames_rejected=1" in message
   assert "database_timeout_events=2" in message
+  assert "time_assistance_attempted_cycle_seconds=34.600" in message
+  assert "time_assistance_written_cycle_seconds=34.700" in message
+  assert (
+    "time_assistance_ack_observed_cycle_seconds=34.800"
+    in message
+  )
+  assert "time_assistance_write_status=succeeded" in message
+  assert "time_assistance_ack_status=rejected" in message
+  assert "time_assistance_ack_info_code=5" in message
+  assert "time_assistance_accepted_cycle_seconds=none" in message
+  assert (
+    "time_assistance_accepted_before_gnss_start=false"
+    in message
+  )
   assert (
     "acquisition_start_claimed_cycle_seconds=35.000"
     in message
@@ -638,10 +823,14 @@ def test_observed_c4_delay_restores_full_cycle_before_durable_start(
     "send_mga_with_strict_ack",
     send_mga,
   )
+  def send_time(*_args, **_kwargs) -> bool:
+    events.append("time_write")
+    return False
+
   monkeypatch.setattr(
     pigeond,
     "send_time_assistance",
-    lambda *_args, **_kwargs: False,
+    send_time,
   )
   monkeypatch.setattr(
     pigeond,
@@ -712,6 +901,9 @@ def test_observed_c4_delay_restores_full_cycle_before_durable_start(
     "position_write"
   )
   assert events.index("position_write") < events.index(
+    "time_write"
+  )
+  assert events.index("time_write") < events.index(
     "acquisition_start_claim"
   )
   assert events.index("acquisition_start_claim") < events.index(

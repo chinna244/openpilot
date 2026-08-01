@@ -7,6 +7,7 @@ from openpilot.system.ubloxd.navigation_database_restore import (
   NAVIGATION_DATABASE_RESTORE_MAX_AGE_SECONDS,
   NavigationDatabaseRestoreDisposition,
 )
+import openpilot.system.ubloxd.navigation_database_restore_runtime as restore_runtime
 from openpilot.system.ubloxd.navigation_database_restore_runtime import (
   NavigationDatabaseRestoreBootState,
   NavigationDatabaseRestoreCandidateIdentity,
@@ -15,6 +16,9 @@ from openpilot.system.ubloxd.navigation_database_restore_runtime import (
   NavigationDatabaseRestoreInitializationError,
   NavigationDatabaseRestoreRuntime,
   NavigationDatabaseRestoreSnapshot,
+  PositionAssistanceAckStatus,
+  PositionAssistanceFailureKind,
+  PositionAssistanceWriteStatus,
   load_navigation_database_restore_boot_state,
   store_navigation_database_restore_boot_state,
 )
@@ -255,6 +259,146 @@ def test_position_assistance_claim_survives_process_restart(tmp_path: Path) -> N
   second = runtime(tmp_path)
   second.send_position_once(messages.append)
   assert len(messages) == 1
+
+
+def test_position_assistance_success_is_structured(tmp_path: Path) -> None:
+  result = runtime(tmp_path).send_position_once(lambda _message: None)
+
+  assert result.position_assistance_attempted
+  assert result.position_assistance_succeeded
+  assert result.position_assistance_message_id == 0x40
+  assert result.position_assistance_message_type == 0x01
+  assert (
+    result.position_assistance_write_status
+    is PositionAssistanceWriteStatus.SUCCEEDED
+  )
+  assert (
+    result.position_assistance_ack_status
+    is PositionAssistanceAckStatus.ACCEPTED
+  )
+  assert result.position_assistance_ack_info_code == 0
+  assert result.position_assistance_failure_kind is None
+  assert result.position_assistance_error_type is None
+  assert result.position_assistance_error is None
+
+
+@pytest.mark.parametrize(
+  (
+    "exception",
+    "write_status",
+    "ack_status",
+    "failure_kind",
+    "info_code",
+  ),
+  (
+    (
+      MgaReceiverNackError(
+        "receiver not ready",
+        message_id=0x40,
+        message_type=0x01,
+        ack_type=0,
+        ack_version=0,
+        info_code=5,
+        rejected_message_id=0x40,
+      ),
+      PositionAssistanceWriteStatus.SUCCEEDED,
+      PositionAssistanceAckStatus.REJECTED,
+      PositionAssistanceFailureKind.ACK_REJECTED,
+      5,
+    ),
+    (
+      TimeoutError("position ACK timeout"),
+      PositionAssistanceWriteStatus.SUCCEEDED,
+      PositionAssistanceAckStatus.TIMED_OUT,
+      PositionAssistanceFailureKind.ACK_TIMEOUT,
+      None,
+    ),
+    (
+      MgaWriteError(
+        "position write failed",
+        message_id=0x40,
+        message_type=0x01,
+      ),
+      PositionAssistanceWriteStatus.FAILED,
+      PositionAssistanceAckStatus.NOT_ATTEMPTED,
+      PositionAssistanceFailureKind.WRITE,
+      None,
+    ),
+    (
+      MgaTransactionError(
+        "position ACK observation failed",
+        message_id=0x40,
+        message_type=0x01,
+        write_succeeded=True,
+      ),
+      PositionAssistanceWriteStatus.SUCCEEDED,
+      PositionAssistanceAckStatus.OBSERVATION_FAILED,
+      PositionAssistanceFailureKind.WRITE,
+      None,
+    ),
+  ),
+)
+def test_position_assistance_failures_remain_structured(
+  tmp_path: Path,
+  exception: Exception,
+  write_status: PositionAssistanceWriteStatus,
+  ack_status: PositionAssistanceAckStatus,
+  failure_kind: PositionAssistanceFailureKind,
+  info_code: int | None,
+) -> None:
+  def fail(_message: bytes) -> None:
+    raise exception
+
+  result = runtime(tmp_path).send_position_once(fail)
+
+  assert result.position_assistance_attempted
+  assert not result.position_assistance_succeeded
+  assert result.position_assistance_message_id == 0x40
+  assert result.position_assistance_message_type == 0x01
+  assert result.position_assistance_write_status is write_status
+  assert result.position_assistance_ack_status is ack_status
+  assert result.position_assistance_ack_info_code == info_code
+  assert result.position_assistance_failure_kind is failure_kind
+  assert result.position_assistance_error_type == type(exception).__name__
+  assert str(exception) in (result.position_assistance_error or "")
+
+
+def test_position_assistance_build_failure_is_structured(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  monkeypatch.setattr(
+    restore_runtime,
+    "build_position_assistance_message",
+    lambda **_kwargs: (_ for _ in ()).throw(
+      ValueError("position build failed")
+    ),
+  )
+
+  result = runtime(tmp_path).send_position_once(
+    lambda _message: pytest.fail("position message must not be written")
+  )
+
+  assert result.position_assistance_attempted
+  assert not result.position_assistance_succeeded
+  assert result.position_assistance_message_id is None
+  assert result.position_assistance_message_type is None
+  assert (
+    result.position_assistance_write_status
+    is PositionAssistanceWriteStatus.NOT_ATTEMPTED
+  )
+  assert (
+    result.position_assistance_ack_status
+    is PositionAssistanceAckStatus.NOT_ATTEMPTED
+  )
+  assert (
+    result.position_assistance_failure_kind
+    is PositionAssistanceFailureKind.BUILD
+  )
+  assert result.position_assistance_error_type == "ValueError"
+  assert "position build failed" in (
+    result.position_assistance_error or ""
+  )
 
 
 def test_unverified_startup_performs_zero_database_writes(tmp_path: Path) -> None:

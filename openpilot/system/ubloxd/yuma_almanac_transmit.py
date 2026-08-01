@@ -27,15 +27,52 @@ Sleeper = Callable[[float], None]
 
 
 class MgaReceiverNackError(CacheValidationError):
-  pass
+  def __init__(
+    self,
+    message: str,
+    *,
+    message_id: int | None = None,
+    message_type: int | None = None,
+    ack_type: int | None = None,
+    ack_version: int | None = None,
+    info_code: int | None = None,
+    rejected_message_id: int | None = None,
+  ) -> None:
+    super().__init__(message)
+    self.message_id = message_id
+    self.message_type = message_type
+    self.ack_type = ack_type
+    self.ack_version = ack_version
+    self.info_code = info_code
+    self.rejected_message_id = rejected_message_id
 
 
 class MgaWriteError(OSError):
-  pass
+  def __init__(
+    self,
+    message: str,
+    *,
+    message_id: int | None = None,
+    message_type: int | None = None,
+  ) -> None:
+    super().__init__(message)
+    self.message_id = message_id
+    self.message_type = message_type
 
 
 class MgaTransactionError(Exception):
-  pass
+  def __init__(
+    self,
+    message: str,
+    *,
+    message_id: int | None = None,
+    message_type: int | None = None,
+    write_succeeded: bool | None = None,
+  ) -> None:
+    super().__init__(message)
+    self.message_id = message_id
+    self.message_type = message_type
+    self.write_succeeded = write_succeeded
 
 
 class YumaAlmanacTransmitStatus(StrEnum):

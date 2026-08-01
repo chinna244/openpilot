@@ -206,6 +206,62 @@ def test_power_on_stop_precedes_baud_transition_and_transactions() -> None:
   assert initialize_segment is not None
   assert initialize_segment.index("restore_navigation_assistance(") < (initialize_segment.index("send_time_assistance("))
 
+def test_structured_telemetry_keeps_assistance_command_order() -> None:
+  source, tree = source_tree(PIGEOND)
+
+  paused = named_node(tree, "paused_gnss_acquisition")
+  paused_segment = ast.get_source_segment(source, paused)
+  assert paused_segment is not None
+  assert paused_segment.index(
+    "pigeon.send(CONTROLLED_GNSS_STOP_MESSAGE)"
+  ) < paused_segment.index("yield")
+  assert paused_segment.index("yield") < paused_segment.index(
+    "pigeon.send(CONTROLLED_GNSS_START_MESSAGE)"
+  )
+
+  initialize = named_node(tree, "initialize_receiver_cycle")
+  initialize_segment = ast.get_source_segment(source, initialize)
+  assert initialize_segment is not None
+  restore = initialize_segment.index(
+    "restore_navigation_assistance("
+  )
+  time_assistance = initialize_segment.index(
+    "send_time_assistance("
+  )
+  acquisition_claim = initialize_segment.index(
+    "claim_acquisition_start("
+  )
+  assert restore < time_assistance < acquisition_claim
+
+  restore_helper = named_node(
+    tree,
+    "restore_navigation_assistance",
+  )
+  restore_segment = ast.get_source_segment(
+    source,
+    restore_helper,
+  )
+  assert restore_segment is not None
+  database_restore = restore_segment.index(
+    "navigation_database_runtime.evaluate("
+  )
+  position_restore = restore_segment.index(
+    "navigation_database_runtime.send_position_once("
+  )
+  assert database_restore < position_restore
+
+  run_receiving = named_node(tree, "run_receiving")
+  run_segment = ast.get_source_segment(source, run_receiving)
+  assert run_segment is not None
+  receiver_start = run_segment.index(
+    "initialize_receiver_cycle("
+  )
+  runtime_yuma = run_segment.index(
+    "yuma_feature.evaluate("
+  )
+  assert receiver_start < runtime_yuma
+
+
 # COMMIT9_DBD_RUNTIME_BEFORE_RECEIVER_TEST
 
 

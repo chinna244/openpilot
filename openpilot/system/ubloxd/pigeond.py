@@ -120,6 +120,9 @@ from openpilot.system.ubloxd.navigation_database_restore_runtime import (
   NavigationDatabaseRestoreExecution,
   NavigationDatabaseRestoreFrameFailureKind,
   NavigationDatabaseRestoreRuntime,
+  PositionAssistanceAckStatus,
+  PositionAssistanceFailureKind,
+  PositionAssistanceWriteStatus,
 )
 from openpilot.system.ubloxd.receiver_time_provenance import (
   ReceiverTimeProvenanceTracker,
@@ -1653,6 +1656,101 @@ def init(pigeon: TTYPigeon) -> None:
   finish_pigeon_initialization(pigeon)
 
 
+class TimeAssistanceWriteStatus(StrEnum):
+  NOT_ATTEMPTED = "not_attempted"
+  SUCCEEDED = "succeeded"
+  FAILED = "failed"
+
+
+class TimeAssistanceAckStatus(StrEnum):
+  NOT_ATTEMPTED = "not_attempted"
+  ACCEPTED = "accepted"
+  REJECTED = "rejected"
+  TIMED_OUT = "timed_out"
+  OBSERVATION_FAILED = "observation_failed"
+
+
+@dataclass(frozen=True)
+class TimeAssistanceAttemptDiagnostic:
+  attempted_at: float
+  written_at: float | None
+  ack_observed_at: float | None
+  write_status: TimeAssistanceWriteStatus
+  ack_status: TimeAssistanceAckStatus
+  ack_info_code: int | None
+  accepted_at: float | None
+  message_id: int | None
+  message_type: int | None
+  source: str
+  correction: bool
+  diagnostic_context: str | None = None
+  error_type: str | None = None
+  error: str | None = None
+
+
+TimeAssistanceDiagnosticCallback = Callable[
+  [TimeAssistanceAttemptDiagnostic],
+  None,
+]
+
+
+def format_time_assistance_attempt_diagnostic(
+  diagnostic: TimeAssistanceAttemptDiagnostic,
+) -> str:
+  def optional(value: object | None) -> str:
+    return "none" if value is None else str(value)
+
+  def message_byte(value: int | None) -> str:
+    return "none" if value is None else f"0x{value:02X}"
+
+  return ", ".join((
+    "GPS time assistance diagnostic",
+    f"attempted_at={diagnostic.attempted_at}",
+    f"written_at={optional(diagnostic.written_at)}",
+    f"ack_observed_at={optional(diagnostic.ack_observed_at)}",
+    f"write_status={diagnostic.write_status.value}",
+    f"ack_status={diagnostic.ack_status.value}",
+    f"ack_info_code={optional(diagnostic.ack_info_code)}",
+    f"accepted_at={optional(diagnostic.accepted_at)}",
+    f"message_id={message_byte(diagnostic.message_id)}",
+    f"message_type={message_byte(diagnostic.message_type)}",
+    f"source={diagnostic.source}",
+    f"correction={str(diagnostic.correction).lower()}",
+    "diagnostic_context="
+    + optional(diagnostic.diagnostic_context),
+    f"error_type={optional(diagnostic.error_type)}",
+    f"error={optional(diagnostic.error)}",
+  ))
+
+
+def log_time_assistance_attempt_diagnostic(
+  diagnostic: TimeAssistanceAttemptDiagnostic,
+) -> None:
+  message = format_time_assistance_attempt_diagnostic(diagnostic)
+  if diagnostic.ack_status in (
+    TimeAssistanceAckStatus.REJECTED,
+    TimeAssistanceAckStatus.TIMED_OUT,
+    TimeAssistanceAckStatus.OBSERVATION_FAILED,
+  ) or diagnostic.write_status is TimeAssistanceWriteStatus.FAILED:
+    cloudlog.warning(message)
+  else:
+    cloudlog.info(message)
+
+
+def _publish_time_assistance_attempt_diagnostic(
+  callback: TimeAssistanceDiagnosticCallback | None,
+  diagnostic: TimeAssistanceAttemptDiagnostic,
+) -> None:
+  if callback is None:
+    return
+  try:
+    callback(diagnostic)
+  except Exception:
+    cloudlog.exception(
+      "GPS time assistance diagnostic callback failed"
+    )
+
+
 def send_time_assistance(
   pigeon: TTYPigeon,
   assistance_time: datetime | None = None,
@@ -1665,8 +1763,12 @@ def send_time_assistance(
   independent: bool | None = None,
   source_provenance: TimeProvenance | None = None,
   correction: bool = False,
+  diagnostic_callback: TimeAssistanceDiagnosticCallback | None = None,
+  monotonic: Callable[[], float] | None = None,
 ) -> bool:
   """Send trusted UTC or an explicit RTC-derived estimate."""
+  clock = time.monotonic if monotonic is None else monotonic
+  attempted_at = clock()
   time_tracker = time_provenance or getattr(
     pigeon,
     "time_provenance",
@@ -1675,6 +1777,25 @@ def send_time_assistance(
   if assistance_time is None:
     host_time = read_host_time_observation()
     if host_time is None or not host_time.independent:
+      _publish_time_assistance_attempt_diagnostic(
+        diagnostic_callback,
+        TimeAssistanceAttemptDiagnostic(
+          attempted_at=attempted_at,
+          written_at=None,
+          ack_observed_at=None,
+          write_status=TimeAssistanceWriteStatus.NOT_ATTEMPTED,
+          ack_status=TimeAssistanceAckStatus.NOT_ATTEMPTED,
+          ack_info_code=None,
+          accepted_at=None,
+          message_id=None,
+          message_type=None,
+          source=source,
+          correction=correction,
+          diagnostic_context=diagnostic_context,
+          error_type="TrustedTimeUnavailable",
+          error="independent host time is unavailable",
+        ),
+      )
       return False
 
     assistance_time = host_time.utc
@@ -1689,9 +1810,43 @@ def send_time_assistance(
     source_provenance = TimeProvenance.NETWORK_INDEPENDENT
     source = host_time.source.value
 
-  msg = build_time_assistance_message(
-    assistance_time,
-    accuracy_seconds=accuracy_seconds,
+  try:
+    msg = build_time_assistance_message(
+      assistance_time,
+      accuracy_seconds=accuracy_seconds,
+    )
+  except Exception as exc:
+    _publish_time_assistance_attempt_diagnostic(
+      diagnostic_callback,
+      TimeAssistanceAttemptDiagnostic(
+        attempted_at=attempted_at,
+        written_at=None,
+        ack_observed_at=None,
+        write_status=TimeAssistanceWriteStatus.NOT_ATTEMPTED,
+        ack_status=TimeAssistanceAckStatus.NOT_ATTEMPTED,
+        ack_info_code=None,
+        accepted_at=None,
+        message_id=None,
+        message_type=None,
+        source=source,
+        correction=correction,
+        diagnostic_context=diagnostic_context,
+        error_type=type(exc).__name__,
+        error=str(exc),
+      ),
+    )
+    raise
+
+  message_id = msg[3] if len(msg) > 3 else None
+  payload_length = (
+    int.from_bytes(msg[4:6], "little")
+    if len(msg) >= 6
+    else 0
+  )
+  message_type = (
+    msg[6]
+    if payload_length > 0 and len(msg) > 6
+    else None
   )
   context_suffix = (
     f", {diagnostic_context}"
@@ -1722,7 +1877,7 @@ def send_time_assistance(
         provenance=source_provenance,
         correction=correction,
       )
-  except Exception:
+  except Exception as exc:
     cloudlog.exception(
       ", ".join((
         "Time assistance serial write failed",
@@ -1730,6 +1885,25 @@ def send_time_assistance(
         "write_result=failed",
         "ack_result=not_attempted",
       )) + context_suffix
+    )
+    _publish_time_assistance_attempt_diagnostic(
+      diagnostic_callback,
+      TimeAssistanceAttemptDiagnostic(
+        attempted_at=attempted_at,
+        written_at=None,
+        ack_observed_at=None,
+        write_status=TimeAssistanceWriteStatus.FAILED,
+        ack_status=TimeAssistanceAckStatus.NOT_ATTEMPTED,
+        ack_info_code=None,
+        accepted_at=None,
+        message_id=message_id,
+        message_type=message_type,
+        source=source,
+        correction=correction,
+        diagnostic_context=diagnostic_context,
+        error_type=type(exc).__name__,
+        error=str(exc),
+      ),
     )
     return False
 
@@ -1740,7 +1914,7 @@ def send_time_assistance(
       msg,
       timeout=ack_timeout,
     )
-  except Exception:
+  except Exception as exc:
     cloudlog.exception(
       ", ".join((
         "Time assistance written; ublox ACK observation failed",
@@ -1748,6 +1922,25 @@ def send_time_assistance(
         "write_result=succeeded",
         "ack_result=observation_failed",
       )) + context_suffix
+    )
+    _publish_time_assistance_attempt_diagnostic(
+      diagnostic_callback,
+      TimeAssistanceAttemptDiagnostic(
+        attempted_at=attempted_at,
+        written_at=transaction.sent_at,
+        ack_observed_at=None,
+        write_status=TimeAssistanceWriteStatus.SUCCEEDED,
+        ack_status=TimeAssistanceAckStatus.OBSERVATION_FAILED,
+        ack_info_code=None,
+        accepted_at=None,
+        message_id=message_id,
+        message_type=message_type,
+        source=source,
+        correction=correction,
+        diagnostic_context=diagnostic_context,
+        error_type=type(exc).__name__,
+        error=str(exc),
+      ),
     )
     return False
 
@@ -1760,37 +1953,90 @@ def send_time_assistance(
         "ack_result=timed_out",
       )) + context_suffix
     )
-    return False
-  else:
-    ack_fields = (
-      f"ack_type={acknowledgment.acknowledgment_type}",
-      f"ack_version={acknowledgment.version}",
-      f"ack_infoCode={acknowledgment.info_code}",
-      f"ack_message_id=0x{acknowledgment.message_id:02X}",
+    _publish_time_assistance_attempt_diagnostic(
+      diagnostic_callback,
+      TimeAssistanceAttemptDiagnostic(
+        attempted_at=attempted_at,
+        written_at=transaction.sent_at,
+        ack_observed_at=None,
+        write_status=TimeAssistanceWriteStatus.SUCCEEDED,
+        ack_status=TimeAssistanceAckStatus.TIMED_OUT,
+        ack_info_code=None,
+        accepted_at=None,
+        message_id=message_id,
+        message_type=message_type,
+        source=source,
+        correction=correction,
+        diagnostic_context=diagnostic_context,
+        error_type="TimeoutError",
+        error="matching u-blox MGA acknowledgment timed out",
+      ),
     )
-    if acknowledgment.accepted:
-      cloudlog.info(
-        ", ".join((
-          "Time assistance written and accepted by ublox",
-          *message_fields,
-          "write_result=succeeded",
-          "ack_result=accepted",
-          *ack_fields,
-        )) + context_suffix
-      )
-    else:
-      cloudlog.warning(
-        ", ".join((
-          "Time assistance written but rejected by ublox",
-          *message_fields,
-          "write_result=succeeded",
-          "ack_result=rejected",
-          *ack_fields,
-        )) + context_suffix
-      )
-      return False
+    return False
 
-  return True
+  ack_observed_at = clock()
+  ack_fields = (
+    f"ack_type={acknowledgment.acknowledgment_type}",
+    f"ack_version={acknowledgment.version}",
+    f"ack_infoCode={acknowledgment.info_code}",
+    f"ack_message_id=0x{acknowledgment.message_id:02X}",
+  )
+  if acknowledgment.accepted:
+    cloudlog.info(
+      ", ".join((
+        "Time assistance written and accepted by ublox",
+        *message_fields,
+        "write_result=succeeded",
+        "ack_result=accepted",
+        *ack_fields,
+      )) + context_suffix
+    )
+    _publish_time_assistance_attempt_diagnostic(
+      diagnostic_callback,
+      TimeAssistanceAttemptDiagnostic(
+        attempted_at=attempted_at,
+        written_at=transaction.sent_at,
+        ack_observed_at=ack_observed_at,
+        write_status=TimeAssistanceWriteStatus.SUCCEEDED,
+        ack_status=TimeAssistanceAckStatus.ACCEPTED,
+        ack_info_code=acknowledgment.info_code,
+        accepted_at=ack_observed_at,
+        message_id=message_id,
+        message_type=message_type,
+        source=source,
+        correction=correction,
+        diagnostic_context=diagnostic_context,
+      ),
+    )
+    return True
+
+  cloudlog.warning(
+    ", ".join((
+      "Time assistance written but rejected by ublox",
+      *message_fields,
+      "write_result=succeeded",
+      "ack_result=rejected",
+      *ack_fields,
+    )) + context_suffix
+  )
+  _publish_time_assistance_attempt_diagnostic(
+    diagnostic_callback,
+    TimeAssistanceAttemptDiagnostic(
+      attempted_at=attempted_at,
+      written_at=transaction.sent_at,
+      ack_observed_at=ack_observed_at,
+      write_status=TimeAssistanceWriteStatus.SUCCEEDED,
+      ack_status=TimeAssistanceAckStatus.REJECTED,
+      ack_info_code=acknowledgment.info_code,
+      accepted_at=None,
+      message_id=message_id,
+      message_type=message_type,
+      source=source,
+      correction=correction,
+      diagnostic_context=diagnostic_context,
+    ),
+  )
+  return False
 
 
 def evaluate_time_authority(
@@ -2046,9 +2292,10 @@ def send_mga_with_strict_ack(
 
   expected_message_id = message[3]
   payload_length = int.from_bytes(message[4:6], "little")
+  expected_message_type = message[6] if payload_length > 0 else None
   mga_message_type = (
-    f"0x{message[6]:02X}"
-    if payload_length > 0
+    f"0x{expected_message_type:02X}"
+    if expected_message_type is not None
     else "unavailable"
   )
 
@@ -2073,11 +2320,16 @@ def send_mga_with_strict_ack(
       )
   except OSError as exc:
     raise MgaWriteError(
-      f"Failed to write MGA message 0x{expected_message_id:02X}: {type(exc).__name__}: {exc}"
+      f"Failed to write MGA message 0x{expected_message_id:02X}: {type(exc).__name__}: {exc}",
+      message_id=expected_message_id,
+      message_type=expected_message_type,
     ) from exc
   except ResponseTransactionError as exc:
     raise MgaTransactionError(
-      f"Failed to start MGA acknowledgment transaction for message 0x{expected_message_id:02X}: {type(exc).__name__}: {exc}"
+      f"Failed to start MGA acknowledgment transaction for message 0x{expected_message_id:02X}: {type(exc).__name__}: {exc}",
+      message_id=expected_message_id,
+      message_type=expected_message_type,
+      write_succeeded=False,
     ) from exc
 
   try:
@@ -2091,7 +2343,10 @@ def send_mga_with_strict_ack(
     raise
   except (OSError, ResponseTransactionError) as exc:
     raise MgaTransactionError(
-      f"MGA acknowledgment transaction failed for message 0x{expected_message_id:02X}: {type(exc).__name__}: {exc}"
+      f"MGA acknowledgment transaction failed for message 0x{expected_message_id:02X}: {type(exc).__name__}: {exc}",
+      message_id=expected_message_id,
+      message_type=expected_message_type,
+      write_succeeded=True,
     ) from exc
 
   if acknowledgment is None:
@@ -2112,7 +2367,13 @@ def send_mga_with_strict_ack(
       )
     raise MgaReceiverNackError(
       "u-blox rejected MGA message: "
-      + ", ".join(rejection_fields)
+      + ", ".join(rejection_fields),
+      message_id=expected_message_id,
+      message_type=expected_message_type,
+      ack_type=acknowledgment.acknowledgment_type,
+      ack_version=acknowledgment.version,
+      info_code=acknowledgment.info_code,
+      rejected_message_id=acknowledgment.message_id,
     )
 
 
@@ -2518,6 +2779,15 @@ class NavigationAssistanceRestoreResult:
   permanently_rejected_indexes: tuple[int, ...] = ()
   permanently_timed_out_indexes: tuple[int, ...] = ()
   failure_phase: NavigationAssistanceRestoreFailurePhase | None = None
+  position_assistance_attempted: bool = False
+  position_assistance_succeeded: bool = False
+  position_assistance_message_id: int | None = None
+  position_assistance_message_type: int | None = None
+  position_assistance_write_status: PositionAssistanceWriteStatus = PositionAssistanceWriteStatus.NOT_ATTEMPTED
+  position_assistance_ack_status: PositionAssistanceAckStatus = PositionAssistanceAckStatus.NOT_ATTEMPTED
+  position_assistance_ack_info_code: int | None = None
+  position_assistance_error_type: str | None = None
+  position_assistance_error: str | None = None
   cache_saved_at_utc: datetime | None = None
   restored_cache_generation: str | None = None
   restored_cache_selection_reason: str | None = None
@@ -2583,6 +2853,14 @@ def format_navigation_assistance_restore_summary(
       "database_restore_disposition=not_attempted",
       "database_frames_attempted=0",
       "database_terminal_ack_count_matched=not_applicable_per_frame_restore",
+      "position_assistance_attempted=false",
+      "position_assistance_message_id=none",
+      "position_assistance_message_type=none",
+      "position_assistance_write_status=not_attempted",
+      "position_assistance_ack_status=not_attempted",
+      "position_assistance_ack_info_code=none",
+      "position_assistance_error_type=none",
+      "position_assistance_error=none",
       f"time_assistance_source={time_assistance_source or 'none'}",
     )
   else:
@@ -2619,10 +2897,41 @@ def format_navigation_assistance_restore_summary(
     "database_restore_runtime_phase="
     + (result.database_restore_runtime_phase or "none"),
     "database_terminal_ack_count_matched=not_applicable_per_frame_restore",
+    "position_assistance_attempted="
+    + str(result.position_assistance_attempted).lower(),
+    "position_assistance_succeeded="
+    + str(result.position_assistance_succeeded).lower(),
+    "position_assistance_message_id="
+    + (
+      f"0x{result.position_assistance_message_id:02X}"
+      if result.position_assistance_message_id is not None
+      else "none"
+    ),
+    "position_assistance_message_type="
+    + (
+      f"0x{result.position_assistance_message_type:02X}"
+      if result.position_assistance_message_type is not None
+      else "none"
+    ),
+    "position_assistance_write_status="
+    + result.position_assistance_write_status.value,
+    "position_assistance_ack_status="
+    + result.position_assistance_ack_status.value,
+    "position_assistance_ack_info_code="
+    + (
+      str(result.position_assistance_ack_info_code)
+      if result.position_assistance_ack_info_code is not None
+      else "none"
+    ),
+    "position_assistance_error_type="
+    + (result.position_assistance_error_type or "none"),
+    "position_assistance_error="
+    + (result.position_assistance_error or "none"),
     f"time_assistance_source={time_assistance_source or 'unknown'}",
     f"restored_cache_generation={result.restored_cache_generation or 'none'}",
     f"restored_cache_selection_reason={result.restored_cache_selection_reason or 'none'}",
     f"restored_cache_age_seconds={result.restored_cache_age_seconds}",
+    "quality_evaluation_stage=restore_result",
     f"restored_cache_age_evidence={result.restored_cache_age_evidence or 'none'}",
     f"restored_cache_age_verified={str(result.restored_cache_age_verified).lower()}",
     f"captured_gps_ephemeris_available={result.captured_gps_ephemeris_available}",
@@ -2639,8 +2948,11 @@ def format_navigation_assistance_restore_summary(
     f"restored_glonass_almanac_available={result.restored_glonass_almanac_available}",
     f"restored_gps_ephemeris_available={result.restored_gps_ephemeris_available}",
     f"restored_glonass_ephemeris_available={result.restored_glonass_ephemeris_available}",
+    f"effective_gps_ephemeris_available={result.restored_gps_ephemeris_available}",
+    f"effective_glonass_ephemeris_available={result.restored_glonass_ephemeris_available}",
     f"restored_satellites_used={result.restored_satellites_used}",
     f"restored_gps_startup_ready={result.restored_gps_startup_ready}",
+    f"effective_gps_startup_ready={result.restored_gps_startup_ready}",
     f"restored_gps_almanac_satellite_ids={result.restored_gps_almanac_satellite_ids}",
     f"initially_rejected_indexes={list(result.initially_rejected_indexes)}",
     f"initially_timed_out_indexes={list(result.initially_timed_out_indexes)}",
@@ -2674,6 +2986,29 @@ def log_navigation_assistance_restore_result(
     cloudlog.info(message)
 
 
+def _position_assistance_failure_phase(
+  execution: NavigationDatabaseRestoreExecution,
+) -> NavigationAssistanceRestoreFailurePhase:
+  mapping = {
+    PositionAssistanceFailureKind.BUILD: (
+      NavigationAssistanceRestoreFailurePhase.POSITION_ASSISTANCE_BUILD
+    ),
+    PositionAssistanceFailureKind.WRITE: (
+      NavigationAssistanceRestoreFailurePhase.POSITION_ASSISTANCE_WRITE
+    ),
+    PositionAssistanceFailureKind.ACK_REJECTED: (
+      NavigationAssistanceRestoreFailurePhase.POSITION_ASSISTANCE_ACK_REJECTED
+    ),
+    PositionAssistanceFailureKind.ACK_TIMEOUT: (
+      NavigationAssistanceRestoreFailurePhase.POSITION_ASSISTANCE_ACK_TIMEOUT
+    ),
+  }
+  return mapping.get(
+    execution.position_assistance_failure_kind,
+    NavigationAssistanceRestoreFailurePhase.POSITION_ASSISTANCE_WRITE,
+  )
+
+
 def navigation_assistance_result_from_database_execution(
   execution: NavigationDatabaseRestoreExecution,
 ) -> NavigationAssistanceRestoreResult:
@@ -2687,7 +3022,7 @@ def navigation_assistance_result_from_database_execution(
     failure_phase = (
       None
       if execution.position_assistance_succeeded
-      else NavigationAssistanceRestoreFailurePhase.POSITION_ASSISTANCE_WRITE
+      else _position_assistance_failure_phase(execution)
     )
   elif execution.position_assistance_succeeded:
     status = NavigationAssistanceRestoreStatus.PARTIAL
@@ -2699,7 +3034,7 @@ def navigation_assistance_result_from_database_execution(
   else:
     status = NavigationAssistanceRestoreStatus.FAILED
     failure_phase = (
-      NavigationAssistanceRestoreFailurePhase.POSITION_ASSISTANCE_WRITE
+      _position_assistance_failure_phase(execution)
       if execution.position_assistance_attempted
       else NavigationAssistanceRestoreFailurePhase.CACHE_LOAD
     )
@@ -2729,6 +3064,31 @@ def navigation_assistance_result_from_database_execution(
       NavigationDatabaseRestoreFrameFailureKind.TIMED_OUT,
     ),
     failure_phase=failure_phase,
+    position_assistance_attempted=(
+      execution.position_assistance_attempted
+    ),
+    position_assistance_succeeded=(
+      execution.position_assistance_succeeded
+    ),
+    position_assistance_message_id=(
+      execution.position_assistance_message_id
+    ),
+    position_assistance_message_type=(
+      execution.position_assistance_message_type
+    ),
+    position_assistance_write_status=(
+      execution.position_assistance_write_status
+    ),
+    position_assistance_ack_status=(
+      execution.position_assistance_ack_status
+    ),
+    position_assistance_ack_info_code=(
+      execution.position_assistance_ack_info_code
+    ),
+    position_assistance_error_type=(
+      execution.position_assistance_error_type
+    ),
+    position_assistance_error=execution.position_assistance_error,
     cache_saved_at_utc=execution.cache_saved_at_utc,
     restored_cache_generation=execution.cache_generation,
     restored_cache_selection_reason=execution.cache_selection_reason,
@@ -3610,6 +3970,11 @@ class ReceiverCycleInitialization:
   authorized_time: AuthorizedTime | None = None
   host_time_observation: HostTimeObservation | None = None
   authority_evaluation: TimeAuthorityEvaluation | None = None
+  time_assistance_attempts: tuple[
+    TimeAssistanceAttemptDiagnostic,
+    ...,
+  ] = ()
+  gnss_start_sent_at: float | None = None
 
 
 def _startup_timeline_elapsed(
@@ -3642,6 +4007,10 @@ def format_gps_startup_timeline(
   gnss_start_sent_at: float | None,
   restore_result: NavigationAssistanceRestoreResult | None,
   authorized_time: AuthorizedTime | None,
+  time_assistance_attempts: tuple[
+    TimeAssistanceAttemptDiagnostic,
+    ...,
+  ] = (),
 ) -> str:
   wait_duration = (
     trusted_time_wait_completed_at - trusted_time_wait_started_at
@@ -3692,6 +4061,23 @@ def format_gps_startup_timeline(
     if authorized_time is not None
     else "none"
   )
+  time_attempt = (
+    time_assistance_attempts[-1]
+    if time_assistance_attempts
+    else None
+  )
+  time_accepted_before_start = (
+    (
+      time_attempt.accepted_at <= gnss_start_sent_at
+      if time_attempt.accepted_at is not None
+      else False
+    )
+    if (
+      time_attempt is not None
+      and gnss_start_sent_at is not None
+    )
+    else None
+  )
 
   fields = (
     "GPS startup timeline",
@@ -3730,6 +4116,69 @@ def format_gps_startup_timeline(
     f"database_frames_accepted={frames_accepted}",
     f"database_frames_rejected={frames_rejected}",
     f"database_timeout_events={timeout_events}",
+    "time_assistance_attempted_cycle_seconds="
+    + _startup_timeline_elapsed(
+      (
+        time_attempt.attempted_at
+        if time_attempt is not None
+        else None
+      ),
+      cycle_started_at,
+    ),
+    "time_assistance_written_cycle_seconds="
+    + _startup_timeline_elapsed(
+      (
+        time_attempt.written_at
+        if time_attempt is not None
+        else None
+      ),
+      cycle_started_at,
+    ),
+    "time_assistance_ack_observed_cycle_seconds="
+    + _startup_timeline_elapsed(
+      (
+        time_attempt.ack_observed_at
+        if time_attempt is not None
+        else None
+      ),
+      cycle_started_at,
+    ),
+    "time_assistance_write_status="
+    + (
+      time_attempt.write_status.value
+      if time_attempt is not None
+      else TimeAssistanceWriteStatus.NOT_ATTEMPTED.value
+    ),
+    "time_assistance_ack_status="
+    + (
+      time_attempt.ack_status.value
+      if time_attempt is not None
+      else TimeAssistanceAckStatus.NOT_ATTEMPTED.value
+    ),
+    "time_assistance_ack_info_code="
+    + (
+      str(time_attempt.ack_info_code)
+      if (
+        time_attempt is not None
+        and time_attempt.ack_info_code is not None
+      )
+      else "none"
+    ),
+    "time_assistance_accepted_cycle_seconds="
+    + _startup_timeline_elapsed(
+      (
+        time_attempt.accepted_at
+        if time_attempt is not None
+        else None
+      ),
+      cycle_started_at,
+    ),
+    "time_assistance_accepted_before_gnss_start="
+    + (
+      str(time_accepted_before_start).lower()
+      if time_accepted_before_start is not None
+      else "unknown"
+    ),
     "acquisition_start_claimed_cycle_seconds="
     + _startup_timeline_elapsed(
       acquisition_start_claimed_at,
@@ -3758,6 +4207,10 @@ def log_gps_startup_timeline(
   gnss_start_sent_at: float | None,
   restore_result: NavigationAssistanceRestoreResult | None,
   authorized_time: AuthorizedTime | None,
+  time_assistance_attempts: tuple[
+    TimeAssistanceAttemptDiagnostic,
+    ...,
+  ] = (),
 ) -> None:
   cloudlog.info(
     format_gps_startup_timeline(
@@ -3779,6 +4232,7 @@ def log_gps_startup_timeline(
       gnss_start_sent_at=gnss_start_sent_at,
       restore_result=restore_result,
       authorized_time=authorized_time,
+      time_assistance_attempts=time_assistance_attempts,
     )
   )
 
@@ -3896,10 +4350,19 @@ def initialize_receiver_cycle(
     NavigationAssistanceRestoreResult | None
   ) = None
   navigation_assistance_restore_attempted = False
+  time_assistance_attempts: list[
+    TimeAssistanceAttemptDiagnostic
+  ] = []
   acquisition_start_claimed = False
   next_time_assistance_attempt = (
     cycle_started_at + TIME_SYNC_CHECK_INTERVAL
   )
+
+  def note_time_assistance_attempt(
+    diagnostic: TimeAssistanceAttemptDiagnostic,
+  ) -> None:
+    time_assistance_attempts.append(diagnostic)
+    log_time_assistance_attempt_diagnostic(diagnostic)
 
   def pre_acquisition_initialization() -> None:
     nonlocal mon_ver_info
@@ -4013,6 +4476,7 @@ def initialize_receiver_cycle(
         ),
         independent=authorized_time.independent,
         source_provenance=authorized_time.provenance,
+        diagnostic_callback=note_time_assistance_attempt,
       )
       if trusted_time_assistance_sent:
         time_assistance_source = authorized_time.evidence.value
@@ -4063,6 +4527,7 @@ def initialize_receiver_cycle(
       gnss_start_sent_at=initialization.gnss_start_sent_at,
       restore_result=navigation_assistance_restore_result,
       authorized_time=authorized_time,
+      time_assistance_attempts=tuple(time_assistance_attempts),
     )
   except Exception:
     cloudlog.exception("GPS startup timeline logging failed")
@@ -4120,6 +4585,8 @@ def initialize_receiver_cycle(
     authorized_time=authorized_time,
     host_time_observation=host_time_observation,
     authority_evaluation=authority_evaluation,
+    time_assistance_attempts=tuple(time_assistance_attempts),
+    gnss_start_sent_at=initialization.gnss_start_sent_at,
   )
 
 
@@ -4749,6 +5216,7 @@ def maybe_send_receiver_time_correction(
     independent=True,
     source_provenance=independent.provenance,
     correction=True,
+    diagnostic_callback=log_time_assistance_attempt_diagnostic,
   )
   write_observed = time_provenance.correction_written
   log_receiver_correction_decision(
@@ -5047,6 +5515,19 @@ class YumaSupplementationFeature:
     self,
     outcome: YumaSupplementationRuntimeOutcome,
   ) -> YumaSupplementationRuntimeOutcome:
+    gnss_start_sent_at = getattr(
+      self._initialization,
+      "gnss_start_sent_at",
+      None,
+    )
+    completed_before_gnss_start = (
+      outcome.completion_monotonic <= gnss_start_sent_at
+      if (
+        outcome.completion_monotonic is not None
+        and gnss_start_sent_at is not None
+      )
+      else None
+    )
     return replace(
       outcome,
       receiver_cycle=self._receiver_cycle,
@@ -5054,6 +5535,8 @@ class YumaSupplementationFeature:
         outcome.plan.reason
         is not YumaSupplementationReason.FEATURE_DISABLED
       ),
+      gnss_start_sent_at_monotonic=gnss_start_sent_at,
+      completed_before_gnss_start=completed_before_gnss_start,
     )
 
   def _queue_cancellation(
@@ -5432,7 +5915,11 @@ def log_yuma_supplementation_outcome(
   outcome: YumaSupplementationRuntimeOutcome,
 ) -> None:
   def optional(value: object | None) -> str:
-    return "none" if value is None else str(value)
+    if value is None:
+      return "none"
+    if isinstance(value, bool):
+      return str(value).lower()
+    return str(value)
 
   def timestamp(value: datetime | None) -> str:
     return "none" if value is None else value.isoformat()
@@ -5444,6 +5931,7 @@ def log_yuma_supplementation_outcome(
   )
   fields = [
     "GPS public YUMA supplementation",
+    "quality_evaluation_stage=yuma_runtime",
     f"enabled={str(outcome.feature_enabled).lower()}",
     f"terminal={str(outcome.terminal).lower()}",
     f"retry_pending={str(outcome.retry_pending).lower()}",
@@ -5457,6 +5945,16 @@ def log_yuma_supplementation_outcome(
     + str(outcome.nav_sat_observation_expired).lower(),
     f"dbd_state={database_state}",
     f"dbd_age_seconds={optional(outcome.database_age_seconds)}",
+    "restored_cache_age_evidence="
+    + optional(outcome.restored_cache_age_evidence),
+    "restored_cache_age_verified="
+    + optional(outcome.restored_cache_age_verified),
+    "captured_gps_ephemeris_available="
+    + optional(outcome.captured_gps_ephemeris_available),
+    "captured_glonass_ephemeris_available="
+    + optional(outcome.captured_glonass_ephemeris_available),
+    "captured_gps_startup_ready="
+    + optional(outcome.captured_gps_startup_ready),
     "restored_cache_generation="
     + optional(outcome.restored_cache_generation),
     "restored_cache_selection_reason="
@@ -5469,9 +5967,15 @@ def log_yuma_supplementation_outcome(
     + optional(outcome.restored_gps_ephemeris_available),
     "restored_glonass_ephemeris_available="
     + optional(outcome.restored_glonass_ephemeris_available),
+    "effective_gps_ephemeris_available="
+    + optional(outcome.restored_gps_ephemeris_available),
+    "effective_glonass_ephemeris_available="
+    + optional(outcome.restored_glonass_ephemeris_available),
     "restored_satellites_used="
     + optional(outcome.restored_satellites_used),
     "restored_gps_startup_ready="
+    + optional(outcome.restored_gps_startup_ready),
+    "effective_gps_startup_ready="
     + optional(outcome.restored_gps_startup_ready),
     "restored_gps_almanac_satellite_ids="
     + optional(outcome.restored_gps_almanac_satellite_ids),
@@ -5487,7 +5991,13 @@ def log_yuma_supplementation_outcome(
     + optional(outcome.nav_sat_wait_seconds),
     "completion_elapsed_seconds="
     + optional(outcome.completion_elapsed_seconds),
+    "completion_monotonic="
+    + optional(outcome.completion_monotonic),
     "completion_utc=" + timestamp(outcome.completion_utc),
+    "gnss_start_sent_at_monotonic="
+    + optional(outcome.gnss_start_sent_at_monotonic),
+    "completed_before_gnss_start="
+    + optional(outcome.completed_before_gnss_start),
     "yuma_snapshot_sha256="
     + optional(outcome.yuma_snapshot_sha256),
     "cancellation_reason="
@@ -5955,6 +6465,9 @@ def run_receiving(duration: int = 0):
             ),
             independent=authorized_time.independent,
             source_provenance=authorized_time.provenance,
+            diagnostic_callback=(
+              log_time_assistance_attempt_diagnostic
+            ),
           )
           if (
             trusted_time_assistance_sent

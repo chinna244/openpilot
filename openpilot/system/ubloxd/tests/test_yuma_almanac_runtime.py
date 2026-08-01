@@ -1063,6 +1063,7 @@ def test_runtime_uses_post_transmission_completion_clock(monkeypatch):
 
   assert outcome is not None
   assert outcome.completion_elapsed_seconds == 3.5
+  assert outcome.completion_monotonic == 103.5
   assert outcome.completion_utc == NOW + timedelta(seconds=3.5)
   assert outcome.runtime_elapsed_seconds == 3.5
   assert outcome.yuma_snapshot_sha256 is not None

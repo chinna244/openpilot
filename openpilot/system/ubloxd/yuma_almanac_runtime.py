@@ -105,7 +105,10 @@ class YumaSupplementationRuntimeOutcome:
   nav_sat_observed_elapsed_seconds: float | None = None
   nav_sat_wait_seconds: float | None = None
   completion_elapsed_seconds: float | None = None
+  completion_monotonic: float | None = None
   completion_utc: datetime | None = None
+  gnss_start_sent_at_monotonic: float | None = None
+  completed_before_gnss_start: bool | None = None
   cancellation_reason: YumaSupplementationReason | None = None
   receiver_cycle: int | None = None
   feature_enabled: bool = True
@@ -612,6 +615,7 @@ class YumaSupplementationRuntime:
       completion_elapsed_seconds=(
         runtime_elapsed_seconds if terminal else None
       ),
+      completion_monotonic=(now if terminal else None),
       completion_utc=(trusted_now if terminal else None),
       cancellation_reason=(
         plan.reason if plan.reason in cancellation_reasons else None

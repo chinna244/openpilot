@@ -494,8 +494,11 @@ def test_strict_mga_ack_classifies_receiver_write_failure(monkeypatch):
     lambda pigeon, message: (_ for _ in ()).throw(OSError("injected write failure")),
   )
 
-  with pytest.raises(pigeond.MgaWriteError):
+  with pytest.raises(pigeond.MgaWriteError) as raised:
     pigeond.send_mga_with_strict_ack(object(), _mga_message())
+
+  assert raised.value.message_id == 0x40
+  assert raised.value.message_type == 0x01
 
 
 def test_strict_mga_ack_classifies_transaction_failure(monkeypatch):
@@ -510,8 +513,12 @@ def test_strict_mga_ack_classifies_transaction_failure(monkeypatch):
     lambda *args, **kwargs: (_ for _ in ()).throw(pigeond.ResponseTransactionError("injected transaction failure")),
   )
 
-  with pytest.raises(pigeond.MgaTransactionError):
+  with pytest.raises(pigeond.MgaTransactionError) as raised:
     pigeond.send_mga_with_strict_ack(object(), _mga_message())
+
+  assert raised.value.message_id == 0x40
+  assert raised.value.message_type == 0x01
+  assert raised.value.write_succeeded
 
 
 def test_strict_mga_ack_does_not_wrap_programming_type_error(
@@ -578,8 +585,15 @@ def test_strict_mga_ack_classifies_receiver_nack(monkeypatch):
     lambda *args, **kwargs: acknowledgment,
   )
 
-  with pytest.raises(pigeond.MgaReceiverNackError):
+  with pytest.raises(pigeond.MgaReceiverNackError) as raised:
     pigeond.send_mga_with_strict_ack(object(), _mga_message())
+
+  assert raised.value.message_id == 0x40
+  assert raised.value.message_type == 0x01
+  assert raised.value.ack_type == 1
+  assert raised.value.ack_version == 0
+  assert raised.value.info_code == 1
+  assert raised.value.rejected_message_id == 0x40
 
 
 def test_strict_mga_ack_keeps_malformed_message_nonretryable():
@@ -598,6 +612,80 @@ def test_strict_mga_ack_keeps_malformed_message_nonretryable():
       TimeoutError,
     ),
   )
+
+
+@pytest.mark.parametrize(
+  ("completion_monotonic", "gnss_start_sent_at", "expected"),
+  (
+    (0.5, 1.0, True),
+    (2.0, 1.0, False),
+    (None, 1.0, None),
+  ),
+)
+def test_yuma_outcome_explicitly_compares_completion_to_gnss_start(
+  completion_monotonic,
+  gnss_start_sent_at,
+  expected,
+):
+  feature = object.__new__(pigeond.YumaSupplementationFeature)
+  feature._receiver_cycle = 3
+  feature._initialization = SimpleNamespace(
+    gnss_start_sent_at=gnss_start_sent_at
+  )
+  outcome = pigeond.YumaSupplementationRuntimeOutcome(
+    plan=SimpleNamespace(
+      reason=pigeond.YumaSupplementationReason.FEATURE_DISABLED
+    ),
+    completion_monotonic=completion_monotonic,
+  )
+
+  contextualized = feature._contextualize_outcome(outcome)
+
+  assert (
+    contextualized.gnss_start_sent_at_monotonic
+    == gnss_start_sent_at
+  )
+  assert contextualized.completed_before_gnss_start is expected
+
+
+def test_yuma_log_labels_captured_and_effective_quality(
+  monkeypatch,
+):
+  logs = []
+  monkeypatch.setattr(pigeond.cloudlog, "info", logs.append)
+  outcome = pigeond.YumaSupplementationRuntimeOutcome(
+    plan=SimpleNamespace(
+      action=SimpleNamespace(value="send_missing"),
+      reason=SimpleNamespace(value="database_restore_incomplete"),
+      satellite_ids=frozenset((1, 2)),
+      unavailable_satellite_ids=frozenset(),
+    ),
+    restored_cache_age_evidence="trusted_utc",
+    restored_cache_age_verified=True,
+    captured_gps_ephemeris_available=6,
+    captured_glonass_ephemeris_available=8,
+    captured_gps_startup_ready=True,
+    restored_gps_ephemeris_available=6,
+    restored_glonass_ephemeris_available=8,
+    restored_gps_startup_ready=True,
+    completion_monotonic=2.757,
+    gnss_start_sent_at_monotonic=1.310,
+    completed_before_gnss_start=False,
+    terminal=True,
+  )
+
+  pigeond.log_yuma_supplementation_outcome(outcome)
+
+  message = logs[-1]
+  assert "quality_evaluation_stage=yuma_runtime" in message
+  assert "restored_cache_age_evidence=trusted_utc" in message
+  assert "captured_gps_ephemeris_available=6" in message
+  assert "captured_glonass_ephemeris_available=8" in message
+  assert "effective_gps_ephemeris_available=6" in message
+  assert "effective_glonass_ephemeris_available=8" in message
+  assert "gnss_start_sent_at_monotonic=1.31" in message
+  assert "completion_monotonic=2.757" in message
+  assert "completed_before_gnss_start=false" in message
 
 
 def test_receiver_utc_anchor_accepts_fresh_unreliable_nav_pvt():

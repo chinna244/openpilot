@@ -67,6 +67,27 @@ class NavigationDatabaseRestoreInitializationError(RuntimeError):
   """Receiver startup cannot safely establish boot-scoped DBD ownership."""
 
 
+class PositionAssistanceWriteStatus(StrEnum):
+  NOT_ATTEMPTED = "not_attempted"
+  SUCCEEDED = "succeeded"
+  FAILED = "failed"
+
+
+class PositionAssistanceAckStatus(StrEnum):
+  NOT_ATTEMPTED = "not_attempted"
+  ACCEPTED = "accepted"
+  REJECTED = "rejected"
+  TIMED_OUT = "timed_out"
+  OBSERVATION_FAILED = "observation_failed"
+
+
+class PositionAssistanceFailureKind(StrEnum):
+  BUILD = "build"
+  WRITE = "write"
+  ACK_REJECTED = "ack_rejected"
+  ACK_TIMEOUT = "ack_timeout"
+
+
 @dataclass(frozen=True)
 class NavigationDatabaseRestoreSnapshot:
   saved_at_utc: datetime
@@ -228,6 +249,13 @@ class NavigationDatabaseRestoreExecution:
   failure_phase: str | None = None
   position_assistance_attempted: bool = False
   position_assistance_succeeded: bool = False
+  position_assistance_message_id: int | None = None
+  position_assistance_message_type: int | None = None
+  position_assistance_write_status: PositionAssistanceWriteStatus = PositionAssistanceWriteStatus.NOT_ATTEMPTED
+  position_assistance_ack_status: PositionAssistanceAckStatus = PositionAssistanceAckStatus.NOT_ATTEMPTED
+  position_assistance_ack_info_code: int | None = None
+  position_assistance_failure_kind: PositionAssistanceFailureKind | None = None
+  position_assistance_error_type: str | None = None
   position_assistance_error: str | None = None
   cache_saved_at_utc: datetime | None = None
   cache_generation: str | None = None
@@ -652,6 +680,13 @@ class NavigationDatabaseRestoreRuntime:
     self._position_claimed = False
     self._position_attempted = False
     self._position_succeeded = False
+    self._position_message_id: int | None = None
+    self._position_message_type: int | None = None
+    self._position_write_status = PositionAssistanceWriteStatus.NOT_ATTEMPTED
+    self._position_ack_status = PositionAssistanceAckStatus.NOT_ATTEMPTED
+    self._position_ack_info_code: int | None = None
+    self._position_failure_kind: PositionAssistanceFailureKind | None = None
+    self._position_error_type: str | None = None
     self._position_error: str | None = None
     self._yuma_sent = False
     self._state_persistence_error: str | None = None
@@ -944,12 +979,101 @@ class NavigationDatabaseRestoreRuntime:
         altitude_cm=snapshot.altitude_cm,
         position_accuracy_cm=snapshot.position_accuracy_cm,
       )
-      send_message(message)
     except Exception as exc:
+      self._position_failure_kind = PositionAssistanceFailureKind.BUILD
+      self._position_error_type = type(exc).__name__
       self._position_error = _bounded_error(exc)
       self._position_succeeded = False
     else:
-      self._position_succeeded = True
+      self._position_message_id = message[3] if len(message) > 3 else None
+      payload_length = int.from_bytes(message[4:6], "little") if len(message) >= 6 else 0
+      self._position_message_type = (
+        message[6]
+        if payload_length > 0 and len(message) > 6
+        else None
+      )
+      try:
+        send_message(message)
+      except MgaReceiverNackError as exc:
+        self._position_message_id = (
+          exc.message_id
+          if exc.message_id is not None
+          else self._position_message_id
+        )
+        self._position_message_type = (
+          exc.message_type
+          if exc.message_type is not None
+          else self._position_message_type
+        )
+        self._position_write_status = PositionAssistanceWriteStatus.SUCCEEDED
+        self._position_ack_status = PositionAssistanceAckStatus.REJECTED
+        self._position_ack_info_code = exc.info_code
+        self._position_failure_kind = PositionAssistanceFailureKind.ACK_REJECTED
+        self._position_error_type = type(exc).__name__
+        self._position_error = _bounded_error(exc)
+        self._position_succeeded = False
+      except TimeoutError as exc:
+        self._position_write_status = PositionAssistanceWriteStatus.SUCCEEDED
+        self._position_ack_status = PositionAssistanceAckStatus.TIMED_OUT
+        self._position_failure_kind = PositionAssistanceFailureKind.ACK_TIMEOUT
+        self._position_error_type = type(exc).__name__
+        self._position_error = _bounded_error(exc)
+        self._position_succeeded = False
+      except MgaWriteError as exc:
+        self._position_message_id = (
+          exc.message_id
+          if exc.message_id is not None
+          else self._position_message_id
+        )
+        self._position_message_type = (
+          exc.message_type
+          if exc.message_type is not None
+          else self._position_message_type
+        )
+        self._position_write_status = PositionAssistanceWriteStatus.FAILED
+        self._position_ack_status = PositionAssistanceAckStatus.NOT_ATTEMPTED
+        self._position_failure_kind = PositionAssistanceFailureKind.WRITE
+        self._position_error_type = type(exc).__name__
+        self._position_error = _bounded_error(exc)
+        self._position_succeeded = False
+      except MgaTransactionError as exc:
+        self._position_message_id = (
+          exc.message_id
+          if exc.message_id is not None
+          else self._position_message_id
+        )
+        self._position_message_type = (
+          exc.message_type
+          if exc.message_type is not None
+          else self._position_message_type
+        )
+        write_succeeded = exc.write_succeeded is True
+        self._position_write_status = (
+          PositionAssistanceWriteStatus.SUCCEEDED
+          if write_succeeded
+          else PositionAssistanceWriteStatus.FAILED
+        )
+        self._position_ack_status = (
+          PositionAssistanceAckStatus.OBSERVATION_FAILED
+          if write_succeeded
+          else PositionAssistanceAckStatus.NOT_ATTEMPTED
+        )
+        self._position_failure_kind = PositionAssistanceFailureKind.WRITE
+        self._position_error_type = type(exc).__name__
+        self._position_error = _bounded_error(exc)
+        self._position_succeeded = False
+      except Exception as exc:
+        self._position_write_status = PositionAssistanceWriteStatus.FAILED
+        self._position_ack_status = PositionAssistanceAckStatus.NOT_ATTEMPTED
+        self._position_failure_kind = PositionAssistanceFailureKind.WRITE
+        self._position_error_type = type(exc).__name__
+        self._position_error = _bounded_error(exc)
+        self._position_succeeded = False
+      else:
+        self._position_write_status = PositionAssistanceWriteStatus.SUCCEEDED
+        self._position_ack_status = PositionAssistanceAckStatus.ACCEPTED
+        self._position_ack_info_code = 0
+        self._position_succeeded = True
     self._execution = self._build_execution()
     return self._execution
 
@@ -1323,6 +1447,13 @@ class NavigationDatabaseRestoreRuntime:
       failure_phase=self._last_failure_phase,
       position_assistance_attempted=self._position_attempted,
       position_assistance_succeeded=self._position_succeeded,
+      position_assistance_message_id=self._position_message_id,
+      position_assistance_message_type=self._position_message_type,
+      position_assistance_write_status=self._position_write_status,
+      position_assistance_ack_status=self._position_ack_status,
+      position_assistance_ack_info_code=self._position_ack_info_code,
+      position_assistance_failure_kind=self._position_failure_kind,
+      position_assistance_error_type=self._position_error_type,
       position_assistance_error=self._position_error,
       cache_saved_at_utc=(snapshot.saved_at_utc if snapshot else None),
       cache_generation=(snapshot.generation if snapshot else None),
