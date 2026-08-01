@@ -24,6 +24,7 @@ from openpilot.selfdrive.car.helpers import convert_carControlSP, convert_to_cap
 
 from openpilot.sunnypilot.mads.helpers import set_alternative_experience, set_car_specific_params
 from openpilot.sunnypilot.selfdrive.car import interfaces as sunnypilot_interfaces
+from openpilot.sunnypilot.selfdrive.car.alpha_long_toggle import AlphaLongToggleMonitor
 
 REPLAY = "REPLAY" in os.environ
 
@@ -127,6 +128,9 @@ class Car:
     set_alternative_experience(self.CP, self.CP_SP, self.params)
     set_car_specific_params(self.CP, self.CP_SP, self.params)
 
+    # onroad AlphaLongitudinalEnabled changes: sequence any ECU hand-back, then cycle
+    self.alpha_long_monitor = AlphaLongToggleMonitor(self.CP, self.params)
+
     # Dynamic Experimental Control
     self.dynamic_experimental_control = self.params.get_bool("DynamicExperimentalControl")
 
@@ -213,7 +217,8 @@ class Car:
     if can_rcv_valid and REPLAY:
       self.can_log_mono_time = messaging.log_from_bytes(can_strs[0]).logMonoTime
 
-    self.v_cruise_helper.update_speed_limit_assist(self.is_metric, self.sm['longitudinalPlanSP'], self.sm['carControlSP'])
+    self.v_cruise_helper.update_speed_limit_assist(self.is_metric, self.sm['longitudinalPlanSP'], self.sm['carControlSP'],
+                                                   lp_updated=self.sm.updated['longitudinalPlanSP'])
     self.v_cruise_helper.update_v_cruise(CS, self.sm['carControl'].enabled, self.is_metric)
     if self.sm['carControl'].enabled and not self.CC_prev.enabled:
       # Use CarState w/ buttons from the step selfdrived enables on
@@ -222,6 +227,10 @@ class Car:
     # TODO: mirror the carState.cruiseState struct?
     CS.vCruise = float(self.v_cruise_helper.v_cruise_kph)
     CS.vCruiseCluster = float(self.v_cruise_helper.v_cruise_cluster_kph)
+
+    # publish the cruise arbiter's session (plannerd mirrors it into the plan; the
+    # ICBM servo freezes on a pending confirm prompt)
+    self.v_cruise_helper.cruise_arbiter.fill_msg(CS_SP)
 
     return CS, CS_SP, RD
 
@@ -280,7 +289,10 @@ class Car:
     if self.sm.all_alive(['carControl']):
       # send car controls over can
       now_nanos = self.can_log_mono_time if REPLAY else int(time.monotonic() * 1e9)
-      self.last_actuators_output, can_sends = self.CI.apply(CC, convert_carControlSP(CC_SP), now_nanos)
+      CC_SP_struct = convert_carControlSP(CC_SP)
+      self.v_cruise_helper.cruise_arbiter.gate_send_button(CC_SP_struct)
+      self.alpha_long_monitor.update(CS, CC, CC_SP_struct)
+      self.last_actuators_output, can_sends = self.CI.apply(CC, CC_SP_struct, now_nanos)
       self.pm.send('sendcan', can_list_to_can_capnp(can_sends, msgtype='sendcan', valid=CS.canValid))
 
       self.CC_prev = CC
@@ -307,6 +319,7 @@ class Car:
       # sunnypilot
       self.dynamic_experimental_control = self.params.get_bool("DynamicExperimentalControl")
       self.v_cruise_helper.read_custom_set_speed_params()
+      self.alpha_long_monitor.update_params()
 
       time.sleep(0.1)
 

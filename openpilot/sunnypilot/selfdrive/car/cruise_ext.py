@@ -12,12 +12,11 @@ from opendbc.car import structs
 from openpilot.common.constants import CV
 from openpilot.common.params import Params
 from openpilot.common.realtime import DT_CTRL
+from openpilot.sunnypilot.selfdrive.car.cruise_arbiter import CruiseArbiter, V_CRUISE_MAX, V_CRUISE_UNSET, \
+  ACTIVE_STATES as SESSION_ACTIVE_STATES
 from openpilot.sunnypilot.selfdrive.car.intelligent_cruise_button_management.helpers import get_minimum_set_speed
-from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.speed_limit_assist import ACTIVE_STATES as SLA_ACTIVE_STATES
-from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.helpers import compare_cluster_target
 
 ButtonType = car.CarState.ButtonEvent.Type
-SpeedLimitAssistState = custom.LongitudinalPlanSP.SpeedLimit.AssistState
 LongitudinalPlanSource = custom.LongitudinalPlanSP.LongitudinalPlanSource
 IcbmState = custom.IntelligentCruiseButtonManagement.IntelligentCruiseButtonManagementState
 
@@ -25,9 +24,7 @@ CRUISE_BUTTON_TIMER = {ButtonType.decelCruise: 0, ButtonType.accelCruise: 0,
                        ButtonType.setCruise: 0, ButtonType.resumeCruise: 0,
                        ButtonType.cancel: 0, ButtonType.mainCruise: 0}
 
-V_CRUISE_MIN = 8
-V_CRUISE_MAX = 145
-V_CRUISE_UNSET = 255
+V_CRUISE_MIN = 8  # V_CRUISE_MAX / V_CRUISE_UNSET come from cruise_arbiter
 
 # Setpoint reconciliation for non-pcmCruiseSpeed (ICBM) cars. The stock ECU keeps the real
 # set speed and steps it on wheel presses while openpilot integrates the same presses, so
@@ -77,24 +74,22 @@ class VCruiseHelperSP:
     # Setpoint reconciliation (non-pcmCruiseSpeed cars)
     self.reconcile_frames = 0
     self.reconcile_allowed = False
-    self._press_owned_by_sla = False
 
     # Plan/actuation regime, updated from longitudinalPlanSP + carControlSP each frame
     self.lp_source = LongitudinalPlanSource.cruise
     self.icbm_state = IcbmState.inactive
 
-    # Speed Limit Assist
-    self.sla_state = SpeedLimitAssistState.disabled
-    self.prev_sla_state = SpeedLimitAssistState.disabled
-    self.speed_limit_final_last = 0.
-    self.speed_limit_final_last_kph = 0.
-    self.req_plus = False
-    self.req_minus = False
+    # Cruise arbiter: classifies every +/- press once and owns the SLA session on
+    # non-pcm (stock-ACC button) cars; no-op elsewhere
+    self.cruise_arbiter = CruiseArbiter(CP, CP_SP)
+    self.cruise_arbiter.read_params(self.params)
 
   def read_custom_set_speed_params(self) -> None:
     self.custom_acc_enabled = self.params.get_bool("CustomAccIncrementsEnabled")
     self.short_increment = self.params.get("CustomAccShortPressIncrement", return_default=True)
     self.long_increment = self.params.get("CustomAccLongPressIncrement", return_default=True)
+    # rides card's params thread, keeping param reads off the 100 Hz path
+    self.cruise_arbiter.read_params(self.params)
 
   def update_v_cruise_delta(self, long_press: bool, v_cruise_delta: float) -> tuple[bool, float]:
     if not self.custom_acc_enabled:
@@ -124,13 +119,6 @@ class VCruiseHelperSP:
       update_manual_button_timers(CS, self.enable_button_timers)
       button_pressed = any(self.enable_button_timers[k] > 0 for k in self.enable_button_timers)
 
-      # Ownership is decided at the press edge and holds for the whole press: the increment
-      # applies at release, and by then SLA has usually consumed the press and gone
-      # inactive, which would let an SLA-owned press leak through as an increment.
-      for b in RECONCILE_BUTTONS:
-        if self.enable_button_timers[b] == 1:
-          self._press_owned_by_sla = self.sla_state in SLA_ACTIVE_STATES
-
       if enabled and not self.enabled_prev:
         self.enabled_prev = not button_pressed
         enabled = False
@@ -156,10 +144,11 @@ class VCruiseHelperSP:
     dash_kph = CS.cruiseState.speed * CV.MS_TO_KPH
     if pressed:
       if self.reconcile_frames <= 0:
-        # evaluated once at press start, before the press's own ECU effect lands
+        # evaluated once at press start, before the press's own ECU effect lands; the
+        # arbiter's pre-frame snapshot is the session state the press was aimed at
         agree_setpoint = abs(dash_kph - self.v_cruise_kph) <= RECONCILE_AGREE_KPH
-        sla_session = self.sla_state in SLA_ACTIVE_STATES or self.prev_sla_state in SLA_ACTIVE_STATES
-        agree_sla = sla_session and abs(dash_kph - self.speed_limit_final_last_kph) <= RECONCILE_AGREE_KPH
+        sla_session = self.cruise_arbiter.state_prev_frame in SESSION_ACTIVE_STATES
+        agree_sla = sla_session and abs(dash_kph - self.cruise_arbiter.slf_kph) <= RECONCILE_AGREE_KPH
         self.reconcile_allowed = agree_setpoint or agree_sla
       self.reconcile_frames = RECONCILE_SETTLE_FRAMES
     else:
@@ -168,11 +157,14 @@ class VCruiseHelperSP:
     if not self.reconcile_allowed:
       return
 
-    # even a legitimate window must not adopt while a limiter drives the plan or ICBM is
-    # stepping the dash
+    # even a legitimate window must not adopt while a limiter drives the plan, ICBM is
+    # stepping the dash, or a confirm prompt is pending (the frozen dash is not the
+    # driver's answer)
     if self.lp_source != LongitudinalPlanSource.cruise:
       return
     if self.icbm_state in (IcbmState.increasing, IcbmState.decreasing):
+      return
+    if self.cruise_arbiter.prompting:
       return
 
     if dash_kph > 1:
@@ -180,29 +172,26 @@ class VCruiseHelperSP:
       self.v_cruise_cluster_kph = self.v_cruise_kph
 
   def update_speed_limit_assist(self, is_metric, LP_SP: custom.LongitudinalPlanSP,
-                                CC_SP: custom.CarControlSP) -> None:
-    resolver = LP_SP.speedLimit.resolver
-    self.speed_limit_final_last = resolver.speedLimitFinalLast
-    self.speed_limit_final_last_kph = self.speed_limit_final_last * CV.MS_TO_KPH
-    self.prev_sla_state = self.sla_state
-    self.sla_state = LP_SP.speedLimit.assist.state
+                                CC_SP: custom.CarControlSP, lp_updated: bool = True) -> None:
     self.lp_source = LP_SP.longitudinalPlanSource
     self.icbm_state = CC_SP.intelligentCruiseButtonManagement.state
-    self.req_plus, self.req_minus = compare_cluster_target(self.v_cruise_cluster_kph * CV.KPH_TO_MS,
-                                                           self.speed_limit_final_last, is_metric)
+    self.cruise_arbiter.is_metric = is_metric
+    if lp_updated:  # resolver values only change when the plan message does
+      self.cruise_arbiter.update_limit(LP_SP)
 
-  def update_speed_limit_assist_pre_active_confirmed(self, button_type: car.CarState.ButtonEvent.Type) -> bool:
-    if self.sla_state == SpeedLimitAssistState.preActive or self.prev_sla_state == SpeedLimitAssistState.preActive:
-      if button_type == ButtonType.decelCruise and self.req_minus:
-        return True
-      if button_type == ButtonType.accelCruise and self.req_plus:
-        return True
+  def press_owned(self, button_type) -> bool:
+    # a press the arbiter classified as confirm or dismiss never increments v_cruise
+    return self.cruise_arbiter.press_owned(button_type)
 
-    return False
+  def update_cruise_arbiter(self, CS: car.CarState, enabled: bool) -> None:
+    if not self.cruise_arbiter.applicable:
+      return
 
-  @property
-  def speed_limit_assist_owns_buttons(self) -> bool:
-    # A press that started while SLA was active carries SLA semantics (abort in flight,
-    # re-anchor once settled), never a v_cruise increment; the ECU's step comes back via
-    # reconcile_setpoint_with_dash, so incrementing here would count the press twice.
-    return self._press_owned_by_sla
+    v_cruise_kph = self.cruise_arbiter.step(CS, enabled, self.v_cruise_kph, self.v_cruise_cluster_kph)
+    if self.cruise_arbiter.adopted_this_frame:
+      # an upward confirm adopted the limit as the setpoint; the ECU's own +1 step from
+      # the confirm press must not be re-adopted over it
+      self.v_cruise_kph = v_cruise_kph
+      self.v_cruise_cluster_kph = v_cruise_kph
+      self.reconcile_frames = 0
+      self.reconcile_allowed = False

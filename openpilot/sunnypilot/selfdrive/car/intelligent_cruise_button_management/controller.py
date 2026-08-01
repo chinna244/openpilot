@@ -19,6 +19,7 @@ from openpilot.sunnypilot.selfdrive.car.cruise_ext import CRUISE_BUTTON_TIMER, u
 LongitudinalPlanSource = custom.LongitudinalPlanSP.LongitudinalPlanSource
 State = custom.IntelligentCruiseButtonManagement.IntelligentCruiseButtonManagementState
 SendButtonState = custom.IntelligentCruiseButtonManagement.SendButtonState
+SessionState = custom.LongitudinalPlanSP.SpeedLimit.AssistState
 
 INACTIVE_TIMER = 0.4
 # Reaction deadband in display units, applied only while a limiter (SCC/SLA) drives the
@@ -99,6 +100,10 @@ class IntelligentCruiseButtonManagement:
     self.is_ready = False
     self.is_ready_prev = False
     self.is_metric = False
+    # a pending SLA confirm prompt freezes the servo: the plan cap already holds, but
+    # the dash must not move at all while the driver is being asked (card additionally
+    # vetoes emission with same-frame session state; this gate is one hop stale)
+    self.prompt_frozen = False
     self.decel_overshoot_enabled = False
     self.overshoot_mph = 0.0
     self.overshoot_params = DECEL_OVERSHOOT_PARAMS.get(CP.brand)
@@ -153,10 +158,14 @@ class IntelligentCruiseButtonManagement:
     self.react_deadband = REACT_DEADBAND if self.limiter_active or self.overshoot_mph > 0 else 1
 
   def update_restore_quiet_timer(self) -> None:
-    # how long an up-error has persisted against a still target; any target motion or the
-    # error closing resets it
+    # how long an up-error has persisted against a still target; any target motion, the
+    # error closing, or a pending confirm prompt resets it. Holding the timer at zero
+    # through the prompt means a decline or timeout still waits out a FULL quiet window
+    # before any restore: the prompt must not pre-pay the servo's patience.
     up_error = self.v_target - self.v_cruise_cluster
-    if up_error >= self.react_deadband and self.v_target == self.v_target_prev:
+    if self.prompt_frozen:
+      self.restore_quiet_timer = 0
+    elif up_error >= self.react_deadband and self.v_target == self.v_target_prev:
       self.restore_quiet_timer += 1
     else:
       self.restore_quiet_timer = 0
@@ -196,16 +205,31 @@ class IntelligentCruiseButtonManagement:
     self.pre_active_timer = max(0, self.pre_active_timer - 1)
     self.update_restore_quiet_timer()
 
+    # a pending confirm prompt parks any move; transitions out of holding are gated below
+    if self.prompt_frozen and self.state in (State.preActive, State.increasing, State.decreasing):
+      self.state = State.holding
+
     # HOLDING, ACCELERATING, DECELERATING, PRE_ACTIVE
     if self.state != State.inactive:
       if not self.is_ready:
         self.state = State.inactive
 
       else:
+        # Up-moves need the quiet window on decel_needs_stable_setpoint cars, on EVERY
+        # entry path: the preActive route (taken after any driver press resets
+        # readiness) used to bypass it straight into increasing, letting the servo
+        # chase a stale target before card had settled the press's own effects.
+        # The overshoot exemption only covers the overshoot command's own slow release
+        # (still limiter-sourced); residual overshoot after a source flip back to cruise
+        # must not bypass the quiet window into a full baseline restore.
+        up_allowed = ((self.overshoot_mph > 0 and self.limiter_active)
+                      or not self.profile.decel_needs_stable_setpoint
+                      or self.restore_quiet_timer >= RESTORE_QUIET_FRAMES)
+
         # PRE_ACTIVE
         if self.state == State.preActive:
           if self.pre_active_timer <= 0:
-            if self.v_target - self.v_cruise_cluster >= self.react_deadband:
+            if self.v_target - self.v_cruise_cluster >= self.react_deadband and up_allowed:
               self.state = State.increasing
 
             elif self.v_cruise_cluster - self.v_target >= self.react_deadband and self.v_cruise_cluster > self.v_cruise_min:
@@ -215,11 +239,9 @@ class IntelligentCruiseButtonManagement:
               self.state = State.holding
 
         # HOLDING
-        elif self.state == State.holding:
+        elif self.state == State.holding and not self.prompt_frozen:
           down_pending = self.v_cruise_cluster - self.v_target >= self.react_deadband
           up_pending = self.v_target - self.v_cruise_cluster >= self.react_deadband
-          up_allowed = (self.overshoot_mph > 0 or not self.profile.decel_needs_stable_setpoint
-                        or self.restore_quiet_timer >= RESTORE_QUIET_FRAMES)
           if down_pending or (up_pending and up_allowed):
             self.pre_active_timer = int(REACT_TIMER / DT_CTRL)
             self.state = State.preActive
@@ -258,12 +280,13 @@ class IntelligentCruiseButtonManagement:
     self.is_ready = ready and not button_pressed
 
   def run(self, CS: car.CarState, CC: car.CarControl, LP_SP: custom.LongitudinalPlanSP, is_metric: bool,
-          decel_overshoot_enabled: bool = False) -> None:
+          decel_overshoot_enabled: bool = False, session_state=SessionState.disabled) -> None:
     if self.CP_SP.pcmCruiseSpeed:
       return
 
     self.is_metric = is_metric
     self.decel_overshoot_enabled = decel_overshoot_enabled
+    self.prompt_frozen = session_state == SessionState.preActive
 
     self.update_calculations(CS, LP_SP)
     self.update_readiness(CS, CC)

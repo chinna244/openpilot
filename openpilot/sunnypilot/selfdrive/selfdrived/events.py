@@ -42,7 +42,8 @@ def speed_limit_pre_active_alert(CP: car.CarParams, CS: car.CarState, sm: messag
   speed_conv = CV.MS_TO_KPH if metric else CV.MS_TO_MPH
   v_cruise_cluster = CS.vCruiseCluster
   set_speed = sm['controlsState'].deprecated.vCruise if v_cruise_cluster == 0.0 else v_cruise_cluster
-  set_speed_conv = round(set_speed * speed_conv)
+  # vCruise/vCruiseCluster are kph; the resolver speeds below are m/s
+  set_speed_conv = round(set_speed * CV.KPH_TO_MS * speed_conv)
 
   speed_limit_final_last = sm['longitudinalPlanSP'].speedLimit.resolver.speedLimitFinalLast
   speed_limit_final_last_conv = round(speed_limit_final_last * speed_conv)
@@ -227,14 +228,6 @@ EVENTS_SP: dict[int, dict[str, Alert | AlertCallbackType]] = {
 
   EventNameSP.speedLimitPreActive: {
     ET.WARNING: speed_limit_pre_active_alert,
-  },
-
-  EventNameSP.speedLimitPending: {
-    ET.WARNING: Alert(
-      "Auto adjusting to last speed limit",
-      "",
-      AlertStatus.normal, AlertSize.small,
-      Priority.LOW, VisualAlert.none, AudibleAlertSP.promptSingleHigh, 5.),
   },
 
   EventNameSP.e2eChime: {

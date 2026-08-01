@@ -187,7 +187,9 @@ class SteeringLayoutMici(NavScroller):
 
     torque_allowed = self._torque_allowed = (ui_state.CP is not None and
                                              ui_state.CP.steerControlType != car.CarParams.SteerControlType.angle)
-    if not torque_allowed and self._prev_torque_allowed is not False:
+    # wipe only on a known angle-steering car; CP None just means the car is not
+    # fingerprinted yet (fresh install), where a wipe would race card's seeded defaults
+    if ui_state.CP is not None and not torque_allowed and self._prev_torque_allowed is not False:
       ui_state.params.remove("EnforceTorqueControl")
       ui_state.params.remove("NeuralNetworkLateralControl")
     self._prev_torque_allowed = torque_allowed

@@ -12,7 +12,7 @@ from openpilot.cereal import log
 from openpilot.cereal.services import SERVICE_LIST
 from openpilot.common.utils import strip_deprecated_keys
 from openpilot.common.filter_simple import FirstOrderFilter
-from openpilot.common.params import Params
+from openpilot.common.params import Params, ParamKeyFlag
 from openpilot.common.realtime import DT_HW
 from openpilot.selfdrive.selfdrived.alertmanager import set_offroad_alert
 from openpilot.common.hardware import HARDWARE, TICI
@@ -34,6 +34,7 @@ TEMP_TAU = 5.   # 5s time constant
 DISCONNECT_TIMEOUT = 5.  # wait 5 seconds before going offroad after disconnect so you get an alert
 PANDA_STATES_TIMEOUT = round(1000 / SERVICE_LIST['pandaStates'].frequency * 1.5)  # 1.5x the expected pandaState frequency
 ONROAD_CYCLE_TIME = 1  # seconds to wait offroad after requesting an onroad cycle
+OFFROAD_REQUEST_TIMEOUT = 10  # seconds for card's stock-ECU hand-back before force-offroad is granted anyway
 
 ThermalBand = namedtuple("ThermalBand", ['min_temp', 'max_temp'])
 HardwareState = namedtuple("HardwareState", ['network_type', 'network_info', 'network_strength', 'network_stats',
@@ -179,6 +180,7 @@ def hardware_thread(end_event, hw_queue) -> None:
   engaged_prev = False
   pwrsave = False
   offroad_cycle_count = 0
+  offroad_request_count = 0
 
   params = Params()
   power_monitor = PowerMonitoring()
@@ -201,8 +203,28 @@ def hardware_thread(end_event, hw_queue) -> None:
     # handle requests to cycle system started state
     if params.get_bool("OnroadCycleRequested"):
       params.put_bool("OnroadCycleRequested", False, block=True)
+      # pandad races manager's onroad-transition param clearing when the cycle restarts.
+      # If it wins, it applies the previous session's CarParams safety immediately and
+      # opens the harness relay seconds before controls come up, cutting the camera off
+      # from the car long enough to fault it. Run the same clear early so the new
+      # session sequences like a normal boot: ELM327 (relay closed) until the fresh
+      # CarParams is ready.
+      params.clear_all(ParamKeyFlag.CLEAR_ON_ONROAD_TRANSITION)
       offroad_cycle_count = sm.frame
     onroad_conditions["not_onroad_cycle"] = (sm.frame - offroad_cycle_count) >= ONROAD_CYCLE_TIME * SERVICE_LIST['pandaStates'].frequency
+
+    # Force-offroad requests defer to card so brands that silence a stock ECU can hand
+    # it back first (openpilot/sunnypilot/selfdrive/car/alpha_long_toggle.py). Grant
+    # directly when there is no onroad session to hand back from, or if card has not
+    # finished in time - the request must never silently fail.
+    if params.get_bool("OffroadModeRequested"):
+      offroad_request_count += 1
+      no_session = started_ts is None
+      if no_session or offroad_request_count >= OFFROAD_REQUEST_TIMEOUT * SERVICE_LIST['pandaStates'].frequency:
+        params.put_bool("OffroadMode", True)
+        params.put_bool("OffroadModeRequested", False)
+    else:
+      offroad_request_count = 0
 
     if sm.updated['pandaStates'] and len(pandaStates) > 0:
 

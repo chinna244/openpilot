@@ -50,6 +50,10 @@ class VCruiseHelper(VCruiseHelperSP):
 
     _enabled = self.update_enabled_state(CS, enabled)
 
+    # classify presses and step the SLA session before increments and reconciliation,
+    # in the same frame as the button events (see CruiseArbiter.step for the ordering)
+    self.update_cruise_arbiter(CS, enabled)
+
     if CS.cruiseState.available:
       if not self.CP.pcmCruise or (not self.CP_SP.pcmCruiseSpeed and _enabled):
         # if stock cruise is completely disabled, then we can use our own set speed logic
@@ -109,15 +113,10 @@ class VCruiseHelper(VCruiseHelperSP):
     if not self.button_change_states[button_type]["enabled"]:
       return
 
-    # Speed Limit Assist for Non PCM long cars.
-    # True: Disallow set speed changes when user confirmed the target set speed during preActive state
-    # False: Allow set speed changes as SLA is not requesting user confirmation
-    if self.update_speed_limit_assist_pre_active_confirmed(button_type):
-      return
-
-    # While SLA is active, presses carry SLA semantics (abort/re-anchor); the setpoint is
-    # updated by dash reconciliation instead, so the ECU's step is not counted twice.
-    if self.speed_limit_assist_owns_buttons:
+    # A press the cruise arbiter classified as confirm or dismiss carries session
+    # semantics, never a v_cruise increment; the ECU's own step comes back via dash
+    # reconciliation, so incrementing here would count the press twice.
+    if self.press_owned(button_type):
       return
 
     long_press, v_cruise_delta = VCruiseHelperSP.update_v_cruise_delta(self, long_press, v_cruise_delta)

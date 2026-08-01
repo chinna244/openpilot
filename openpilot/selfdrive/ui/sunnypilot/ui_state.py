@@ -11,6 +11,7 @@ from opendbc.car.structs import car
 from openpilot.common.params import Params
 from openpilot.selfdrive.ui.sunnypilot.layouts.settings.display import OnroadBrightness
 from openpilot.sunnypilot.sunnylink.sunnylink_state import SunnylinkState
+from openpilot.sunnypilot.selfdrive.ui.offroad_mode import request_offroad_mode
 from openpilot.system.ui.lib.application import gui_app
 
 OpenpilotState = log.SelfdriveState.OpenpilotState
@@ -197,10 +198,14 @@ class UIStateSP:
       if not CP.enableBsm:
         self.params.remove("AutoLaneChangeBsmDelay")
     else:
-      # No CarParams: clear all car-dependent params as safety default
-      self.params.remove("EnforceTorqueControl")
-      self.params.remove("NeuralNetworkLateralControl")
-      self.params.remove("AlphaLongitudinalEnabled")
+      # No CarParams: clear all car-dependent params as safety default. Never while
+      # onroad: on a fresh install's first drive, card seeds car-dependent defaults
+      # (e.g. the Mazda torque-control stack) during init, before CarParamsPersistent
+      # is written, and this wipe would race it and silently undo the seed.
+      if not self.started:
+        self.params.remove("EnforceTorqueControl")
+        self.params.remove("NeuralNetworkLateralControl")
+        self.params.remove("AlphaLongitudinalEnabled")
 
     # No longitudinal control: no experimental mode or DEC
     if not has_long:
@@ -227,7 +232,7 @@ class UIStateSP:
 class DeviceSP:
   def _set_awake(self, on: bool, _ui_state=None):
     if _ui_state.boot_offroad_mode == 1 and not on:
-      _ui_state.params.put_bool("OffroadMode", True)
+      request_offroad_mode(_ui_state.params, True)
 
   @staticmethod
   def set_onroad_brightness(_ui_state, awake: bool, cur_brightness: float) -> float:
