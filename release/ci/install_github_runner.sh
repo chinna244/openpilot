@@ -6,6 +6,10 @@ DEFAULT_REPO_URL="https://github.com/sunnypilot"
 START_AT_BOOT=false
 RESTORE_MODE=false
 RUNNER_VERSION="2.325.0"
+# Runner groups only exist for org/enterprise scopes and cannot be created on a free
+# plan, so pass an empty group to register against a single repository instead.
+RUNNER_GROUP="tici-tizi"
+RUNNER_LABELS="tici"
 
 # Parse command line arguments
 while [[ $# -gt 0 ]]; do
@@ -20,6 +24,14 @@ while [[ $# -gt 0 ]]; do
             ;;
         --repo)
             REPO_URL="$2"
+            shift 2
+            ;;
+        --runnergroup)
+            RUNNER_GROUP="$2"
+            shift 2
+            ;;
+        --labels)
+            RUNNER_LABELS="$2"
             shift 2
             ;;
         --restore)
@@ -119,7 +131,9 @@ configure_runner() {
     remount_rw
     echo "Configuring runner..."
     cd "$RUNNER_DIR"
-    sudo -u ${RUNNER_USER} ./config.sh --url "$REPO_URL" --token "$GITHUB_TOKEN" --name $(hostname) --runnergroup "tici-tizi" --labels "tici" --work "$BUILDS_DIR" --unattended
+    local group_args=()
+    [ -n "$RUNNER_GROUP" ] && group_args=(--runnergroup "$RUNNER_GROUP")
+    sudo -u ${RUNNER_USER} ./config.sh --url "$REPO_URL" --token "$GITHUB_TOKEN" --name $(hostname) "${group_args[@]}" --labels "$RUNNER_LABELS" --work "$BUILDS_DIR" --unattended
     remount_ro
 }
 
@@ -243,6 +257,8 @@ main() {
             echo "Optional arguments:"
             echo "  --start-at-boot    Enable auto-start at boot (default: false)"
             echo "  --repo            Repository URL (default: ${DEFAULT_REPO_URL})"
+            echo "  --runnergroup     Runner group, org scope only; pass '' for a repo runner (default: ${RUNNER_GROUP})"
+            echo "  --labels          Runner labels (default: ${RUNNER_LABELS})"
             echo "  --restore         Restore existing runner configuration"
             exit 1
         fi
