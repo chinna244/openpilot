@@ -201,6 +201,13 @@ def hardware_thread(end_event, hw_queue) -> None:
     # handle requests to cycle system started state
     if params.get_bool("OnroadCycleRequested"):
       params.put_bool("OnroadCycleRequested", False, block=True)
+      # pandad races manager's onroad-transition param clearing when the cycle restarts.
+      # If it wins, it applies the previous session's CarParams safety immediately and
+      # opens the harness relay seconds before controls come up, cutting the camera off
+      # from the car long enough to fault it. Clear here so the new session sequences
+      # like a normal boot: ELM327 (relay closed) until the fresh CarParams is ready.
+      params.remove("ControlsReady")
+      params.remove("FirmwareQueryDone")
       offroad_cycle_count = sm.frame
     onroad_conditions["not_onroad_cycle"] = (sm.frame - offroad_cycle_count) >= ONROAD_CYCLE_TIME * SERVICE_LIST['pandaStates'].frequency
 
