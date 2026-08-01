@@ -2389,6 +2389,9 @@ class NavigationAssistanceRestoreFailurePhase(StrEnum):
   POSITION_ASSISTANCE_WRITE = "position_assistance_write"
   POSITION_ASSISTANCE_ACK_REJECTED = "position_assistance_ack_rejected"
   POSITION_ASSISTANCE_ACK_TIMEOUT = "position_assistance_ack_timeout"
+  POSITION_ASSISTANCE_ACK_OBSERVATION_FAILED = (
+    "position_assistance_ack_observation_failed"
+  )
   DATABASE_FRAME_RESTORE = "database_frame_restore"
 
 
@@ -3001,6 +3004,9 @@ def _position_assistance_failure_phase(
     ),
     PositionAssistanceFailureKind.ACK_TIMEOUT: (
       NavigationAssistanceRestoreFailurePhase.POSITION_ASSISTANCE_ACK_TIMEOUT
+    ),
+    PositionAssistanceFailureKind.ACK_OBSERVATION_FAILED: (
+      NavigationAssistanceRestoreFailurePhase.POSITION_ASSISTANCE_ACK_OBSERVATION_FAILED
     ),
   }
   return mapping.get(

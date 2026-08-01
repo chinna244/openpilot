@@ -119,6 +119,10 @@ def snapshot() -> NavigationDatabaseRestoreSnapshot:
       PositionAssistanceFailureKind.ACK_TIMEOUT,
       pigeond.NavigationAssistanceRestoreFailurePhase.POSITION_ASSISTANCE_ACK_TIMEOUT,
     ),
+    (
+      PositionAssistanceFailureKind.ACK_OBSERVATION_FAILED,
+      pigeond.NavigationAssistanceRestoreFailurePhase.POSITION_ASSISTANCE_ACK_OBSERVATION_FAILED,
+    ),
   ),
 )
 def test_position_failure_kind_survives_runtime_result_mapping(
@@ -139,6 +143,7 @@ def test_position_failure_kind_survives_runtime_result_mapping(
       if failure_kind in (
         PositionAssistanceFailureKind.ACK_REJECTED,
         PositionAssistanceFailureKind.ACK_TIMEOUT,
+        PositionAssistanceFailureKind.ACK_OBSERVATION_FAILED,
       )
       else PositionAssistanceWriteStatus.FAILED
     ),
@@ -148,7 +153,11 @@ def test_position_failure_kind_survives_runtime_result_mapping(
       else (
         PositionAssistanceAckStatus.TIMED_OUT
         if failure_kind is PositionAssistanceFailureKind.ACK_TIMEOUT
-        else PositionAssistanceAckStatus.NOT_ATTEMPTED
+        else (
+          PositionAssistanceAckStatus.OBSERVATION_FAILED
+          if failure_kind is PositionAssistanceFailureKind.ACK_OBSERVATION_FAILED
+          else PositionAssistanceAckStatus.NOT_ATTEMPTED
+        )
       )
     ),
     position_assistance_ack_info_code=(

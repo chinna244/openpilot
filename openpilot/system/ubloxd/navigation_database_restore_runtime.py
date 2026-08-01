@@ -86,6 +86,7 @@ class PositionAssistanceFailureKind(StrEnum):
   WRITE = "write"
   ACK_REJECTED = "ack_rejected"
   ACK_TIMEOUT = "ack_timeout"
+  ACK_OBSERVATION_FAILED = "ack_observation_failed"
 
 
 @dataclass(frozen=True)
@@ -1058,7 +1059,11 @@ class NavigationDatabaseRestoreRuntime:
           if write_succeeded
           else PositionAssistanceAckStatus.NOT_ATTEMPTED
         )
-        self._position_failure_kind = PositionAssistanceFailureKind.WRITE
+        self._position_failure_kind = (
+          PositionAssistanceFailureKind.ACK_OBSERVATION_FAILED
+          if write_succeeded
+          else PositionAssistanceFailureKind.WRITE
+        )
         self._position_error_type = type(exc).__name__
         self._position_error = _bounded_error(exc)
         self._position_succeeded = False
