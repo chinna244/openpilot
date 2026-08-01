@@ -227,7 +227,8 @@ class UIStateSP:
 class DeviceSP:
   def _set_awake(self, on: bool, _ui_state=None):
     if _ui_state.boot_offroad_mode == 1 and not on:
-      _ui_state.params.put_bool("OffroadMode", True)
+      # deferred: card runs the stock-ECU hand-back, then grants OffroadMode
+      _ui_state.params.put_bool("OffroadModeRequested", True)
 
   @staticmethod
   def set_onroad_brightness(_ui_state, awake: bool, cur_brightness: float) -> float:

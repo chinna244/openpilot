@@ -176,7 +176,11 @@ class DeviceLayoutSP(DeviceLayout):
 
     def _set_always_offroad(result: int):
       if result == DialogResult.CONFIRM and not ui_state.engaged:
-        ui_state.params.put_bool("OffroadMode", not _offroad_mode_state)
+        if not _offroad_mode_state:
+          # deferred: card runs the stock-ECU hand-back, then grants OffroadMode
+          ui_state.params.put_bool("OffroadModeRequested", True)
+        else:
+          ui_state.params.put_bool("OffroadMode", False)
 
     gui_app.push_widget(ConfirmDialog(_offroad_mode_str, tr("Confirm"), callback=lambda result: _set_always_offroad(result)))
 

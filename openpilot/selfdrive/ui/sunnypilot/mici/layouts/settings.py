@@ -89,7 +89,11 @@ class SettingsLayoutSP(OP.SettingsLayout):
 
     def _set_offroad_status(status: bool):
       if not ui_state.engaged:
-        ui_state.params.put_bool("OffroadMode", status)
+        if status:
+          # deferred: card runs the stock-ECU hand-back, then grants OffroadMode
+          ui_state.params.put_bool("OffroadModeRequested", True)
+        else:
+          ui_state.params.put_bool("OffroadMode", False)
         ui_state.always_offroad = status
 
     if not enable:
