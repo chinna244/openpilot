@@ -1573,12 +1573,16 @@ def deinitialize_and_exit(pigeon: TTYPigeon | None):
 class PreAcquisitionInitialization:
   callback: Callable[[], None]
   executed: bool = False
+  gnss_start_sent_at: float | None = None
 
   def run(self) -> None:
     if self.executed:
       return
     self.executed = True
     self.callback()
+
+  def note_gnss_start_sent(self, now: float) -> None:
+    self.gnss_start_sent_at = now
 
 
 _ACTIVE_PRE_ACQUISITION_INITIALIZATION: (
@@ -1629,6 +1633,9 @@ def paused_gnss_acquisition(pigeon: TTYPigeon) -> Iterator[None]:
     raise
   else:
     pigeon.send(CONTROLLED_GNSS_START_MESSAGE)
+    initialization = _ACTIVE_PRE_ACQUISITION_INITIALIZATION
+    if initialization is not None:
+      initialization.note_gnss_start_sent(time.monotonic())
     time.sleep(CONTROLLED_GNSS_TRANSITION_DELAY)
 
 
@@ -3605,6 +3612,168 @@ class ReceiverCycleInitialization:
   authority_evaluation: TimeAuthorityEvaluation | None = None
 
 
+def _startup_timeline_elapsed(
+  value: float | None,
+  cycle_started_at: float,
+) -> str:
+  if value is None:
+    return "none"
+  return f"{value - cycle_started_at:.3f}"
+
+
+def format_gps_startup_timeline(
+  *,
+  cycle: int,
+  reason: str,
+  cycle_started_at: float,
+  trusted_time_wait_started_at: float | None,
+  trusted_time_wait_completed_at: float | None,
+  independent_network_time_seen_at: float | None,
+  acquisition_start_claimed_at: float | None,
+  gnss_start_sent_at: float | None,
+  restore_result: NavigationAssistanceRestoreResult | None,
+  authorized_time: AuthorizedTime | None,
+) -> str:
+  wait_duration = (
+    trusted_time_wait_completed_at - trusted_time_wait_started_at
+    if (
+      trusted_time_wait_started_at is not None
+      and trusted_time_wait_completed_at is not None
+    )
+    else None
+  )
+  disposition = "not_attempted"
+  cache_generation = "none"
+  cache_selection_reason = "none"
+  cache_age = "none"
+  frames_attempted = 0
+  frames_accepted = 0
+  frames_rejected = 0
+  timeout_events = 0
+
+  if restore_result is not None:
+    if restore_result.database_restore_disposition is not None:
+      disposition = (
+        restore_result.database_restore_disposition.value
+      )
+    cache_generation = (
+      restore_result.restored_cache_generation or "none"
+    )
+    cache_selection_reason = (
+      restore_result.restored_cache_selection_reason or "none"
+    )
+    if restore_result.restored_cache_age_seconds is not None:
+      cache_age = str(
+        restore_result.restored_cache_age_seconds
+      )
+    frames_attempted = (
+      restore_result.database_frames_attempted_count
+    )
+    frames_accepted = restore_result.accepted_frame_count
+    frames_rejected = len(
+      restore_result.permanently_rejected_indexes
+    )
+    timeout_events = (
+      len(restore_result.initially_timed_out_indexes)
+      + len(restore_result.permanently_timed_out_indexes)
+    )
+
+  trusted_time_source = (
+    authorized_time.evidence.value
+    if authorized_time is not None
+    else "none"
+  )
+
+  fields = (
+    "GPS startup timeline",
+    f"cycle={cycle}",
+    f"reason={reason}",
+    "trusted_time_wait_started_cycle_seconds="
+    + _startup_timeline_elapsed(
+      trusted_time_wait_started_at,
+      cycle_started_at,
+    ),
+    "trusted_time_wait_completed_cycle_seconds="
+    + _startup_timeline_elapsed(
+      trusted_time_wait_completed_at,
+      cycle_started_at,
+    ),
+    "trusted_time_wait_duration_seconds="
+    + (
+      "none"
+      if wait_duration is None
+      else f"{wait_duration:.3f}"
+    ),
+    "independent_network_time_first_seen_cycle_seconds="
+    + _startup_timeline_elapsed(
+      independent_network_time_seen_at,
+      cycle_started_at,
+    ),
+    "trusted_time_available="
+    + str(authorized_time is not None).lower(),
+    f"trusted_time_source={trusted_time_source}",
+    f"database_restore_disposition={disposition}",
+    f"restored_cache_generation={cache_generation}",
+    "restored_cache_selection_reason="
+    + cache_selection_reason,
+    f"restored_cache_age_seconds={cache_age}",
+    f"database_frames_attempted={frames_attempted}",
+    f"database_frames_accepted={frames_accepted}",
+    f"database_frames_rejected={frames_rejected}",
+    f"database_timeout_events={timeout_events}",
+    "acquisition_start_claimed_cycle_seconds="
+    + _startup_timeline_elapsed(
+      acquisition_start_claimed_at,
+      cycle_started_at,
+    ),
+    "gnss_start_sent_cycle_seconds="
+    + _startup_timeline_elapsed(
+      gnss_start_sent_at,
+      cycle_started_at,
+    ),
+    "related_acquisition_milestones="
+    + "first_nonempty_rawx|first_fix_ok|first_reliable_fix",
+  )
+  return ", ".join(fields)
+
+
+def log_gps_startup_timeline(
+  *,
+  cycle: int,
+  reason: str,
+  cycle_started_at: float,
+  trusted_time_wait_started_at: float | None,
+  trusted_time_wait_completed_at: float | None,
+  independent_network_time_seen_at: float | None,
+  acquisition_start_claimed_at: float | None,
+  gnss_start_sent_at: float | None,
+  restore_result: NavigationAssistanceRestoreResult | None,
+  authorized_time: AuthorizedTime | None,
+) -> None:
+  cloudlog.info(
+    format_gps_startup_timeline(
+      cycle=cycle,
+      reason=reason,
+      cycle_started_at=cycle_started_at,
+      trusted_time_wait_started_at=(
+        trusted_time_wait_started_at
+      ),
+      trusted_time_wait_completed_at=(
+        trusted_time_wait_completed_at
+      ),
+      independent_network_time_seen_at=(
+        independent_network_time_seen_at
+      ),
+      acquisition_start_claimed_at=(
+        acquisition_start_claimed_at
+      ),
+      gnss_start_sent_at=gnss_start_sent_at,
+      restore_result=restore_result,
+      authorized_time=authorized_time,
+    )
+  )
+
+
 def drain_receiver_before_database_restore(pigeon: TTYPigeon) -> None:
   """Dispatch all buffered receiver input before the DBD restore decision."""
   drain = getattr(pigeon, "drain_before_transaction", None)
@@ -3688,6 +3857,18 @@ def initialize_receiver_cycle(
     host_time_observation,
   )
   authorized_time = authority_evaluation.authorized_time
+  authority_evaluated_at = time.monotonic()
+  independent_network_time_seen_at = (
+    authority_evaluated_at
+    if (
+      authorized_time is not None
+      and is_current_independent_network_time(authorized_time)
+    )
+    else None
+  )
+  trusted_time_wait_started_at: float | None = None
+  trusted_time_wait_completed_at: float | None = None
+  acquisition_start_claimed_at: float | None = None
   database_runtime = (
     navigation_database_runtime
     or NavigationDatabaseRestoreRuntime(receiver_fingerprint)
@@ -3729,6 +3910,10 @@ def initialize_receiver_cycle(
     nonlocal host_time_observation
     nonlocal authority_evaluation
     nonlocal authorized_time
+    nonlocal independent_network_time_seen_at
+    nonlocal trusted_time_wait_started_at
+    nonlocal trusted_time_wait_completed_at
+    nonlocal acquisition_start_claimed_at
 
     if collect_mon_ver_diagnostics:
       mon_ver_info = log_mon_ver_diagnostics(pigeon)
@@ -3748,6 +3933,7 @@ def initialize_receiver_cycle(
         or not is_current_independent_network_time(authorized_time)
       )
     ):
+      trusted_time_wait_started_at = time.monotonic()
       host_time_observation, authority_evaluation = (
         wait_for_current_independent_network_time(
           authority,
@@ -3755,7 +3941,16 @@ def initialize_receiver_cycle(
           authority_evaluation,
         )
       )
+      trusted_time_wait_completed_at = time.monotonic()
       authorized_time = authority_evaluation.authorized_time
+      if (
+        independent_network_time_seen_at is None
+        and authorized_time is not None
+        and is_current_independent_network_time(authorized_time)
+      ):
+        independent_network_time_seen_at = (
+          trusted_time_wait_completed_at
+        )
       if database_runtime.controller.pending:
         drain_receiver_before_database_restore(pigeon)
     if (
@@ -3824,6 +4019,7 @@ def initialize_receiver_cycle(
       if not database_runtime.claim_acquisition_start():
         raise RuntimeError("GNSS START claim persistence failed")
       acquisition_start_claimed = True
+      acquisition_start_claimed_at = time.monotonic()
   with install_pre_acquisition_initialization(
     pre_acquisition_initialization
   ) as initialization:
@@ -3838,6 +4034,29 @@ def initialize_receiver_cycle(
     database_runtime.note_acquisition_started()
     acquisition_start_claimed = True
     initialization.run()
+  try:
+    log_gps_startup_timeline(
+      cycle=cycle_id,
+      reason=reason,
+      cycle_started_at=cycle_started_at,
+      trusted_time_wait_started_at=(
+        trusted_time_wait_started_at
+      ),
+      trusted_time_wait_completed_at=(
+        trusted_time_wait_completed_at
+      ),
+      independent_network_time_seen_at=(
+        independent_network_time_seen_at
+      ),
+      acquisition_start_claimed_at=(
+        acquisition_start_claimed_at
+      ),
+      gnss_start_sent_at=initialization.gnss_start_sent_at,
+      restore_result=navigation_assistance_restore_result,
+      authorized_time=authorized_time,
+    )
+  except Exception:
+    cloudlog.exception("GPS startup timeline logging failed")
   provenance.enable_receiver_observations(time.monotonic())
 
   assistnow_autonomous_configuration_attempted = False

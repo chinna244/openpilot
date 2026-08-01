@@ -96,6 +96,99 @@ def snapshot() -> NavigationDatabaseRestoreSnapshot:
   )
 
 
+def test_startup_timeline_formats_correlated_fields() -> None:
+  restore = pigeond.NavigationAssistanceRestoreResult(
+    status=pigeond.NavigationAssistanceRestoreStatus.PARTIAL,
+    total_frame_count=3,
+    accepted_frame_count=2,
+    initially_timed_out_indexes=(2,),
+    permanently_rejected_indexes=(1,),
+    permanently_timed_out_indexes=(2,),
+    restored_cache_generation="primary",
+    restored_cache_selection_reason=(
+      "trusted_age_only_eligible:primary"
+    ),
+    restored_cache_age_seconds=1800.0,
+    database_restore_disposition=(
+      NavigationDatabaseRestoreDisposition.RESTORED
+    ),
+    database_frames_attempted_count=3,
+  )
+
+  message = pigeond.format_gps_startup_timeline(
+    cycle=2,
+    reason="process_start",
+    cycle_started_at=10.0,
+    trusted_time_wait_started_at=12.0,
+    trusted_time_wait_completed_at=44.5,
+    independent_network_time_seen_at=44.5,
+    acquisition_start_claimed_at=45.0,
+    gnss_start_sent_at=45.1,
+    restore_result=restore,
+    authorized_time=network_time(),
+  )
+
+  assert "GPS startup timeline" in message
+  assert "cycle=2" in message
+  assert "reason=process_start" in message
+  assert (
+    "trusted_time_wait_started_cycle_seconds=2.000"
+    in message
+  )
+  assert (
+    "trusted_time_wait_completed_cycle_seconds=34.500"
+    in message
+  )
+  assert "trusted_time_wait_duration_seconds=32.500" in message
+  assert (
+    "independent_network_time_first_seen_cycle_seconds=34.500"
+    in message
+  )
+  assert "trusted_time_available=true" in message
+  assert "database_restore_disposition=restored" in message
+  assert "restored_cache_generation=primary" in message
+  assert (
+    "restored_cache_selection_reason=trusted_age_only_eligible:primary"
+    in message
+  )
+  assert "restored_cache_age_seconds=1800.0" in message
+  assert "database_frames_attempted=3" in message
+  assert "database_frames_accepted=2" in message
+  assert "database_frames_rejected=1" in message
+  assert "database_timeout_events=2" in message
+  assert (
+    "acquisition_start_claimed_cycle_seconds=35.000"
+    in message
+  )
+  assert "gnss_start_sent_cycle_seconds=35.100" in message
+  assert (
+    "related_acquisition_milestones=first_nonempty_rawx|first_fix_ok|first_reliable_fix"
+    in message
+  )
+
+
+def test_paused_acquisition_records_start_timestamp(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  pigeon = FakePigeon()
+  monkeypatch.setattr(pigeond.time, "sleep", lambda _delay: None)
+  monkeypatch.setattr(pigeond.time, "monotonic", lambda: 12.5)
+
+  with pigeond.install_pre_acquisition_initialization(
+    lambda: None
+  ) as initialization:
+    with pigeond.paused_gnss_acquisition(
+      pigeon  # type: ignore[arg-type, ty:invalid-argument-type]
+    ):
+      initialization.run()
+
+  assert initialization.gnss_start_sent_at == 12.5
+  assert (
+    pigeon.sent[-1]
+    == pigeond.CONTROLLED_GNSS_START_MESSAGE
+  )
+
+
 def test_paused_gnss_acquisition_stays_stopped_after_failure(
   monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -429,6 +522,16 @@ def test_observed_c4_delay_restores_full_cycle_before_durable_start(
     boottime_reader=lambda: TEST_BOOTTIME_SECONDS,
   )
   database_indexes: list[int] = []
+  timeline_calls: list[dict[str, object]] = []
+
+  def capture_timeline(**kwargs: object) -> None:
+    timeline_calls.append(kwargs)
+
+  monkeypatch.setattr(
+    pigeond,
+    "log_gps_startup_timeline",
+    capture_timeline,
+  )
   real_wait = pigeond.wait_for_current_independent_network_time
   real_claim = runtime.claim_acquisition_start
 
@@ -599,6 +702,13 @@ def test_observed_c4_delay_restores_full_cycle_before_durable_start(
   assert events.index("gnss_start") < events.index(
     "normal_configuration"
   )
+  assert len(timeline_calls) == 1
+  timeline = timeline_calls[0]
+  assert timeline["restore_result"] is restore
+  assert timeline["authorized_time"] == network_time()
+  assert timeline["independent_network_time_seen_at"] is not None
+  assert timeline["acquisition_start_claimed_at"] is not None
+  assert timeline["gnss_start_sent_at"] is not None
 
 
 
