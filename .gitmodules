@@ -7,7 +7,8 @@
   url = https://github.com/sunnyhaibin/panda.git
 [submodule "opendbc"]
   path = opendbc_repo
-  url = https://github.com/zoompilot/opendbc.git
+	url = https://github.com/chinna244/opendbc-sunnypilot.git
+	branch = mazda-dev
 [submodule "msgq"]
   path = msgq_repo
   url = https://github.com/sunnypilot/msgq.git
@@ -23,6 +24,3 @@
 [submodule "sunnypilot/neural_network_data"]
 	path = openpilot/sunnypilot/neural_network_data
   url = https://github.com/sunnypilot/neural-network-data.git
-[submodule "opendbc_repo"]
-	url = https://github.com/chinna244/opendbc-sunnypilot.git
-	branch = mazda-dev
