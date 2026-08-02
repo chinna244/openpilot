@@ -119,7 +119,9 @@ from openpilot.system.ubloxd.navigation_database_restore import (
 from openpilot.system.ubloxd.navigation_database_restore_runtime import (
   NavigationDatabaseRestoreExecution,
   NavigationDatabaseRestoreFrameFailureKind,
+  NavigationDatabaseRestoreInitializationError,
   NavigationDatabaseRestoreRuntime,
+  NavigationDatabaseRestoreUnavailableRuntime,
   PositionAssistanceAckStatus,
   PositionAssistanceFailureKind,
   PositionAssistanceWriteStatus,
@@ -182,6 +184,7 @@ from openpilot.system.ubloxd.yuma_almanac_transmit import (
   MgaReceiverNackError,
   MgaTransactionError,
   MgaWriteError,
+  YumaAssistanceStateUnavailableError,
 )
 from openpilot.system.ubloxd.yuma_almanac_config import (
   PUBLIC_YUMA_ALMANAC_PARAM_POLL_SECONDS,
@@ -4490,10 +4493,15 @@ def send_yuma_with_durable_claim(
   navigation_database_runtime: NavigationDatabaseRestoreRuntime,
   send_message: Callable[[bytes], object],
   message: bytes,
-) -> object:
+) -> None:
   if not navigation_database_runtime.claim_yuma_transmission():
-    raise RuntimeError("YUMA claim persistence failed")
-  return send_message(message)
+    cloudlog.error(
+      "GPS YUMA transmission suppressed: assistance state unavailable"
+    )
+    raise YumaAssistanceStateUnavailableError(
+      "durable YUMA ownership claim unavailable"
+    )
+  send_message(message)
 
 
 def initialize_receiver_cycle(
@@ -4545,10 +4553,20 @@ def initialize_receiver_cycle(
   trusted_time_wait_started_at: float | None = None
   trusted_time_wait_completed_at: float | None = None
   acquisition_start_claimed_at: float | None = None
-  database_runtime = (
-    navigation_database_runtime
-    or NavigationDatabaseRestoreRuntime(receiver_fingerprint)
-  )
+  try:
+    database_runtime = (
+      navigation_database_runtime
+      or NavigationDatabaseRestoreRuntime(receiver_fingerprint)
+    )
+  except NavigationDatabaseRestoreInitializationError as exc:
+    cloudlog.exception(
+      "GPS assistance state unavailable; assistance disabled while "
+      + "GNSS START continues"
+    )
+    database_runtime = NavigationDatabaseRestoreUnavailableRuntime(
+      receiver_fingerprint,
+      str(exc),
+    )
   database_runtime.prepare()
 
   mon_ver_info: MonVerInfo | None = None
@@ -4572,11 +4590,37 @@ def initialize_receiver_cycle(
     cycle_started_at + TIME_SYNC_CHECK_INTERVAL
   )
 
+  assistance_state_failure_logged = False
+
   def note_time_assistance_attempt(
     diagnostic: TimeAssistanceAttemptDiagnostic,
   ) -> None:
     time_assistance_attempts.append(diagnostic)
     log_time_assistance_attempt_diagnostic(diagnostic)
+
+  def note_assistance_state_unavailable(operation: str) -> None:
+    nonlocal assistance_state_failure_logged
+    if position_assistance_retry is not None:
+      position_assistance_retry.runtime = None
+    if assistance_state_failure_logged:
+      return
+    assistance_state_failure_logged = True
+    cloudlog.error(
+      ", ".join((
+        "GPS assistance state unavailable",
+        f"operation={operation}",
+        "error="
+        + (
+          database_runtime.execution.state_persistence_error
+          or "unknown"
+        ),
+        "dbd_disabled=true",
+        "position_assistance_disabled=true",
+        "yuma_disabled=true",
+        "position_retry_disabled=true",
+        "gnss_start_continues=true",
+      ))
+    )
 
   def pre_acquisition_initialization() -> None:
     nonlocal mon_ver_info
@@ -4646,10 +4690,14 @@ def initialize_receiver_cycle(
       )
     ):
       if not database_runtime.close_restore_window_unverified():
-        raise RuntimeError("DBD timeout decision persistence failed")
+        note_assistance_state_unavailable(
+          "close_restore_window_unverified"
+        )
     if database_runtime.controller.pending:
       if not database_runtime.close_restore_window_for_early_acquisition():
-        raise RuntimeError("DBD early-acquisition decision persistence failed")
+        note_assistance_state_unavailable(
+          "close_restore_window_for_early_acquisition"
+        )
     attempt_started_at = time.monotonic()
     if authorized_time is not None:
       yuma_time_anchor_utc = authorized_time.utc
@@ -4676,7 +4724,15 @@ def initialize_receiver_cycle(
     )
     navigation_assistance_restore_attempted = True
 
-    if position_assistance_retry is not None:
+    if not database_runtime.state_available:
+      note_assistance_state_unavailable(
+        "navigation_assistance_restore"
+      )
+
+    if (
+      position_assistance_retry is not None
+      and database_runtime.state_available
+    ):
       retry_runtime = position_assistance_retry.runtime
       if retry_runtime is not None:
         retry_runtime.arm_from_initial(
@@ -4730,7 +4786,9 @@ def initialize_receiver_cycle(
 
     if not acquisition_start_claimed:
       if not database_runtime.claim_acquisition_start():
-        raise RuntimeError("GNSS START claim persistence failed")
+        note_assistance_state_unavailable(
+          "claim_acquisition_start"
+        )
       acquisition_start_claimed = True
       acquisition_start_claimed_at = time.monotonic()
   def note_gnss_start_sent(now: float) -> None:
@@ -4752,7 +4810,10 @@ def initialize_receiver_cycle(
     # compatibility path sends no controlled START itself, so close the
     # in-process DBD window before running the callback without treating
     # unavailable test storage as a receiver-action persistence failure.
-    database_runtime.note_acquisition_started()
+    if not database_runtime.note_acquisition_started():
+      note_assistance_state_unavailable(
+        "compatibility_note_acquisition_started"
+      )
     acquisition_start_claimed = True
     initialization.run()
   try:
@@ -5644,6 +5705,16 @@ def create_yuma_supplementation_runtime(
   )
 
 
+def yuma_assistance_state_unavailable_outcome(
+  outcome: object | None,
+) -> bool:
+  result = getattr(outcome, "transmit_result", None)
+  return (
+    getattr(result, "assistance_state_unavailable", False)
+    is True
+  )
+
+
 class YumaSupplementationFeature:
   def __init__(
     self,
@@ -5958,7 +6029,7 @@ class YumaSupplementationFeature:
 
   def evaluate_provisional(
     self,
-    send_message: Callable[[bytes], bool],
+    send_message: Callable[[bytes], None],
     *,
     now: float,
     reliable_fix_available: bool,
@@ -5989,7 +6060,12 @@ class YumaSupplementationFeature:
       reference,
       send_message,
     )
-    if outcome.receiver_write_attempted:
+    if yuma_assistance_state_unavailable_outcome(outcome):
+      if outcome.receiver_write_attempted:
+        self._provisional_reference_used = reference
+      self._cycle_injection_consumed = True
+      self._runtime = None
+    elif outcome.receiver_write_attempted:
       self._provisional_reference_used = reference
       self._cycle_injection_consumed = True
       self._runtime = None
@@ -6046,7 +6122,7 @@ class YumaSupplementationFeature:
 
   def evaluate(
     self,
-    send_message: Callable[[bytes], bool],
+    send_message: Callable[[bytes], None],
     *,
     now: float,
     nav_sat: NavSatQuality | None,
@@ -6071,7 +6147,16 @@ class YumaSupplementationFeature:
       return None
     if outcome.transmission_attempt > 0:
       self._cycle_injection_consumed = True
-    return self._contextualize_outcome(outcome)
+    contextualized = self._contextualize_outcome(outcome)
+    if yuma_assistance_state_unavailable_outcome(contextualized):
+      self._cycle_injection_consumed = True
+      self._runtime = None
+      return replace(
+        contextualized,
+        terminal=True,
+        retry_pending=False,
+      )
+    return contextualized
 
 
 def log_provisional_yuma_reference_decision(
@@ -6349,6 +6434,37 @@ def persist_yuma_supplementation_outcome(
     )
 
 
+@dataclass
+class ReceiverAcquisitionStateGuard:
+  handled: bool = False
+
+  def note_once(
+    self,
+    navigation_database_runtime: NavigationDatabaseRestoreRuntime,
+  ) -> bool | None:
+    if self.handled:
+      return None
+    self.handled = True
+    if navigation_database_runtime.acquisition_started:
+      return True
+    return navigation_database_runtime.note_acquisition_started()
+
+
+def handle_receiver_acquisition_state(
+  navigation_database_runtime: NavigationDatabaseRestoreRuntime,
+  position_assistance_retry: PositionAssistancePostStartRetryController,
+  guard: ReceiverAcquisitionStateGuard,
+) -> None:
+  result = guard.note_once(navigation_database_runtime)
+  if result is not False:
+    return
+  cloudlog.error(
+    "GPS acquisition latch persistence failed; assistance "
+    + "disabled while receiver processing continues"
+  )
+  position_assistance_retry.runtime = None
+
+
 def run_receiving(duration: int = 0):
   diagnostic_process_start_time = time.monotonic()
   startup_diagnostics = GpsStartupDiagnostics(
@@ -6375,29 +6491,48 @@ def run_receiving(duration: int = 0):
   receiver_time_provenance = (
     ReceiverTimeProvenanceTracker()
   )
-  navigation_database_runtime = NavigationDatabaseRestoreRuntime(
-    receiver_fingerprint
-  )
   try:
-    position_assistance_retry_runtime = (
-      PositionAssistanceRetryRuntime(receiver_fingerprint)
+    navigation_database_runtime = NavigationDatabaseRestoreRuntime(
+      receiver_fingerprint
     )
-  except Exception:
+  except NavigationDatabaseRestoreInitializationError as exc:
     cloudlog.exception(
-      "GPS position assistance retry state unavailable"
+      "GPS assistance state unavailable; assistance disabled while "
+      + "GNSS START continues"
     )
+    navigation_database_runtime = (
+      NavigationDatabaseRestoreUnavailableRuntime(
+        receiver_fingerprint,
+        str(exc),
+      )
+    )
+  if navigation_database_runtime.state_available:
+    try:
+      position_assistance_retry_runtime = (
+        PositionAssistanceRetryRuntime(receiver_fingerprint)
+      )
+    except Exception:
+      cloudlog.exception(
+        "GPS position assistance retry state unavailable"
+      )
+      position_assistance_retry_runtime = None
+  else:
     position_assistance_retry_runtime = None
   position_assistance_retry = (
     PositionAssistancePostStartRetryController(
       position_assistance_retry_runtime
     )
   )
+  acquisition_state_guard = ReceiverAcquisitionStateGuard()
   pigeon: TTYPigeon
 
   def dispatch_frames(frames: list[bytes]) -> None:
     if receiver_frames_show_gnss_acquisition(frames):
-      if not navigation_database_runtime.note_acquisition_started():
-        raise RuntimeError("acquisition latch persistence failed")
+      handle_receiver_acquisition_state(
+        navigation_database_runtime,
+        position_assistance_retry,
+        acquisition_state_guard,
+      )
     frame_time = time.monotonic()
     completed = process_receiver_frames(
       frames,
@@ -6429,8 +6564,8 @@ def run_receiving(duration: int = 0):
     )
 
 
-  def send_yuma_message(message: bytes) -> object:
-    return send_yuma_with_durable_claim(
+  def send_yuma_message(message: bytes) -> None:
+    send_yuma_with_durable_claim(
       navigation_database_runtime,
       lambda claimed_message: send_mga_with_strict_ack(
         pigeon, claimed_message

@@ -3,6 +3,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from openpilot.system.ubloxd import pigeond
 from openpilot.system.ubloxd.yuma_almanac import YumaAlmanacError
 from openpilot.system.ubloxd.yuma_almanac_transmit import (
   YUMA_ALMANAC_RETRY_DELAY_SECONDS,
@@ -479,3 +480,94 @@ def test_transmit_records_retry_failure_category(
   assert result.status is YumaAlmanacTransmitStatus.COMPLETE
   assert getattr(result, field) == (1,)
   assert result.attempted_satellite_ids == (1, 1)
+
+
+def test_assistance_state_unavailable_is_not_reported_as_yuma_success(
+  tmp_path,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  path = prepare_cache(tmp_path, monkeypatch, 1, 2, 3)
+  claim_attempts = 0
+  receiver_writes: list[bytes] = []
+  error_logs: list[str] = []
+  retry_sleeps: list[float] = []
+
+  class RejectingRuntime:
+    def claim_yuma_transmission(self) -> bool:
+      nonlocal claim_attempts
+      claim_attempts += 1
+      return False
+
+  runtime = RejectingRuntime()
+  monkeypatch.setattr(pigeond.cloudlog, "error", error_logs.append)
+
+  result = transmit_public_yuma_almanac(
+    lambda message: pigeond.send_yuma_with_durable_claim(
+      runtime,  # type: ignore[arg-type, ty:invalid-argument-type]
+      receiver_writes.append,
+      message,
+    ),
+    trusted_now=NOW,
+    satellite_ids=frozenset((1, 2, 3)),
+    path=path,
+    sleep=retry_sleeps.append,
+  )
+
+  assert claim_attempts == 1
+  assert receiver_writes == []
+  assert result.status is YumaAlmanacTransmitStatus.UNAVAILABLE
+  assert result.attempted_satellite_ids == ()
+  assert result.accepted_satellite_ids == ()
+  assert result.failed_satellite_ids == ()
+  assert result.unavailable_satellite_ids == (1, 2, 3)
+  assert result.assistance_state_unavailable
+  assert not result.receiver_write_attempted
+  assert retry_sleeps == []
+  assert len(error_logs) == 1
+
+
+def test_assistance_state_unavailable_after_first_accept_preserves_partial_history(
+  tmp_path,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  path = prepare_cache(tmp_path, monkeypatch, 1, 2, 3)
+  claim_attempts = 0
+  receiver_writes: list[bytes] = []
+  error_logs: list[str] = []
+  retry_sleeps: list[float] = []
+
+  class FailingAfterFirstClaimRuntime:
+    def claim_yuma_transmission(self) -> bool:
+      nonlocal claim_attempts
+      claim_attempts += 1
+      return claim_attempts == 1
+
+  runtime = FailingAfterFirstClaimRuntime()
+  monkeypatch.setattr(pigeond.cloudlog, "error", error_logs.append)
+
+  result = transmit_public_yuma_almanac(
+    lambda message: pigeond.send_yuma_with_durable_claim(
+      runtime,  # type: ignore[arg-type, ty:invalid-argument-type]
+      receiver_writes.append,
+      message,
+    ),
+    trusted_now=NOW,
+    satellite_ids=frozenset((1, 2, 3)),
+    path=path,
+    sleep=retry_sleeps.append,
+  )
+
+  assert claim_attempts == 2
+  assert [message[8] for message in receiver_writes] == [1]
+  assert result.status is YumaAlmanacTransmitStatus.PARTIAL
+  assert result.attempted_satellite_ids == (1,)
+  assert result.accepted_satellite_ids == (1,)
+  assert result.failed_satellite_ids == ()
+  assert result.rejected_satellite_ids == ()
+  assert result.timed_out_satellite_ids == ()
+  assert result.deferred_satellite_ids == ()
+  assert result.unavailable_satellite_ids == (2, 3)
+  assert result.assistance_state_unavailable
+  assert result.receiver_write_attempted
+  assert retry_sleeps == []
+  assert len(error_logs) == 1
