@@ -671,7 +671,7 @@ def test_delayed_network_time_restores_before_gnss_start(
   monkeypatch.setattr(
     pigeond,
     "wait_for_current_independent_network_time",
-    lambda _authority, observation, _evaluation: (
+    lambda _authority, observation, _evaluation, **_kwargs: (
       events.append("trusted_time_arrived") or observation,
       SimpleNamespace(authorized_time=network_time()),
     ),
@@ -718,7 +718,7 @@ def test_delayed_network_time_restores_before_gnss_start(
 
 
 
-def test_observed_c4_delay_restores_full_cycle_before_durable_start(
+def test_observed_c4_delay_does_not_block_gnss_start(
   tmp_path: Path,
   monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -735,6 +735,8 @@ def test_observed_c4_delay_restores_full_cycle_before_durable_start(
   )
   database_indexes: list[int] = []
   timeline_calls: list[dict[str, object]] = []
+  wait_timeouts: list[float] = []
+  polling_events: list[str] = []
 
   def capture_timeline(**kwargs: object) -> None:
     timeline_calls.append(kwargs)
@@ -750,29 +752,35 @@ def test_observed_c4_delay_restores_full_cycle_before_durable_start(
   def monotonic() -> float:
     return clock[0]
 
-  def sleeper(delay: float) -> None:
-    clock[0] += delay
+  def unexpected_reader():
+    polling_events.append("reader")
+    raise AssertionError("zero startup wait must not poll network time")
 
-  def delayed_wait(_authority, observation, evaluation):
-    def evaluator(_time_authority, _observation):
-      authorized_time = (
-        network_time() if clock[0] >= 32.5 else None
-      )
-      if (
-        authorized_time is not None
-        and "trusted_time_arrived" not in events
-      ):
-        events.append("trusted_time_arrived")
-      return SimpleNamespace(authorized_time=authorized_time)
+  def unexpected_evaluator(_time_authority, _observation):
+    polling_events.append("evaluator")
+    raise AssertionError("zero startup wait must not reevaluate network time")
 
+  def unexpected_sleeper(_delay: float) -> None:
+    polling_events.append("sleeper")
+    raise AssertionError("zero startup wait must not sleep")
+
+  def delayed_wait(
+    _authority,
+    observation,
+    evaluation,
+    *,
+    timeout_seconds: float = pigeond.NAVIGATION_DATABASE_TRUSTED_TIME_WAIT_SECONDS,
+  ):
+    wait_timeouts.append(timeout_seconds)
     return real_wait(
       object(),  # type: ignore[arg-type, ty:invalid-argument-type]
       observation,
       evaluation,
-      observation_reader=lambda: None,
-      evaluator=evaluator,  # type: ignore[arg-type, ty:invalid-argument-type]
+      timeout_seconds=timeout_seconds,
+      observation_reader=unexpected_reader,
+      evaluator=unexpected_evaluator,  # type: ignore[arg-type]
       monotonic=monotonic,
-      sleeper=sleeper,
+      sleeper=unexpected_sleeper,
     )
 
   def send_mga(_pigeon, _message, **kwargs):
@@ -879,40 +887,22 @@ def test_observed_c4_delay_restores_full_cycle_before_durable_start(
 
   restore = result.navigation_assistance_restore_result
   assert restore is not None
-  assert clock[0] == pytest.approx(32.5)
+  assert wait_timeouts == [0.0]
+  assert polling_events == []
+  assert clock[0] == pytest.approx(0.0)
   assert (
     runtime.controller.disposition
-    is NavigationDatabaseRestoreDisposition.RESTORED
+    is NavigationDatabaseRestoreDisposition.SKIPPED_UNVERIFIED
   )
-  assert (
-    runtime.controller.disposition
-    is not NavigationDatabaseRestoreDisposition.SKIPPED_UNVERIFIED
-  )
-  assert restore.database_frames_attempted_count == 1
-  assert restore.accepted_frame_count == 1
-  assert restore.total_frame_count == 1
-  assert restore.restored_cache_generation == "primary"
-  assert (
-    restore.restored_cache_selection_reason
-    == "trusted_age_only_eligible:primary"
-  )
+  assert restore.database_frames_attempted_count == 0
+  assert database_indexes == []
   assert runtime.execution.position_assistance_attempted
-  assert runtime.execution.position_assistance_succeeded
   assert runtime.acquisition_started
-  assert database_indexes == [0]
-  assert events.index("gnss_stop") < events.index(
-    "trusted_time_arrived"
-  )
-  assert events.index("trusted_time_arrived") < events.index(
-    "dbd_write"
-  )
-  assert events.index("dbd_write") < events.index(
-    "position_write"
-  )
+  assert "trusted_time_arrived" not in events
+  assert "dbd_write" not in events
+  assert "position_write" in events
+  assert "time_write" not in events
   assert events.index("position_write") < events.index(
-    "time_write"
-  )
-  assert events.index("time_write") < events.index(
     "acquisition_start_claim"
   )
   assert events.index("acquisition_start_claim") < events.index(
@@ -924,10 +914,20 @@ def test_observed_c4_delay_restores_full_cycle_before_durable_start(
   assert len(timeline_calls) == 1
   timeline = timeline_calls[0]
   assert timeline["restore_result"] is restore
-  assert timeline["authorized_time"] == network_time()
-  assert timeline["independent_network_time_seen_at"] is not None
-  assert timeline["acquisition_start_claimed_at"] is not None
-  assert timeline["gnss_start_sent_at"] is not None
+  assert timeline["authorized_time"] is None
+  assert timeline["independent_network_time_seen_at"] is None
+  wait_started_at = timeline["trusted_time_wait_started_at"]
+  wait_completed_at = timeline["trusted_time_wait_completed_at"]
+  acquisition_claimed_at = timeline["acquisition_start_claimed_at"]
+  gnss_start_sent_at = timeline["gnss_start_sent_at"]
+  assert isinstance(wait_started_at, float)
+  assert isinstance(wait_completed_at, float)
+  assert isinstance(acquisition_claimed_at, float)
+  assert isinstance(gnss_start_sent_at, float)
+  assert wait_completed_at >= wait_started_at
+  assert wait_completed_at - wait_started_at < 1.0
+  assert acquisition_claimed_at <= gnss_start_sent_at
+
 
 
 
@@ -1000,7 +1000,7 @@ def test_acquisition_dispatched_after_network_wait_blocks_dbd(tmp_path: Path, mo
   monkeypatch.setattr(
     pigeond,
     "wait_for_current_independent_network_time",
-    lambda _authority, observation, _evaluation: (
+    lambda _authority, observation, _evaluation, **_kwargs: (
       observation,
       SimpleNamespace(authorized_time=network_time()),
     ),
