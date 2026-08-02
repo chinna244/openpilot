@@ -6,7 +6,7 @@ All tests are driven by config, not hardcoded fingerprints.
 import numpy as np
 import pytest
 
-from unittest.mock import MagicMock, patch  # noqa: TID251
+from unittest.mock import MagicMock, patch
 from opendbc.sunnypilot.car.interfaces import get_speed_dep_config
 from openpilot.selfdrive.locationd.torqued import (
   TorqueEstimator, TorqueBuckets, VERSION, MIN_FILTER_DECAY,
@@ -410,7 +410,7 @@ class TestNaNHandling:
     with patch('numpy.linalg.svd', side_effect=np.linalg.LinAlgError):
       results = est._estimate_params_speed_binned()
 
-    bin_results = {idx: valid for idx, valid in results}
+    bin_results = dict(results)
     assert bin_results[target_bin] is False
 
   @patch(PATCH_EXT_PARAMS)
