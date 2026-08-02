@@ -24,6 +24,7 @@ class NavigationDatabaseRestoreDisposition(StrEnum):
   RESTORED = "restored"
   SKIPPED_EXPIRED = "skipped_expired"
   SKIPPED_UNVERIFIED = "skipped_unverified"
+  SKIPPED_EARLY_ACQUISITION = "skipped_early_acquisition"
   SKIPPED_LATE_RECEIVER_TIME = "skipped_late_receiver_time"
   SKIPPED_ACQUISITION_ALREADY_STARTED = "skipped_acquisition_already_started"
   SKIPPED_RELIABLE_FIX = "skipped_reliable_fix"

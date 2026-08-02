@@ -4638,8 +4638,6 @@ def initialize_receiver_cycle(
         independent_network_time_seen_at = (
           trusted_time_wait_completed_at
         )
-      if database_runtime.controller.pending:
-        drain_receiver_before_database_restore(pigeon)
     if (
       database_runtime.controller.pending
       and (
@@ -4649,6 +4647,9 @@ def initialize_receiver_cycle(
     ):
       if not database_runtime.close_restore_window_unverified():
         raise RuntimeError("DBD timeout decision persistence failed")
+    if database_runtime.controller.pending:
+      if not database_runtime.close_restore_window_for_early_acquisition():
+        raise RuntimeError("DBD early-acquisition decision persistence failed")
     attempt_started_at = time.monotonic()
     if authorized_time is not None:
       yuma_time_anchor_utc = authorized_time.utc
