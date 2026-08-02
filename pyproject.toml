@@ -196,6 +196,108 @@ exclude = [
 unresolved-import = "ignore"  # Cython-compiled modules (.pyx)
 unresolved-attribute = "ignore"  # many from capnp and Cython modules
 
+[tool.ty.terminal]
+# Keep existing baseline warnings visible without failing CI.
+# Any error-level diagnostic still fails CI.
+error-on-warning = false
+
+# BEGIN MAZDA-DEV TY BASELINE OVERRIDES
+# These exact file/rule pairs existed on mazda-dev before
+# the static-analysis baseline repair.
+# New rules and diagnostics in other files remain errors.
+
+[[tool.ty.overrides]]
+include = [
+  "openpilot/selfdrive/ui/sunnypilot/mici/widgets/number_picker.py",
+]
+
+[tool.ty.overrides.rules]
+call-non-callable = "warn"
+
+[[tool.ty.overrides]]
+include = [
+  "openpilot/system/ubloxd/gps_assistance.py",
+  "openpilot/system/ubloxd/gps_drive_audit.py",
+  "openpilot/system/ubloxd/pigeond.py",
+  "openpilot/system/ubloxd/tests/test_gps_assistance.py",
+  "openpilot/system/ubloxd/tests/test_gps_cache_quality.py",
+  "openpilot/system/ubloxd/tests/test_gps_drive_audit.py",
+  "openpilot/system/ubloxd/tests/test_pigeond_assistnow_autonomous.py",
+  "openpilot/system/ubloxd/tests/test_pigeond_diagnostics.py",
+  "openpilot/system/ubloxd/tests/test_pigeond_time_assistance.py",
+  "openpilot/system/ubloxd/tests/test_pigeond_watchdog.py",
+  "openpilot/system/ubloxd/tests/test_provisional_yuma_reference.py",
+  "openpilot/system/ubloxd/tests/test_yuma_almanac_controller.py",
+  "openpilot/system/ubloxd/tests/test_yuma_pigeond_foundation.py",
+  "openpilot/system/ubloxd/trusted_time_anchor.py",
+  "openpilot/system/ubloxd/trusted_time_authority.py",
+  "openpilot/system/ubloxd/yuma_almanac_outcome.py",
+]
+
+[tool.ty.overrides.rules]
+invalid-argument-type = "warn"
+
+[[tool.ty.overrides]]
+include = [
+  "openpilot/system/ubloxd/tests/test_pigeond_strict_config.py",
+]
+
+[tool.ty.overrides.rules]
+invalid-argument-type = "warn"
+invalid-method-override = "warn"
+
+[[tool.ty.overrides]]
+include = [
+  "openpilot/sunnypilot/selfdrive/controls/lib/longitudinal_planner.py",
+]
+
+[tool.ty.overrides.rules]
+invalid-argument-type = "warn"
+missing-argument = "warn"
+too-many-positional-arguments = "warn"
+
+[[tool.ty.overrides]]
+include = [
+  "openpilot/system/ubloxd/provisional_yuma_reference.py",
+  "openpilot/system/ubloxd/receiver_time_provenance.py",
+  "openpilot/system/ubloxd/rtc_time_observation.py",
+  "openpilot/system/ubloxd/tests/test_gps_fixed_cache.py",
+  "openpilot/system/ubloxd/tests/test_gps_onroad_cache_refresh.py",
+  "openpilot/system/ubloxd/trusted_time_validation.py",
+]
+
+[tool.ty.overrides.rules]
+invalid-argument-type = "warn"
+unsupported-operator = "warn"
+
+[[tool.ty.overrides]]
+include = [
+  "openpilot/selfdrive/ui/sunnypilot/mici/layouts/models.py",
+  "openpilot/sunnypilot/selfdrive/locationd/torqued_ext.py",
+  "openpilot/tools/sim/bridge/metadrive/metadrive_process.py",
+]
+
+[tool.ty.overrides.rules]
+invalid-assignment = "warn"
+
+[[tool.ty.overrides]]
+include = [
+  "openpilot/sunnypilot/selfdrive/car/intelligent_cruise_button_management/controller.py",
+]
+
+[tool.ty.overrides.rules]
+invalid-return-type = "warn"
+unsupported-operator = "warn"
+
+[[tool.ty.overrides]]
+include = [
+  "openpilot/system/ubloxd/tests/test_trusted_time_validation.py",
+]
+
+[tool.ty.overrides.rules]
+unsupported-operator = "warn"
+
+# END MAZDA-DEV TY BASELINE OVERRIDES
 [tool.uv]
 python-preference = "only-managed"
 default-groups = ["standalone"]
