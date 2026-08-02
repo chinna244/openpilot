@@ -1341,3 +1341,79 @@ def test_previous_boot_replacement_succeeds_after_storage_recovers(
   assert persisted is not None
   assert persisted.boot_id == BOOT_ID
   assert persisted.disposition is NavigationDatabaseRestoreDisposition.PENDING
+
+# PR64_COMMIT2_EARLY_ACQUISITION_DBD_POLICY
+
+
+def test_early_acquisition_closes_only_database_restore_window(
+  tmp_path: Path,
+) -> None:
+  state_path = tmp_path / "dbd_state.json"
+  first = NavigationDatabaseRestoreRuntime(
+    "receiver",
+    snapshot_loader=lambda _fingerprint: snapshot(),
+    retry_delay_seconds=0.0,
+    state_path=state_path,
+    boot_id_reader=lambda: BOOT_ID,
+    boottime_reader=lambda: TEST_BOOTTIME_SECONDS,
+  )
+  first.prepare()
+
+  assert first.close_restore_window_for_early_acquisition()
+  assert (
+    first.controller.disposition
+    is NavigationDatabaseRestoreDisposition.SKIPPED_EARLY_ACQUISITION
+  )
+  assert not first.acquisition_started
+
+  first_position_writes: list[bytes] = []
+  first_result = first.send_position_once(
+    first_position_writes.append
+  )
+
+  assert first_result.position_assistance_attempted
+  assert first_result.position_assistance_succeeded
+  assert len(first_position_writes) == 1
+  assert not first.acquisition_started
+
+  second = NavigationDatabaseRestoreRuntime(
+    "receiver",
+    snapshot_loader=lambda _fingerprint: snapshot(),
+    retry_delay_seconds=0.0,
+    state_path=state_path,
+    boot_id_reader=lambda: BOOT_ID,
+    boottime_reader=lambda: TEST_BOOTTIME_SECONDS,
+  )
+  second.prepare()
+
+  assert (
+    second.controller.disposition
+    is NavigationDatabaseRestoreDisposition.SKIPPED_EARLY_ACQUISITION
+  )
+  assert not second.acquisition_started
+
+  database_writes: list[tuple[bytes, int]] = []
+  second_result = second.evaluate(
+    authorized_time=network_time(),
+    reliable_fix_available=False,
+    yuma_already_sent=False,
+    send_database_message=(
+      lambda frame, index: database_writes.append((frame, index))
+    ),
+  )
+
+  assert (
+    second_result.disposition
+    is NavigationDatabaseRestoreDisposition.SKIPPED_EARLY_ACQUISITION
+  )
+  assert database_writes == []
+  assert second_result.database_write_attempt_count == 0
+
+  second_position_writes: list[bytes] = []
+  second_result = second.send_position_once(
+    second_position_writes.append
+  )
+
+  assert second_position_writes == []
+  assert not second_result.position_assistance_attempted
+  assert not second.acquisition_started

@@ -220,10 +220,10 @@ PRE_TRANSACTION_DRAIN_MAX_BYTES = 64 * 1024
 CONTROLLED_GNSS_STOP_MESSAGE = b"\xB5\x62\x06\x04\x04\x00\x00\x00\x08\x00\x16\x74"
 CONTROLLED_GNSS_START_MESSAGE = b"\xB5\x62\x06\x04\x04\x00\x00\x00\x09\x00\x17\x76"
 CONTROLLED_GNSS_TRANSITION_DELAY = 0.05
-# C4 independent network time commonly becomes available after the original
-# five-second window. Keep the pre-acquisition wait bounded while allowing
-# current network UTC to authorize DBD cache age before GNSS START.
+# General callers may still use a bounded wait for independent network time.
 NAVIGATION_DATABASE_TRUSTED_TIME_WAIT_SECONDS = 40.0
+# Receiver startup must not hold GNSS stopped while waiting for optional time.
+NAVIGATION_DATABASE_PRESTART_TRUSTED_TIME_WAIT_SECONDS = 0.0
 NAVIGATION_DATABASE_TRUSTED_TIME_POLL_SECONDS = 0.25
 # A validated MGA-DBD cache is capped at 64 KiB. Frequent dispatch between
 # transactions is the primary bound; these limits retain four cache volumes or
@@ -1641,6 +1641,8 @@ def paused_gnss_acquisition(pigeon: TTYPigeon) -> Iterator[None]:
   # clearing the hot-start BBR data. Newer firmware does not ACK these
   # commands, so the transition is bounded by a short deterministic delay.
   pigeon.send(CONTROLLED_GNSS_STOP_MESSAGE)
+  stopped_at = time.monotonic()
+  cloudlog.info(f"GPS acquisition transition: phase=stop_sent monotonic={stopped_at:.6f}")
   time.sleep(CONTROLLED_GNSS_TRANSITION_DELAY)
   try:
     yield
@@ -1657,8 +1659,10 @@ def paused_gnss_acquisition(pigeon: TTYPigeon) -> Iterator[None]:
       if callable(drain):
         drain("position_assistance_pre_gnss_start_boundary")
     pigeon.send(CONTROLLED_GNSS_START_MESSAGE)
+    started_at = time.monotonic()
+    cloudlog.info(f"GPS acquisition transition: phase=start_sent monotonic={started_at:.6f} prestart_elapsed_seconds={started_at - stopped_at:.6f}")
     if initialization is not None:
-      initialization.note_gnss_start_sent(time.monotonic())
+      initialization.note_gnss_start_sent(started_at)
     time.sleep(CONTROLLED_GNSS_TRANSITION_DELAY)
 
 
@@ -4620,6 +4624,7 @@ def initialize_receiver_cycle(
           authority,
           host_time_observation,
           authority_evaluation,
+          timeout_seconds=NAVIGATION_DATABASE_PRESTART_TRUSTED_TIME_WAIT_SECONDS,
         )
       )
       trusted_time_wait_completed_at = time.monotonic()
@@ -4633,8 +4638,6 @@ def initialize_receiver_cycle(
         independent_network_time_seen_at = (
           trusted_time_wait_completed_at
         )
-      if database_runtime.controller.pending:
-        drain_receiver_before_database_restore(pigeon)
     if (
       database_runtime.controller.pending
       and (
@@ -4644,6 +4647,9 @@ def initialize_receiver_cycle(
     ):
       if not database_runtime.close_restore_window_unverified():
         raise RuntimeError("DBD timeout decision persistence failed")
+    if database_runtime.controller.pending:
+      if not database_runtime.close_restore_window_for_early_acquisition():
+        raise RuntimeError("DBD early-acquisition decision persistence failed")
     attempt_started_at = time.monotonic()
     if authorized_time is not None:
       yuma_time_anchor_utc = authorized_time.utc

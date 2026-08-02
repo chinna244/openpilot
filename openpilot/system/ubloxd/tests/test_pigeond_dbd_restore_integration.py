@@ -645,12 +645,28 @@ def test_post_power_stop_precedes_boot_wait(
   assert events.index("gnss_stop") < events.index("init_baudrate")
 
 
-def test_delayed_network_time_restores_before_gnss_start(
+def test_delayed_network_time_skips_dbd_for_early_start(
   tmp_path: Path,
   monkeypatch: pytest.MonkeyPatch,
 ) -> None:
   events: list[str] = []
   pigeon = FakePigeon(events)
+  def guarded_drain(
+    _self,
+    operation: str,
+  ) -> None:
+    if operation == "navigation_database_post_time_wait":
+      raise AssertionError(
+        "early acquisition must not execute the obsolete DBD drain"
+      )
+    events.append(operation)
+
+  monkeypatch.setattr(
+    type(pigeon),
+    "drain_before_transaction",
+    guarded_drain,
+    raising=False,
+  )
   runtime = NavigationDatabaseRestoreRuntime(
     "receiver",
     snapshot_loader=lambda _fingerprint: snapshot(),
@@ -658,6 +674,19 @@ def test_delayed_network_time_restores_before_gnss_start(
     state_path=tmp_path / "dbd_state.json",
     boot_id_reader=lambda: BOOT_ID,
     boottime_reader=lambda: TEST_BOOTTIME_SECONDS,
+  )
+  original_claim_acquisition_start = (
+    runtime.claim_acquisition_start
+  )
+
+  def claim_acquisition_start() -> bool:
+    events.append("acquisition_start_claim")
+    return original_claim_acquisition_start()
+
+  monkeypatch.setattr(
+    runtime,
+    "claim_acquisition_start",
+    claim_acquisition_start,
   )
   database_indexes: list[int] = []
   monkeypatch.setattr(pigeond.time, "sleep", lambda _delay: None)
@@ -671,7 +700,7 @@ def test_delayed_network_time_restores_before_gnss_start(
   monkeypatch.setattr(
     pigeond,
     "wait_for_current_independent_network_time",
-    lambda _authority, observation, _evaluation: (
+    lambda _authority, observation, _evaluation, **_kwargs: (
       events.append("trusted_time_arrived") or observation,
       SimpleNamespace(authorized_time=network_time()),
     ),
@@ -681,11 +710,21 @@ def test_delayed_network_time_restores_before_gnss_start(
   monkeypatch.setattr(pigeond, "log_navx5_ack_aiding_support", lambda _info: None)
   def send_mga(_pigeon, _message, **kwargs):
     index = kwargs.get("database_frame_index")
-    if index is not None:
+    if index is None:
+      events.append("position_write")
+    else:
       database_indexes.append(index)
       events.append("dbd_write")
   monkeypatch.setattr(pigeond, "send_mga_with_strict_ack", send_mga)
-  monkeypatch.setattr(pigeond, "send_time_assistance", lambda *_args, **_kwargs: False)
+  def send_time(*_args, **_kwargs) -> bool:
+    events.append("time_write")
+    return True
+
+  monkeypatch.setattr(
+    pigeond,
+    "send_time_assistance",
+    send_time,
+  )
   monkeypatch.setattr(
     pigeond,
     "log_navigation_assistance_restore_result",
@@ -709,16 +748,42 @@ def test_delayed_network_time_restores_before_gnss_start(
     navigation_database_runtime=runtime,
   )
 
-  assert runtime.controller.disposition is NavigationDatabaseRestoreDisposition.RESTORED
-  assert database_indexes == [0]
-  assert events.index("gnss_stop") < events.index("trusted_time_arrived")
-  assert events.index("trusted_time_arrived") < events.index("dbd_write")
-  assert events.index("dbd_write") < events.index("gnss_start")
+  restore = result.navigation_assistance_restore_result
+  assert restore is not None
+  assert (
+    runtime.controller.disposition
+    is NavigationDatabaseRestoreDisposition.SKIPPED_EARLY_ACQUISITION
+  )
+  assert restore.database_frames_attempted_count == 0
+  assert database_indexes == []
+  assert runtime.execution.position_assistance_attempted
+  assert runtime.execution.position_assistance_succeeded
+  assert "dbd_write" not in events
+  assert "position_write" in events
+  assert events.index("gnss_stop") < events.index(
+    "trusted_time_arrived"
+  )
+  assert events.index("trusted_time_arrived") < events.index(
+    "position_write"
+  )
+  assert "navigation_database_post_time_wait" not in events
+  assert events.index("position_write") < events.index(
+    "time_write"
+  )
+  assert events.index("time_write") < events.index(
+    "acquisition_start_claim"
+  )
+  assert events.index("acquisition_start_claim") < events.index(
+    "gnss_start"
+  )
+  assert result.trusted_time_assistance_sent
   assert result.navigation_assistance_restore_attempted
 
 
 
-def test_observed_c4_delay_restores_full_cycle_before_durable_start(
+
+
+def test_observed_c4_delay_does_not_block_gnss_start(
   tmp_path: Path,
   monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -735,6 +800,8 @@ def test_observed_c4_delay_restores_full_cycle_before_durable_start(
   )
   database_indexes: list[int] = []
   timeline_calls: list[dict[str, object]] = []
+  wait_timeouts: list[float] = []
+  polling_events: list[str] = []
 
   def capture_timeline(**kwargs: object) -> None:
     timeline_calls.append(kwargs)
@@ -750,29 +817,35 @@ def test_observed_c4_delay_restores_full_cycle_before_durable_start(
   def monotonic() -> float:
     return clock[0]
 
-  def sleeper(delay: float) -> None:
-    clock[0] += delay
+  def unexpected_reader():
+    polling_events.append("reader")
+    raise AssertionError("zero startup wait must not poll network time")
 
-  def delayed_wait(_authority, observation, evaluation):
-    def evaluator(_time_authority, _observation):
-      authorized_time = (
-        network_time() if clock[0] >= 32.5 else None
-      )
-      if (
-        authorized_time is not None
-        and "trusted_time_arrived" not in events
-      ):
-        events.append("trusted_time_arrived")
-      return SimpleNamespace(authorized_time=authorized_time)
+  def unexpected_evaluator(_time_authority, _observation):
+    polling_events.append("evaluator")
+    raise AssertionError("zero startup wait must not reevaluate network time")
 
+  def unexpected_sleeper(_delay: float) -> None:
+    polling_events.append("sleeper")
+    raise AssertionError("zero startup wait must not sleep")
+
+  def delayed_wait(
+    _authority,
+    observation,
+    evaluation,
+    *,
+    timeout_seconds: float = pigeond.NAVIGATION_DATABASE_TRUSTED_TIME_WAIT_SECONDS,
+  ):
+    wait_timeouts.append(timeout_seconds)
     return real_wait(
       object(),  # type: ignore[arg-type, ty:invalid-argument-type]
       observation,
       evaluation,
-      observation_reader=lambda: None,
-      evaluator=evaluator,  # type: ignore[arg-type, ty:invalid-argument-type]
+      timeout_seconds=timeout_seconds,
+      observation_reader=unexpected_reader,
+      evaluator=unexpected_evaluator,  # type: ignore[arg-type]
       monotonic=monotonic,
-      sleeper=sleeper,
+      sleeper=unexpected_sleeper,
     )
 
   def send_mga(_pigeon, _message, **kwargs):
@@ -879,40 +952,22 @@ def test_observed_c4_delay_restores_full_cycle_before_durable_start(
 
   restore = result.navigation_assistance_restore_result
   assert restore is not None
-  assert clock[0] == pytest.approx(32.5)
+  assert wait_timeouts == [0.0]
+  assert polling_events == []
+  assert clock[0] == pytest.approx(0.0)
   assert (
     runtime.controller.disposition
-    is NavigationDatabaseRestoreDisposition.RESTORED
+    is NavigationDatabaseRestoreDisposition.SKIPPED_UNVERIFIED
   )
-  assert (
-    runtime.controller.disposition
-    is not NavigationDatabaseRestoreDisposition.SKIPPED_UNVERIFIED
-  )
-  assert restore.database_frames_attempted_count == 1
-  assert restore.accepted_frame_count == 1
-  assert restore.total_frame_count == 1
-  assert restore.restored_cache_generation == "primary"
-  assert (
-    restore.restored_cache_selection_reason
-    == "trusted_age_only_eligible:primary"
-  )
+  assert restore.database_frames_attempted_count == 0
+  assert database_indexes == []
   assert runtime.execution.position_assistance_attempted
-  assert runtime.execution.position_assistance_succeeded
   assert runtime.acquisition_started
-  assert database_indexes == [0]
-  assert events.index("gnss_stop") < events.index(
-    "trusted_time_arrived"
-  )
-  assert events.index("trusted_time_arrived") < events.index(
-    "dbd_write"
-  )
-  assert events.index("dbd_write") < events.index(
-    "position_write"
-  )
+  assert "trusted_time_arrived" not in events
+  assert "dbd_write" not in events
+  assert "position_write" in events
+  assert "time_write" not in events
   assert events.index("position_write") < events.index(
-    "time_write"
-  )
-  assert events.index("time_write") < events.index(
     "acquisition_start_claim"
   )
   assert events.index("acquisition_start_claim") < events.index(
@@ -924,10 +979,20 @@ def test_observed_c4_delay_restores_full_cycle_before_durable_start(
   assert len(timeline_calls) == 1
   timeline = timeline_calls[0]
   assert timeline["restore_result"] is restore
-  assert timeline["authorized_time"] == network_time()
-  assert timeline["independent_network_time_seen_at"] is not None
-  assert timeline["acquisition_start_claimed_at"] is not None
-  assert timeline["gnss_start_sent_at"] is not None
+  assert timeline["authorized_time"] is None
+  assert timeline["independent_network_time_seen_at"] is None
+  wait_started_at = timeline["trusted_time_wait_started_at"]
+  wait_completed_at = timeline["trusted_time_wait_completed_at"]
+  acquisition_claimed_at = timeline["acquisition_start_claimed_at"]
+  gnss_start_sent_at = timeline["gnss_start_sent_at"]
+  assert isinstance(wait_started_at, float)
+  assert isinstance(wait_completed_at, float)
+  assert isinstance(acquisition_claimed_at, float)
+  assert isinstance(gnss_start_sent_at, float)
+  assert wait_completed_at >= wait_started_at
+  assert wait_completed_at - wait_started_at < 1.0
+  assert acquisition_claimed_at <= gnss_start_sent_at
+
 
 
 
@@ -975,7 +1040,10 @@ def test_pending_dbd_yuma_claim_survives_restart(
 
 # COMMIT7_DBD_LIVE_BOUNDARY_TESTS
 
-def test_acquisition_dispatched_after_network_wait_blocks_dbd(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_early_acquisition_skips_post_wait_drain_and_dbd(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
   events: list[str] = []
   runtime = NavigationDatabaseRestoreRuntime(
     "receiver",
@@ -985,29 +1053,59 @@ def test_acquisition_dispatched_after_network_wait_blocks_dbd(tmp_path: Path, mo
     boot_id_reader=lambda: BOOT_ID,
     boottime_reader=lambda: TEST_BOOTTIME_SECONDS,
   )
+
   class DrainPigeon(FakePigeon):
     def drain_before_transaction(self, operation: str) -> None:
       events.append(operation)
       if operation == "navigation_database_post_time_wait":
-        events.append("rawx_dispatched")
-        assert runtime.note_acquisition_started()
+        raise AssertionError(
+          "early acquisition must not execute the obsolete DBD drain"
+        )
+
   pigeon = DrainPigeon(events)
   database_indexes: list[int] = []
+
   monkeypatch.setattr(pigeond.time, "sleep", lambda _delay: None)
-  monkeypatch.setattr(pigeond, "start_pigeon_transport", lambda _pigeon: None)
-  monkeypatch.setattr(pigeond, "read_host_time_observation", lambda: None)
-  monkeypatch.setattr(pigeond, "evaluate_time_authority", lambda _authority, _observation: SimpleNamespace(authorized_time=None))
+  monkeypatch.setattr(
+    pigeond,
+    "start_pigeon_transport",
+    lambda _pigeon: None,
+  )
+  monkeypatch.setattr(
+    pigeond,
+    "read_host_time_observation",
+    lambda: None,
+  )
+  monkeypatch.setattr(
+    pigeond,
+    "evaluate_time_authority",
+    lambda _authority, _observation: SimpleNamespace(
+      authorized_time=None
+    ),
+  )
   monkeypatch.setattr(
     pigeond,
     "wait_for_current_independent_network_time",
-    lambda _authority, observation, _evaluation: (
+    lambda _authority, observation, _evaluation, **_kwargs: (
       observation,
       SimpleNamespace(authorized_time=network_time()),
     ),
   )
-  monkeypatch.setattr(pigeond, "poll_mon_ver", lambda _pigeon: None)
-  monkeypatch.setattr(pigeond, "configure_navx5_ack_aiding", lambda *_args: None)
-  monkeypatch.setattr(pigeond, "log_navx5_ack_aiding_support", lambda _info: None)
+  monkeypatch.setattr(
+    pigeond,
+    "poll_mon_ver",
+    lambda _pigeon: None,
+  )
+  monkeypatch.setattr(
+    pigeond,
+    "configure_navx5_ack_aiding",
+    lambda *_args: None,
+  )
+  monkeypatch.setattr(
+    pigeond,
+    "log_navx5_ack_aiding_support",
+    lambda _info: None,
+  )
   monkeypatch.setattr(
     pigeond,
     "send_mga_with_strict_ack",
@@ -1017,11 +1115,32 @@ def test_acquisition_dispatched_after_network_wait_blocks_dbd(tmp_path: Path, mo
       else None
     ),
   )
-  monkeypatch.setattr(pigeond, "send_time_assistance", lambda *_args, **_kwargs: False)
-  monkeypatch.setattr(pigeond, "log_navigation_assistance_restore_result", lambda *_args, **_kwargs: None)
-  monkeypatch.setattr(pigeond, "finish_pigeon_initialization", lambda _pigeon: None)
-  monkeypatch.setattr(pigeond, "log_assistnow_autonomous_support", lambda _info: True)
-  monkeypatch.setattr(pigeond, "configure_assistnow_autonomous", lambda *_args: None)
+  monkeypatch.setattr(
+    pigeond,
+    "send_time_assistance",
+    lambda *_args, **_kwargs: False,
+  )
+  monkeypatch.setattr(
+    pigeond,
+    "log_navigation_assistance_restore_result",
+    lambda *_args, **_kwargs: None,
+  )
+  monkeypatch.setattr(
+    pigeond,
+    "finish_pigeon_initialization",
+    lambda _pigeon: None,
+  )
+  monkeypatch.setattr(
+    pigeond,
+    "log_assistnow_autonomous_support",
+    lambda _info: True,
+  )
+  monkeypatch.setattr(
+    pigeond,
+    "configure_assistnow_autonomous",
+    lambda *_args: None,
+  )
+
   result = pigeond.initialize_receiver_cycle(
     pigeon,  # ty: ignore[invalid-argument-type]
     "receiver",
@@ -1031,10 +1150,16 @@ def test_acquisition_dispatched_after_network_wait_blocks_dbd(tmp_path: Path, mo
     time_provenance=FakeProvenance(),  # ty: ignore[invalid-argument-type]
     navigation_database_runtime=runtime,
   )
-  assert events.index("rawx_dispatched") < events.index("gnss_start")
-  assert runtime.controller.disposition is NavigationDatabaseRestoreDisposition.SKIPPED_ACQUISITION_ALREADY_STARTED
+
+  assert "navigation_database_post_time_wait" not in events
   assert database_indexes == []
+  assert (
+    runtime.controller.disposition
+    is NavigationDatabaseRestoreDisposition.SKIPPED_EARLY_ACQUISITION
+  )
+  assert events.index("gnss_stop") < events.index("gnss_start")
   assert result.navigation_assistance_restore_attempted
+
 
 
 def test_frame_zero_transaction_drain_guard_blocks_receiver_write(tmp_path: Path) -> None:

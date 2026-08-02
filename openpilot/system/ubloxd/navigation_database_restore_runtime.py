@@ -1098,6 +1098,16 @@ class NavigationDatabaseRestoreRuntime:
     self._execution = self._build_execution(self._last_authorized_time)
     return persisted
 
+  def close_restore_window_for_early_acquisition(self) -> bool:
+    # Persist a terminal DBD skip while preserving pre-START assistance.
+    if self._controller.pending and not self._controller.restore_attempted:
+      self._controller.skip(
+        NavigationDatabaseRestoreDisposition.SKIPPED_EARLY_ACQUISITION
+      )
+    persisted = self._persist_state()
+    self._execution = self._build_execution(self._last_authorized_time)
+    return persisted
+
   def claim_acquisition_start(self) -> bool:
     """Durably close the DBD window before sending GNSS START."""
     if self._controller.acquisition_started:

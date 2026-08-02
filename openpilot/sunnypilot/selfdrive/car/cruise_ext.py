@@ -30,7 +30,7 @@ V_CRUISE_MIN = 8  # V_CRUISE_MAX / V_CRUISE_UNSET come from cruise_arbiter
 # set speed and steps it on wheel presses while openpilot integrates the same presses, so
 # the two drift (grid-snapped long presses, gas-override presses, trailing increments).
 # Around a driver press the dash is the ECU's truth of the setpoint, but only when nothing
-# is deliberately holding it away from v_cruise: adopt it iff the plan source is cruise and
+# is deliberately holding it away from v_cruise: adopt it if the plan source is cruise and
 # ICBM is not mid-move. The settle time absorbs the ECU's trailing long-press increment
 # (lands well inside 1 s on a CX-5 2022).
 RECONCILE_SETTLE_TIME = 1.0  # s after the last press
