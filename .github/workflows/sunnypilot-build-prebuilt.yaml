@@ -347,6 +347,7 @@ jobs:
         shell: bash
 
       - name: Post to Discourse
+        if: github.repository == 'sunnypilot/sunnypilot'
         uses: ./.github/workflows/post-to-discourse
         with:
           discourse-url: ${{ vars.DISCOURSE_URL }}
