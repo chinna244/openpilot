@@ -46,12 +46,12 @@ def test_live_loop_creates_fresh_state_for_each_receiver_cycle() -> None:
   assert segment is not None
   assert len(
     calls(node, "create_receiver_cycle_assistance_state")
-  ) == 3
+  ) == 2
   assert len(
     calls(node, "prepare_receiver_cycle_response_state")
-  ) == 2
+  ) == 1
   initialize_calls = calls(node, "initialize_receiver_cycle")
-  assert len(initialize_calls) == 3
+  assert len(initialize_calls) == 2
   for call in initialize_calls:
     keywords = {keyword.arg for keyword in call.keywords}
     assert "navigation_database_runtime" in keywords
@@ -335,31 +335,53 @@ def test_dbd_runtime_initialization_precedes_receiver_construction_and_io() -> N
   assert fallback_runtime < receiver_start
 
 
-def test_recovery_flushes_old_frames_before_fresh_cycle_state() -> None:
+def test_recovery_paths_share_one_bounded_receiver_reset_helper() -> None:
   source, tree = source_tree(PIGEOND)
   node = named_node(tree, "run_receiving")
   segment = ast.get_source_segment(source, node)
   assert segment is not None
 
-  for reason in ("no_data_watchdog", "all_zero_data"):
-    cycle = segment.index(f'"{reason}"')
-    cancel = segment.rfind(
-      "position_assistance_retry.cancel_receiver_cycle(now)",
-      0,
-      cycle,
+  recovery_helpers = [
+    item
+    for item in node.body
+    if (
+      isinstance(item, ast.FunctionDef)
+      and item.name == "recover_receiver"
     )
-    assert cancel >= 0
-    response_reset = segment.index(
-      "prepare_receiver_cycle_response_state(pigeon)",
-      cancel,
-      cycle,
-    )
-    fresh_state = segment.index(
-      "create_receiver_cycle_assistance_state(",
-      response_reset,
-      cycle,
-    )
-    assert cancel < response_reset < fresh_state < cycle
+  ]
+  assert len(recovery_helpers) == 1
+  helper = recovery_helpers[0]
+  helper_segment = ast.get_source_segment(source, helper)
+  assert helper_segment is not None
+
+  cancel = helper_segment.index(
+    "position_assistance_retry.cancel_receiver_cycle("
+  )
+  response_reset = helper_segment.index(
+    "prepare_receiver_cycle_response_state(pigeon)"
+  )
+  fresh_state = helper_segment.index(
+    "create_receiver_cycle_assistance_state()"
+  )
+  completed = helper_segment.index(
+    "data_watchdog.recovery_completed("
+  )
+  assert cancel < response_reset < fresh_state < completed
+  assert len(
+    calls(helper, "create_receiver_cycle_assistance_state")
+  ) == 1
+  assert "GPS receiver recovery started" in helper_segment
+  assert "GPS receiver recovery completed" in helper_segment
+  assert 'f"reason={reason_value}"' in helper_segment
+  assert 'f"attempt={attempt}"' in helper_segment
+
+  assert segment.count(
+    "recover_receiver(\n        ReceiverRecoveryReason.NO_DATA,"
+  ) == 1
+  assert segment.count(
+    "recover_receiver(\n          ReceiverRecoveryReason.ALL_ZERO_DATA,"
+  ) == 1
+  assert "data_watchdog.request_recovery(" in segment
 
 
 def test_yuma_assistance_state_unavailable_is_terminal_without_retry() -> None:
