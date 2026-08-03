@@ -177,12 +177,37 @@ def test_initial_dbd_decision_precedes_time_and_normal_configuration() -> None:
   assert "install_pre_acquisition_initialization(" in segment
 
 
+def test_process_start_transport_precedes_pr66_state_creation() -> None:
+  source, tree = source_tree(PIGEOND)
+  node = named_node(tree, "run_receiving")
+  segment = ast.get_source_segment(source, node)
+  assert segment is not None
+  disable_dispatch = segment.index("pigeon.set_frame_dispatcher(None)")
+  bootstrap = segment.index("bootstrap_process_start_transport(pigeon)")
+  state = segment.index(") = create_receiver_cycle_assistance_state()")
+  enable_dispatch = segment.index("pigeon.set_frame_dispatcher(dispatch_frames)")
+  initialize = segment.index("initialize_receiver_cycle(")
+  assert disable_dispatch < bootstrap < state < enable_dispatch < initialize
+
+
+def test_successful_bootstrap_frames_reach_fresh_pr66_state_before_assistance() -> None:
+  source, tree = source_tree(PIGEOND)
+  node = named_node(tree, "initialize_receiver_cycle")
+  segment = ast.get_source_segment(source, node)
+  assert segment is not None
+  prepare = segment.index("database_runtime.prepare()")
+  dispatch = segment.index("pigeon.dispatch_pending_frames()")
+  assistance = segment.index("resolve_pre_acquisition_mon_ver(")
+  assert prepare < dispatch < assistance
+
+
 def test_pre_database_setup_does_not_ignore_acquisition_frames() -> None:
   source, tree = source_tree(PIGEOND)
   initialize = named_node(tree, "initialize_receiver_cycle")
   segment = ast.get_source_segment(source, initialize)
   assert segment is not None
-  assert "poll_mon_ver(pigeon)" in segment
+  assert "resolve_pre_acquisition_mon_ver(" in segment
+  assert "initialization.transport_mon_ver_info" in segment
   assert "configure_navx5_ack_aiding(pigeon, mon_ver_info)" in segment
 
   unrelated = named_node(tree, "_queue_unrelated_frames")
@@ -253,6 +278,7 @@ def test_power_on_stop_precedes_baud_transition_and_transactions() -> None:
   assert initialize_segment is not None
   assert initialize_segment.index("restore_navigation_assistance(") < (initialize_segment.index("send_time_assistance("))
 
+
 def test_structured_telemetry_keeps_assistance_command_order() -> None:
   source, tree = source_tree(PIGEOND)
 
@@ -318,12 +344,28 @@ def test_dbd_runtime_initialization_precedes_receiver_construction_and_io() -> N
   segment = ast.get_source_segment(source, node)
   assert segment is not None
 
-  assistance_state = segment.index(
-    "create_receiver_cycle_assistance_state("
-  )
   pigeon = segment.index("pigeon = TTYPigeon(")
-  first_cycle = segment.index("initialize_receiver_cycle(")
-  assert assistance_state < pigeon < first_cycle
+  bootstrap = segment.index("bootstrap_process_start_transport(pigeon)")
+  assistance_state = segment.index(
+    "create_receiver_cycle_assistance_state(",
+    bootstrap,
+  )
+  first_cycle = segment.index(
+    "initialize_receiver_cycle(",
+    assistance_state,
+  )
+  assert pigeon < bootstrap < assistance_state < first_cycle
+
+  recovery = segment.index("def recover_receiver(")
+  recovery_state = segment.index(
+    "create_receiver_cycle_assistance_state()",
+    recovery,
+  )
+  recovery_cycle = segment.index(
+    "initialize_receiver_cycle(",
+    recovery_state,
+  )
+  assert recovery < recovery_state < recovery_cycle
 
   initialize = named_node(tree, "initialize_receiver_cycle")
   initialize_segment = ast.get_source_segment(source, initialize)

@@ -217,6 +217,11 @@ def test_init_raises_when_receiver_configuration_fails(
   )
   monkeypatch.setattr(
     pigeond,
+    "poll_mon_ver",
+    lambda _pigeon, _timeout: object(),
+  )
+  monkeypatch.setattr(
+    pigeond,
     "init_pigeon",
     lambda _pigeon: False,
   )

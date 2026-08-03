@@ -646,6 +646,11 @@ def test_post_power_stop_precedes_boot_wait(
   )
   monkeypatch.setattr(pigeond.time, "sleep", lambda _delay: events.append("sleep"))
   monkeypatch.setattr(pigeond, "init_baudrate", lambda _pigeon: events.append("init_baudrate"))
+  monkeypatch.setattr(
+    pigeond,
+    "poll_mon_ver",
+    lambda _pigeon, _timeout: SimpleNamespace(),
+  )
   pigeond.start_pigeon_transport(pigeon)  # type: ignore[arg-type, ty:invalid-argument-type]
   assert events.index("power_on") < events.index("gnss_stop")
   assert events.index("gnss_stop") < events.index("sleep", events.index("power_on"))
@@ -1264,6 +1269,11 @@ def test_prepared_receiver_response_state_is_not_reset_twice(
     pigeond,
     "init_baudrate",
     lambda _pigeon: None,
+  )
+  monkeypatch.setattr(
+    pigeond,
+    "poll_mon_ver",
+    lambda _pigeon, _timeout: SimpleNamespace(),
   )
 
   pigeon = Pigeon()

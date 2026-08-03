@@ -209,6 +209,9 @@ TIME_ASSISTANCE_RETRY_INTERVAL = 30.0
 GPS_ASSISTANCE_ACK_TIMEOUT = 0.75
 GPS_ASSISTANCE_FRAME_RETRY_DELAY = 0.25
 MON_VER_POLL_TIMEOUT = 0.5
+RECEIVER_TRANSPORT_PROBE_TIMEOUT = MON_VER_POLL_TIMEOUT
+PROCESS_START_RECEIVER_TRANSPORT_MAX_ATTEMPTS = 3
+RUNTIME_RECOVERY_RECEIVER_TRANSPORT_MAX_ATTEMPTS = 1
 NAVX5_POLL_TIMEOUT = 0.5
 CFG_ACK_TIMEOUT = 1.1
 NAVX5_ACK_TIMEOUT = CFG_ACK_TIMEOUT
@@ -349,6 +352,12 @@ class TTYPigeon:
     self._receiver_cycle = 0
     self._receiver_cycle_response_state_prepared = False
     self.time_provenance: ReceiverTimeProvenanceTracker | None = None
+
+  def set_frame_dispatcher(
+    self,
+    frame_dispatcher: Callable[[list[bytes]], None] | None,
+  ) -> None:
+    self._frame_dispatcher = frame_dispatcher
 
   def send(self, dat: bytes) -> None:
     self.tty.write(dat)
@@ -925,15 +934,7 @@ def log_acquisition_configuration_diagnostics(
       cloudlog.exception(f"GPS acquisition configuration {name} diagnostic poll failed")
 
 
-def log_mon_ver_diagnostics(pigeon: TTYPigeon) -> MonVerInfo | None:
-  try:
-    info = poll_mon_ver(pigeon)
-  except Exception:
-    cloudlog.exception("GPS MON-VER diagnostic poll failed")
-    return None
-  if info is None:
-    cloudlog.warning("GPS MON-VER diagnostic response unavailable or malformed")
-    return None
+def log_mon_ver_info(info: MonVerInfo) -> None:
   cloudlog.info(", ".join((
     "GPS MON-VER diagnostics",
     f"software_version={info.software_version}",
@@ -945,7 +946,37 @@ def log_mon_ver_diagnostics(pigeon: TTYPigeon) -> MonVerInfo | None:
     f"extensions={list(info.extensions)}",
     f"diagnostic_identity={normalized_receiver_identity(info)}",
   )))
+
+
+def log_mon_ver_diagnostics(pigeon: TTYPigeon) -> MonVerInfo | None:
+  try:
+    info = poll_mon_ver(pigeon)
+  except Exception:
+    cloudlog.exception("GPS MON-VER diagnostic poll failed")
+    return None
+  if info is None:
+    cloudlog.warning("GPS MON-VER diagnostic response unavailable or malformed")
+    return None
+  log_mon_ver_info(info)
   return info
+
+
+def resolve_pre_acquisition_mon_ver(
+  pigeon: TTYPigeon,
+  verified_info: MonVerInfo | None,
+  collect_diagnostics: bool,
+) -> MonVerInfo | None:
+  if verified_info is not None:
+    if collect_diagnostics:
+      log_mon_ver_info(verified_info)
+    return verified_info
+  if collect_diagnostics:
+    return log_mon_ver_diagnostics(pigeon)
+  try:
+    return poll_mon_ver(pigeon)
+  except Exception:
+    cloudlog.exception("GPS MON-VER compatibility poll failed")
+    return None
 
 
 def navx5_ack_aiding_compatibility(info: MonVerInfo | None) -> tuple[bool, str]:
@@ -1585,6 +1616,8 @@ def deinitialize_and_exit(pigeon: TTYPigeon | None):
 class PreAcquisitionInitialization:
   callback: Callable[[], None]
   gnss_start_callback: Callable[[float], None] | None = None
+  transport_already_started: bool = False
+  transport_mon_ver_info: MonVerInfo | None = None
   executed: bool = False
   gnss_start_sent_at: float | None = None
   pre_gnss_start_drain_required: bool = False
@@ -1613,11 +1646,22 @@ _ACTIVE_PRE_ACQUISITION_INITIALIZATION: (
 def install_pre_acquisition_initialization(
   callback: Callable[[], None],
   gnss_start_callback: Callable[[float], None] | None = None,
+  transport_already_started: bool = False,
+  transport_mon_ver_info: MonVerInfo | None = None,
 ) -> Iterator[PreAcquisitionInitialization]:
   global _ACTIVE_PRE_ACQUISITION_INITIALIZATION
   if _ACTIVE_PRE_ACQUISITION_INITIALIZATION is not None:
     raise RuntimeError("pre-acquisition initialization is already active")
-  state = PreAcquisitionInitialization(callback, gnss_start_callback)
+  if transport_already_started and transport_mon_ver_info is None:
+    raise ValueError(
+      "transport_mon_ver_info is required when transport is already started"
+    )
+  state = PreAcquisitionInitialization(
+    callback,
+    gnss_start_callback,
+    transport_already_started=transport_already_started,
+    transport_mon_ver_info=transport_mon_ver_info,
+  )
   _ACTIVE_PRE_ACQUISITION_INITIALIZATION = state
   try:
     yield state
@@ -1633,7 +1677,13 @@ def prepare_receiver_cycle_response_state(
   pigeon._receiver_cycle_response_state_prepared = True
 
 
-def start_pigeon_transport(pigeon: TTYPigeon) -> None:
+def _start_pigeon_transport_attempts(
+  pigeon: TTYPigeon,
+  max_attempts: int,
+) -> MonVerInfo:
+  if type(max_attempts) is not int or max_attempts < 1:
+    raise ValueError("max_attempts must be a positive integer")
+
   signal.signal(signal.SIGINT, lambda sig, frame: deinitialize_and_exit(pigeon))
   response_state_prepared = (
     getattr(
@@ -1645,16 +1695,102 @@ def start_pigeon_transport(pigeon: TTYPigeon) -> None:
   )
   if response_state_prepared:
     pigeon._receiver_cycle_response_state_prepared = False
-  elif hasattr(pigeon, "_stream_parser"):
-    pigeon.reset_response_state()
-  set_power(False)
-  time.sleep(0.1)
-  set_power(True)
-  # STOP is the first possible receiver command after power-on. It is
-  # repeated by init_baudrate after the receiver boot interval.
-  pigeon.send(CONTROLLED_GNSS_STOP_MESSAGE)
-  time.sleep(0.5)
-  init_baudrate(pigeon)
+
+  last_transport_error: BaseException | None = None
+  for attempt in range(1, max_attempts + 1):
+    try:
+      if (
+        not (attempt == 1 and response_state_prepared)
+        and hasattr(pigeon, "_stream_parser")
+      ):
+        pigeon.reset_response_state()
+      set_power(False)
+      time.sleep(0.1)
+      set_power(True)
+      # STOP is the first possible receiver command after power-on. It is
+      # repeated by init_baudrate after the receiver boot interval.
+      pigeon.send(CONTROLLED_GNSS_STOP_MESSAGE)
+      time.sleep(0.5)
+      init_baudrate(pigeon)
+      mon_ver_info = poll_mon_ver(
+        pigeon,
+        RECEIVER_TRANSPORT_PROBE_TIMEOUT,
+      )
+    except RawPublicationError:
+      raise
+    except (OSError, ResponseTransactionError) as exc:
+      last_transport_error = exc
+      cloudlog.warning(", ".join((
+        "GPS receiver transport verification",
+        f"attempt={attempt}",
+        f"max_attempts={max_attempts}",
+        "baud=460800",
+        "probe=MON-VER",
+        "result=transport_error",
+        f"error_type={type(exc).__name__}",
+        f"error={exc}",
+      )))
+      continue
+
+    if mon_ver_info is not None:
+      cloudlog.info(", ".join((
+        "GPS receiver transport verification",
+        f"attempt={attempt}",
+        f"max_attempts={max_attempts}",
+        "baud=460800",
+        "probe=MON-VER",
+        "result=verified",
+      )))
+      return mon_ver_info
+
+    cloudlog.warning(", ".join((
+      "GPS receiver transport verification",
+      f"attempt={attempt}",
+      f"max_attempts={max_attempts}",
+      "baud=460800",
+      "probe=MON-VER",
+      "result=no_response",
+    )))
+
+  error = ReceiverConfigurationError(
+    "Failed to verify u-blox transport at 460800 baud after "
+    + f"{max_attempts} physical receiver attempt"
+    + ("" if max_attempts == 1 else "s")
+  )
+  if last_transport_error is not None:
+    raise error from last_transport_error
+  raise error
+
+
+def start_pigeon_transport(pigeon: TTYPigeon) -> None:
+  mon_ver_info = _start_pigeon_transport_attempts(
+    pigeon,
+    RUNTIME_RECOVERY_RECEIVER_TRANSPORT_MAX_ATTEMPTS,
+  )
+  initialization = _ACTIVE_PRE_ACQUISITION_INITIALIZATION
+  if initialization is not None:
+    initialization.transport_mon_ver_info = mon_ver_info
+
+
+def bootstrap_process_start_transport(
+  pigeon: TTYPigeon,
+) -> MonVerInfo:
+  return _start_pigeon_transport_attempts(
+    pigeon,
+    PROCESS_START_RECEIVER_TRANSPORT_MAX_ATTEMPTS,
+  )
+
+
+def supports_process_start_transport_bootstrap(
+  pigeon: object,
+) -> bool:
+  return all((
+    callable(getattr(pigeon, "send", None)),
+    callable(getattr(pigeon, "reset_response_state", None)),
+    callable(getattr(pigeon, "set_frame_dispatcher", None)),
+    callable(getattr(pigeon, "dispatch_pending_frames", None)),
+    callable(getattr(pigeon, "receive_transaction_data", None)),
+  ))
 
 
 @contextmanager
@@ -1694,8 +1830,9 @@ def finish_pigeon_initialization(pigeon: TTYPigeon) -> None:
 
 
 def init(pigeon: TTYPigeon) -> None:
-  start_pigeon_transport(pigeon)
   initialization = _ACTIVE_PRE_ACQUISITION_INITIALIZATION
+  if initialization is None or not initialization.transport_already_started:
+    start_pigeon_transport(pigeon)
   if initialization is not None:
     with paused_gnss_acquisition(pigeon):
       initialization.run()
@@ -4599,8 +4736,11 @@ def initialize_receiver_cycle(
   time_provenance: ReceiverTimeProvenanceTracker | None = None,
   navigation_database_runtime: NavigationDatabaseRestoreRuntime | None = None,
   position_assistance_retry: PositionAssistancePostStartRetryController | None = None,
+  transport_mon_ver_info: MonVerInfo | None = None,
+  cycle_started_at: float | None = None,
 ) -> ReceiverCycleInitialization:
-  cycle_started_at = time.monotonic()
+  if cycle_started_at is None:
+    cycle_started_at = time.monotonic()
   startup_diagnostics.start_cycle(reason, cycle_started_at)
   provenance = time_provenance or ReceiverTimeProvenanceTracker()
   cycle_id = getattr(
@@ -4653,6 +4793,11 @@ def initialize_receiver_cycle(
       str(exc),
     )
   database_runtime.prepare()
+  if (
+    transport_mon_ver_info is not None
+    and hasattr(pigeon, "dispatch_pending_frames")
+  ):
+    pigeon.dispatch_pending_frames()
 
   mon_ver_info: MonVerInfo | None = None
   ack_aiding_configuration_attempted = False
@@ -4729,14 +4874,11 @@ def initialize_receiver_cycle(
     nonlocal trusted_time_wait_completed_at
     nonlocal acquisition_start_claimed_at
 
-    if collect_mon_ver_diagnostics:
-      mon_ver_info = log_mon_ver_diagnostics(pigeon)
-    else:
-      try:
-        mon_ver_info = poll_mon_ver(pigeon)
-      except Exception:
-        cloudlog.exception("GPS MON-VER compatibility poll failed")
-        mon_ver_info = None
+    mon_ver_info = resolve_pre_acquisition_mon_ver(
+      pigeon,
+      initialization.transport_mon_ver_info,
+      collect_mon_ver_diagnostics,
+    )
     log_navx5_ack_aiding_support(mon_ver_info)
     configure_navx5_ack_aiding(pigeon, mon_ver_info)
     ack_aiding_configuration_attempted = True
@@ -4886,6 +5028,8 @@ def initialize_receiver_cycle(
   with install_pre_acquisition_initialization(
     pre_acquisition_initialization,
     note_gnss_start_sent,
+    transport_already_started=transport_mon_ver_info is not None,
+    transport_mon_ver_info=transport_mon_ver_info,
   ) as initialization:
     init(pigeon)
 
@@ -6629,12 +6773,34 @@ def run_receiving(duration: int = 0):
   receiver_time_provenance = (
     ReceiverTimeProvenanceTracker()
   )
+  process_start_cycle_started_at = time.monotonic()
+  active_frame_dispatcher: (
+    Callable[[list[bytes]], None] | None
+  ) = None
+
+  def dispatch_receiver_frames(frames: list[bytes]) -> None:
+    if active_frame_dispatcher is not None:
+      active_frame_dispatcher(frames)
+
+  pigeon = TTYPigeon(
+    lambda data: publish_ublox_raw(pm, data),
+    dispatch_receiver_frames,
+  )
+  process_start_transport_bootstrap_supported = (
+    supports_process_start_transport_bootstrap(pigeon)
+  )
+  if process_start_transport_bootstrap_supported:
+    pigeon.set_frame_dispatcher(None)
+  process_start_mon_ver_info = (
+    bootstrap_process_start_transport(pigeon)
+    if process_start_transport_bootstrap_supported
+    else None
+  )
   (
     navigation_database_runtime,
     position_assistance_retry,
     acquisition_state_guard,
   ) = create_receiver_cycle_assistance_state()
-  pigeon: TTYPigeon
 
   def dispatch_frames(frames: list[bytes]) -> None:
     if receiver_frames_show_gnss_acquisition(frames):
@@ -6663,10 +6829,10 @@ def run_receiving(duration: int = 0):
       getattr(pigeon, "receiver_cycle", 0),
     )
 
-  pigeon = TTYPigeon(
-    lambda data: publish_ublox_raw(pm, data),
-    dispatch_frames,
-  )
+  if process_start_transport_bootstrap_supported:
+    pigeon.set_frame_dispatcher(dispatch_frames)
+  else:
+    active_frame_dispatcher = dispatch_frames
 
   def execute_position_assistance_retry() -> None:
     position_assistance_retry.execute_ready(
@@ -6698,6 +6864,8 @@ def run_receiving(duration: int = 0):
     time_provenance=receiver_time_provenance,
     navigation_database_runtime=navigation_database_runtime,
     position_assistance_retry=position_assistance_retry,
+    transport_mon_ver_info=process_start_mon_ver_info,
+    cycle_started_at=process_start_cycle_started_at,
   )
   execute_position_assistance_retry()
   startup_diagnostics.initialization_complete(
