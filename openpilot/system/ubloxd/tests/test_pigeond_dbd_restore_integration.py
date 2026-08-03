@@ -21,6 +21,10 @@ from openpilot.system.ubloxd.navigation_database_restore_runtime import (
   PositionAssistanceFailureKind,
   PositionAssistanceWriteStatus,
 )
+from openpilot.system.ubloxd.position_assistance_retry import (
+  PositionAssistanceRetryState,
+  PositionAssistanceRetryStateError,
+)
 from openpilot.system.ubloxd.trusted_time_anchor import (
   TimeProvenance,
   TrustedTimeSource,
@@ -1040,6 +1044,238 @@ def test_pending_dbd_yuma_claim_survives_restart(
     is NavigationDatabaseRestoreDisposition.SKIPPED_YUMA_ALREADY_SENT
   )
   assert database_writes == []
+
+
+def test_new_receiver_cycle_reopens_navigation_assistance_state(
+  tmp_path: Path,
+) -> None:
+  state_path = tmp_path / "dbd_state.json"
+  first = NavigationDatabaseRestoreRuntime(
+    "receiver",
+    snapshot_loader=lambda _fingerprint: snapshot(),
+    retry_delay_seconds=0.0,
+    state_path=state_path,
+    boot_id_reader=lambda: BOOT_ID,
+    boottime_reader=lambda: TEST_BOOTTIME_SECONDS,
+  )
+  assert first.claim_yuma_transmission()
+  assert first.claim_acquisition_start()
+
+  same_cycle = NavigationDatabaseRestoreRuntime(
+    "receiver",
+    snapshot_loader=lambda _fingerprint: snapshot(),
+    retry_delay_seconds=0.0,
+    state_path=state_path,
+    boot_id_reader=lambda: BOOT_ID,
+    boottime_reader=lambda: TEST_BOOTTIME_SECONDS,
+  )
+  assert same_cycle.yuma_sent
+  assert same_cycle.acquisition_started
+
+  next_cycle = NavigationDatabaseRestoreRuntime(
+    "receiver",
+    snapshot_loader=lambda _fingerprint: snapshot(),
+    retry_delay_seconds=0.0,
+    state_path=state_path,
+    boot_id_reader=lambda: BOOT_ID,
+    boottime_reader=lambda: TEST_BOOTTIME_SECONDS,
+    new_receiver_cycle=True,
+  )
+  assert not next_cycle.yuma_sent
+  assert not next_cycle.acquisition_started
+  assert next_cycle.controller.pending
+  assert next_cycle.claim_yuma_transmission()
+  assert next_cycle.claim_acquisition_start()
+
+
+def test_new_receiver_cycle_navigation_read_error_does_not_overwrite(
+  tmp_path: Path,
+) -> None:
+  stores: list[tuple[object, Path]] = []
+
+  def fail_load(_path: Path) -> object:
+    raise OSError("read unavailable")
+
+  def record_store(state: object, path: Path) -> None:
+    stores.append((state, path))
+
+  with pytest.raises(
+    NavigationDatabaseRestoreInitializationError,
+    match="state_load_failed:OSError:read unavailable",
+  ):
+    NavigationDatabaseRestoreRuntime(
+      "receiver",
+      snapshot_loader=lambda _fingerprint: snapshot(),
+      retry_delay_seconds=0.0,
+      state_path=tmp_path / "dbd_state.json",
+      boot_id_reader=lambda: BOOT_ID,
+      boottime_reader=lambda: TEST_BOOTTIME_SECONDS,
+      state_loader=fail_load,  # type: ignore[arg-type, ty:invalid-argument-type]
+      state_storer=record_store,
+      new_receiver_cycle=True,
+    )
+
+  assert stores == []
+
+
+def test_new_receiver_cycle_reopens_position_retry_state(
+  tmp_path: Path,
+) -> None:
+  state_path = tmp_path / "position_retry_state.json"
+  execution = NavigationDatabaseRestoreExecution(
+    disposition=NavigationDatabaseRestoreDisposition.SKIPPED_NO_USABLE_CACHE,
+    total_frame_count=0,
+    accepted_frame_count=0,
+    database_write_attempt_count=0,
+    position_assistance_attempted=True,
+    position_assistance_write_status=PositionAssistanceWriteStatus.SUCCEEDED,
+    position_assistance_ack_status=PositionAssistanceAckStatus.REJECTED,
+    position_assistance_ack_info_code=5,
+  )
+  first = pigeond.PositionAssistanceRetryRuntime(
+    "receiver",
+    state_path=state_path,
+    boot_id_reader=lambda: BOOT_ID,
+    boottime_reader=lambda: TEST_BOOTTIME_SECONDS,
+  )
+  assert first.arm_from_initial(execution, b"position-message")
+  first.cancel(
+    pigeond.PositionAssistanceRetryResult.CANCELLED_RECEIVER_CYCLE_CHANGED,
+    TEST_BOOTTIME_SECONDS,
+  )
+  assert first.state.retry_completed
+
+  same_cycle = pigeond.PositionAssistanceRetryRuntime(
+    "receiver",
+    state_path=state_path,
+    boot_id_reader=lambda: BOOT_ID,
+    boottime_reader=lambda: TEST_BOOTTIME_SECONDS,
+  )
+  assert same_cycle.state.retry_completed
+
+  next_cycle = pigeond.PositionAssistanceRetryRuntime(
+    "receiver",
+    state_path=state_path,
+    boot_id_reader=lambda: BOOT_ID,
+    boottime_reader=lambda: TEST_BOOTTIME_SECONDS,
+    new_receiver_cycle=True,
+  )
+  assert not next_cycle.state.initial_attempted
+  assert not next_cycle.state.retry_armed
+  assert not next_cycle.state.retry_claimed
+  assert not next_cycle.state.retry_completed
+  assert next_cycle.arm_from_initial(
+    execution,
+    b"position-message",
+  )
+
+
+def test_new_receiver_cycle_retry_read_error_does_not_overwrite(
+  tmp_path: Path,
+) -> None:
+  stores: list[tuple[PositionAssistanceRetryState, Path]] = []
+
+  def fail_load(
+    _path: Path,
+  ) -> PositionAssistanceRetryState | None:
+    raise OSError("read unavailable")
+
+  def record_store(
+    state: PositionAssistanceRetryState,
+    path: Path,
+  ) -> None:
+    stores.append((state, path))
+
+  with pytest.raises(
+    PositionAssistanceRetryStateError,
+    match="OSError:read unavailable",
+  ):
+    pigeond.PositionAssistanceRetryRuntime(
+      "receiver",
+      state_path=tmp_path / "position_retry_state.json",
+      boot_id_reader=lambda: BOOT_ID,
+      boottime_reader=lambda: TEST_BOOTTIME_SECONDS,
+      state_loader=fail_load,
+      state_storer=record_store,
+      new_receiver_cycle=True,
+    )
+
+  assert stores == []
+
+
+def test_receiver_cycle_navigation_factory_requests_fresh_state(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  navigation_calls: list[bool] = []
+
+  class NavigationRuntime:
+    def __init__(
+      self,
+      _receiver_fingerprint: str,
+      *,
+      new_receiver_cycle: bool,
+    ) -> None:
+      navigation_calls.append(new_receiver_cycle)
+
+  monkeypatch.setattr(
+    pigeond,
+    "NavigationDatabaseRestoreRuntime",
+    NavigationRuntime,
+  )
+
+  first = pigeond.create_receiver_cycle_navigation_state("receiver")
+  second = pigeond.create_receiver_cycle_navigation_state("receiver")
+
+  assert navigation_calls == [True, True]
+  assert first is not second
+
+
+def test_prepared_receiver_response_state_is_not_reset_twice(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  resets = 0
+
+  class Pigeon:
+    _stream_parser = object()
+
+    def reset_response_state(self) -> None:
+      nonlocal resets
+      resets += 1
+
+    def send(self, _message: bytes) -> None:
+      pass
+
+  monkeypatch.setattr(
+    pigeond.signal,
+    "signal",
+    lambda *_args, **_kwargs: None,
+  )
+  monkeypatch.setattr(
+    pigeond,
+    "set_power",
+    lambda _enabled: None,
+  )
+  monkeypatch.setattr(
+    pigeond.time,
+    "sleep",
+    lambda _delay: None,
+  )
+  monkeypatch.setattr(
+    pigeond,
+    "init_baudrate",
+    lambda _pigeon: None,
+  )
+
+  pigeon = Pigeon()
+  pigeond.prepare_receiver_cycle_response_state(
+    pigeon,  # type: ignore[arg-type, ty:invalid-argument-type]
+  )
+  pigeond.start_pigeon_transport(
+    pigeon,  # type: ignore[arg-type, ty:invalid-argument-type]
+  )
+
+  assert resets == 1
+  assert not pigeon._receiver_cycle_response_state_prepared
 
 # COMMIT7_DBD_LIVE_BOUNDARY_TESTS
 

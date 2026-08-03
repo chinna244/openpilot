@@ -285,11 +285,14 @@ class PositionAssistanceRetryRuntime:
     boottime_reader: Callable[[], float | None] = read_boottime_seconds,
     state_loader: Callable[[Path], PositionAssistanceRetryState | None] = load_position_assistance_retry_state,
     state_storer: Callable[[PositionAssistanceRetryState, Path], None] = store_position_assistance_retry_state,
+    new_receiver_cycle: bool = False,
   ) -> None:
     if not isinstance(receiver_fingerprint, str):
       raise ValueError("receiver_fingerprint must be a string")
     if not isinstance(state_path, Path):
       raise ValueError("state_path must be a Path")
+    if not isinstance(new_receiver_cycle, bool):
+      raise ValueError("new_receiver_cycle must be a bool")
     self._receiver_fingerprint = receiver_fingerprint
     self._state_path = state_path
     self._state_storer = state_storer
@@ -309,6 +312,14 @@ class PositionAssistanceRetryRuntime:
       persisted = state_loader(state_path)
     except Exception as exc:
       raise PositionAssistanceRetryStateError(f"state load failed: {_bounded_error(exc)}") from exc
+    if new_receiver_cycle:
+      self._state = baseline
+      if not self._persist():
+        raise PositionAssistanceRetryStateError(
+          "receiver cycle baseline persist failed: "
+          + (self._persistence_error or "unknown")
+        )
+      return
     if persisted is None or persisted.boot_id != boot_id or persisted.receiver_fingerprint != receiver_fingerprint:
       self._state = baseline
       self._persist()

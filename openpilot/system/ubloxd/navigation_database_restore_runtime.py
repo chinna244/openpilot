@@ -623,7 +623,7 @@ def _classify_failure(
 
 
 class NavigationDatabaseRestoreRuntime:
-  """Persists one DBD decision and receiver-write claims per Linux boot."""
+  """Persists one DBD decision and receiver-write claims per receiver cycle."""
 
   def __init__(
     self,
@@ -641,6 +641,7 @@ class NavigationDatabaseRestoreRuntime:
     state_loader: Callable[[Path], NavigationDatabaseRestoreBootState | None] = load_navigation_database_restore_boot_state,
     state_quarantiner: Callable[[Path, str], Path] = quarantine_navigation_database_restore_boot_state,
     state_storer: Callable[[NavigationDatabaseRestoreBootState, Path], None] = store_navigation_database_restore_boot_state,
+    new_receiver_cycle: bool = False,
   ) -> None:
     if not isinstance(receiver_fingerprint, str):
       raise ValueError("receiver_fingerprint must be a string")
@@ -664,6 +665,8 @@ class NavigationDatabaseRestoreRuntime:
       raise ValueError("retry_delay_seconds must be finite and non-negative")
     if not isinstance(state_path, Path):
       raise ValueError("state_path must be a Path")
+    if not isinstance(new_receiver_cycle, bool):
+      raise ValueError("new_receiver_cycle must be a bool")
 
     self._receiver_fingerprint = receiver_fingerprint
     self._snapshot_loader = snapshot_loader
@@ -789,18 +792,31 @@ class NavigationDatabaseRestoreRuntime:
       and persisted.receiver_fingerprint == self._receiver_fingerprint
     )
 
+    receiver_fingerprint_mismatch = (
+      persisted is not None
+      and persisted.boot_id == self._boot_id
+      and persisted.receiver_fingerprint != self._receiver_fingerprint
+    )
+
     if quarantine_closed:
       pass
+    elif receiver_fingerprint_mismatch:
+      self._fail_closed("boot_state:receiver_fingerprint_mismatch")
+      if not self._persist_state():
+        detail = self._state_persistence_error or "unknown"
+        raise NavigationDatabaseRestoreInitializationError(
+          f"boot_state:current_boot_baseline_persist_failed:{detail}"
+        )
+    elif new_receiver_cycle:
+      if not self._persist_state():
+        detail = self._state_persistence_error or "unknown"
+        raise NavigationDatabaseRestoreInitializationError(
+          "receiver_cycle:baseline_persist_failed:"
+          + detail
+        )
     elif valid_same_boot_state:
       self._restore_persisted_state(persisted)
     else:
-      if (
-        persisted is not None
-        and persisted.boot_id == self._boot_id
-        and persisted.receiver_fingerprint != self._receiver_fingerprint
-      ):
-        self._fail_closed("boot_state:receiver_fingerprint_mismatch")
-
       if not self._persist_state():
         detail = self._state_persistence_error or "unknown"
         raise NavigationDatabaseRestoreInitializationError(

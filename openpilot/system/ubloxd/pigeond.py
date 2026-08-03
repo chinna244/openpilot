@@ -347,6 +347,7 @@ class TTYPigeon:
     self._raw_publisher = raw_publisher
     self._frame_dispatcher = frame_dispatcher
     self._receiver_cycle = 0
+    self._receiver_cycle_response_state_prepared = False
     self.time_provenance: ReceiverTimeProvenanceTracker | None = None
 
   def send(self, dat: bytes) -> None:
@@ -1624,9 +1625,27 @@ def install_pre_acquisition_initialization(
     _ACTIVE_PRE_ACQUISITION_INITIALIZATION = None
 
 
+def prepare_receiver_cycle_response_state(
+  pigeon: TTYPigeon,
+) -> None:
+  if hasattr(pigeon, "_stream_parser"):
+    pigeon.reset_response_state()
+  pigeon._receiver_cycle_response_state_prepared = True
+
+
 def start_pigeon_transport(pigeon: TTYPigeon) -> None:
   signal.signal(signal.SIGINT, lambda sig, frame: deinitialize_and_exit(pigeon))
-  if hasattr(pigeon, "_stream_parser"):
+  response_state_prepared = (
+    getattr(
+      pigeon,
+      "_receiver_cycle_response_state_prepared",
+      False,
+    )
+    is True
+  )
+  if response_state_prepared:
+    pigeon._receiver_cycle_response_state_prepared = False
+  elif hasattr(pigeon, "_stream_parser"):
     pigeon.reset_response_state()
   set_power(False)
   time.sleep(0.1)
@@ -6465,6 +6484,25 @@ def handle_receiver_acquisition_state(
   position_assistance_retry.runtime = None
 
 
+def create_receiver_cycle_navigation_state(
+  receiver_fingerprint: str,
+) -> NavigationDatabaseRestoreRuntime:
+  try:
+    return NavigationDatabaseRestoreRuntime(
+      receiver_fingerprint,
+      new_receiver_cycle=True,
+    )
+  except NavigationDatabaseRestoreInitializationError as exc:
+    cloudlog.exception(
+      "GPS assistance state unavailable; assistance disabled while "
+      + "GNSS START continues"
+    )
+    return NavigationDatabaseRestoreUnavailableRuntime(
+      receiver_fingerprint,
+      str(exc),
+    )
+
+
 def run_receiving(duration: int = 0):
   diagnostic_process_start_time = time.monotonic()
   startup_diagnostics = GpsStartupDiagnostics(
@@ -6477,6 +6515,40 @@ def run_receiving(duration: int = 0):
   receiver_fingerprint = (
     gps_assistance_receiver_fingerprint(params)
   )
+
+  def create_receiver_cycle_assistance_state() -> tuple[
+    NavigationDatabaseRestoreRuntime,
+    PositionAssistancePostStartRetryController,
+    ReceiverAcquisitionStateGuard,
+  ]:
+    navigation_database_runtime = (
+      create_receiver_cycle_navigation_state(
+        receiver_fingerprint
+      )
+    )
+    if navigation_database_runtime.state_available:
+      try:
+        position_assistance_retry_runtime = (
+          PositionAssistanceRetryRuntime(
+            receiver_fingerprint,
+            new_receiver_cycle=True,
+          )
+        )
+      except Exception:
+        cloudlog.exception(
+          "GPS position assistance retry state unavailable"
+        )
+        position_assistance_retry_runtime = None
+    else:
+      position_assistance_retry_runtime = None
+
+    return (
+      navigation_database_runtime,
+      PositionAssistancePostStartRetryController(
+        position_assistance_retry_runtime
+      ),
+      ReceiverAcquisitionStateGuard(),
+    )
 
   fix_tracker = ReliableFixTracker()
   capture_quality_tracker = CaptureQualityTracker()
@@ -6491,39 +6563,11 @@ def run_receiving(duration: int = 0):
   receiver_time_provenance = (
     ReceiverTimeProvenanceTracker()
   )
-  try:
-    navigation_database_runtime = NavigationDatabaseRestoreRuntime(
-      receiver_fingerprint
-    )
-  except NavigationDatabaseRestoreInitializationError as exc:
-    cloudlog.exception(
-      "GPS assistance state unavailable; assistance disabled while "
-      + "GNSS START continues"
-    )
-    navigation_database_runtime = (
-      NavigationDatabaseRestoreUnavailableRuntime(
-        receiver_fingerprint,
-        str(exc),
-      )
-    )
-  if navigation_database_runtime.state_available:
-    try:
-      position_assistance_retry_runtime = (
-        PositionAssistanceRetryRuntime(receiver_fingerprint)
-      )
-    except Exception:
-      cloudlog.exception(
-        "GPS position assistance retry state unavailable"
-      )
-      position_assistance_retry_runtime = None
-  else:
-    position_assistance_retry_runtime = None
-  position_assistance_retry = (
-    PositionAssistancePostStartRetryController(
-      position_assistance_retry_runtime
-    )
-  )
-  acquisition_state_guard = ReceiverAcquisitionStateGuard()
+  (
+    navigation_database_runtime,
+    position_assistance_retry,
+    acquisition_state_guard,
+  ) = create_receiver_cycle_assistance_state()
   pigeon: TTYPigeon
 
   def dispatch_frames(frames: list[bytes]) -> None:
@@ -6919,6 +6963,12 @@ def run_receiving(duration: int = 0):
       cloudlog.error("No data from ublox for 10 seconds; power-cycling and reinitializing receiver")
 
       position_assistance_retry.cancel_receiver_cycle(now)
+      prepare_receiver_cycle_response_state(pigeon)
+      (
+        navigation_database_runtime,
+        position_assistance_retry,
+        acquisition_state_guard,
+      ) = create_receiver_cycle_assistance_state()
       cycle_initialization = initialize_receiver_cycle(
         pigeon,
         receiver_fingerprint,
@@ -6996,6 +7046,12 @@ def run_receiving(duration: int = 0):
         )
 
         position_assistance_retry.cancel_receiver_cycle(now)
+        prepare_receiver_cycle_response_state(pigeon)
+        (
+          navigation_database_runtime,
+          position_assistance_retry,
+          acquisition_state_guard,
+        ) = create_receiver_cycle_assistance_state()
         cycle_initialization = initialize_receiver_cycle(
           pigeon,
           receiver_fingerprint,
