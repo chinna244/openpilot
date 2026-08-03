@@ -289,12 +289,26 @@ def run_receiving_with_fakes(
       return False
 
   class FakeWatchdog:
+    max_recoveries = 1
+    recovery_cooldown_seconds = 30.0
+    healthy_rearm_seconds = 60.0
+
+    def __init__(self):
+      self.recoveries = 0
+
     def check(self, now):
       events.append(("watchdog_check",))
+      if watchdog_recovery:
+        self.recoveries += 1
       return watchdog_recovery
 
-    def note_data(self, now):
+    def request_recovery(self, reason, now):
+      self.recoveries += 1
+      return True
+
+    def note_data(self, now, *, healthy=True):
       events.append(("watchdog_note_data",))
+      return False
 
     def recovery_completed(self, now):
       events.append(("watchdog_recovery_complete",))
@@ -1151,7 +1165,7 @@ def test_run_receiving_restores_cache_only_after_acceptable_time(
   ("data", "reason", "watchdog_completion"),
   [
     (b"", "no_data_watchdog", True),
-    (b"\x00", "all_zero_data", False),
+    (b"\x00", "all_zero_data", True),
   ],
 )
 def test_run_receiving_wires_recovery_cycle_and_reset_order(

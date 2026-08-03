@@ -3764,40 +3764,106 @@ def is_all_zero_ublox_data(data: bytes) -> bool:
   return bool(data) and not any(data)
 
 
+class ReceiverRecoveryReason(StrEnum):
+  NO_DATA = "no_data_watchdog"
+  ALL_ZERO_DATA = "all_zero_data"
+  STALLED_ACQUISITION = "stalled_acquisition"
+
+
 class UbloxDataWatchdog:
+  """Shared physical receiver recovery budget for transport failures."""
+
   def __init__(
     self,
     timeout: float = 10.0,
     max_recoveries: int = 1,
+    recovery_cooldown_seconds: float = 30.0,
+    healthy_rearm_seconds: float = 60.0,
     start_time: float | None = None,
   ):
     self.timeout = timeout
     self.max_recoveries = max_recoveries
+    self.recovery_cooldown_seconds = recovery_cooldown_seconds
+    self.healthy_rearm_seconds = healthy_rearm_seconds
     self.last_data_time = (
       time.monotonic()
       if start_time is None
       else start_time
     )
     self.recoveries = 0
+    self.last_recovery_completed_time: float | None = None
+    self.last_recovery_reason: ReceiverRecoveryReason | None = None
+    self.healthy_data_since: float | None = None
 
-  def note_data(self, now: float) -> None:
+  def note_data(
+    self,
+    now: float,
+    *,
+    healthy: bool = True,
+  ) -> bool:
     self.last_data_time = now
+    if not healthy:
+      self.healthy_data_since = None
+      return False
+    if self.recoveries == 0:
+      return False
+    if self.healthy_data_since is None:
+      self.healthy_data_since = now
+      return False
+    if (
+      now - self.healthy_data_since
+      < self.healthy_rearm_seconds
+    ):
+      return False
+
     self.recoveries = 0
+    self.last_recovery_completed_time = None
+    self.last_recovery_reason = None
+    self.healthy_data_since = None
+    return True
+
+  def request_recovery(
+    self,
+    reason: ReceiverRecoveryReason,
+    now: float,
+  ) -> bool:
+    if not isinstance(reason, ReceiverRecoveryReason):
+      raise ValueError("reason must be a ReceiverRecoveryReason")
+    if (
+      self.last_recovery_completed_time is not None
+      and (
+        now - self.last_recovery_completed_time
+        < self.recovery_cooldown_seconds
+      )
+    ):
+      return False
+    if self.recoveries >= self.max_recoveries:
+      raise RuntimeError(", ".join((
+        "GPS receiver recovery budget exhausted",
+        f"reason={reason.value}",
+        f"attempts={self.recoveries}",
+        f"max_attempts={self.max_recoveries}",
+      )))
+
+    self.recoveries += 1
+    self.last_recovery_reason = reason
+    self.healthy_data_since = None
+    return True
 
   def check(self, now: float) -> bool:
     if now - self.last_data_time < self.timeout:
       return False
 
-    if self.recoveries >= self.max_recoveries:
-      raise RuntimeError(
-        "No data from ublox after watchdog recovery"
-      )
-
-    self.recoveries += 1
-    return True
+    self.healthy_data_since = None
+    return self.request_recovery(
+      ReceiverRecoveryReason.NO_DATA,
+      now,
+    )
 
   def recovery_completed(self, now: float) -> None:
     self.last_data_time = now
+    self.last_recovery_completed_time = now
+    self.healthy_data_since = None
 
 
 class GpsStartupDiagnostics:
@@ -6686,6 +6752,125 @@ def run_receiving(duration: int = 0):
     cycle_initialization.assistnow_autonomous_supported
   )
   data_watchdog = UbloxDataWatchdog()
+
+  def recover_receiver(
+    reason: ReceiverRecoveryReason,
+    requested_at: float,
+  ) -> None:
+    nonlocal navigation_database_runtime
+    nonlocal position_assistance_retry
+    nonlocal acquisition_state_guard
+    nonlocal trusted_time_assistance_sent
+    nonlocal next_time_assistance_attempt
+    nonlocal mon_ver_info
+    nonlocal assistnow_autonomous_configuration_attempted
+    nonlocal assistnow_autonomous_supported
+    nonlocal latest_independent_time
+    nonlocal host_time_state
+    nonlocal latest_authority_evaluation
+
+    reason_value = reason.value
+    attempt = data_watchdog.recoveries
+    cloudlog.warning(", ".join((
+      "GPS receiver recovery started",
+      f"reason={reason_value}",
+      f"attempt={attempt}",
+      f"max_attempts={data_watchdog.max_recoveries}",
+      (
+        "cooldown_seconds="
+        + f"{data_watchdog.recovery_cooldown_seconds:.1f}"
+      ),
+      (
+        "healthy_rearm_seconds="
+        + f"{data_watchdog.healthy_rearm_seconds:.1f}"
+      ),
+    )))
+
+    position_assistance_retry.cancel_receiver_cycle(
+      requested_at
+    )
+    prepare_receiver_cycle_response_state(pigeon)
+    (
+      navigation_database_runtime,
+      position_assistance_retry,
+      acquisition_state_guard,
+    ) = create_receiver_cycle_assistance_state()
+    cycle_initialization = initialize_receiver_cycle(
+      pigeon,
+      receiver_fingerprint,
+      startup_diagnostics,
+      reason_value,
+      time_authority=time_authority,
+      time_provenance=receiver_time_provenance,
+      navigation_database_runtime=navigation_database_runtime,
+      position_assistance_retry=position_assistance_retry,
+    )
+    execute_position_assistance_retry()
+    initialization_completed_at = (
+      cycle_initialization.completed_at
+    )
+
+    stream_parser.reset()
+    fix_tracker.reset()
+    capture_quality_tracker.reset()
+    dump_collector.cancel()
+    capture_state.reset_receiver_cycle()
+
+    trusted_time_assistance_sent = (
+      cycle_initialization.trusted_time_assistance_sent
+    )
+    next_time_assistance_attempt = (
+      cycle_initialization.next_time_assistance_attempt
+    )
+    mon_ver_info = cycle_initialization.mon_ver_info
+    assistnow_autonomous_configuration_attempted = (
+      cycle_initialization.assistnow_autonomous_configuration_attempted
+    )
+    assistnow_autonomous_supported = (
+      cycle_initialization.assistnow_autonomous_supported
+    )
+    autonomous_orbit_diagnostics.logged_state_mask = 0
+    data_watchdog.recovery_completed(time.monotonic())
+    startup_diagnostics.initialization_complete(
+      initialization_completed_at
+    )
+    yuma_feature.reset_receiver_cycle(
+      cycle_initialization,
+      getattr(pigeon, "receiver_cycle", 0),
+    )
+    cycle_independent_time = independent_time_observation(
+      getattr(cycle_initialization, "authorized_time", None)
+    )
+    if cycle_independent_time is not None:
+      latest_independent_time = cycle_independent_time
+    host_time_state = host_time_processing_state(
+      getattr(
+        cycle_initialization,
+        "host_time_observation",
+        None,
+      ),
+      getattr(
+        cycle_initialization,
+        "authority_evaluation",
+        None,
+      ),
+      now=time.monotonic(),
+    )
+    latest_authority_evaluation = getattr(
+      cycle_initialization,
+      "authority_evaluation",
+      None,
+    )
+    cloudlog.info(", ".join((
+      "GPS receiver recovery completed",
+      f"reason={reason_value}",
+      f"attempt={attempt}",
+      (
+        "receiver_cycle="
+        + str(getattr(pigeon, "receiver_cycle", 0))
+      ),
+    )))
+
   cloudlog.info(", ".join((
     "GPS navigation assistance quality policy",
     f"reliable_fix_seconds={MINIMUM_RELIABLE_FIX_SECONDS:.0f}",
@@ -6960,162 +7145,38 @@ def run_receiving(duration: int = 0):
         time.sleep(0.001)
         continue
 
-      cloudlog.error("No data from ublox for 10 seconds; power-cycling and reinitializing receiver")
-
-      position_assistance_retry.cancel_receiver_cycle(now)
-      prepare_receiver_cycle_response_state(pigeon)
-      (
-        navigation_database_runtime,
-        position_assistance_retry,
-        acquisition_state_guard,
-      ) = create_receiver_cycle_assistance_state()
-      cycle_initialization = initialize_receiver_cycle(
-        pigeon,
-        receiver_fingerprint,
-        startup_diagnostics,
-        "no_data_watchdog",
-        time_authority=time_authority,
-        time_provenance=receiver_time_provenance,
-        navigation_database_runtime=navigation_database_runtime,
-        position_assistance_retry=position_assistance_retry,
-      )
-      execute_position_assistance_retry()
-      initialization_completed_at = (
-        cycle_initialization.completed_at
-      )
-
-      stream_parser.reset()
-      fix_tracker.reset()
-      capture_quality_tracker.reset()
-      dump_collector.cancel()
-      capture_state.reset_receiver_cycle()
-
-      trusted_time_assistance_sent = (
-        cycle_initialization.trusted_time_assistance_sent
-      )
-      next_time_assistance_attempt = (
-        cycle_initialization.next_time_assistance_attempt
-      )
-      mon_ver_info = cycle_initialization.mon_ver_info
-      assistnow_autonomous_configuration_attempted = (
-        cycle_initialization.assistnow_autonomous_configuration_attempted
-      )
-      assistnow_autonomous_supported = (
-        cycle_initialization.assistnow_autonomous_supported
-      )
-      autonomous_orbit_diagnostics.logged_state_mask = 0
-      data_watchdog.recovery_completed(time.monotonic())
-      startup_diagnostics.initialization_complete(
-        initialization_completed_at
-      )
-      yuma_feature.reset_receiver_cycle(
-        cycle_initialization,
-        getattr(pigeon, "receiver_cycle", 0),
-      )
-      cycle_independent_time = independent_time_observation(
-        getattr(cycle_initialization, "authorized_time", None)
-      )
-      if cycle_independent_time is not None:
-        latest_independent_time = cycle_independent_time
-      host_time_state = host_time_processing_state(
-        getattr(
-          cycle_initialization,
-          "host_time_observation",
-          None,
-        ),
-        getattr(
-          cycle_initialization,
-          "authority_evaluation",
-          None,
-        ),
-        now=time.monotonic(),
-      )
-      latest_authority_evaluation = getattr(
-        cycle_initialization,
-        "authority_evaluation",
-        None,
+      recover_receiver(
+        ReceiverRecoveryReason.NO_DATA,
+        now,
       )
       continue
 
-    data_watchdog.note_data(now)
+    all_zero_data = is_all_zero_ublox_data(data)
+    if data_watchdog.note_data(
+      now,
+      healthy=not all_zero_data,
+    ):
+      cloudlog.info(", ".join((
+        "GPS receiver recovery budget rearmed",
+        (
+          "healthy_rearm_seconds="
+          + f"{data_watchdog.healthy_rearm_seconds:.1f}"
+        ),
+        f"max_attempts={data_watchdog.max_recoveries}",
+      )))
 
     if data:
-      if is_all_zero_ublox_data(data):
-        cloudlog.warning(
-          "received all-zero data from ublox, re-initing!"
-        )
+      if all_zero_data:
+        if not data_watchdog.request_recovery(
+          ReceiverRecoveryReason.ALL_ZERO_DATA,
+          now,
+        ):
+          time.sleep(0.001)
+          continue
 
-        position_assistance_retry.cancel_receiver_cycle(now)
-        prepare_receiver_cycle_response_state(pigeon)
-        (
-          navigation_database_runtime,
-          position_assistance_retry,
-          acquisition_state_guard,
-        ) = create_receiver_cycle_assistance_state()
-        cycle_initialization = initialize_receiver_cycle(
-          pigeon,
-          receiver_fingerprint,
-          startup_diagnostics,
-          "all_zero_data",
-          time_authority=time_authority,
-          time_provenance=receiver_time_provenance,
-          navigation_database_runtime=navigation_database_runtime,
-          position_assistance_retry=position_assistance_retry,
-        )
-        execute_position_assistance_retry()
-        initialization_completed_at = (
-          cycle_initialization.completed_at
-        )
-
-        stream_parser.reset()
-        fix_tracker.reset()
-        capture_quality_tracker.reset()
-        dump_collector.cancel()
-        capture_state.reset_receiver_cycle()
-
-        trusted_time_assistance_sent = (
-          cycle_initialization.trusted_time_assistance_sent
-        )
-        next_time_assistance_attempt = (
-          cycle_initialization.next_time_assistance_attempt
-        )
-        mon_ver_info = cycle_initialization.mon_ver_info
-        assistnow_autonomous_configuration_attempted = (
-          cycle_initialization.assistnow_autonomous_configuration_attempted
-        )
-        assistnow_autonomous_supported = (
-          cycle_initialization.assistnow_autonomous_supported
-        )
-        autonomous_orbit_diagnostics.logged_state_mask = 0
-        startup_diagnostics.initialization_complete(
-          initialization_completed_at
-        )
-        yuma_feature.reset_receiver_cycle(
-          cycle_initialization,
-          getattr(pigeon, "receiver_cycle", 0),
-        )
-        cycle_independent_time = independent_time_observation(
-          getattr(cycle_initialization, "authorized_time", None)
-        )
-        if cycle_independent_time is not None:
-          latest_independent_time = cycle_independent_time
-        host_time_state = host_time_processing_state(
-          getattr(
-            cycle_initialization,
-            "host_time_observation",
-            None,
-          ),
-          getattr(
-            cycle_initialization,
-            "authority_evaluation",
-            None,
-          ),
-          now=time.monotonic(),
-        )
-        latest_authority_evaluation = getattr(
-          cycle_initialization,
-          "authority_evaluation",
-          None,
+        recover_receiver(
+          ReceiverRecoveryReason.ALL_ZERO_DATA,
+          now,
         )
         continue
 
