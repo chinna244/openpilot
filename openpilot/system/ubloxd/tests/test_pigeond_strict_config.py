@@ -753,6 +753,11 @@ def test_init_resets_response_state_before_receiver_power_cycle(monkeypatch):
   monkeypatch.setattr(pigeond.signal, "signal", lambda *_args: None)
   monkeypatch.setattr(pigeond, "set_power", lambda enabled: events.append(f"power={enabled}"))
   monkeypatch.setattr(pigeond, "init_baudrate", lambda _pigeon: events.append("baud"))
+  monkeypatch.setattr(
+    pigeond,
+    "poll_mon_ver",
+    lambda _pigeon, _timeout: SimpleNamespace(),
+  )
   monkeypatch.setattr(pigeond, "init_pigeon", lambda _pigeon: True)
   monkeypatch.setattr(pigeond.time, "sleep", lambda _duration: None)
 
@@ -1215,3 +1220,256 @@ def test_upd_sos_invalid_responses_are_ignored_until_valid_restore_status():
 
   assert pigeon.poll_backup_restore_status() == 2
   assert b"".join(pigeon.published) == b"".join(invalid) + valid
+
+
+class TransportPigeon:
+  _receiver_cycle_response_state_prepared = False
+  _stream_parser = SimpleNamespace()
+
+  def __init__(self, events):
+    self.events = events
+
+  def reset_response_state(self):
+    self.events.append("reset")
+
+  def send(self, message):
+    self.events.append(("send", message))
+
+
+def configure_transport_test(monkeypatch, events, *, init_baudrate=None, poll_mon_ver=None):
+  monkeypatch.setattr(pigeond.signal, "signal", lambda *_args: None)
+  monkeypatch.setattr(
+    pigeond,
+    "set_power",
+    lambda enabled: events.append(("power", enabled)),
+  )
+  monkeypatch.setattr(pigeond.time, "sleep", lambda _duration: None)
+  monkeypatch.setattr(
+    pigeond,
+    "init_baudrate",
+    init_baudrate or (lambda _pigeon: events.append("baud_transition")),
+  )
+  monkeypatch.setattr(
+    pigeond,
+    "poll_mon_ver",
+    poll_mon_ver or (lambda _pigeon, _timeout: SimpleNamespace()),
+  )
+
+
+def test_process_start_transport_can_use_three_attempts(monkeypatch):
+  events = []
+  probe_results = iter((None, None, SimpleNamespace()))
+  configure_transport_test(
+    monkeypatch,
+    events,
+    poll_mon_ver=lambda _pigeon, _timeout: next(probe_results),
+  )
+
+  info = pigeond.bootstrap_process_start_transport(TransportPigeon(events))
+
+  assert info is not None
+  assert events.count("baud_transition") == 3
+  assert events.count(("power", False)) == 3
+  assert events.count(("power", True)) == 3
+
+
+def test_pr67_runtime_recovery_allows_one_transport_attempt(monkeypatch):
+  events = []
+  configure_transport_test(
+    monkeypatch,
+    events,
+    poll_mon_ver=lambda _pigeon, _timeout: None,
+  )
+
+  with pytest.raises(
+    pigeond.ReceiverConfigurationError,
+    match="after 1 physical receiver attempt",
+  ):
+    pigeond.start_pigeon_transport(TransportPigeon(events))
+
+  assert events.count(("power", False)) == 1
+  assert events.count(("power", True)) == 1
+
+
+@pytest.mark.parametrize(
+  "error_type",
+  (OSError, pigeond.ResponseTransactionError),
+)
+def test_transport_error_retries_at_process_start(monkeypatch, error_type):
+  events = []
+  attempts = 0
+
+  def init_baudrate(_pigeon):
+    nonlocal attempts
+    attempts += 1
+    if attempts == 1:
+      raise error_type("transport unavailable")
+
+  configure_transport_test(
+    monkeypatch,
+    events,
+    init_baudrate=init_baudrate,
+  )
+  pigeond.bootstrap_process_start_transport(TransportPigeon(events))
+
+  assert attempts == 2
+  assert events.count(("power", False)) == 2
+  assert events.count(("power", True)) == 2
+
+
+def test_raw_publication_error_is_not_retried(monkeypatch):
+  events = []
+
+  def publication_error(_pigeon):
+    raise pigeond.RawPublicationError("publication unavailable")
+
+  configure_transport_test(
+    monkeypatch,
+    events,
+    init_baudrate=publication_error,
+  )
+  with pytest.raises(
+    pigeond.RawPublicationError,
+    match="publication unavailable",
+  ):
+    pigeond.bootstrap_process_start_transport(TransportPigeon(events))
+
+  assert events.count(("power", False)) == 1
+  assert events.count(("power", True)) == 1
+
+
+def test_programming_exception_is_not_swallowed(monkeypatch):
+  events = []
+
+  def programming_error(_pigeon):
+    raise ValueError("programming error")
+
+  configure_transport_test(
+    monkeypatch,
+    events,
+    init_baudrate=programming_error,
+  )
+  with pytest.raises(ValueError, match="programming error"):
+    pigeond.bootstrap_process_start_transport(TransportPigeon(events))
+
+  assert events.count(("power", False)) == 1
+  assert events.count(("power", True)) == 1
+
+
+def test_process_start_retry_discards_failed_cycle_frames(monkeypatch):
+  events = []
+  dispatched: list[tuple[object, object, object, list[bytes]]] = []
+  attempts = 0
+
+  class BootstrapPigeon(TransportPigeon):
+    def __init__(self, transport_events):
+      super().__init__(transport_events)
+      self._pending_frames: list[bytes] = []
+      self._frame_dispatcher = None
+
+    def reset_response_state(self):
+      events.append("reset")
+      self._pending_frames.clear()
+
+    def set_frame_dispatcher(self, dispatcher):
+      self._frame_dispatcher = dispatcher
+
+    def queue_pending_frames(self, frames, _operation):
+      self._pending_frames.extend(frames)
+
+    def dispatch_pending_frames(self):
+      if self._pending_frames and self._frame_dispatcher is not None:
+        frames = list(self._pending_frames)
+        self._frame_dispatcher(frames)
+        self._pending_frames.clear()
+
+  pigeon = BootstrapPigeon(events)
+
+  def poll_mon_ver(_pigeon, _timeout):
+    nonlocal attempts
+    attempts += 1
+    pigeond._queue_unrelated_frames(
+      pigeon,
+      [f"attempt-{attempts}".encode()],
+      lambda _frame: False,
+    )
+    if attempts == 1:
+      return None
+    return SimpleNamespace()
+
+  configure_transport_test(
+    monkeypatch,
+    events,
+    poll_mon_ver=poll_mon_ver,
+  )
+  info = pigeond.bootstrap_process_start_transport(pigeon)
+
+  fresh_navigation_runtime = object()
+  fresh_position_retry_runtime = object()
+  fresh_acquisition_guard = object()
+  pigeon.set_frame_dispatcher(
+    lambda frames: dispatched.append(
+      (
+        fresh_navigation_runtime,
+        fresh_position_retry_runtime,
+        fresh_acquisition_guard,
+        frames,
+      )
+    )
+  )
+  pigeon.dispatch_pending_frames()
+
+  assert info is not None
+  assert dispatched == [
+    (
+      fresh_navigation_runtime,
+      fresh_position_retry_runtime,
+      fresh_acquisition_guard,
+      [b"attempt-2"],
+    )
+  ]
+
+
+def test_verified_mon_ver_is_reused_without_second_poll(monkeypatch):
+  info = SimpleNamespace()
+  logged = []
+  monkeypatch.setattr(
+    pigeond,
+    "poll_mon_ver",
+    lambda *_args: pytest.fail("unexpected second MON-VER poll"),
+  )
+  monkeypatch.setattr(pigeond, "log_mon_ver_info", logged.append)
+
+  assert (
+    pigeond.resolve_pre_acquisition_mon_ver(
+      object(),
+      info,
+      True,
+    )
+    is info
+  )
+  assert logged == [info]
+
+
+def test_process_start_transport_bootstrap_support_detection():
+  class CompleteTransport:
+    def send(self, _message):
+      pass
+
+    def reset_response_state(self):
+      pass
+
+    def set_frame_dispatcher(self, _dispatcher):
+      pass
+
+    def dispatch_pending_frames(self):
+      pass
+
+    def receive_transaction_data(self, _transaction):
+      return b"", [], []
+
+  class IncompleteTransport:
+    pass
+
+  assert pigeond.supports_process_start_transport_bootstrap(CompleteTransport())
+  assert not pigeond.supports_process_start_transport_bootstrap(IncompleteTransport())
