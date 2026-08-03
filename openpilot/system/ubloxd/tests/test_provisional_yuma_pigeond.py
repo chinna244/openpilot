@@ -239,7 +239,7 @@ def test_unexpected_write_exception_consumes_cycle_and_blocks_regular_yuma(monke
 
   assert feature.set_provisional_reference(ref)
   outcome = feature.evaluate_provisional(
-    lambda _message: True, now=2.1, reliable_fix_available=False
+    lambda _message: None, now=2.1, reliable_fix_available=False
   )
 
   assert outcome is failed_after_write
@@ -289,7 +289,7 @@ def test_disagreement_persists_across_pigeond_restart_for_same_boot(
   )
   assert first.set_provisional_reference(ref)
   assert first.evaluate_provisional(
-    lambda _message: True, now=2.1, reliable_fix_available=False
+    lambda _message: None, now=2.1, reliable_fix_available=False
   ) is not None
 
   validation = CrossBootRtcValidation(

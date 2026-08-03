@@ -56,7 +56,7 @@ def test_acquisition_latch_is_updated_before_receiver_processing() -> None:
   segment = ast.get_source_segment(source, node)
   assert segment is not None
   assert segment.index("receiver_frames_show_gnss_acquisition(frames)") < segment.index("process_receiver_frames(")
-  assert "navigation_database_runtime.note_acquisition_started()" in segment
+  assert "handle_receiver_acquisition_state(" in segment
 
 
 def test_database_decision_runs_before_yuma_transmission() -> None:
@@ -85,6 +85,8 @@ def test_database_decision_runs_before_yuma_transmission() -> None:
   assert helper_segment.index(
     "navigation_database_runtime.claim_yuma_transmission()"
   ) < helper_segment.index("send_message(message)")
+  assert "raise YumaAssistanceStateUnavailableError(" in helper_segment
+  assert "return False" not in helper_segment
 
 
 def test_skipped_database_never_populates_restored_quality_fields() -> None:
@@ -286,3 +288,32 @@ def test_dbd_runtime_initialization_precedes_receiver_construction_and_io() -> N
   )
   receiver_start = initialize_segment.index("init(pigeon)")
   assert fallback_runtime < receiver_start
+
+
+def test_yuma_assistance_state_unavailable_is_terminal_without_retry() -> None:
+  source, tree = source_tree(PIGEOND)
+  helper = named_node(
+    tree,
+    "yuma_assistance_state_unavailable_outcome",
+  )
+  helper_segment = ast.get_source_segment(source, helper)
+  assert helper_segment is not None
+  assert 'getattr(result, "assistance_state_unavailable", False)' in helper_segment
+  assert "is True" in helper_segment
+  assert "YumaAlmanacTransmitStatus" not in helper_segment
+  assert "attempted_satellite_ids" not in helper_segment
+  assert "accepted_satellite_ids" not in helper_segment
+  assert "unavailable_satellite_ids" not in helper_segment
+
+  feature = named_node(tree, "YumaSupplementationFeature")
+  feature_segment = ast.get_source_segment(source, feature)
+  assert feature_segment is not None
+  assert feature_segment.count(
+    "yuma_assistance_state_unavailable_outcome("
+  ) >= 2
+  assert "self._cycle_injection_consumed = True" in feature_segment
+  assert "self._runtime = None" in feature_segment
+  assert "terminal=True" in feature_segment
+  assert "retry_pending=False" in feature_segment
+  assert "if outcome.receiver_write_attempted:" in feature_segment
+  assert "self._provisional_reference_used = reference" in feature_segment

@@ -26,6 +26,7 @@ from openpilot.system.ubloxd.yuma_almanac import (
 from openpilot.system.ubloxd.yuma_almanac_store import YUMA_ALMANAC_CACHE_PATH, StoredYumaAlmanac, load_yuma_almanac
 from openpilot.system.ubloxd.yuma_almanac_transmit import (
   YumaAlmanacTransmitResult,
+  YumaAssistanceStateUnavailableError,
   transmit_public_yuma_almanac,
 )
 
@@ -477,8 +478,14 @@ def transmit_provisional_yuma_reference(
 
   def tracked_send_message(message: bytes) -> None:
     nonlocal receiver_write_attempted
+    try:
+      send_message(message)
+    except YumaAssistanceStateUnavailableError:
+      raise
+    except Exception:
+      receiver_write_attempted = True
+      raise
     receiver_write_attempted = True
-    send_message(message)
 
   try:
     stored = cache_loader(path)

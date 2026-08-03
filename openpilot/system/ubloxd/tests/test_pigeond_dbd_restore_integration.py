@@ -3,15 +3,18 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
+from typing import cast
 
 import pytest
 
 from openpilot.system.ubloxd import pigeond
+import openpilot.system.ubloxd.navigation_database_restore_runtime as restore_runtime
 from openpilot.system.ubloxd.navigation_database_restore import (
   NavigationDatabaseRestoreDisposition,
 )
 from openpilot.system.ubloxd.navigation_database_restore_runtime import (
   NavigationDatabaseRestoreExecution,
+  NavigationDatabaseRestoreInitializationError,
   NavigationDatabaseRestoreRuntime,
   NavigationDatabaseRestoreSnapshot,
   PositionAssistanceAckStatus,
@@ -617,10 +620,10 @@ def test_yuma_claim_happens_before_receiver_write() -> None:
 def test_failed_yuma_claim_performs_zero_receiver_writes() -> None:
   writes: list[bytes] = []
   runtime = SimpleNamespace(claim_yuma_transmission=lambda: False)
-  with pytest.raises(RuntimeError, match="YUMA claim persistence failed"):
+  with pytest.raises(pigeond.YumaAssistanceStateUnavailableError):
     pigeond.send_yuma_with_durable_claim(
       runtime,  # type: ignore[arg-type, ty:invalid-argument-type]
-      lambda message: writes.append(message),
+      writes.append,
       b"yuma",
     )
   assert writes == []
@@ -1193,3 +1196,297 @@ def test_frame_zero_transaction_drain_guard_blocks_receiver_write(tmp_path: Path
   assert result.disposition is NavigationDatabaseRestoreDisposition.WRITE_FAILED
   assert receiver_writes == []
   assert result.permanent_failures
+
+def test_assistance_state_initialization_failure_still_starts_gnss(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  events: list[str] = []
+  pigeon = FakePigeon(events)
+  assistance_writes: list[bytes] = []
+  retry_controller = (
+    pigeond.PositionAssistancePostStartRetryController(
+      cast(pigeond.PositionAssistanceRetryRuntime, SimpleNamespace())
+    )
+  )
+
+  def unavailable_runtime(
+    _receiver_fingerprint: str,
+  ) -> NavigationDatabaseRestoreRuntime:
+    raise NavigationDatabaseRestoreInitializationError(
+      "boot_state:storage_unavailable"
+    )
+
+  monkeypatch.setattr(
+    pigeond,
+    "NavigationDatabaseRestoreRuntime",
+    unavailable_runtime,
+  )
+  monkeypatch.setattr(pigeond.time, "sleep", lambda _delay: None)
+  monkeypatch.setattr(
+    pigeond,
+    "start_pigeon_transport",
+    lambda _pigeon: None,
+  )
+  monkeypatch.setattr(
+    pigeond,
+    "read_host_time_observation",
+    lambda: None,
+  )
+  monkeypatch.setattr(
+    pigeond,
+    "evaluate_time_authority",
+    lambda _authority, _observation: SimpleNamespace(
+      authorized_time=network_time()
+    ),
+  )
+  monkeypatch.setattr(pigeond, "poll_mon_ver", lambda _pigeon: None)
+  monkeypatch.setattr(
+    pigeond,
+    "configure_navx5_ack_aiding",
+    lambda *_args: None,
+  )
+  monkeypatch.setattr(
+    pigeond,
+    "log_navx5_ack_aiding_support",
+    lambda _info: None,
+  )
+  monkeypatch.setattr(
+    pigeond,
+    "send_mga_with_strict_ack",
+    lambda _pigeon, message, **_kwargs: assistance_writes.append(
+      message
+    ),
+  )
+  monkeypatch.setattr(
+    pigeond,
+    "send_time_assistance",
+    lambda *_args, **_kwargs: events.append("time_assistance") or True,
+  )
+  monkeypatch.setattr(
+    pigeond,
+    "log_navigation_assistance_restore_result",
+    lambda *_args, **_kwargs: None,
+  )
+  monkeypatch.setattr(
+    pigeond,
+    "finish_pigeon_initialization",
+    lambda _pigeon: events.append("normal_configuration"),
+  )
+  monkeypatch.setattr(
+    pigeond,
+    "log_assistnow_autonomous_support",
+    lambda _info: True,
+  )
+  monkeypatch.setattr(
+    pigeond,
+    "configure_assistnow_autonomous",
+    lambda *_args: None,
+  )
+
+  result = pigeond.initialize_receiver_cycle(
+    pigeon,  # type: ignore[arg-type, ty:invalid-argument-type]
+    "receiver",
+    FakeDiagnostics(),  # type: ignore[arg-type, ty:invalid-argument-type]
+    "test",
+    time_authority=object(),  # type: ignore[arg-type, ty:invalid-argument-type]
+    time_provenance=FakeProvenance(),  # type: ignore[arg-type, ty:invalid-argument-type]
+    position_assistance_retry=retry_controller,
+  )
+
+  assert assistance_writes == []
+  assert retry_controller.runtime is None
+  assert events.index("gnss_stop") < events.index("time_assistance")
+  assert events.index("time_assistance") < events.index("gnss_start")
+  assert events.index("gnss_start") < events.index(
+    "normal_configuration"
+  )
+  restore = result.navigation_assistance_restore_result
+  assert restore is not None
+  assert restore.database_restore_state_error == (
+    "boot_state:storage_unavailable"
+  )
+
+
+def test_restore_state_persistence_failure_does_not_block_gnss_start(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  events: list[str] = []
+  pigeon = FakePigeon(events)
+  store_calls = 0
+  assistance_writes: list[bytes] = []
+
+  def fail_after_baseline(state, path: Path) -> None:
+    nonlocal store_calls
+    store_calls += 1
+    if store_calls > 1:
+      raise OSError("storage unavailable")
+    restore_runtime.store_navigation_database_restore_boot_state(
+      state,
+      path,
+    )
+
+  runtime = NavigationDatabaseRestoreRuntime(
+    "receiver",
+    snapshot_loader=lambda _fingerprint: snapshot(),
+    retry_delay_seconds=0.0,
+    state_path=tmp_path / "dbd_state.json",
+    boot_id_reader=lambda: BOOT_ID,
+    boottime_reader=lambda: TEST_BOOTTIME_SECONDS,
+    state_storer=fail_after_baseline,
+  )
+
+  monkeypatch.setattr(pigeond.time, "sleep", lambda _delay: None)
+  monkeypatch.setattr(
+    pigeond,
+    "start_pigeon_transport",
+    lambda _pigeon: None,
+  )
+  monkeypatch.setattr(
+    pigeond,
+    "read_host_time_observation",
+    lambda: None,
+  )
+  monkeypatch.setattr(
+    pigeond,
+    "evaluate_time_authority",
+    lambda _authority, _observation: SimpleNamespace(
+      authorized_time=None
+    ),
+  )
+  monkeypatch.setattr(pigeond, "poll_mon_ver", lambda _pigeon: None)
+  monkeypatch.setattr(
+    pigeond,
+    "configure_navx5_ack_aiding",
+    lambda *_args: None,
+  )
+  monkeypatch.setattr(
+    pigeond,
+    "log_navx5_ack_aiding_support",
+    lambda _info: None,
+  )
+  monkeypatch.setattr(
+    pigeond,
+    "send_mga_with_strict_ack",
+    lambda _pigeon, message, **_kwargs: assistance_writes.append(
+      message
+    ),
+  )
+  monkeypatch.setattr(
+    pigeond,
+    "send_time_assistance",
+    lambda *_args, **_kwargs: False,
+  )
+  monkeypatch.setattr(
+    pigeond,
+    "log_navigation_assistance_restore_result",
+    lambda *_args, **_kwargs: None,
+  )
+  monkeypatch.setattr(
+    pigeond,
+    "finish_pigeon_initialization",
+    lambda _pigeon: events.append("normal_configuration"),
+  )
+  monkeypatch.setattr(
+    pigeond,
+    "log_assistnow_autonomous_support",
+    lambda _info: True,
+  )
+  monkeypatch.setattr(
+    pigeond,
+    "configure_assistnow_autonomous",
+    lambda *_args: None,
+  )
+
+  result = pigeond.initialize_receiver_cycle(
+    pigeon,  # type: ignore[arg-type, ty:invalid-argument-type]
+    "receiver",
+    FakeDiagnostics(),  # type: ignore[arg-type, ty:invalid-argument-type]
+    "test",
+    time_authority=object(),  # type: ignore[arg-type, ty:invalid-argument-type]
+    time_provenance=FakeProvenance(),  # type: ignore[arg-type, ty:invalid-argument-type]
+    navigation_database_runtime=runtime,
+  )
+
+  assert not runtime.state_available
+  assert assistance_writes == []
+  assert events.index("gnss_stop") < events.index("gnss_start")
+  assert events.index("gnss_start") < events.index(
+    "normal_configuration"
+  )
+  restore = result.navigation_assistance_restore_result
+  assert restore is not None
+  assert restore.database_restore_state_error is not None
+
+
+def test_acquisition_state_failure_is_handled_once(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  persistence_attempts = 0
+  errors: list[str] = []
+
+  def fail_once() -> bool:
+    nonlocal persistence_attempts
+    persistence_attempts += 1
+    return False
+
+  runtime = SimpleNamespace(
+    acquisition_started=False,
+    note_acquisition_started=fail_once,
+  )
+  retry = SimpleNamespace(runtime=object())
+  guard = pigeond.ReceiverAcquisitionStateGuard()
+  monkeypatch.setattr(pigeond.cloudlog, "error", errors.append)
+
+  for _ in range(25):
+    pigeond.handle_receiver_acquisition_state(
+      runtime,  # type: ignore[arg-type, ty:invalid-argument-type]
+      retry,  # type: ignore[arg-type, ty:invalid-argument-type]
+      guard,
+    )
+
+  assert persistence_attempts == 1
+  assert len(errors) == 1
+  assert retry.runtime is None
+
+
+def test_yuma_assistance_state_suppression_uses_explicit_marker() -> None:
+  normal_outcome = SimpleNamespace(
+    transmit_result=SimpleNamespace(
+      assistance_state_unavailable=True,
+      status="partial",
+      attempted_satellite_ids=(1,),
+      accepted_satellite_ids=(1,),
+      unavailable_satellite_ids=(2, 3),
+    ),
+    terminal=True,
+    retry_pending=False,
+  )
+  provisional_outcome = SimpleNamespace(
+    transmit_result=SimpleNamespace(
+      assistance_state_unavailable=True,
+      status="unavailable",
+      attempted_satellite_ids=(),
+      accepted_satellite_ids=(),
+      unavailable_satellite_ids=(1, 2, 3),
+    ),
+    receiver_write_attempted=False,
+  )
+  structural_shape_without_marker = SimpleNamespace(
+    transmit_result=SimpleNamespace(
+      status="unavailable",
+      requested_satellite_ids=(1, 2, 3),
+      attempted_satellite_ids=(),
+      accepted_satellite_ids=(),
+      failed_satellite_ids=(),
+      unavailable_satellite_ids=(1, 2, 3),
+    )
+  )
+
+  assert pigeond.yuma_assistance_state_unavailable_outcome(normal_outcome)
+  assert pigeond.yuma_assistance_state_unavailable_outcome(
+    provisional_outcome
+  )
+  assert not pigeond.yuma_assistance_state_unavailable_outcome(
+    structural_shape_without_marker
+  )

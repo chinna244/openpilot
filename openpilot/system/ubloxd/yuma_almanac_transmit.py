@@ -75,6 +75,10 @@ class MgaTransactionError(Exception):
     self.write_succeeded = write_succeeded
 
 
+class YumaAssistanceStateUnavailableError(RuntimeError):
+  """Durable assistance ownership is unavailable before receiver I/O."""
+
+
 class YumaAlmanacTransmitStatus(StrEnum):
   COMPLETE = "complete"
   PARTIAL = "partial"
@@ -99,6 +103,7 @@ class YumaAlmanacTransmitResult:
   unavailable_satellite_ids: tuple[int, ...] = ()
   reference_time_utc: datetime | None = None
   downloaded_at_utc: datetime | None = None
+  assistance_state_unavailable: bool = False
 
   @property
   def receiver_write_attempted(self) -> bool:
@@ -268,6 +273,34 @@ def transmit_public_yuma_almanac(
       attempted.append(satellite_id)
       try:
         send_message(frame)
+      except YumaAssistanceStateUnavailableError:
+        attempted.pop()
+        accepted_ids = tuple(sorted(accepted))
+        unavailable_ids = tuple(
+          value
+          for value in requested
+          if value not in accepted
+        )
+        return YumaAlmanacTransmitResult(
+          status=(
+            YumaAlmanacTransmitStatus.PARTIAL
+            if accepted_ids
+            else YumaAlmanacTransmitStatus.UNAVAILABLE
+          ),
+          requested_satellite_ids=requested,
+          attempted_satellite_ids=tuple(attempted),
+          accepted_satellite_ids=accepted_ids,
+          failed_satellite_ids=tuple(
+            sorted(item[0] for item in failed)
+          ),
+          rejected_satellite_ids=tuple(sorted(rejected)),
+          timed_out_satellite_ids=tuple(sorted(timed_out)),
+          deferred_satellite_ids=tuple(sorted(deferred)),
+          unavailable_satellite_ids=unavailable_ids,
+          reference_time_utc=reference_time,
+          downloaded_at_utc=stored.downloaded_at_utc,
+          assistance_state_unavailable=True,
+        )
       except TimeoutError:
         timed_out.add(satellite_id)
         pending.append((satellite_id, frame))

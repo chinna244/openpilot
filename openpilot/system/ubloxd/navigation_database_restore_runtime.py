@@ -692,6 +692,8 @@ class NavigationDatabaseRestoreRuntime:
     self._position_error: str | None = None
     self._yuma_sent = False
     self._state_persistence_error: str | None = None
+    self._assistance_state_disabled = False
+    self._assistance_state_disabled_reason: str | None = None
     self._recovered_interrupted_attempt = False
     self._persisted_candidate_identities: tuple[NavigationDatabaseRestoreCandidateIdentity, ...] = ()
     self._persisted_cache_generation: str | None = None
@@ -831,6 +833,31 @@ class NavigationDatabaseRestoreRuntime:
   def position_assistance_message(self) -> bytes | None:
     return self._position_message
 
+  @property
+  def state_available(self) -> bool:
+    return not self._assistance_state_disabled
+
+  @property
+  def assistance_state_disabled_reason(self) -> str | None:
+    return self._assistance_state_disabled_reason
+
+  def _disable_assistance_state(self, reason: str) -> None:
+    bounded_reason = reason if isinstance(reason, str) and reason else "unknown"
+    if not self._assistance_state_disabled:
+      self._assistance_state_disabled = True
+      self._assistance_state_disabled_reason = bounded_reason
+    self._state_persistence_error = self._assistance_state_disabled_reason
+    self._position_claimed = True
+    if self._position_error is None:
+      self._position_error = (
+        "boot_state:assistance_state_disabled:"
+        + (self._assistance_state_disabled_reason or "unknown")
+      )
+    if self._controller.pending and not self._controller.restore_attempted:
+      self._controller.skip(
+        NavigationDatabaseRestoreDisposition.SKIPPED_UNVERIFIED
+      )
+
   def _fail_closed(self, reason: str) -> None:
     self._position_claimed = True
     self._position_error = reason
@@ -903,13 +930,15 @@ class NavigationDatabaseRestoreRuntime:
     )
 
   def _persist_state(self) -> bool:
+    if self._assistance_state_disabled:
+      return False
     if self._boot_id is None:
-      self._state_persistence_error = "boot_id_unavailable"
+      self._disable_assistance_state("boot_id_unavailable")
       return False
     try:
       self._state_storer(self._state(), self._state_path)
     except Exception as exc:
-      self._state_persistence_error = _bounded_error(exc)
+      self._disable_assistance_state(_bounded_error(exc))
       return False
     self._state_persistence_error = None
     return True
@@ -931,6 +960,9 @@ class NavigationDatabaseRestoreRuntime:
     return loaded
 
   def prepare(self) -> NavigationDatabaseRestoreExecution:
+    if not self.state_available:
+      self._execution = self._build_execution(self._last_authorized_time)
+      return self._execution
     if self._caches_loaded:
       return self._execution
     self._caches_loaded = True
@@ -968,6 +1000,9 @@ class NavigationDatabaseRestoreRuntime:
     if not callable(send_message):
       raise ValueError("send_message must be callable")
     self.prepare()
+    if not self.state_available:
+      self._execution = self._build_execution(self._last_authorized_time)
+      return self._execution
     snapshot = self._position_snapshot
     if snapshot is None or self._position_claimed:
       return self._execution
@@ -1090,6 +1125,8 @@ class NavigationDatabaseRestoreRuntime:
 
   def close_restore_window_unverified(self) -> bool:
     """Persist a terminal timeout skip while GNSS remains stopped."""
+    if not self.state_available:
+      return False
     if self._controller.pending and not self._controller.restore_attempted:
       self._controller.skip(
         NavigationDatabaseRestoreDisposition.SKIPPED_UNVERIFIED
@@ -1100,6 +1137,8 @@ class NavigationDatabaseRestoreRuntime:
 
   def close_restore_window_for_early_acquisition(self) -> bool:
     # Persist a terminal DBD skip while preserving pre-START assistance.
+    if not self.state_available:
+      return False
     if self._controller.pending and not self._controller.restore_attempted:
       self._controller.skip(
         NavigationDatabaseRestoreDisposition.SKIPPED_EARLY_ACQUISITION
@@ -1111,7 +1150,11 @@ class NavigationDatabaseRestoreRuntime:
   def claim_acquisition_start(self) -> bool:
     """Durably close the DBD window before sending GNSS START."""
     if self._controller.acquisition_started:
-      return self._state_persistence_error is None
+      return self.state_available
+    if not self.state_available:
+      self._controller.note_acquisition_started()
+      self._execution = self._build_execution(self._last_authorized_time)
+      return False
     if self._controller.pending and not self._controller.restore_attempted:
       self._controller.skip(
         NavigationDatabaseRestoreDisposition.SKIPPED_ACQUISITION_ALREADY_STARTED
@@ -1126,8 +1169,10 @@ class NavigationDatabaseRestoreRuntime:
 
   def claim_yuma_transmission(self) -> bool:
     """Durably consume the boot's YUMA/DBD choice before receiver I/O."""
+    if not self.state_available:
+      return False
     if self._yuma_sent:
-      return self._state_persistence_error is None
+      return True
     self._yuma_sent = True
     if self._controller.pending and not self._controller.restore_attempted:
       self._controller.skip(
@@ -1271,6 +1316,10 @@ class NavigationDatabaseRestoreRuntime:
     """Revalidate trusted age and acquisition at each receiver-write boundary."""
     if isinstance(frame_index, bool) or not isinstance(frame_index, int) or frame_index < 0:
       raise ValueError("database frame index must be a non-negative int")
+    if not self.state_available:
+      raise NavigationDatabaseRestoreTerminalBoundaryError(
+        "DBD receiver write blocked: assistance state unavailable"
+      )
     if not self._controller.restore_attempted or self._controller.terminal:
       raise NavigationDatabaseRestoreTerminalBoundaryError(
         "DBD receiver write is outside an active restore attempt"
@@ -1306,8 +1355,14 @@ class NavigationDatabaseRestoreRuntime:
   ) -> NavigationDatabaseRestoreExecution:
     if not callable(send_database_message):
       raise ValueError("send_database_message must be callable")
+    if not self.state_available:
+      self._execution = self._build_execution(authorized_time)
+      return self._execution
     self.prepare()
     self._last_authorized_time = authorized_time
+    if not self.state_available:
+      self._execution = self._build_execution(authorized_time)
+      return self._execution
     if self._controller.terminal:
       self._execution = self._build_execution(authorized_time)
       return self._execution
@@ -1486,3 +1541,93 @@ class NavigationDatabaseRestoreRuntime:
       state_persistence_error=self._state_persistence_error,
       recovered_interrupted_attempt=self._recovered_interrupted_attempt,
     )
+
+
+class NavigationDatabaseRestoreUnavailableRuntime(NavigationDatabaseRestoreRuntime):
+  # Disables assistance writes when durable state cannot be established.
+
+  def __init__(self, receiver_fingerprint: str, error: str) -> None:
+    if not isinstance(receiver_fingerprint, str):
+      raise ValueError("receiver_fingerprint must be a string")
+    if not isinstance(error, str) or not error:
+      raise ValueError("error must be a non-empty string")
+    self._controller = NavigationDatabaseRestoreBootController()
+    self._controller.skip(
+      NavigationDatabaseRestoreDisposition.SKIPPED_UNVERIFIED
+    )
+    self._database_snapshot = None
+    self._position_snapshot = None
+    self._position_message = None
+    self._yuma_sent = False
+    self._state_persistence_error = error
+    self._assistance_state_disabled = True
+    self._assistance_state_disabled_reason = error
+    self._execution = NavigationDatabaseRestoreExecution(
+      disposition=self._controller.disposition,
+      total_frame_count=0,
+      accepted_frame_count=0,
+      database_write_attempt_count=0,
+      execution_error=error,
+      failure_phase="state_initialization",
+      position_assistance_error_type=(
+        NavigationDatabaseRestoreInitializationError.__name__
+      ),
+      position_assistance_error=error,
+      state_persistence_error=error,
+    )
+
+  def prepare(self) -> NavigationDatabaseRestoreExecution:
+    return self._execution
+
+  def send_position_once(
+    self,
+    send_message: Callable[[bytes], object],
+  ) -> NavigationDatabaseRestoreExecution:
+    if not callable(send_message):
+      raise ValueError("send_message must be callable")
+    return self._execution
+
+  def close_restore_window_unverified(self) -> bool:
+    return False
+
+  def close_restore_window_for_early_acquisition(self) -> bool:
+    return False
+
+  def claim_acquisition_start(self) -> bool:
+    self._controller.note_acquisition_started()
+    return False
+
+  def note_acquisition_started(self) -> bool:
+    return self.claim_acquisition_start()
+
+  def claim_yuma_transmission(self) -> bool:
+    return False
+
+  def note_yuma_sent(self) -> bool:
+    return False
+
+  def validate_database_write_boundary(self, frame_index: int) -> None:
+    if (
+      isinstance(frame_index, bool)
+      or not isinstance(frame_index, int)
+      or frame_index < 0
+    ):
+      raise ValueError(
+        "database frame index must be a non-negative int"
+      )
+    raise NavigationDatabaseRestoreTerminalBoundaryError(
+      "DBD receiver write blocked: assistance state unavailable"
+    )
+
+  def evaluate(
+    self,
+    *,
+    authorized_time: AuthorizedTime | None,
+    reliable_fix_available: bool,
+    yuma_already_sent: bool,
+    send_database_message: Callable[[bytes, int], object],
+  ) -> NavigationDatabaseRestoreExecution:
+    del authorized_time, reliable_fix_available, yuma_already_sent
+    if not callable(send_database_message):
+      raise ValueError("send_database_message must be callable")
+    return self._execution

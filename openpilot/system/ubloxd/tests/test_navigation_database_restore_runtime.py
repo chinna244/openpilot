@@ -16,6 +16,7 @@ from openpilot.system.ubloxd.navigation_database_restore_runtime import (
   NavigationDatabaseRestoreInitializationError,
   NavigationDatabaseRestoreRuntime,
   NavigationDatabaseRestoreSnapshot,
+  NavigationDatabaseRestoreUnavailableRuntime,
   PositionAssistanceAckStatus,
   PositionAssistanceFailureKind,
   PositionAssistanceWriteStatus,
@@ -1417,3 +1418,81 @@ def test_early_acquisition_closes_only_database_restore_window(
   assert second_position_writes == []
   assert not second_result.position_assistance_attempted
   assert not second.acquisition_started
+
+
+def test_unavailable_runtime_blocks_assistance_but_allows_acquisition() -> None:
+  value = NavigationDatabaseRestoreUnavailableRuntime(
+    "receiver",
+    "boot_state:storage_unavailable",
+  )
+  database_writes: list[tuple[bytes, int]] = []
+  position_writes: list[bytes] = []
+
+  execution = value.evaluate(
+    authorized_time=network_time(),
+    reliable_fix_available=False,
+    yuma_already_sent=False,
+    send_database_message=(
+      lambda message, index: database_writes.append((message, index))
+    ),
+  )
+  value.send_position_once(position_writes.append)
+
+  assert not value.state_available
+  assert execution.state_persistence_error == (
+    "boot_state:storage_unavailable"
+  )
+  assert database_writes == []
+  assert position_writes == []
+  assert not value.claim_yuma_transmission()
+  assert not value.claim_acquisition_start()
+  assert value.acquisition_started
+
+
+def test_state_failure_remains_latched_after_storage_recovers(
+  tmp_path: Path,
+) -> None:
+  store_calls = 0
+
+  def fail_once_then_recover(
+    state: NavigationDatabaseRestoreBootState,
+    path: Path,
+  ) -> None:
+    nonlocal store_calls
+    store_calls += 1
+    if store_calls == 2:
+      raise OSError("transient disk failure")
+    store_navigation_database_restore_boot_state(state, path)
+
+  value = NavigationDatabaseRestoreRuntime(
+    "receiver",
+    snapshot_loader=lambda _fingerprint: snapshot(),
+    retry_delay_seconds=0.0,
+    state_path=tmp_path / "dbd_state.json",
+    boot_id_reader=lambda: BOOT_ID,
+    state_storer=fail_once_then_recover,
+    boottime_reader=lambda: TEST_BOOTTIME_SECONDS,
+  )
+
+  value.prepare()
+  assert not value.state_available
+  assert value.assistance_state_disabled_reason == "OSError:transient disk failure"
+
+  database_writes: list[tuple[bytes, int]] = []
+  position_writes: list[bytes] = []
+  value.evaluate(
+    authorized_time=network_time(),
+    reliable_fix_available=False,
+    yuma_already_sent=False,
+    send_database_message=(
+      lambda message, index: database_writes.append((message, index))
+    ),
+  )
+  value.send_position_once(position_writes.append)
+
+  assert database_writes == []
+  assert position_writes == []
+  assert not value.claim_yuma_transmission()
+  assert not value.claim_acquisition_start()
+  assert value.acquisition_started
+  assert store_calls == 2
