@@ -26,7 +26,7 @@ def calls(node: ast.AST, name: str) -> list[ast.Call]:
   ]
 
 
-def test_initialize_receiver_cycle_uses_boot_scoped_runtime_adapter() -> None:
+def test_initialize_receiver_cycle_uses_receiver_cycle_runtime_adapter() -> None:
   source, tree = source_tree(PIGEOND)
   node = named_node(tree, "initialize_receiver_cycle")
   restore_calls = calls(node, "restore_navigation_assistance")
@@ -39,15 +39,60 @@ def test_initialize_receiver_cycle_uses_boot_scoped_runtime_adapter() -> None:
   assert "allow_legacy_direct_restore" not in segment
 
 
-def test_live_loop_reuses_one_runtime_for_all_receiver_cycles() -> None:
-  _source, tree = source_tree(PIGEOND)
+def test_live_loop_creates_fresh_state_for_each_receiver_cycle() -> None:
+  source, tree = source_tree(PIGEOND)
   node = named_node(tree, "run_receiving")
-  assert len(calls(node, "NavigationDatabaseRestoreRuntime")) == 1
+  segment = ast.get_source_segment(source, node)
+  assert segment is not None
+  assert len(
+    calls(node, "create_receiver_cycle_assistance_state")
+  ) == 3
+  assert len(
+    calls(node, "prepare_receiver_cycle_response_state")
+  ) == 2
   initialize_calls = calls(node, "initialize_receiver_cycle")
   assert len(initialize_calls) == 3
   for call in initialize_calls:
     keywords = {keyword.arg for keyword in call.keywords}
     assert "navigation_database_runtime" in keywords
+    assert "response_state_prepared" not in keywords
+
+  navigation_factory = named_node(
+    tree,
+    "create_receiver_cycle_navigation_state",
+  )
+  navigation_calls = calls(
+    navigation_factory,
+    "NavigationDatabaseRestoreRuntime",
+  )
+  assert len(navigation_calls) == 1
+  assert any(
+    keyword.arg == "new_receiver_cycle"
+    and isinstance(keyword.value, ast.Constant)
+    and keyword.value.value is True
+    for keyword in navigation_calls[0].keywords
+  )
+
+  assistance_factories = [
+    item
+    for item in node.body
+    if (
+      isinstance(item, ast.FunctionDef)
+      and item.name == "create_receiver_cycle_assistance_state"
+    )
+  ]
+  assert len(assistance_factories) == 1
+  retry_calls = calls(
+    assistance_factories[0],
+    "PositionAssistanceRetryRuntime",
+  )
+  assert len(retry_calls) == 1
+  assert any(
+    keyword.arg == "new_receiver_cycle"
+    and isinstance(keyword.value, ast.Constant)
+    and keyword.value.value is True
+    for keyword in retry_calls[0].keywords
+  )
 
 
 def test_acquisition_latch_is_updated_before_receiver_processing() -> None:
@@ -273,12 +318,12 @@ def test_dbd_runtime_initialization_precedes_receiver_construction_and_io() -> N
   segment = ast.get_source_segment(source, node)
   assert segment is not None
 
-  runtime = segment.index(
-    "navigation_database_runtime = NavigationDatabaseRestoreRuntime("
+  assistance_state = segment.index(
+    "create_receiver_cycle_assistance_state("
   )
   pigeon = segment.index("pigeon = TTYPigeon(")
   first_cycle = segment.index("initialize_receiver_cycle(")
-  assert runtime < pigeon < first_cycle
+  assert assistance_state < pigeon < first_cycle
 
   initialize = named_node(tree, "initialize_receiver_cycle")
   initialize_segment = ast.get_source_segment(source, initialize)
@@ -288,6 +333,33 @@ def test_dbd_runtime_initialization_precedes_receiver_construction_and_io() -> N
   )
   receiver_start = initialize_segment.index("init(pigeon)")
   assert fallback_runtime < receiver_start
+
+
+def test_recovery_flushes_old_frames_before_fresh_cycle_state() -> None:
+  source, tree = source_tree(PIGEOND)
+  node = named_node(tree, "run_receiving")
+  segment = ast.get_source_segment(source, node)
+  assert segment is not None
+
+  for reason in ("no_data_watchdog", "all_zero_data"):
+    cycle = segment.index(f'"{reason}"')
+    cancel = segment.rfind(
+      "position_assistance_retry.cancel_receiver_cycle(now)",
+      0,
+      cycle,
+    )
+    assert cancel >= 0
+    response_reset = segment.index(
+      "prepare_receiver_cycle_response_state(pigeon)",
+      cancel,
+      cycle,
+    )
+    fresh_state = segment.index(
+      "create_receiver_cycle_assistance_state(",
+      response_reset,
+      cycle,
+    )
+    assert cancel < response_reset < fresh_state < cycle
 
 
 def test_yuma_assistance_state_unavailable_is_terminal_without_retry() -> None:
