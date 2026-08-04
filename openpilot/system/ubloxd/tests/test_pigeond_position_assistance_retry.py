@@ -391,6 +391,37 @@ def test_pre_start_input_is_drained_only_when_retry_is_armed(
   ]
 
 
+def test_pre_start_drain_failure_still_attempts_gnss_start(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  events: list[str] = []
+
+  class Pigeon:
+    def drain_before_transaction(self, operation: str) -> None:
+      events.append(operation)
+      raise OSError("drain failed")
+
+    def send(self, message: bytes) -> None:
+      if message == pigeond.CONTROLLED_GNSS_STOP_MESSAGE:
+        events.append("stop")
+      elif message == pigeond.CONTROLLED_GNSS_START_MESSAGE:
+        events.append("start")
+
+  monkeypatch.setattr(pigeond.time, "sleep", lambda _delay: None)
+
+  with pytest.raises(OSError, match="drain failed"):
+    with pigeond.install_pre_acquisition_initialization(lambda: None) as initialization:
+      initialization.require_pre_gnss_start_drain()
+      with pigeond.paused_gnss_acquisition(Pigeon()):  # ty: ignore[invalid-argument-type]
+        initialization.run()
+
+  assert events == [
+    "stop",
+    "position_assistance_pre_gnss_start_boundary",
+    "start",
+  ]
+
+
 def test_normal_gnss_start_does_not_run_position_retry_drain(
   monkeypatch: pytest.MonkeyPatch,
 ) -> None:

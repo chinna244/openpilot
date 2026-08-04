@@ -226,7 +226,7 @@ def test_partial_database_uses_full_yuma_immediately():
   plan = evaluate(state)
 
   assert plan.action is YumaSupplementationAction.SEND_ALL
-  assert plan.reason is YumaSupplementationReason.DATABASE_RESTORE_INCOMPLETE
+  assert plan.reason is YumaSupplementationReason.DATABASE_RESTORE_PARTIAL
 
 
 def test_missing_cache_retries_and_uses_file_when_it_appears():

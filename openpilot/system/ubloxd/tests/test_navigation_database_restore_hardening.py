@@ -6,6 +6,12 @@ from pathlib import Path
 
 import pytest
 
+from openpilot.system.ubloxd.gps_assistance import (
+  NavigationQuality,
+  QUALITY_POLICY_VERSION,
+  QUALITY_VERSION,
+)
+
 from openpilot.system.ubloxd.navigation_database_restore import (
   NAVIGATION_DATABASE_RESTORE_MAX_AGE_SECONDS,
   NavigationDatabaseRestoreDisposition,
@@ -62,7 +68,22 @@ def snapshot(
     longitude_e7=-960_000_000,
     altitude_cm=20_000,
     position_accuracy_cm=10_000,
-    quality=None,
+    quality=NavigationQuality(
+      quality_version=QUALITY_VERSION,
+      policy_version=QUALITY_POLICY_VERSION,
+      capture_context="onroad",
+      continuous_reliable_fix_seconds=20.0,
+      continuous_orbit_quality_seconds=10.0,
+      gps_satellites_known=8,
+      glonass_satellites_known=8,
+      gps_ephemeris_available=4,
+      glonass_ephemeris_available=6,
+      satellites_used=8,
+      gps_almanac_available=5,
+      glonass_almanac_available=5,
+      assistnow_offline_available=0,
+      orbit_source_counts={"ephemeris": 10, "almanac": 6},
+    ),
     generation="primary",
     selection_reason="hardening_test",
   )
@@ -132,7 +153,7 @@ def test_invalid_state_is_quarantined_and_same_boot_stays_closed(
     authorized_time=network_time(),
     reliable_fix_available=False,
     yuma_already_sent=False,
-    send_database_message=lambda frame, index: writes.append((frame, index)),
+    send_database_message=lambda frame, index, _mark: writes.append((frame, index)),
   )
 
   assert (
@@ -167,7 +188,7 @@ def test_invalid_state_is_quarantined_and_same_boot_stays_closed(
     authorized_time=network_time(),
     reliable_fix_available=False,
     yuma_already_sent=False,
-    send_database_message=lambda frame, index: second_writes.append(
+    send_database_message=lambda frame, index, _mark: second_writes.append(
       (frame, index)
     ),
   )
@@ -205,13 +226,14 @@ def test_acquisition_boundary_stops_after_first_frame(
   attempted_indexes: list[int] = []
   receiver_writes: list[tuple[bytes, int]] = []
 
-  def guarded_send(frame: bytes, index: int) -> None:
+  def guarded_send(frame: bytes, index: int, mark_write_attempt) -> None:
     attempted_indexes.append(index)
 
     if index == 0:
       assert value.note_acquisition_started()
 
     value.validate_database_write_boundary(index)
+    mark_write_attempt()
     receiver_writes.append((frame, index))
 
   result = value.evaluate(
@@ -224,7 +246,7 @@ def test_acquisition_boundary_stops_after_first_frame(
   assert result.disposition is NavigationDatabaseRestoreDisposition.WRITE_FAILED
   assert attempted_indexes == [0]
   assert receiver_writes == []
-  assert result.database_write_attempt_count == 1
+  assert result.database_write_attempt_count == 0
   assert len(result.permanent_failures) == 1
   assert (
     result.permanent_failures[0].kind
@@ -262,9 +284,10 @@ def test_expired_cache_boundary_stops_after_first_frame(
   attempted_indexes: list[int] = []
   receiver_writes: list[tuple[bytes, int]] = []
 
-  def guarded_send(frame: bytes, index: int) -> None:
+  def guarded_send(frame: bytes, index: int, mark_write_attempt) -> None:
     attempted_indexes.append(index)
     value.validate_database_write_boundary(index)
+    mark_write_attempt()
     receiver_writes.append((frame, index))
 
   result = value.evaluate(
@@ -274,10 +297,10 @@ def test_expired_cache_boundary_stops_after_first_frame(
     send_database_message=guarded_send,
   )
 
-  assert result.disposition is NavigationDatabaseRestoreDisposition.WRITE_FAILED
+  assert result.disposition is NavigationDatabaseRestoreDisposition.RESTORE_CACHE_EXPIRED
   assert attempted_indexes == [0]
   assert receiver_writes == []
-  assert result.database_write_attempt_count == 1
+  assert result.database_write_attempt_count == 0
   assert len(result.permanent_failures) == 1
   assert (
     result.permanent_failures[0].kind
@@ -305,15 +328,17 @@ def test_terminal_boundary_clears_previously_queued_retries(
 
   attempted_indexes: list[int] = []
 
-  def guarded_send(_frame: bytes, index: int) -> None:
+  def guarded_send(_frame: bytes, index: int, mark_write_attempt) -> None:
     attempted_indexes.append(index)
 
     if index == 0:
+      mark_write_attempt()
       raise TimeoutError("retryable frame-zero timeout")
     if index == 1:
       assert value.note_acquisition_started()
       value.validate_database_write_boundary(index)
 
+    mark_write_attempt()
     raise AssertionError("terminal boundary did not stop the initial pass")
 
   result = value.evaluate(
@@ -326,7 +351,7 @@ def test_terminal_boundary_clears_previously_queued_retries(
   assert result.disposition is NavigationDatabaseRestoreDisposition.WRITE_FAILED
   assert attempted_indexes == [0, 1]
   assert sleep_delays == []
-  assert result.database_write_attempt_count == 2
+  assert result.database_write_attempt_count == 1
   assert tuple(
     failure.frame_index
     for failure in result.initial_failures
@@ -341,6 +366,13 @@ def test_terminal_boundary_clears_previously_queued_retries(
     failure.frame_index
     for failure in result.permanent_failures
   ) == (1,)
+  assert result.first_failure is not None
+  assert result.first_failure.frame_index == 0
+  assert result.first_failure.attempt == 1
+  assert (
+    result.first_failure.kind
+    is NavigationDatabaseRestoreFrameFailureKind.TIMED_OUT
+  )
 
 
 def test_terminal_boundary_stops_remaining_retry_frames(
@@ -361,8 +393,9 @@ def test_terminal_boundary_stops_remaining_retry_frames(
 
   attempted_indexes: list[int] = []
 
-  def retryable_send(_frame: bytes, index: int) -> None:
+  def retryable_send(_frame: bytes, index: int, mark_write_attempt) -> None:
     attempted_indexes.append(index)
+    mark_write_attempt()
     raise TimeoutError(f"frame {index} timeout")
 
   result = value.evaluate(

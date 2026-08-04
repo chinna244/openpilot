@@ -10,6 +10,14 @@ from openpilot.system.ubloxd.gps_assistance import (
   NavSatQuality,
   add_ubx_checksum,
 )
+from openpilot.system.ubloxd.trusted_time_anchor import (
+  TimeProvenance,
+  TrustedTimeSource,
+)
+from openpilot.system.ubloxd.trusted_time_authority import (
+  AuthorizedTime,
+  TimeAuthorizationEvidence,
+)
 
 
 SAVED_AT = datetime(2026, 7, 21, 10, tzinfo=UTC)
@@ -315,12 +323,13 @@ def _stub_receiver_initialization_dependencies(
     lambda *args, **kwargs: send_time_result,
   )
   authorized = (
-    SimpleNamespace(
+    AuthorizedTime(
       utc=datetime(2026, 7, 23, 13, 0, tzinfo=UTC),
-      evidence=SimpleNamespace(value="system_synchronized"),
-      mga_accuracy_seconds=30,
+      uncertainty_seconds=30.0,
+      source=TrustedTimeSource.SYSTEM_SYNCHRONIZED,
+      provenance=TimeProvenance.NETWORK_INDEPENDENT,
       independent=True,
-      provenance=SimpleNamespace(value="network_independent"),
+      evidence=TimeAuthorizationEvidence.SYSTEM_SYNCHRONIZED,
       observed_boottime_seconds=100.0,
     )
     if trusted_time

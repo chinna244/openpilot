@@ -1,9 +1,11 @@
 from datetime import UTC, datetime
+from typing import cast
 
 import pytest
 
 from openpilot.system.ubloxd.navigation_database_restore import (
   NAVIGATION_DATABASE_RESTORE_MAX_AGE_SECONDS,
+  NavigationDatabaseRestoreAgePolicy,
   NavigationDatabaseRestoreBootController,
   NavigationDatabaseRestoreDecision,
   NavigationDatabaseRestoreDecisionAction,
@@ -25,13 +27,25 @@ def test_disposition_values_are_stable() -> None:
   assert {item.name: item.value for item in NavigationDatabaseRestoreDisposition} == {
     "PENDING": "pending",
     "RESTORED": "restored",
+    "RESTORE_PARTIAL": "restore_partial",
+    "RESTORE_REJECTED": "restore_rejected",
+    "RESTORE_RESPONSE_TIMEOUT": "restore_response_timeout",
+    "RESTORE_TRANSFER_DEADLINE": "restore_transfer_deadline",
+    "RESTORE_TRANSPORT_ERROR": "restore_transport_error",
+    "RESTORE_CACHE_EXPIRED": "restore_cache_expired",
     "SKIPPED_EXPIRED": "skipped_expired",
     "SKIPPED_UNVERIFIED": "skipped_unverified",
+    "SKIPPED_NO_TRUSTED_TIME": "skipped_no_trusted_time",
+    "SKIPPED_WAIT_TIMEOUT": "skipped_wait_timeout",
+    "SKIPPED_WAIT_ERROR": "skipped_wait_error",
+    "SKIPPED_STATE_UNAVAILABLE": "skipped_state_unavailable",
     "SKIPPED_EARLY_ACQUISITION": "skipped_early_acquisition",
     "SKIPPED_LATE_RECEIVER_TIME": "skipped_late_receiver_time",
     "SKIPPED_ACQUISITION_ALREADY_STARTED": "skipped_acquisition_already_started",
     "SKIPPED_RELIABLE_FIX": "skipped_reliable_fix",
     "SKIPPED_YUMA_ALREADY_SENT": "skipped_yuma_already_sent",
+    "SKIPPED_NO_CACHE": "skipped_no_cache",
+    "SKIPPED_CACHE_UNQUALIFIED": "skipped_cache_unqualified",
     "SKIPPED_NO_USABLE_CACHE": "skipped_no_usable_cache",
     "WRITE_FAILED": "write_failed",
   }
@@ -132,6 +146,12 @@ def test_skip_rejects_nonintentional_disposition() -> None:
   for disposition in (
     NavigationDatabaseRestoreDisposition.PENDING,
     NavigationDatabaseRestoreDisposition.RESTORED,
+    NavigationDatabaseRestoreDisposition.RESTORE_PARTIAL,
+    NavigationDatabaseRestoreDisposition.RESTORE_REJECTED,
+    NavigationDatabaseRestoreDisposition.RESTORE_RESPONSE_TIMEOUT,
+    NavigationDatabaseRestoreDisposition.RESTORE_TRANSFER_DEADLINE,
+    NavigationDatabaseRestoreDisposition.RESTORE_TRANSPORT_ERROR,
+    NavigationDatabaseRestoreDisposition.RESTORE_CACHE_EXPIRED,
     NavigationDatabaseRestoreDisposition.WRITE_FAILED,
   ):
     with pytest.raises(ValueError):
@@ -374,13 +394,43 @@ def test_invalid_maximum_age_is_rejected(
   maximum_cache_age_seconds: object,
 ) -> None:
   with pytest.raises(ValueError):
+    NavigationDatabaseRestoreAgePolicy(
+      maximum_cache_age_seconds  # type: ignore[arg-type, ty:invalid-argument-type]
+    )
+
+
+def test_decision_uses_supplied_candidate_age_policy() -> None:
+  policy = NavigationDatabaseRestoreAgePolicy(120.0)
+  assert evaluate_navigation_database_restore(
+    reliable_fix_available=False,
+    yuma_already_sent=False,
+    authorized_time=authorized_time(),
+    cache_age_seconds=120.0,
+    gnss_acquisition_started=False,
+    age_policy=policy,
+  ).should_restore
+  assert (
+    evaluate_navigation_database_restore(
+      reliable_fix_available=False,
+      yuma_already_sent=False,
+      authorized_time=authorized_time(),
+      cache_age_seconds=120.001,
+      gnss_acquisition_started=False,
+      age_policy=policy,
+    ).skip_disposition
+    is NavigationDatabaseRestoreDisposition.SKIPPED_EXPIRED
+  )
+
+
+def test_decision_rejects_nonpolicy_age_policy() -> None:
+  with pytest.raises(ValueError):
     evaluate_navigation_database_restore(
       reliable_fix_available=False,
       yuma_already_sent=False,
       authorized_time=authorized_time(),
       cache_age_seconds=30.0,
       gnss_acquisition_started=False,
-      maximum_cache_age_seconds=maximum_cache_age_seconds,  # type: ignore[arg-type, ty:invalid-argument-type]
+      age_policy=cast(NavigationDatabaseRestoreAgePolicy, object()),
     )
 
 

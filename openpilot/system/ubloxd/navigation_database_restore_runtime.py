@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from hashlib import sha256
 import json
@@ -31,7 +31,8 @@ from openpilot.system.ubloxd.gps_assistance import (
   load_cache,
 )
 from openpilot.system.ubloxd.navigation_database_restore import (
-  NAVIGATION_DATABASE_RESTORE_MAX_AGE_SECONDS,
+  DEFAULT_NAVIGATION_DATABASE_RESTORE_AGE_POLICY,
+  NavigationDatabaseRestoreAgePolicy,
   NavigationDatabaseRestoreBootController,
   NavigationDatabaseRestoreDisposition,
   evaluate_navigation_database_restore,
@@ -49,8 +50,11 @@ from openpilot.system.ubloxd.yuma_almanac_transmit import (
 )
 
 
-NAVIGATION_DATABASE_RESTORE_STATE_VERSION = 2
+NAVIGATION_DATABASE_RESTORE_STATE_VERSION = 4
+POLICY_NAVIGATION_DATABASE_RESTORE_STATE_VERSION = 3
+LEGACY_NAVIGATION_DATABASE_RESTORE_STATE_VERSION = 2
 NAVIGATION_DATABASE_RESTORE_STATE_PATH = Path("/data/gps_assistance/navigation_database_restore_state.json")
+NAVIGATION_DATABASE_RESTORE_TRANSFER_BUDGET_SECONDS = 15.0
 
 
 class NavigationDatabaseRestoreStateError(ValueError):
@@ -148,12 +152,19 @@ class NavigationDatabaseRestoreTerminalBoundaryError(
   """The active DBD restore can no longer safely send any frame."""
 
 
+class NavigationDatabaseRestoreTransferDeadlineError(
+  NavigationDatabaseRestoreTerminalBoundaryError
+):
+  """The whole-DBD transfer budget expired."""
+
+
 class NavigationDatabaseRestoreFrameFailureKind(StrEnum):
   REJECTED = "rejected"
   TIMED_OUT = "timed_out"
   WRITE_ERROR = "write_error"
   TRANSACTION_ERROR = "transaction_error"
   VALIDATION_ERROR = "validation_error"
+  TRANSFER_DEADLINE = "transfer_deadline"
   UNEXPECTED_ERROR = "unexpected_error"
 
   @property
@@ -171,6 +182,50 @@ class NavigationDatabaseRestoreFrameFailure:
   attempt: int
   kind: NavigationDatabaseRestoreFrameFailureKind
   error: str
+
+  def __post_init__(self) -> None:
+    if isinstance(self.frame_index, bool) or not isinstance(self.frame_index, int) or self.frame_index < 0:
+      raise NavigationDatabaseRestoreStateError("failure frame index is invalid")
+    if isinstance(self.attempt, bool) or not isinstance(self.attempt, int) or self.attempt not in (1, 2):
+      raise NavigationDatabaseRestoreStateError("failure attempt is invalid")
+    if not isinstance(self.kind, NavigationDatabaseRestoreFrameFailureKind):
+      raise NavigationDatabaseRestoreStateError("failure kind is invalid")
+    if not isinstance(self.error, str) or not self.error:
+      raise NavigationDatabaseRestoreStateError("failure error is invalid")
+
+  def to_json_dict(self) -> dict[str, object]:
+    return {
+      "frame_index": self.frame_index,
+      "attempt": self.attempt,
+      "kind": self.kind.value,
+      "error": self.error,
+    }
+
+  @classmethod
+  def from_json_dict(
+    cls,
+    value: object,
+  ) -> NavigationDatabaseRestoreFrameFailure:
+    if not isinstance(value, dict) or set(value) != {
+      "frame_index",
+      "attempt",
+      "kind",
+      "error",
+    }:
+      raise NavigationDatabaseRestoreStateError("frame failure is invalid")
+    mapping = cast(dict[str, object], value)
+    try:
+      kind = NavigationDatabaseRestoreFrameFailureKind(
+        cast(str, mapping["kind"])
+      )
+    except (TypeError, ValueError) as exc:
+      raise NavigationDatabaseRestoreStateError("failure kind is invalid") from exc
+    return cls(
+      frame_index=cast(int, mapping["frame_index"]),
+      attempt=cast(int, mapping["attempt"]),
+      kind=kind,
+      error=cast(str, mapping["error"]),
+    )
 
 
 @dataclass(frozen=True)
@@ -238,6 +293,43 @@ class NavigationDatabaseRestoreCandidateIdentity:
 
 
 @dataclass(frozen=True)
+class NavigationDatabaseRestoreCandidatePolicy:
+  snapshot: NavigationDatabaseRestoreSnapshot
+  age_policy: NavigationDatabaseRestoreAgePolicy = (
+    DEFAULT_NAVIGATION_DATABASE_RESTORE_AGE_POLICY
+  )
+
+  def __post_init__(self) -> None:
+    if not isinstance(self.snapshot, NavigationDatabaseRestoreSnapshot):
+      raise ValueError("candidate snapshot is invalid")
+    if not isinstance(self.age_policy, NavigationDatabaseRestoreAgePolicy):
+      raise ValueError("candidate age policy is invalid")
+
+  @property
+  def identity(self) -> NavigationDatabaseRestoreCandidateIdentity:
+    return NavigationDatabaseRestoreCandidateIdentity.from_snapshot(
+      self.snapshot
+    )
+
+  @property
+  def maximum_age_seconds(self) -> float:
+    return self.age_policy.maximum_age_seconds
+
+  @property
+  def expires_at_utc(self) -> datetime:
+    return self.snapshot.saved_at_utc + timedelta(
+      seconds=self.maximum_age_seconds
+    )
+
+  @property
+  def database_digest(self) -> str:
+    return self.identity.database_digest
+
+  def accepts_age(self, cache_age_seconds: float | None) -> bool:
+    return self.age_policy.accepts(cache_age_seconds)
+
+
+@dataclass(frozen=True)
 class NavigationDatabaseRestoreExecution:
   disposition: NavigationDatabaseRestoreDisposition
   total_frame_count: int
@@ -261,12 +353,22 @@ class NavigationDatabaseRestoreExecution:
   cache_saved_at_utc: datetime | None = None
   cache_generation: str | None = None
   cache_selection_reason: str | None = None
+  cache_database_digest: str | None = None
   cache_age_seconds: float | None = None
+  cache_maximum_age_seconds: float | None = None
+  cache_expires_at_utc: datetime | None = None
+  candidate_identities: tuple[
+    NavigationDatabaseRestoreCandidateIdentity, ...
+  ] = ()
   effective_quality: RestoredNavigationQuality | None = None
   captured_quality: NavigationQuality | None = None
   boot_id: str | None = None
   state_persistence_error: str | None = None
   recovered_interrupted_attempt: bool = False
+  transfer_budget_seconds: float | None = None
+  transfer_started_at: float | None = None
+  transfer_completed_at: float | None = None
+  transfer_deadline: float | None = None
 
   @property
   def database_available(self) -> bool:
@@ -292,6 +394,255 @@ class NavigationDatabaseRestoreExecution:
   ) -> tuple[int, ...]:
     return tuple(failure.frame_index for failure in self.permanent_failures if failure.kind in kinds)
 
+  @property
+  def first_failure(self) -> NavigationDatabaseRestoreFrameFailure | None:
+    if self.initial_failures:
+      return self.initial_failures[0]
+    return self.permanent_failures[0] if self.permanent_failures else None
+
+  @property
+  def transfer_elapsed_seconds(self) -> float | None:
+    if (
+      self.transfer_started_at is None
+      or self.transfer_completed_at is None
+    ):
+      return None
+    return max(
+      0.0,
+      self.transfer_completed_at - self.transfer_started_at,
+    )
+
+
+@dataclass(frozen=True)
+class NavigationDatabaseRestorePersistedExecution:
+  disposition: NavigationDatabaseRestoreDisposition
+  total_frame_count: int
+  accepted_frame_count: int
+  database_write_attempt_count: int
+  initial_failures: tuple[NavigationDatabaseRestoreFrameFailure, ...] = ()
+  retry_accepted_indexes: tuple[int, ...] = ()
+  permanent_failures: tuple[NavigationDatabaseRestoreFrameFailure, ...] = ()
+  execution_error: str | None = None
+  failure_phase: str | None = None
+  cache_selection_reason: str | None = None
+  cache_age_seconds: float | None = None
+  transfer_budget_seconds: float | None = None
+  transfer_started_at: float | None = None
+  transfer_completed_at: float | None = None
+  transfer_deadline: float | None = None
+
+  def __post_init__(self) -> None:
+    if not isinstance(self.disposition, NavigationDatabaseRestoreDisposition) or not self.disposition.terminal or self.disposition.intentionally_skipped:
+      raise NavigationDatabaseRestoreStateError("persisted restore disposition is invalid")
+    for name, value in (
+      ("total_frame_count", self.total_frame_count),
+      ("accepted_frame_count", self.accepted_frame_count),
+      ("database_write_attempt_count", self.database_write_attempt_count),
+    ):
+      if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise NavigationDatabaseRestoreStateError(f"{name} is invalid")
+    if self.accepted_frame_count > self.total_frame_count:
+      raise NavigationDatabaseRestoreStateError("accepted frame count exceeds total")
+    if self.database_write_attempt_count < self.accepted_frame_count:
+      raise NavigationDatabaseRestoreStateError(
+        "write attempt count is below accepted frame count"
+      )
+    for name, failures in (
+      ("initial_failures", self.initial_failures),
+      ("permanent_failures", self.permanent_failures),
+    ):
+      if not isinstance(failures, tuple) or not all(isinstance(failure, NavigationDatabaseRestoreFrameFailure) for failure in failures):
+        raise NavigationDatabaseRestoreStateError(f"{name} is invalid")
+      if any(failure.frame_index >= self.total_frame_count for failure in failures):
+        raise NavigationDatabaseRestoreStateError(f"{name} frame index is invalid")
+      indexes = tuple(failure.frame_index for failure in failures)
+      if len(set(indexes)) != len(indexes):
+        raise NavigationDatabaseRestoreStateError(
+          f"{name} frame indexes are duplicated"
+        )
+    if any(failure.attempt != 1 for failure in self.initial_failures):
+      raise NavigationDatabaseRestoreStateError(
+        "initial failure attempt is invalid"
+      )
+    if not isinstance(self.retry_accepted_indexes, tuple) or not all(
+      not isinstance(index, bool) and isinstance(index, int) and 0 <= index < self.total_frame_count
+      for index in self.retry_accepted_indexes
+    ):
+      raise NavigationDatabaseRestoreStateError("retry accepted indexes are invalid")
+    if len(set(self.retry_accepted_indexes)) != len(self.retry_accepted_indexes):
+      raise NavigationDatabaseRestoreStateError("retry accepted indexes are duplicated")
+    initial_indexes = {
+      failure.frame_index for failure in self.initial_failures
+    }
+    permanent_indexes = {
+      failure.frame_index for failure in self.permanent_failures
+    }
+    retry_accepted_indexes = set(self.retry_accepted_indexes)
+    if not retry_accepted_indexes <= initial_indexes:
+      raise NavigationDatabaseRestoreStateError(
+        "retry accepted index lacks an initial failure"
+      )
+    if retry_accepted_indexes & permanent_indexes:
+      raise NavigationDatabaseRestoreStateError(
+        "retry accepted and permanent failure indexes overlap"
+      )
+    if len(retry_accepted_indexes) > self.accepted_frame_count:
+      raise NavigationDatabaseRestoreStateError(
+        "retry accepted count exceeds accepted frame count"
+      )
+    if any(
+      failure.attempt == 2
+      and failure.frame_index not in initial_indexes
+      for failure in self.permanent_failures
+    ):
+      raise NavigationDatabaseRestoreStateError(
+        "retry failure lacks an initial failure"
+      )
+    for name, value in (
+      ("execution_error", self.execution_error),
+      ("failure_phase", self.failure_phase),
+      ("cache_selection_reason", self.cache_selection_reason),
+    ):
+      if value is not None and (not isinstance(value, str) or not value):
+        raise NavigationDatabaseRestoreStateError(f"{name} is invalid")
+    for name, value in (
+      ("cache_age_seconds", self.cache_age_seconds),
+      ("transfer_budget_seconds", self.transfer_budget_seconds),
+      ("transfer_started_at", self.transfer_started_at),
+      ("transfer_completed_at", self.transfer_completed_at),
+      ("transfer_deadline", self.transfer_deadline),
+    ):
+      if value is not None and (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not isfinite(float(value))
+      ):
+        raise NavigationDatabaseRestoreStateError(f"{name} is invalid")
+    if self.cache_age_seconds is not None and self.cache_age_seconds < 0.0:
+      raise NavigationDatabaseRestoreStateError("cache age is invalid")
+    if self.transfer_budget_seconds is not None and self.transfer_budget_seconds <= 0.0:
+      raise NavigationDatabaseRestoreStateError("transfer budget is invalid")
+    transfer_boundary_values = (
+      self.transfer_budget_seconds,
+      self.transfer_started_at,
+      self.transfer_deadline,
+    )
+    if any(value is None for value in transfer_boundary_values) and any(value is not None for value in transfer_boundary_values):
+      raise NavigationDatabaseRestoreStateError("transfer boundary fields must be all present or all absent")
+    if self.transfer_started_at is None and self.transfer_completed_at is not None:
+      raise NavigationDatabaseRestoreStateError("transfer completion requires a start")
+    if self.transfer_started_at is not None:
+      assert self.transfer_budget_seconds is not None
+      assert self.transfer_deadline is not None
+      if self.transfer_completed_at is not None and self.transfer_completed_at < self.transfer_started_at:
+        raise NavigationDatabaseRestoreStateError("transfer completion precedes start")
+      if self.transfer_deadline != self.transfer_started_at + self.transfer_budget_seconds:
+        raise NavigationDatabaseRestoreStateError("transfer deadline does not match budget")
+    if self.disposition is NavigationDatabaseRestoreDisposition.RESTORED and (
+      self.total_frame_count <= 0
+      or self.accepted_frame_count != self.total_frame_count
+      or self.permanent_failures
+      or self.execution_error is not None
+    ):
+      raise NavigationDatabaseRestoreStateError("completed restore result is inconsistent")
+    if (
+      self.disposition
+      is NavigationDatabaseRestoreDisposition.RESTORE_PARTIAL
+      and self.accepted_frame_count == 0
+    ):
+      raise NavigationDatabaseRestoreStateError(
+        "partial restore has no accepted frames"
+      )
+    if (
+      self.disposition
+      is not NavigationDatabaseRestoreDisposition.RESTORED
+      and self.disposition
+      is not NavigationDatabaseRestoreDisposition.RESTORE_PARTIAL
+      and self.accepted_frame_count > 0
+    ):
+      raise NavigationDatabaseRestoreStateError(
+        "unsuccessful accepted frames require a partial disposition"
+      )
+
+  @property
+  def first_failure(self) -> NavigationDatabaseRestoreFrameFailure | None:
+    if self.initial_failures:
+      return self.initial_failures[0]
+    return self.permanent_failures[0] if self.permanent_failures else None
+
+  def to_json_dict(self) -> dict[str, object]:
+    return {
+      "disposition": self.disposition.value,
+      "total_frame_count": self.total_frame_count,
+      "accepted_frame_count": self.accepted_frame_count,
+      "database_write_attempt_count": self.database_write_attempt_count,
+      "initial_failures": [failure.to_json_dict() for failure in self.initial_failures],
+      "retry_accepted_indexes": list(self.retry_accepted_indexes),
+      "permanent_failures": [failure.to_json_dict() for failure in self.permanent_failures],
+      "execution_error": self.execution_error,
+      "failure_phase": self.failure_phase,
+      "cache_selection_reason": self.cache_selection_reason,
+      "cache_age_seconds": self.cache_age_seconds,
+      "transfer_budget_seconds": self.transfer_budget_seconds,
+      "transfer_started_at": self.transfer_started_at,
+      "transfer_completed_at": self.transfer_completed_at,
+      "transfer_deadline": self.transfer_deadline,
+    }
+
+  @classmethod
+  def from_json_dict(
+    cls,
+    value: object,
+  ) -> NavigationDatabaseRestorePersistedExecution:
+    keys = {
+      "disposition",
+      "total_frame_count",
+      "accepted_frame_count",
+      "database_write_attempt_count",
+      "initial_failures",
+      "retry_accepted_indexes",
+      "permanent_failures",
+      "execution_error",
+      "failure_phase",
+      "cache_selection_reason",
+      "cache_age_seconds",
+      "transfer_budget_seconds",
+      "transfer_started_at",
+      "transfer_completed_at",
+      "transfer_deadline",
+    }
+    if not isinstance(value, dict) or set(value) != keys:
+      raise NavigationDatabaseRestoreStateError("persisted restore result is invalid")
+    mapping = cast(dict[str, object], value)
+    try:
+      disposition = NavigationDatabaseRestoreDisposition(
+        cast(str, mapping["disposition"])
+      )
+    except (TypeError, ValueError) as exc:
+      raise NavigationDatabaseRestoreStateError("persisted restore disposition is invalid") from exc
+    initial_failures = mapping["initial_failures"]
+    retry_accepted_indexes = mapping["retry_accepted_indexes"]
+    permanent_failures = mapping["permanent_failures"]
+    if not isinstance(initial_failures, list) or not isinstance(retry_accepted_indexes, list) or not isinstance(permanent_failures, list):
+      raise NavigationDatabaseRestoreStateError("persisted restore collections are invalid")
+    return cls(
+      disposition=disposition,
+      total_frame_count=cast(int, mapping["total_frame_count"]),
+      accepted_frame_count=cast(int, mapping["accepted_frame_count"]),
+      database_write_attempt_count=cast(int, mapping["database_write_attempt_count"]),
+      initial_failures=tuple(NavigationDatabaseRestoreFrameFailure.from_json_dict(failure) for failure in initial_failures),
+      retry_accepted_indexes=tuple(cast(int, index) for index in retry_accepted_indexes),
+      permanent_failures=tuple(NavigationDatabaseRestoreFrameFailure.from_json_dict(failure) for failure in permanent_failures),
+      execution_error=cast(str | None, mapping["execution_error"]),
+      failure_phase=cast(str | None, mapping["failure_phase"]),
+      cache_selection_reason=cast(str | None, mapping["cache_selection_reason"]),
+      cache_age_seconds=cast(float | None, mapping["cache_age_seconds"]),
+      transfer_budget_seconds=cast(float | None, mapping["transfer_budget_seconds"]),
+      transfer_started_at=cast(float | None, mapping["transfer_started_at"]),
+      transfer_completed_at=cast(float | None, mapping["transfer_completed_at"]),
+      transfer_deadline=cast(float | None, mapping["transfer_deadline"]),
+    )
+
 
 @dataclass(frozen=True)
 class NavigationDatabaseRestoreBootState:
@@ -306,6 +657,10 @@ class NavigationDatabaseRestoreBootState:
   candidate_identities: tuple[NavigationDatabaseRestoreCandidateIdentity, ...] = ()
   cache_generation: str | None = None
   cache_saved_at_utc: datetime | None = None
+  cache_database_digest: str | None = None
+  cache_maximum_age_seconds: float | None = None
+  cache_expires_at_utc: datetime | None = None
+  restore_result: NavigationDatabaseRestorePersistedExecution | None = None
 
   def __post_init__(self) -> None:
     if self.version != NAVIGATION_DATABASE_RESTORE_STATE_VERSION:
@@ -330,6 +685,12 @@ class NavigationDatabaseRestoreBootState:
       self.disposition
       in (
         NavigationDatabaseRestoreDisposition.RESTORED,
+        NavigationDatabaseRestoreDisposition.RESTORE_PARTIAL,
+        NavigationDatabaseRestoreDisposition.RESTORE_REJECTED,
+        NavigationDatabaseRestoreDisposition.RESTORE_RESPONSE_TIMEOUT,
+        NavigationDatabaseRestoreDisposition.RESTORE_TRANSFER_DEADLINE,
+        NavigationDatabaseRestoreDisposition.RESTORE_TRANSPORT_ERROR,
+        NavigationDatabaseRestoreDisposition.RESTORE_CACHE_EXPIRED,
         NavigationDatabaseRestoreDisposition.WRITE_FAILED,
       )
       and not self.restore_attempted
@@ -349,8 +710,64 @@ class NavigationDatabaseRestoreBootState:
         raise NavigationDatabaseRestoreStateError("cache_saved_at_utc is invalid")
       if self.cache_saved_at_utc.tzinfo is None or self.cache_saved_at_utc.utcoffset() is None:
         raise NavigationDatabaseRestoreStateError("cache_saved_at_utc must be timezone-aware")
-    if (self.cache_generation is None) != (self.cache_saved_at_utc is None):
-      raise NavigationDatabaseRestoreStateError("selected cache generation and timestamp must be paired")
+    selected_policy_values = (
+      self.cache_generation,
+      self.cache_saved_at_utc,
+      self.cache_database_digest,
+      self.cache_maximum_age_seconds,
+      self.cache_expires_at_utc,
+    )
+    if any(value is None for value in selected_policy_values) and any(
+      value is not None for value in selected_policy_values
+    ):
+      raise NavigationDatabaseRestoreStateError(
+        "selected cache policy fields must be all present or all absent"
+      )
+    if self.restore_result is not None:
+      if not isinstance(self.restore_result, NavigationDatabaseRestorePersistedExecution):
+        raise NavigationDatabaseRestoreStateError("restore_result is invalid")
+      if not self.restore_attempted:
+        raise NavigationDatabaseRestoreStateError("restore_result requires restore_attempted")
+      if self.restore_result.disposition is not self.disposition:
+        raise NavigationDatabaseRestoreStateError("restore_result disposition does not match state")
+    if self.cache_database_digest is not None:
+      if (
+        len(self.cache_database_digest) != 64
+        or any(
+          character not in "0123456789abcdef"
+          for character in self.cache_database_digest
+        )
+      ):
+        raise NavigationDatabaseRestoreStateError(
+          "selected cache digest is invalid"
+        )
+      maximum_age = self.cache_maximum_age_seconds
+      if (
+        isinstance(maximum_age, bool)
+        or not isinstance(maximum_age, (int, float))
+        or not isfinite(float(maximum_age))
+        or float(maximum_age) < 0.0
+      ):
+        raise NavigationDatabaseRestoreStateError(
+          "selected cache maximum age is invalid"
+        )
+      expires_at = self.cache_expires_at_utc
+      if not isinstance(expires_at, datetime):
+        raise NavigationDatabaseRestoreStateError(
+          "selected cache expiration is invalid"
+        )
+      if expires_at.tzinfo is None or expires_at.utcoffset() is None:
+        raise NavigationDatabaseRestoreStateError(
+          "selected cache expiration must be timezone-aware"
+        )
+      assert self.cache_saved_at_utc is not None
+      expected_expiration = self.cache_saved_at_utc + timedelta(
+        seconds=float(maximum_age)
+      )
+      if expires_at != expected_expiration:
+        raise NavigationDatabaseRestoreStateError(
+          "selected cache expiration does not match policy"
+        )
 
   def to_json_dict(self) -> dict[str, Any]:
     return {
@@ -365,6 +782,10 @@ class NavigationDatabaseRestoreBootState:
       "candidate_identities": [identity.to_json_dict() for identity in self.candidate_identities],
       "cache_generation": self.cache_generation,
       "cache_saved_at_utc": (self.cache_saved_at_utc.astimezone(UTC).isoformat() if self.cache_saved_at_utc is not None else None),
+      "cache_database_digest": self.cache_database_digest,
+      "cache_maximum_age_seconds": self.cache_maximum_age_seconds,
+      "cache_expires_at_utc": (self.cache_expires_at_utc.astimezone(UTC).isoformat() if self.cache_expires_at_utc is not None else None),
+      "restore_result": (self.restore_result.to_json_dict() if self.restore_result is not None else None),
     }
 
   @classmethod
@@ -372,7 +793,7 @@ class NavigationDatabaseRestoreBootState:
     if not isinstance(value, dict):
       raise NavigationDatabaseRestoreStateError("state root is invalid")
     mapping = cast(dict[str, object], value)
-    expected_keys = {
+    common_keys = {
       "version",
       "boot_id",
       "receiver_fingerprint",
@@ -385,29 +806,65 @@ class NavigationDatabaseRestoreBootState:
       "cache_generation",
       "cache_saved_at_utc",
     }
-    if set(mapping) != expected_keys:
-      raise NavigationDatabaseRestoreStateError("state keys are invalid")
-    saved_at_raw = mapping["cache_saved_at_utc"]
-    if saved_at_raw is None:
-      saved_at = None
-    elif isinstance(saved_at_raw, str):
-      try:
-        saved_at = datetime.fromisoformat(saved_at_raw)
-      except ValueError as exc:
-        raise NavigationDatabaseRestoreStateError("cache_saved_at_utc is invalid") from exc
+    policy_keys = {
+      "cache_database_digest",
+      "cache_maximum_age_seconds",
+      "cache_expires_at_utc",
+    }
+    result_keys = {"restore_result"}
+    version = mapping.get("version")
+    if version == NAVIGATION_DATABASE_RESTORE_STATE_VERSION:
+      if set(mapping) != common_keys | policy_keys | result_keys:
+        raise NavigationDatabaseRestoreStateError("state keys are invalid")
+    elif version == POLICY_NAVIGATION_DATABASE_RESTORE_STATE_VERSION:
+      if set(mapping) != common_keys | policy_keys:
+        raise NavigationDatabaseRestoreStateError("policy state keys are invalid")
+    elif version == LEGACY_NAVIGATION_DATABASE_RESTORE_STATE_VERSION:
+      if set(mapping) != common_keys:
+        raise NavigationDatabaseRestoreStateError("legacy state keys are invalid")
     else:
-      raise NavigationDatabaseRestoreStateError("cache_saved_at_utc is invalid")
+      raise NavigationDatabaseRestoreStateError("unsupported state version")
+
+    def parse_optional_datetime(field: str) -> datetime | None:
+      raw = mapping[field]
+      if raw is None:
+        return None
+      if not isinstance(raw, str):
+        raise NavigationDatabaseRestoreStateError(f"{field} is invalid")
+      try:
+        return datetime.fromisoformat(raw)
+      except ValueError as exc:
+        raise NavigationDatabaseRestoreStateError(
+          f"{field} is invalid"
+        ) from exc
+
+    saved_at = parse_optional_datetime("cache_saved_at_utc")
     try:
       disposition = NavigationDatabaseRestoreDisposition(
         cast(str, mapping["disposition"])
       )
     except (TypeError, ValueError) as exc:
-      raise NavigationDatabaseRestoreStateError("disposition is invalid") from exc
+      raise NavigationDatabaseRestoreStateError(
+        "disposition is invalid"
+      ) from exc
     identities_raw = mapping["candidate_identities"]
     if not isinstance(identities_raw, list):
-      raise NavigationDatabaseRestoreStateError("candidate identities are invalid")
+      raise NavigationDatabaseRestoreStateError(
+        "candidate identities are invalid"
+      )
+
+    legacy = version == LEGACY_NAVIGATION_DATABASE_RESTORE_STATE_VERSION
+    policy_state = version in (
+      POLICY_NAVIGATION_DATABASE_RESTORE_STATE_VERSION,
+      NAVIGATION_DATABASE_RESTORE_STATE_VERSION,
+    )
+    restore_result_raw = (
+      mapping["restore_result"]
+      if version == NAVIGATION_DATABASE_RESTORE_STATE_VERSION
+      else None
+    )
     return cls(
-      version=cast(int, mapping["version"]),
+      version=NAVIGATION_DATABASE_RESTORE_STATE_VERSION,
       boot_id=cast(str, mapping["boot_id"]),
       receiver_fingerprint=cast(str, mapping["receiver_fingerprint"]),
       disposition=disposition,
@@ -422,12 +879,34 @@ class NavigationDatabaseRestoreBootState:
         NavigationDatabaseRestoreCandidateIdentity.from_json_dict(identity)
         for identity in identities_raw
       ),
-      cache_generation=cast(
-        str | None,
-        mapping["cache_generation"],
+      cache_generation=(
+        None if legacy else cast(str | None, mapping["cache_generation"])
       ),
-      cache_saved_at_utc=saved_at,
+      cache_saved_at_utc=(None if legacy else saved_at),
+      cache_database_digest=(
+        cast(str | None, mapping["cache_database_digest"])
+        if policy_state
+        else None
+      ),
+      cache_maximum_age_seconds=(
+        cast(float | None, mapping["cache_maximum_age_seconds"])
+        if policy_state
+        else None
+      ),
+      cache_expires_at_utc=(
+        parse_optional_datetime("cache_expires_at_utc")
+        if policy_state
+        else None
+      ),
+      restore_result=(
+        None
+        if restore_result_raw is None
+        else NavigationDatabaseRestorePersistedExecution.from_json_dict(
+          restore_result_raw
+        )
+      ),
     )
+
 
 
 def load_navigation_database_restore_boot_state(
@@ -609,6 +1088,8 @@ def _bounded_error(exc: BaseException) -> str:
 def _classify_failure(
   exc: BaseException,
 ) -> NavigationDatabaseRestoreFrameFailureKind:
+  if isinstance(exc, NavigationDatabaseRestoreTransferDeadlineError):
+    return NavigationDatabaseRestoreFrameFailureKind.TRANSFER_DEADLINE
   if isinstance(exc, MgaReceiverNackError):
     return NavigationDatabaseRestoreFrameFailureKind.REJECTED
   if isinstance(exc, TimeoutError):
@@ -634,6 +1115,10 @@ class NavigationDatabaseRestoreRuntime:
       NavigationDatabaseRestoreFrozenCaches | NavigationDatabaseRestoreSnapshot | None,
     ] = load_navigation_database_restore_frozen_caches,
     retry_delay_seconds: float = 0.25,
+    transfer_budget_seconds: float = (
+      NAVIGATION_DATABASE_RESTORE_TRANSFER_BUDGET_SECONDS
+    ),
+    monotonic: Callable[[], float] = time.monotonic,
     sleeper: Callable[[float], None] = time.sleep,
     state_path: Path = NAVIGATION_DATABASE_RESTORE_STATE_PATH,
     boot_id_reader: Callable[[], str | None] = read_boot_id,
@@ -647,6 +1132,7 @@ class NavigationDatabaseRestoreRuntime:
       raise ValueError("receiver_fingerprint must be a string")
     for name, dependency in (
       ("snapshot_loader", snapshot_loader),
+      ("monotonic", monotonic),
       ("sleeper", sleeper),
       ("boot_id_reader", boot_id_reader),
       ("boottime_reader", boottime_reader),
@@ -663,6 +1149,15 @@ class NavigationDatabaseRestoreRuntime:
       or float(retry_delay_seconds) < 0.0
     ):
       raise ValueError("retry_delay_seconds must be finite and non-negative")
+    if (
+      isinstance(transfer_budget_seconds, bool)
+      or not isinstance(transfer_budget_seconds, (int, float))
+      or not isfinite(float(transfer_budget_seconds))
+      or float(transfer_budget_seconds) <= 0.0
+    ):
+      raise ValueError(
+        "transfer_budget_seconds must be finite and positive"
+      )
     if not isinstance(state_path, Path):
       raise ValueError("state_path must be a Path")
     if not isinstance(new_receiver_cycle, bool):
@@ -671,15 +1166,19 @@ class NavigationDatabaseRestoreRuntime:
     self._receiver_fingerprint = receiver_fingerprint
     self._snapshot_loader = snapshot_loader
     self._retry_delay_seconds = float(retry_delay_seconds)
+    self._transfer_budget_seconds = float(transfer_budget_seconds)
+    self._monotonic = monotonic
     self._sleeper = sleeper
     self._state_path = state_path
     self._boottime_reader = boottime_reader
     self._state_storer = state_storer
     self._controller = NavigationDatabaseRestoreBootController()
     self._caches_loaded = False
+    self._snapshot_load_error: str | None = None
     self._frozen_caches: NavigationDatabaseRestoreFrozenCaches | None = None
     self._position_snapshot: NavigationDatabaseRestoreSnapshot | None = None
     self._database_snapshot: NavigationDatabaseRestoreSnapshot | None = None
+    self._database_policy: NavigationDatabaseRestoreCandidatePolicy | None = None
     self._candidate_identities: tuple[NavigationDatabaseRestoreCandidateIdentity, ...] = ()
     self._position_claimed = False
     self._position_attempted = False
@@ -701,15 +1200,24 @@ class NavigationDatabaseRestoreRuntime:
     self._persisted_candidate_identities: tuple[NavigationDatabaseRestoreCandidateIdentity, ...] = ()
     self._persisted_cache_generation: str | None = None
     self._persisted_cache_saved_at_utc: datetime | None = None
+    self._persisted_cache_database_digest: str | None = None
+    self._persisted_cache_maximum_age_seconds: float | None = None
+    self._persisted_cache_expires_at_utc: datetime | None = None
     self._last_authorized_time: AuthorizedTime | None = None
     self._last_initial_failures: tuple[NavigationDatabaseRestoreFrameFailure, ...] = ()
     self._last_retry_accepted_indexes: tuple[int, ...] = ()
     self._last_permanent_failures: tuple[NavigationDatabaseRestoreFrameFailure, ...] = ()
     self._last_execution_error: str | None = None
     self._last_failure_phase: str | None = None
+    self._restore_result_details_available = False
+    self._last_total_frame_count = 0
     self._last_accepted_frame_count = 0
     self._last_write_attempt_count = 0
+    self._last_cache_selection_reason: str | None = None
     self._last_cache_age_seconds: float | None = None
+    self._transfer_started_at: float | None = None
+    self._transfer_completed_at: float | None = None
+    self._transfer_deadline: float | None = None
 
     try:
       boot_id = boot_id_reader()
@@ -853,6 +1361,43 @@ class NavigationDatabaseRestoreRuntime:
   def state_available(self) -> bool:
     return not self._assistance_state_disabled
 
+  @staticmethod
+  def _candidate_restorable(
+    snapshot: NavigationDatabaseRestoreSnapshot,
+  ) -> bool:
+    quality = snapshot.quality
+    return bool(
+      snapshot.database_frames
+      and quality is not None
+      and quality.gps_startup_ready
+    )
+
+  @staticmethod
+  def _candidate_wait_qualified(
+    snapshot: NavigationDatabaseRestoreSnapshot,
+  ) -> bool:
+    quality = snapshot.quality
+    return bool(snapshot.database_frames) and (
+      quality is not None and quality.gps_startup_ready
+    )
+
+  @staticmethod
+  def _candidate_age_policy(
+    _snapshot: NavigationDatabaseRestoreSnapshot,
+  ) -> NavigationDatabaseRestoreAgePolicy:
+    return DEFAULT_NAVIGATION_DATABASE_RESTORE_AGE_POLICY
+
+  @property
+  def has_prequalified_database_candidate(self) -> bool:
+    self.prepare()
+    return bool(
+      self._frozen_caches is not None
+      and any(
+        self._candidate_wait_qualified(candidate)
+        for candidate in self._frozen_caches.database_candidates
+      )
+    )
+
   @property
   def assistance_state_disabled_reason(self) -> str | None:
     return self._assistance_state_disabled_reason
@@ -871,7 +1416,7 @@ class NavigationDatabaseRestoreRuntime:
       )
     if self._controller.pending and not self._controller.restore_attempted:
       self._controller.skip(
-        NavigationDatabaseRestoreDisposition.SKIPPED_UNVERIFIED
+        NavigationDatabaseRestoreDisposition.SKIPPED_STATE_UNAVAILABLE
       )
 
   def _fail_closed(self, reason: str) -> None:
@@ -879,6 +1424,59 @@ class NavigationDatabaseRestoreRuntime:
     self._position_error = reason
     if self._controller.pending and not self._controller.restore_attempted:
       self._controller.skip(NavigationDatabaseRestoreDisposition.SKIPPED_UNVERIFIED)
+
+  def _load_persisted_execution(
+    self,
+    result: NavigationDatabaseRestorePersistedExecution,
+  ) -> None:
+    self._restore_result_details_available = True
+    self._last_total_frame_count = result.total_frame_count
+    self._last_accepted_frame_count = result.accepted_frame_count
+    self._last_write_attempt_count = result.database_write_attempt_count
+    self._last_initial_failures = result.initial_failures
+    self._last_retry_accepted_indexes = result.retry_accepted_indexes
+    self._last_permanent_failures = result.permanent_failures
+    self._last_execution_error = result.execution_error
+    self._last_failure_phase = result.failure_phase
+    self._last_cache_selection_reason = result.cache_selection_reason
+    self._last_cache_age_seconds = result.cache_age_seconds
+    if result.transfer_budget_seconds is not None:
+      self._transfer_budget_seconds = result.transfer_budget_seconds
+    self._transfer_started_at = result.transfer_started_at
+    self._transfer_completed_at = result.transfer_completed_at
+    self._transfer_deadline = result.transfer_deadline
+
+  def _persisted_execution_result(
+    self,
+  ) -> NavigationDatabaseRestorePersistedExecution | None:
+    disposition = self._controller.disposition
+    if (
+      not self._restore_result_details_available
+      or not self._controller.restore_attempted
+      or not disposition.terminal
+    ):
+      return None
+    return NavigationDatabaseRestorePersistedExecution(
+      disposition=disposition,
+      total_frame_count=self._last_total_frame_count,
+      accepted_frame_count=self._last_accepted_frame_count,
+      database_write_attempt_count=self._last_write_attempt_count,
+      initial_failures=self._last_initial_failures,
+      retry_accepted_indexes=self._last_retry_accepted_indexes,
+      permanent_failures=self._last_permanent_failures,
+      execution_error=self._last_execution_error,
+      failure_phase=self._last_failure_phase,
+      cache_selection_reason=self._last_cache_selection_reason,
+      cache_age_seconds=self._last_cache_age_seconds,
+      transfer_budget_seconds=(
+        self._transfer_budget_seconds
+        if self._transfer_started_at is not None
+        else None
+      ),
+      transfer_started_at=self._transfer_started_at,
+      transfer_completed_at=self._transfer_completed_at,
+      transfer_deadline=self._transfer_deadline,
+    )
 
   def _restore_persisted_state(
     self,
@@ -899,12 +1497,22 @@ class NavigationDatabaseRestoreRuntime:
     self._persisted_candidate_identities = state.candidate_identities
     self._persisted_cache_generation = state.cache_generation
     self._persisted_cache_saved_at_utc = state.cache_saved_at_utc
+    self._persisted_cache_database_digest = state.cache_database_digest
+    self._persisted_cache_maximum_age_seconds = (
+      state.cache_maximum_age_seconds
+    )
+    self._persisted_cache_expires_at_utc = state.cache_expires_at_utc
+    if state.restore_result is not None:
+      self._load_persisted_execution(state.restore_result)
     if state.acquisition_started:
       self._controller.note_acquisition_started()
 
     if state.restore_attempted:
       self._controller.begin_restore_attempt()
       if state.disposition is NavigationDatabaseRestoreDisposition.PENDING:
+        self._last_execution_error = "interrupted_restore_result_unavailable"
+        self._last_failure_phase = "state_recovery"
+        self._restore_result_details_available = True
         self._controller.finish_restore(NavigationDatabaseRestoreDisposition.WRITE_FAILED)
         self._recovered_interrupted_attempt = True
         self._persist_state()
@@ -943,6 +1551,22 @@ class NavigationDatabaseRestoreRuntime:
       candidate_identities=identities,
       cache_generation=generation,
       cache_saved_at_utc=saved_at,
+      cache_database_digest=(
+        self._database_policy.database_digest
+        if self._database_policy is not None
+        else self._persisted_cache_database_digest
+      ),
+      cache_maximum_age_seconds=(
+        self._database_policy.maximum_age_seconds
+        if self._database_policy is not None
+        else self._persisted_cache_maximum_age_seconds
+      ),
+      cache_expires_at_utc=(
+        self._database_policy.expires_at_utc
+        if self._database_policy is not None
+        else self._persisted_cache_expires_at_utc
+      ),
+      restore_result=self._persisted_execution_result(),
     )
 
   def _persist_state(self) -> bool:
@@ -975,6 +1599,22 @@ class NavigationDatabaseRestoreRuntime:
       raise TypeError("snapshot loader returned an invalid type")
     return loaded
 
+  @staticmethod
+  def _frozen_cache_file_present(
+    frozen: NavigationDatabaseRestoreFrozenCaches,
+  ) -> bool:
+    inventory = frozen.inventory
+    if inventory is not None:
+      return any(
+        inspection.state is not CacheFileState.ABSENT
+        for inspection in (inventory.primary, inventory.previous)
+      )
+    return any((
+      frozen.position_snapshot is not None,
+      frozen.primary_snapshot is not None,
+      frozen.previous_snapshot is not None,
+    ))
+
   def prepare(self) -> NavigationDatabaseRestoreExecution:
     if not self.state_available:
       self._execution = self._build_execution(self._last_authorized_time)
@@ -986,8 +1626,9 @@ class NavigationDatabaseRestoreRuntime:
       loaded = self._snapshot_loader(self._receiver_fingerprint)
       frozen = self._normalize_frozen_caches(loaded)
     except Exception as exc:
+      self._snapshot_load_error = _bounded_error(exc)
       frozen = NavigationDatabaseRestoreFrozenCaches(None, None, None)
-      self._position_error = f"snapshot_load:{_bounded_error(exc)}"
+      self._position_error = f"snapshot_load:{self._snapshot_load_error}"
     self._frozen_caches = frozen
     self._position_snapshot = frozen.position_snapshot
     self._candidate_identities = tuple(NavigationDatabaseRestoreCandidateIdentity.from_snapshot(candidate) for candidate in frozen.database_candidates)
@@ -1002,9 +1643,23 @@ class NavigationDatabaseRestoreRuntime:
       if not self._persist_state():
         self._fail_closed("boot_state:candidate_identity_persist_failed")
 
-    if not frozen.database_candidates and self._controller.pending:
-      self._controller.skip(NavigationDatabaseRestoreDisposition.SKIPPED_NO_USABLE_CACHE)
-      self._persist_state()
+    if self._controller.pending:
+      cache_file_present = self._frozen_cache_file_present(frozen)
+      if not frozen.database_candidates:
+        self._controller.skip(
+          NavigationDatabaseRestoreDisposition.SKIPPED_CACHE_UNQUALIFIED
+          if self._snapshot_load_error is not None or cache_file_present
+          else NavigationDatabaseRestoreDisposition.SKIPPED_NO_CACHE
+        )
+        self._persist_state()
+      elif not any(
+        self._candidate_restorable(candidate)
+        for candidate in frozen.database_candidates
+      ):
+        self._controller.skip(
+          NavigationDatabaseRestoreDisposition.SKIPPED_CACHE_UNQUALIFIED
+        )
+        self._persist_state()
 
     self._execution = self._build_execution()
     return self._execution
@@ -1139,17 +1794,38 @@ class NavigationDatabaseRestoreRuntime:
     self._execution = self._build_execution()
     return self._execution
 
-  def close_restore_window_unverified(self) -> bool:
-    """Persist a terminal timeout skip while GNSS remains stopped."""
+  def _close_restore_window(
+    self,
+    disposition: NavigationDatabaseRestoreDisposition,
+  ) -> bool:
     if not self.state_available:
       return False
     if self._controller.pending and not self._controller.restore_attempted:
-      self._controller.skip(
-        NavigationDatabaseRestoreDisposition.SKIPPED_UNVERIFIED
-      )
+      self._controller.skip(disposition)
     persisted = self._persist_state()
     self._execution = self._build_execution(self._last_authorized_time)
     return persisted
+
+  def close_restore_window_unverified(self) -> bool:
+    """Compatibility terminal skip for invalid or unclassified evidence."""
+    return self._close_restore_window(
+      NavigationDatabaseRestoreDisposition.SKIPPED_UNVERIFIED
+    )
+
+  def close_restore_window_no_trusted_time(self) -> bool:
+    return self._close_restore_window(
+      NavigationDatabaseRestoreDisposition.SKIPPED_NO_TRUSTED_TIME
+    )
+
+  def close_restore_window_wait_timeout(self) -> bool:
+    return self._close_restore_window(
+      NavigationDatabaseRestoreDisposition.SKIPPED_WAIT_TIMEOUT
+    )
+
+  def close_restore_window_wait_error(self) -> bool:
+    return self._close_restore_window(
+      NavigationDatabaseRestoreDisposition.SKIPPED_WAIT_ERROR
+    )
 
   def close_restore_window_for_early_acquisition(self) -> bool:
     # Persist a terminal DBD skip while preserving pre-START assistance.
@@ -1183,9 +1859,30 @@ class NavigationDatabaseRestoreRuntime:
   def note_acquisition_started(self) -> bool:
     return self.claim_acquisition_start()
 
-  def claim_yuma_transmission(self) -> bool:
-    """Durably consume the boot's YUMA/DBD choice before receiver I/O."""
+  def note_early_acquisition_started(self) -> bool:
+    """Durably close only DBD when bootstrap frames show acquisition."""
+    if self._controller.acquisition_started:
+      return self.state_available
     if not self.state_available:
+      self._controller.note_acquisition_started()
+      self._execution = self._build_execution(self._last_authorized_time)
+      return False
+    if self._controller.pending and not self._controller.restore_attempted:
+      self._controller.skip(
+        NavigationDatabaseRestoreDisposition.SKIPPED_EARLY_ACQUISITION
+      )
+    self._controller.note_acquisition_started()
+    persisted = self._persist_state()
+    self._execution = self._build_execution(self._last_authorized_time)
+    return persisted
+
+  @property
+  def database_restore_pending(self) -> bool:
+    return self._controller.pending
+
+  def claim_yuma_transmission(self) -> bool:
+    """Durably consume YUMA only after the DBD decision is terminal."""
+    if not self.state_available or self.database_restore_pending:
       return False
     if self._yuma_sent:
       return True
@@ -1247,13 +1944,17 @@ class NavigationDatabaseRestoreRuntime:
     effective_age = nominal_age + float(uncertainty) + elapsed
     return effective_age if isfinite(effective_age) else None
 
-  def _select_database_snapshot(
+  def _select_database_policy(
     self,
     authorized_time: AuthorizedTime,
-  ) -> tuple[NavigationDatabaseRestoreSnapshot | None, float | None]:
+  ) -> tuple[NavigationDatabaseRestoreCandidatePolicy | None, float | None]:
     assert is_current_independent_network_time(authorized_time)
     assert self._frozen_caches is not None
-    candidates = self._frozen_caches.database_candidates
+    candidates = tuple(
+      candidate
+      for candidate in self._frozen_caches.database_candidates
+      if self._candidate_restorable(candidate)
+    )
     ages = {
       candidate.generation: self._effective_cache_age(candidate, authorized_time)
       for candidate in candidates
@@ -1263,21 +1964,39 @@ class NavigationDatabaseRestoreRuntime:
       matching = [
         candidate
         for candidate in candidates
-        if (candidate.generation == self._persisted_cache_generation and candidate.saved_at_utc == self._persisted_cache_saved_at_utc)
+        if (
+          candidate.generation == self._persisted_cache_generation
+          and candidate.saved_at_utc == self._persisted_cache_saved_at_utc
+          and candidate.database_digest
+          == self._persisted_cache_database_digest
+        )
       ]
-      if len(matching) != 1:
+      if (
+        len(matching) != 1
+        or self._persisted_cache_maximum_age_seconds is None
+        or self._persisted_cache_expires_at_utc is None
+      ):
         return None, None
       selected = matching[0]
-      return selected, ages[selected.generation]
+      policy = NavigationDatabaseRestoreCandidatePolicy(
+        selected,
+        NavigationDatabaseRestoreAgePolicy(
+          self._persisted_cache_maximum_age_seconds
+        ),
+      )
+      if policy.expires_at_utc != self._persisted_cache_expires_at_utc:
+        return None, None
+      return policy, ages[selected.generation]
 
-    eligible: list[NavigationDatabaseRestoreSnapshot] = []
+    eligible: list[NavigationDatabaseRestoreCandidatePolicy] = []
     for candidate in candidates:
       age = ages[candidate.generation]
-      if (
-        age is not None
-        and 0.0 <= age <= NAVIGATION_DATABASE_RESTORE_MAX_AGE_SECONDS
-      ):
-        eligible.append(candidate)
+      policy = NavigationDatabaseRestoreCandidatePolicy(
+        candidate,
+        self._candidate_age_policy(candidate),
+      )
+      if age is not None and policy.accepts_age(age):
+        eligible.append(policy)
     if not eligible:
       valid_ages = [age for age in ages.values() if age is not None and age >= 0.0]
       if len(valid_ages) == len(candidates) and valid_ages:
@@ -1285,24 +2004,47 @@ class NavigationDatabaseRestoreRuntime:
       return None, None
 
     if len(eligible) == 1:
-      selected = eligible[0]
-      return replace(
-        selected,
-        selection_reason=f"trusted_age_only_eligible:{selected.generation}",
-      ), ages[selected.generation]
+      selected_policy = eligible[0]
+      selected = replace(
+        selected_policy.snapshot,
+        selection_reason=(
+          "trusted_age_only_eligible:"
+          + selected_policy.snapshot.generation
+        ),
+      )
+      return (
+        NavigationDatabaseRestoreCandidatePolicy(
+          selected,
+          selected_policy.age_policy,
+        ),
+        ages[selected.generation],
+      )
 
     inventory = self._frozen_caches.inventory
     if inventory is None:
-      selected = next(
-        (candidate for candidate in eligible if candidate.generation == "primary"),
+      selected_policy = next(
+        (
+          policy
+          for policy in eligible
+          if policy.snapshot.generation == "primary"
+        ),
         eligible[0],
       )
-      return replace(
-        selected,
+      selected = replace(
+        selected_policy.snapshot,
         selection_reason="trusted_age_primary_tiebreak",
-      ), ages[selected.generation]
+      )
+      return (
+        NavigationDatabaseRestoreCandidatePolicy(
+          selected,
+          selected_policy.age_policy,
+        ),
+        ages[selected.generation],
+      )
 
-    eligible_generations = {candidate.generation for candidate in eligible}
+    eligible_generations = {
+      policy.snapshot.generation for policy in eligible
+    }
 
     def filtered(inspection: CacheFileInspection) -> CacheFileInspection:
       if inspection.generation in eligible_generations:
@@ -1322,11 +2064,210 @@ class NavigationDatabaseRestoreRuntime:
     )
     if selection is None:
       return None, None
-    selected = next(candidate for candidate in eligible if candidate.generation == selection.generation)
-    return replace(
-      selected,
+    selected_policy = next(
+      policy
+      for policy in eligible
+      if policy.snapshot.generation == selection.generation
+    )
+    selected = replace(
+      selected_policy.snapshot,
       selection_reason=f"trusted_age:{selection.reason}",
-    ), ages[selected.generation]
+    )
+    return (
+      NavigationDatabaseRestoreCandidatePolicy(
+        selected,
+        selected_policy.age_policy,
+      ),
+      ages[selected.generation],
+    )
+
+  def _activate_selected_database_policy(
+    self,
+    authorized_time: AuthorizedTime,
+  ) -> tuple[NavigationDatabaseRestoreCandidatePolicy | None, float | None]:
+    selected_policy, cache_age_seconds = (
+      self._select_database_policy(authorized_time)
+    )
+    if selected_policy is not None:
+      selected = selected_policy.snapshot
+      self._database_policy = selected_policy
+      self._database_snapshot = selected
+      self._last_total_frame_count = len(selected.database_frames)
+      self._last_cache_selection_reason = selected.selection_reason
+      self._persisted_cache_generation = selected.generation
+      self._persisted_cache_saved_at_utc = selected.saved_at_utc
+      self._persisted_cache_database_digest = (
+        selected_policy.database_digest
+      )
+      self._persisted_cache_maximum_age_seconds = (
+        selected_policy.maximum_age_seconds
+      )
+      self._persisted_cache_expires_at_utc = (
+        selected_policy.expires_at_utc
+      )
+    self._last_cache_age_seconds = cache_age_seconds
+    return selected_policy, cache_age_seconds
+
+  def record_pre_restore_transport_error(
+    self,
+    *,
+    authorized_time: AuthorizedTime,
+    error: BaseException,
+    phase: str,
+  ) -> NavigationDatabaseRestoreExecution:
+    if not isinstance(authorized_time, AuthorizedTime):
+      raise ValueError("authorized_time is invalid")
+    if not isinstance(error, BaseException):
+      raise ValueError("error is invalid")
+    if not isinstance(phase, str) or not phase:
+      raise ValueError("phase is invalid")
+    self.prepare()
+    self._last_authorized_time = authorized_time
+    if not self.state_available or self._controller.terminal:
+      self._execution = self._build_execution(authorized_time)
+      return self._execution
+
+    _selected_policy, cache_age_seconds = (
+      self._activate_selected_database_policy(authorized_time)
+    )
+    decision = evaluate_navigation_database_restore(
+      reliable_fix_available=False,
+      yuma_already_sent=self._yuma_sent,
+      authorized_time=authorized_time,
+      cache_age_seconds=cache_age_seconds,
+      gnss_acquisition_started=self._controller.acquisition_started,
+      age_policy=(
+        self._database_policy.age_policy
+        if self._database_policy is not None
+        else DEFAULT_NAVIGATION_DATABASE_RESTORE_AGE_POLICY
+      ),
+    )
+    if not self._controller.apply_decision(decision):
+      self._execution = self._build_execution(authorized_time)
+      return self._execution
+    if not decision.should_restore:
+      self._persist_state()
+      self._execution = self._build_execution(authorized_time)
+      return self._execution
+
+    self._last_accepted_frame_count = 0
+    self._last_write_attempt_count = 0
+    self._last_initial_failures = ()
+    self._last_retry_accepted_indexes = ()
+    self._last_permanent_failures = ()
+    self._last_execution_error = _bounded_error(error)
+    self._last_failure_phase = phase
+    self._restore_result_details_available = True
+    self._controller.finish_restore(
+      NavigationDatabaseRestoreDisposition.RESTORE_TRANSPORT_ERROR
+    )
+    self._persist_state()
+    self._execution = self._build_execution(authorized_time)
+    return self._execution
+
+  def remaining_transfer_seconds(
+    self,
+    frame_index: int,
+    *,
+    phase: str = "ack_wait_budget",
+  ) -> float:
+    if (
+      isinstance(frame_index, bool)
+      or not isinstance(frame_index, int)
+      or frame_index < 0
+    ):
+      raise ValueError("database frame index must be a non-negative int")
+    deadline = self._transfer_deadline
+    if deadline is None:
+      raise NavigationDatabaseRestoreTerminalBoundaryError(
+        "DBD receiver write blocked: transfer deadline unavailable"
+      )
+    now = self._monotonic()
+    if (
+      isinstance(now, bool)
+      or not isinstance(now, (int, float))
+      or not isfinite(float(now))
+    ):
+      raise NavigationDatabaseRestoreTransferDeadlineError(
+        "DBD transfer monotonic time is invalid: "
+        + f"phase={phase},frame_index={frame_index}"
+      )
+    remaining = deadline - float(now)
+    if remaining <= 0.0:
+      raise NavigationDatabaseRestoreTransferDeadlineError(
+        "DBD transfer deadline expired: "
+        + f"phase={phase},frame_index={frame_index}"
+      )
+    return remaining
+
+  def _check_transfer_deadline(
+    self,
+    phase: str,
+    frame_index: int,
+  ) -> None:
+    self.remaining_transfer_seconds(frame_index, phase=phase)
+
+  def _sleep_before_retry(self, frame_index: int) -> None:
+    if not self._retry_delay_seconds:
+      return
+    self._check_transfer_deadline("retry_delay_before", frame_index)
+    assert self._transfer_deadline is not None
+    now = self._monotonic()
+    if (
+      isinstance(now, bool)
+      or not isinstance(now, (int, float))
+      or not isfinite(float(now))
+    ):
+      raise NavigationDatabaseRestoreTransferDeadlineError(
+        "DBD transfer monotonic time is invalid before retry delay"
+      )
+    remaining = self._transfer_deadline - float(now)
+    if remaining <= self._retry_delay_seconds:
+      raise NavigationDatabaseRestoreTransferDeadlineError(
+        "DBD transfer deadline cannot cover retry delay: "
+        + f"frame_index={frame_index}"
+      )
+    self._sleeper(self._retry_delay_seconds)
+    self._check_transfer_deadline("retry_delay_after", frame_index)
+
+  def _completion_disposition(
+    self,
+    *,
+    total_frames: int,
+    accepted_frames: int,
+    permanent_failures: tuple[NavigationDatabaseRestoreFrameFailure, ...],
+    execution_error: str | None,
+  ) -> NavigationDatabaseRestoreDisposition:
+    if (
+      execution_error is None
+      and total_frames > 0
+      and accepted_frames == total_frames
+      and not permanent_failures
+    ):
+      return NavigationDatabaseRestoreDisposition.RESTORED
+    # Once any DBD frame reached the receiver, every unsuccessful outcome is
+    # partial regardless of the later failure kind.  This is the safety-
+    # relevant fact for subsequent assistance arbitration.
+    if accepted_frames > 0:
+      return NavigationDatabaseRestoreDisposition.RESTORE_PARTIAL
+    kinds = {failure.kind for failure in permanent_failures}
+    errors = tuple(failure.error.casefold() for failure in permanent_failures)
+    if NavigationDatabaseRestoreFrameFailureKind.TRANSFER_DEADLINE in kinds:
+      return (
+        NavigationDatabaseRestoreDisposition.RESTORE_TRANSFER_DEADLINE
+      )
+    if any("trusted cache age expired" in error for error in errors):
+      return NavigationDatabaseRestoreDisposition.RESTORE_CACHE_EXPIRED
+    if (
+      NavigationDatabaseRestoreFrameFailureKind.WRITE_ERROR in kinds
+      or NavigationDatabaseRestoreFrameFailureKind.TRANSACTION_ERROR in kinds
+    ):
+      return NavigationDatabaseRestoreDisposition.RESTORE_TRANSPORT_ERROR
+    if NavigationDatabaseRestoreFrameFailureKind.REJECTED in kinds:
+      return NavigationDatabaseRestoreDisposition.RESTORE_REJECTED
+    if NavigationDatabaseRestoreFrameFailureKind.TIMED_OUT in kinds:
+      return NavigationDatabaseRestoreDisposition.RESTORE_RESPONSE_TIMEOUT
+    return NavigationDatabaseRestoreDisposition.WRITE_FAILED
 
   def validate_database_write_boundary(self, frame_index: int) -> None:
     """Revalidate trusted age and acquisition at each receiver-write boundary."""
@@ -1344,9 +2285,16 @@ class NavigationDatabaseRestoreRuntime:
       raise NavigationDatabaseRestoreTerminalBoundaryError(
         "DBD receiver write blocked: GNSS acquisition already started"
       )
+    self._check_transfer_deadline("write_boundary", frame_index)
+    policy = self._database_policy
     snapshot = self._database_snapshot
     authorized_time = self._last_authorized_time
-    if snapshot is None or authorized_time is None or not is_current_independent_network_time(authorized_time):
+    if (
+      policy is None
+      or snapshot is None
+      or authorized_time is None
+      or not is_current_independent_network_time(authorized_time)
+    ):
       raise NavigationDatabaseRestoreTerminalBoundaryError(
         "DBD receiver write blocked: trusted-age evidence is unavailable"
       )
@@ -1356,7 +2304,7 @@ class NavigationDatabaseRestoreRuntime:
       raise NavigationDatabaseRestoreTerminalBoundaryError(
         "DBD receiver write blocked: trusted cache age is unverified"
       )
-    if cache_age_seconds > NAVIGATION_DATABASE_RESTORE_MAX_AGE_SECONDS:
+    if not policy.accepts_age(cache_age_seconds):
       raise NavigationDatabaseRestoreTerminalBoundaryError(
         "DBD receiver write blocked: trusted cache age expired"
       )
@@ -1367,10 +2315,19 @@ class NavigationDatabaseRestoreRuntime:
     authorized_time: AuthorizedTime | None,
     reliable_fix_available: bool,
     yuma_already_sent: bool,
-    send_database_message: Callable[[bytes, int], object],
+    send_database_message: Callable[
+      [bytes, int, Callable[[], None]], object
+    ],
+    pre_start_deadline: float | None = None,
   ) -> NavigationDatabaseRestoreExecution:
     if not callable(send_database_message):
       raise ValueError("send_database_message must be callable")
+    if pre_start_deadline is not None and (
+      isinstance(pre_start_deadline, bool)
+      or not isinstance(pre_start_deadline, (int, float))
+      or not isfinite(float(pre_start_deadline))
+    ):
+      raise ValueError("pre_start_deadline must be finite or None")
     if not self.state_available:
       self._execution = self._build_execution(authorized_time)
       return self._execution
@@ -1385,12 +2342,9 @@ class NavigationDatabaseRestoreRuntime:
 
     cache_age_seconds = None
     if authorized_time is not None and is_current_independent_network_time(authorized_time):
-      selected, cache_age_seconds = self._select_database_snapshot(authorized_time)
-      if selected is not None:
-        self._database_snapshot = selected
-        self._persisted_cache_generation = selected.generation
-        self._persisted_cache_saved_at_utc = selected.saved_at_utc
-      self._last_cache_age_seconds = cache_age_seconds
+      _selected_policy, cache_age_seconds = (
+        self._activate_selected_database_policy(authorized_time)
+      )
 
     decision = evaluate_navigation_database_restore(
       reliable_fix_available=reliable_fix_available,
@@ -1398,6 +2352,11 @@ class NavigationDatabaseRestoreRuntime:
       authorized_time=authorized_time,
       cache_age_seconds=cache_age_seconds,
       gnss_acquisition_started=self._controller.acquisition_started,
+      age_policy=(
+        self._database_policy.age_policy
+        if self._database_policy is not None
+        else DEFAULT_NAVIGATION_DATABASE_RESTORE_AGE_POLICY
+      ),
     )
     if not self._controller.apply_decision(decision):
       self._execution = self._build_execution(authorized_time)
@@ -1409,9 +2368,11 @@ class NavigationDatabaseRestoreRuntime:
 
     snapshot = self._database_snapshot
     if snapshot is None:
-      self._controller.finish_restore(NavigationDatabaseRestoreDisposition.WRITE_FAILED)
+      self._last_total_frame_count = 0
       self._last_execution_error = "eligible_database_snapshot_missing"
       self._last_failure_phase = "selection"
+      self._restore_result_details_available = True
+      self._controller.finish_restore(NavigationDatabaseRestoreDisposition.WRITE_FAILED)
       self._persist_state()
       self._execution = self._build_execution(authorized_time)
       return self._execution
@@ -1423,6 +2384,58 @@ class NavigationDatabaseRestoreRuntime:
       self._execution = self._build_execution(authorized_time)
       return self._execution
 
+    try:
+      transfer_started_at = self._monotonic()
+    except Exception as exc:
+      self._last_total_frame_count = len(snapshot.database_frames)
+      self._last_execution_error = _bounded_error(exc)
+      self._last_failure_phase = "transfer_start_clock"
+      self._restore_result_details_available = True
+      self._controller.finish_restore(
+        NavigationDatabaseRestoreDisposition.WRITE_FAILED
+      )
+      self._persist_state()
+      self._execution = self._build_execution(authorized_time)
+      return self._execution
+    if (
+      isinstance(transfer_started_at, bool)
+      or not isinstance(transfer_started_at, (int, float))
+      or not isfinite(float(transfer_started_at))
+    ):
+      self._last_total_frame_count = len(snapshot.database_frames)
+      self._last_execution_error = "transfer_monotonic_time_invalid"
+      self._last_failure_phase = "transfer_start"
+      self._restore_result_details_available = True
+      self._controller.finish_restore(
+        NavigationDatabaseRestoreDisposition.WRITE_FAILED
+      )
+      self._persist_state()
+      self._execution = self._build_execution(authorized_time)
+      return self._execution
+    started_at = float(transfer_started_at)
+    transfer_deadline = min(
+      started_at + self._transfer_budget_seconds,
+      float(pre_start_deadline)
+      if pre_start_deadline is not None
+      else float("inf"),
+    )
+
+    if transfer_deadline <= started_at:
+      self._last_total_frame_count = len(snapshot.database_frames)
+      self._last_execution_error = "pre_start_deadline_expired"
+      self._last_failure_phase = "transfer_start"
+      self._restore_result_details_available = True
+      self._controller.finish_restore(
+        NavigationDatabaseRestoreDisposition.RESTORE_TRANSFER_DEADLINE
+      )
+      self._persist_state()
+      self._execution = self._build_execution(authorized_time)
+      return self._execution
+    self._transfer_started_at = started_at
+    self._transfer_budget_seconds = transfer_deadline - started_at
+    self._transfer_deadline = transfer_deadline
+    self._transfer_completed_at = None
+
     accepted: set[int] = set()
     initial_failures: list[NavigationDatabaseRestoreFrameFailure] = []
     retry_accepted: list[int] = []
@@ -1432,6 +2445,19 @@ class NavigationDatabaseRestoreRuntime:
     execution_error = None
     failure_phase = None
 
+    def write_attempt_marker() -> Callable[[], None]:
+      marked = False
+
+      def mark_write_attempt() -> None:
+        nonlocal marked
+        nonlocal write_attempts
+        if marked:
+          return
+        marked = True
+        write_attempts += 1
+
+      return mark_write_attempt
+
     try:
       failure_phase = "initial_pass"
       terminal_boundary_failed = False
@@ -1440,8 +2466,11 @@ class NavigationDatabaseRestoreRuntime:
           # Cheap pre-drain guard. The sender retains the post-drain guard
           # immediately before the UART write to close the acquisition race.
           self.validate_database_write_boundary(index)
-          write_attempts += 1
-          send_database_message(frame, index)
+          send_database_message(frame, index, write_attempt_marker())
+          self._check_transfer_deadline(
+            "acknowledgment_complete",
+            index,
+          )
           accepted.add(index)
         except Exception as exc:
           kind = _classify_failure(exc)
@@ -1466,16 +2495,32 @@ class NavigationDatabaseRestoreRuntime:
             permanent_failures.append(failure)
 
       if retry_frames and not terminal_boundary_failed:
-        if self._retry_delay_seconds:
-          failure_phase = "retry_delay"
-          self._sleeper(self._retry_delay_seconds)
+        failure_phase = "retry_delay"
+        try:
+          self._sleep_before_retry(retry_frames[0][0])
+        except NavigationDatabaseRestoreTransferDeadlineError as exc:
+          permanent_failures.append(
+            NavigationDatabaseRestoreFrameFailure(
+              frame_index=retry_frames[0][0],
+              attempt=2,
+              kind=(
+                NavigationDatabaseRestoreFrameFailureKind.TRANSFER_DEADLINE
+              ),
+              error=_bounded_error(exc),
+            )
+          )
+          terminal_boundary_failed = True
 
-        failure_phase = "retry_pass"
-        for index, frame in retry_frames:
+        if not terminal_boundary_failed:
+          failure_phase = "retry_pass"
+        for index, frame in (() if terminal_boundary_failed else retry_frames):
           try:
             self.validate_database_write_boundary(index)
-            write_attempts += 1
-            send_database_message(frame, index)
+            send_database_message(frame, index, write_attempt_marker())
+            self._check_transfer_deadline(
+              "acknowledgment_complete",
+              index,
+            )
             accepted.add(index)
             retry_accepted.append(index)
           except Exception as exc:
@@ -1494,17 +2539,44 @@ class NavigationDatabaseRestoreRuntime:
               break
     except Exception as exc:
       execution_error = _bounded_error(exc)
-    succeeded = execution_error is None and bool(snapshot.database_frames) and len(accepted) == len(snapshot.database_frames) and not permanent_failures
-    self._controller.finish_restore(NavigationDatabaseRestoreDisposition.RESTORED if succeeded else NavigationDatabaseRestoreDisposition.WRITE_FAILED)
-    self._persist_state()
-
+    try:
+      transfer_completed_at = self._monotonic()
+    except Exception as exc:
+      execution_error = _bounded_error(exc)
+      failure_phase = "transfer_completion_clock"
+      self._transfer_completed_at = None
+    else:
+      self._transfer_completed_at = (
+        float(transfer_completed_at)
+        if (
+          not isinstance(transfer_completed_at, bool)
+          and isinstance(transfer_completed_at, (int, float))
+          and isfinite(float(transfer_completed_at))
+        )
+        else None
+      )
+      if self._transfer_completed_at is None:
+        execution_error = "transfer_monotonic_time_invalid"
+        failure_phase = "transfer_completion_clock"
+    final_failures = tuple(permanent_failures)
+    disposition = self._completion_disposition(
+      total_frames=len(snapshot.database_frames),
+      accepted_frames=len(accepted),
+      permanent_failures=final_failures,
+      execution_error=execution_error,
+    )
+    succeeded = disposition is NavigationDatabaseRestoreDisposition.RESTORED
+    self._last_total_frame_count = len(snapshot.database_frames)
     self._last_initial_failures = tuple(initial_failures)
     self._last_retry_accepted_indexes = tuple(retry_accepted)
-    self._last_permanent_failures = tuple(permanent_failures)
+    self._last_permanent_failures = final_failures
     self._last_execution_error = execution_error
     self._last_failure_phase = None if succeeded else failure_phase
     self._last_accepted_frame_count = len(accepted)
     self._last_write_attempt_count = write_attempts
+    self._restore_result_details_available = True
+    self._controller.finish_restore(disposition)
+    self._persist_state()
     self._execution = self._build_execution(authorized_time)
     return self._execution
 
@@ -1529,7 +2601,11 @@ class NavigationDatabaseRestoreRuntime:
 
     return NavigationDatabaseRestoreExecution(
       disposition=self._controller.disposition,
-      total_frame_count=(len(snapshot.database_frames) if snapshot else 0),
+      total_frame_count=(
+        len(snapshot.database_frames)
+        if snapshot is not None
+        else self._last_total_frame_count
+      ),
       accepted_frame_count=self._last_accepted_frame_count,
       database_write_attempt_count=self._last_write_attempt_count,
       initial_failures=self._last_initial_failures,
@@ -1547,15 +2623,50 @@ class NavigationDatabaseRestoreRuntime:
       position_assistance_failure_kind=self._position_failure_kind,
       position_assistance_error_type=self._position_error_type,
       position_assistance_error=self._position_error,
-      cache_saved_at_utc=(snapshot.saved_at_utc if snapshot else None),
-      cache_generation=(snapshot.generation if snapshot else None),
-      cache_selection_reason=(snapshot.selection_reason if snapshot else None),
+      cache_saved_at_utc=(
+        snapshot.saved_at_utc
+        if snapshot is not None
+        else self._persisted_cache_saved_at_utc
+      ),
+      cache_generation=(
+        snapshot.generation
+        if snapshot is not None
+        else self._persisted_cache_generation
+      ),
+      cache_selection_reason=(
+        snapshot.selection_reason
+        if snapshot is not None
+        else self._last_cache_selection_reason
+      ),
+      cache_database_digest=(
+        self._database_policy.database_digest
+        if self._database_policy is not None
+        else self._persisted_cache_database_digest
+      ),
       cache_age_seconds=cache_age_seconds,
+      cache_maximum_age_seconds=(
+        self._database_policy.maximum_age_seconds
+        if self._database_policy is not None
+        else self._persisted_cache_maximum_age_seconds
+      ),
+      cache_expires_at_utc=(
+        self._database_policy.expires_at_utc
+        if self._database_policy is not None
+        else self._persisted_cache_expires_at_utc
+      ),
+      candidate_identities=(
+        self._candidate_identities
+        or self._persisted_candidate_identities
+      ),
       effective_quality=effective_quality,
       captured_quality=(snapshot.quality if snapshot else None),
       boot_id=self._boot_id,
       state_persistence_error=self._state_persistence_error,
       recovered_interrupted_attempt=self._recovered_interrupted_attempt,
+      transfer_budget_seconds=self._transfer_budget_seconds,
+      transfer_started_at=self._transfer_started_at,
+      transfer_completed_at=self._transfer_completed_at,
+      transfer_deadline=self._transfer_deadline,
     )
 
 
@@ -1569,9 +2680,16 @@ class NavigationDatabaseRestoreUnavailableRuntime(NavigationDatabaseRestoreRunti
       raise ValueError("error must be a non-empty string")
     self._controller = NavigationDatabaseRestoreBootController()
     self._controller.skip(
-      NavigationDatabaseRestoreDisposition.SKIPPED_UNVERIFIED
+      NavigationDatabaseRestoreDisposition.SKIPPED_STATE_UNAVAILABLE
     )
     self._database_snapshot = None
+    self._database_policy = None
+    self._transfer_budget_seconds = (
+      NAVIGATION_DATABASE_RESTORE_TRANSFER_BUDGET_SECONDS
+    )
+    self._transfer_started_at = None
+    self._transfer_completed_at = None
+    self._transfer_deadline = None
     self._position_snapshot = None
     self._position_message = None
     self._yuma_sent = False
@@ -1595,6 +2713,10 @@ class NavigationDatabaseRestoreUnavailableRuntime(NavigationDatabaseRestoreRunti
   def prepare(self) -> NavigationDatabaseRestoreExecution:
     return self._execution
 
+  @property
+  def has_prequalified_database_candidate(self) -> bool:
+    return False
+
   def send_position_once(
     self,
     send_message: Callable[[bytes], object],
@@ -1606,6 +2728,15 @@ class NavigationDatabaseRestoreUnavailableRuntime(NavigationDatabaseRestoreRunti
   def close_restore_window_unverified(self) -> bool:
     return False
 
+  def close_restore_window_no_trusted_time(self) -> bool:
+    return False
+
+  def close_restore_window_wait_timeout(self) -> bool:
+    return False
+
+  def close_restore_window_wait_error(self) -> bool:
+    return False
+
   def close_restore_window_for_early_acquisition(self) -> bool:
     return False
 
@@ -1615,6 +2746,10 @@ class NavigationDatabaseRestoreUnavailableRuntime(NavigationDatabaseRestoreRunti
 
   def note_acquisition_started(self) -> bool:
     return self.claim_acquisition_start()
+
+  @property
+  def database_restore_pending(self) -> bool:
+    return False
 
   def claim_yuma_transmission(self) -> bool:
     return False
@@ -1641,9 +2776,12 @@ class NavigationDatabaseRestoreUnavailableRuntime(NavigationDatabaseRestoreRunti
     authorized_time: AuthorizedTime | None,
     reliable_fix_available: bool,
     yuma_already_sent: bool,
-    send_database_message: Callable[[bytes, int], object],
+    send_database_message: Callable[
+      [bytes, int, Callable[[], None]], object
+    ],
+    pre_start_deadline: float | None = None,
   ) -> NavigationDatabaseRestoreExecution:
-    del authorized_time, reliable_fix_available, yuma_already_sent
+    del authorized_time, reliable_fix_available, yuma_already_sent, pre_start_deadline
     if not callable(send_database_message):
       raise ValueError("send_database_message must be callable")
     return self._execution

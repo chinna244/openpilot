@@ -14,7 +14,7 @@ from datetime import datetime, timedelta, UTC
 from enum import StrEnum
 from math import ceil, isfinite
 
-from openpilot.cereal import messaging
+from openpilot.cereal import log, messaging
 from openpilot.common.time_helpers import (
   HostTimeObservation,
   HostTimeSource,
@@ -228,8 +228,10 @@ CONTROLLED_GNSS_START_MESSAGE = b"\xB5\x62\x06\x04\x04\x00\x00\x00\x09\x00\x17\x
 CONTROLLED_GNSS_TRANSITION_DELAY = 0.05
 # General callers may still use a bounded wait for independent network time.
 NAVIGATION_DATABASE_TRUSTED_TIME_WAIT_SECONDS = 40.0
-# Receiver startup must not hold GNSS stopped while waiting for optional time.
-NAVIGATION_DATABASE_PRESTART_TRUSTED_TIME_WAIT_SECONDS = 0.0
+# Only a prequalified process-start DBD candidate may wait for current
+# independent network time. The absolute deadline is measured from receiver
+# cycle start, so transport/configuration time consumes the same budget.
+NAVIGATION_DATABASE_PROCESS_START_TIME_DEADLINE_SECONDS = 45.0
 NAVIGATION_DATABASE_TRUSTED_TIME_POLL_SECONDS = 0.25
 # A validated MGA-DBD cache is capped at 64 KiB. Frequent dispatch between
 # transactions is the primary bound; these limits retain four cache volumes or
@@ -1799,29 +1801,64 @@ def paused_gnss_acquisition(pigeon: TTYPigeon) -> Iterator[None]:
   # clearing the hot-start BBR data. Newer firmware does not ACK these
   # commands, so the transition is bounded by a short deterministic delay.
   pigeon.send(CONTROLLED_GNSS_STOP_MESSAGE)
-  stopped_at = time.monotonic()
-  cloudlog.info(f"GPS acquisition transition: phase=stop_sent monotonic={stopped_at:.6f}")
-  time.sleep(CONTROLLED_GNSS_TRANSITION_DELAY)
+  stopped_at: float | None = None
+  body_error: BaseException | None = None
+  drain_error: BaseException | None = None
+  start_error: BaseException | None = None
   try:
+    stopped_at = time.monotonic()
+    cloudlog.info(f"GPS acquisition transition: phase=stop_sent monotonic={stopped_at:.6f}")
+    time.sleep(CONTROLLED_GNSS_TRANSITION_DELAY)
     yield
-  except BaseException:  # noqa: TRY203
-    # A failed pre-acquisition claim must leave GNSS stopped.
-    raise
-  else:
+  except BaseException as exc:
+    body_error = exc
+  finally:
     initialization = _ACTIVE_PRE_ACQUISITION_INITIALIZATION
     if (
-      initialization is not None
+      body_error is None
+      and initialization is not None
       and initialization.pre_gnss_start_drain_required
     ):
-      drain = getattr(pigeon, "drain_before_transaction", None)
-      if callable(drain):
-        drain("position_assistance_pre_gnss_start_boundary")
-    pigeon.send(CONTROLLED_GNSS_START_MESSAGE)
-    started_at = time.monotonic()
-    cloudlog.info(f"GPS acquisition transition: phase=start_sent monotonic={started_at:.6f} prestart_elapsed_seconds={started_at - stopped_at:.6f}")
-    if initialization is not None:
-      initialization.note_gnss_start_sent(started_at)
-    time.sleep(CONTROLLED_GNSS_TRANSITION_DELAY)
+      try:
+        drain = getattr(pigeon, "drain_before_transaction", None)
+        if callable(drain):
+          drain("position_assistance_pre_gnss_start_boundary")
+      except BaseException as exc:
+        drain_error = exc
+        cloudlog.exception(
+          "GPS pre-START input drain failed; GNSS START still attempted"
+        )
+    try:
+      pigeon.send(CONTROLLED_GNSS_START_MESSAGE)
+      started_at = time.monotonic()
+      prestart_elapsed_seconds = (
+        max(0.0, started_at - stopped_at)
+        if stopped_at is not None
+        else None
+      )
+      cloudlog.info(
+        "GPS acquisition transition: phase=start_sent "
+        + f"monotonic={started_at:.6f} "
+        + "prestart_elapsed_seconds="
+        + (
+          f"{prestart_elapsed_seconds:.6f}"
+          if prestart_elapsed_seconds is not None
+          else "unavailable"
+        )
+      )
+      if initialization is not None:
+        initialization.note_gnss_start_sent(started_at)
+      time.sleep(CONTROLLED_GNSS_TRANSITION_DELAY)
+    except BaseException as exc:
+      start_error = exc
+      cloudlog.exception("GPS controlled GNSS START failed")
+
+  if body_error is not None:
+    raise body_error.with_traceback(body_error.__traceback__)
+  if drain_error is not None:
+    raise drain_error.with_traceback(drain_error.__traceback__)
+  if start_error is not None:
+    raise start_error.with_traceback(start_error.__traceback__)
 
 
 def finish_pigeon_initialization(pigeon: TTYPigeon) -> None:
@@ -2977,7 +3014,10 @@ class NavigationAssistanceRestoreResult:
   cache_saved_at_utc: datetime | None = None
   restored_cache_generation: str | None = None
   restored_cache_selection_reason: str | None = None
+  restored_cache_database_digest: str | None = None
   restored_cache_age_seconds: float | None = None
+  restored_cache_maximum_age_seconds: float | None = None
+  restored_cache_expires_at_utc: datetime | None = None
   restored_cache_age_evidence: str | None = None
   restored_cache_age_verified: bool = False
   captured_gps_ephemeris_available: int | None = None
@@ -3003,10 +3043,28 @@ class NavigationAssistanceRestoreResult:
   database_restore_boot_id: str | None = None
   database_restore_state_error: str | None = None
   database_restore_recovered_interrupted_attempt: bool = False
+  database_restore_candidate_identities: tuple[str, ...] = ()
   database_restore_initial_failure_kinds: tuple[str, ...] = ()
   database_restore_permanent_failure_kinds: tuple[str, ...] = ()
   database_restore_execution_error: str | None = None
   database_restore_runtime_phase: str | None = None
+  database_restore_transfer_budget_seconds: float | None = None
+  database_restore_transfer_started_at: float | None = None
+  database_restore_transfer_completed_at: float | None = None
+  database_restore_transfer_deadline: float | None = None
+  database_restore_transfer_elapsed_seconds: float | None = None
+  database_restore_first_failed_frame_index: int | None = None
+  database_restore_first_failed_attempt: int | None = None
+  database_restore_first_failure_kind: str | None = None
+  database_restore_first_failure_error: str | None = None
+  database_trusted_time_wait_allowed: bool = False
+  database_network_available: bool = False
+  database_trusted_time_wait_started_at: float | None = None
+  database_trusted_time_wait_completed_at: float | None = None
+  database_trusted_time_wait_deadline: float | None = None
+  database_trusted_time_wait_elapsed_seconds: float | None = None
+  database_trusted_time_wait_error_type: str | None = None
+  database_trusted_time_wait_error: str | None = None
 
   @property
   def usable(self) -> bool:
@@ -3074,6 +3132,8 @@ def format_navigation_assistance_restore_summary(
     f"database_restore_state_error={result.database_restore_state_error or 'none'}",
     "database_restore_recovered_interrupted_attempt="
     + str(result.database_restore_recovered_interrupted_attempt).lower(),
+    "database_restore_candidate_identities="
+    + str(list(result.database_restore_candidate_identities)),
     "database_restore_initial_failure_kinds="
     + str(list(result.database_restore_initial_failure_kinds)),
     "database_restore_permanent_failure_kinds="
@@ -3082,6 +3142,40 @@ def format_navigation_assistance_restore_summary(
     + (result.database_restore_execution_error or "none"),
     "database_restore_runtime_phase="
     + (result.database_restore_runtime_phase or "none"),
+    "database_restore_transfer_budget_seconds="
+    + str(result.database_restore_transfer_budget_seconds),
+    "database_restore_transfer_started_at="
+    + str(result.database_restore_transfer_started_at),
+    "database_restore_transfer_completed_at="
+    + str(result.database_restore_transfer_completed_at),
+    "database_restore_transfer_deadline="
+    + str(result.database_restore_transfer_deadline),
+    "database_restore_transfer_elapsed_seconds="
+    + str(result.database_restore_transfer_elapsed_seconds),
+    "database_restore_first_failed_frame_index="
+    + str(result.database_restore_first_failed_frame_index),
+    "database_restore_first_failed_attempt="
+    + str(result.database_restore_first_failed_attempt),
+    "database_restore_first_failure_kind="
+    + (result.database_restore_first_failure_kind or "none"),
+    "database_restore_first_failure_error="
+    + (result.database_restore_first_failure_error or "none"),
+    "database_trusted_time_wait_allowed="
+    + str(result.database_trusted_time_wait_allowed).lower(),
+    "database_network_available="
+    + str(result.database_network_available).lower(),
+    "database_trusted_time_wait_started_at="
+    + str(result.database_trusted_time_wait_started_at),
+    "database_trusted_time_wait_completed_at="
+    + str(result.database_trusted_time_wait_completed_at),
+    "database_trusted_time_wait_deadline="
+    + str(result.database_trusted_time_wait_deadline),
+    "database_trusted_time_wait_elapsed_seconds="
+    + str(result.database_trusted_time_wait_elapsed_seconds),
+    "database_trusted_time_wait_error_type="
+    + (result.database_trusted_time_wait_error_type or "none"),
+    "database_trusted_time_wait_error="
+    + (result.database_trusted_time_wait_error or "none"),
     "database_terminal_ack_count_matched=not_applicable_per_frame_restore",
     "position_assistance_attempted="
     + str(result.position_assistance_attempted).lower(),
@@ -3116,7 +3210,15 @@ def format_navigation_assistance_restore_summary(
     f"time_assistance_source={time_assistance_source or 'unknown'}",
     f"restored_cache_generation={result.restored_cache_generation or 'none'}",
     f"restored_cache_selection_reason={result.restored_cache_selection_reason or 'none'}",
+    f"restored_cache_database_digest={result.restored_cache_database_digest or 'none'}",
     f"restored_cache_age_seconds={result.restored_cache_age_seconds}",
+    f"restored_cache_maximum_age_seconds={result.restored_cache_maximum_age_seconds}",
+    "restored_cache_expires_at_utc="
+    + (
+      result.restored_cache_expires_at_utc.isoformat()
+      if result.restored_cache_expires_at_utc is not None
+      else "none"
+    ),
     "quality_evaluation_stage=restore_result",
     f"restored_cache_age_evidence={result.restored_cache_age_evidence or 'none'}",
     f"restored_cache_age_verified={str(result.restored_cache_age_verified).lower()}",
@@ -3233,6 +3335,7 @@ def navigation_assistance_result_from_database_execution(
     evaluated_quality if disposition.database_available else None
   )
   captured_quality = execution.captured_quality
+  first_failure = execution.first_failure
   return NavigationAssistanceRestoreResult(
     status=status,
     total_frame_count=execution.total_frame_count,
@@ -3281,7 +3384,12 @@ def navigation_assistance_result_from_database_execution(
     cache_saved_at_utc=execution.cache_saved_at_utc,
     restored_cache_generation=execution.cache_generation,
     restored_cache_selection_reason=execution.cache_selection_reason,
+    restored_cache_database_digest=execution.cache_database_digest,
     restored_cache_age_seconds=execution.cache_age_seconds,
+    restored_cache_maximum_age_seconds=(
+      execution.cache_maximum_age_seconds
+    ),
+    restored_cache_expires_at_utc=execution.cache_expires_at_utc,
     restored_cache_age_evidence=(
       evaluated_quality.age_evidence.value
       if evaluated_quality is not None
@@ -3387,6 +3495,14 @@ def navigation_assistance_result_from_database_execution(
     database_restore_recovered_interrupted_attempt=(
       execution.recovered_interrupted_attempt
     ),
+    database_restore_candidate_identities=tuple(
+      ":".join((
+        identity.generation,
+        identity.saved_at_utc.isoformat(),
+        identity.database_digest,
+      ))
+      for identity in execution.candidate_identities
+    ),
     database_restore_initial_failure_kinds=tuple(
       f"{failure.frame_index}:{failure.kind.value}"
       for failure in execution.initial_failures
@@ -3397,6 +3513,29 @@ def navigation_assistance_result_from_database_execution(
     ),
     database_restore_execution_error=execution.execution_error,
     database_restore_runtime_phase=execution.failure_phase,
+    database_restore_transfer_budget_seconds=(
+      execution.transfer_budget_seconds
+    ),
+    database_restore_transfer_started_at=execution.transfer_started_at,
+    database_restore_transfer_completed_at=(
+      execution.transfer_completed_at
+    ),
+    database_restore_transfer_deadline=execution.transfer_deadline,
+    database_restore_transfer_elapsed_seconds=(
+      execution.transfer_elapsed_seconds
+    ),
+    database_restore_first_failed_frame_index=(
+      first_failure.frame_index if first_failure is not None else None
+    ),
+    database_restore_first_failed_attempt=(
+      first_failure.attempt if first_failure is not None else None
+    ),
+    database_restore_first_failure_kind=(
+      first_failure.kind.value if first_failure is not None else None
+    ),
+    database_restore_first_failure_error=(
+      first_failure.error if first_failure is not None else None
+    ),
   )
 
 
@@ -3409,29 +3548,107 @@ def restore_navigation_assistance(
   *,
   navigation_database_runtime: NavigationDatabaseRestoreRuntime | None = None,
   authorized_time: AuthorizedTime | None = None,
+  database_trusted_time_wait_allowed: bool = False,
+  database_network_available: bool = False,
+  database_trusted_time_wait_started_at: float | None = None,
+  database_trusted_time_wait_completed_at: float | None = None,
+  database_trusted_time_wait_deadline: float | None = None,
+  database_trusted_time_wait_error_type: str | None = None,
+  database_trusted_time_wait_error: str | None = None,
+  pre_start_deadline: float | None = None,
   allow_legacy_direct_restore: bool = False,
 ) -> NavigationAssistanceRestoreResult:
   if navigation_database_runtime is not None:
+    def send_database_frame(
+      message: bytes,
+      frame_index: int,
+      mark_write_attempt: Callable[[], None],
+    ) -> None:
+      def before_send() -> None:
+        navigation_database_runtime.validate_database_write_boundary(
+          frame_index
+        )
+        mark_write_attempt()
+
+      send_mga_with_strict_ack(
+        pigeon,
+        message,
+        timeout=min(
+          GPS_ASSISTANCE_ACK_TIMEOUT,
+          navigation_database_runtime.remaining_transfer_seconds(
+            frame_index
+          ),
+        ),
+        database_frame_index=frame_index,
+        before_send=before_send,
+      )
+
     navigation_database_runtime.prepare()
     execution = navigation_database_runtime.evaluate(
       authorized_time=authorized_time,
       reliable_fix_available=False,
       yuma_already_sent=False,
-      send_database_message=(
-        lambda message, frame_index: send_mga_with_strict_ack(
-          pigeon,
-          message,
-          database_frame_index=frame_index,
-          before_send=lambda: navigation_database_runtime.validate_database_write_boundary(frame_index),
-        )
-      ),
+      send_database_message=send_database_frame,
+      pre_start_deadline=pre_start_deadline,
     )
-    if not navigation_database_runtime.acquisition_started:
-      navigation_database_runtime.send_position_once(
-        lambda message: send_mga_with_strict_ack(pigeon, message)
+    if (
+      not navigation_database_runtime.acquisition_started
+      or navigation_database_runtime.controller.disposition
+      is NavigationDatabaseRestoreDisposition.SKIPPED_EARLY_ACQUISITION
+    ):
+      position_timeout = (
+        min(
+          GPS_ASSISTANCE_ACK_TIMEOUT,
+          pre_start_remaining_seconds(pre_start_deadline),
+        )
+        if pre_start_deadline is not None
+        else GPS_ASSISTANCE_ACK_TIMEOUT
       )
+      if position_timeout > 0.0:
+        navigation_database_runtime.send_position_once(
+          lambda message: send_mga_with_strict_ack(
+            pigeon,
+            message,
+            timeout=position_timeout,
+          )
+        )
       execution = navigation_database_runtime.execution
     result = navigation_assistance_result_from_database_execution(execution)
+    wait_elapsed_seconds = (
+      max(
+        0.0,
+        database_trusted_time_wait_completed_at
+        - database_trusted_time_wait_started_at,
+      )
+      if (
+        database_trusted_time_wait_started_at is not None
+        and database_trusted_time_wait_completed_at is not None
+      )
+      else None
+    )
+    result = replace(
+      result,
+      database_trusted_time_wait_allowed=(
+        database_trusted_time_wait_allowed
+      ),
+      database_network_available=database_network_available,
+      database_trusted_time_wait_started_at=(
+        database_trusted_time_wait_started_at
+      ),
+      database_trusted_time_wait_completed_at=(
+        database_trusted_time_wait_completed_at
+      ),
+      database_trusted_time_wait_deadline=(
+        database_trusted_time_wait_deadline
+      ),
+      database_trusted_time_wait_elapsed_seconds=wait_elapsed_seconds,
+      database_trusted_time_wait_error_type=(
+        database_trusted_time_wait_error_type
+      ),
+      database_trusted_time_wait_error=(
+        database_trusted_time_wait_error
+      ),
+    )
     log_navigation_assistance_restore_result(
       result,
       diagnostic_context,
@@ -4681,6 +4898,64 @@ def drain_receiver_before_database_restore(pigeon: TTYPigeon) -> None:
   if callable(drain):
     drain("navigation_database_post_time_wait")
 
+
+def should_wait_for_navigation_database_trusted_time(
+  *,
+  restore_pending: bool,
+  state_available: bool,
+  candidate_available: bool,
+  allow_wait: bool,
+  network_available: bool | None,
+  network_recheck_available: bool,
+  acquisition_started: bool,
+  current_network_time: bool,
+) -> bool:
+  return (
+    restore_pending
+    and state_available
+    and candidate_available
+    and allow_wait
+    and (network_available is not False or network_recheck_available)
+    and not acquisition_started
+    and not current_network_time
+  )
+
+
+def navigation_database_trusted_time_wait_expired(
+  *,
+  wait_attempted: bool,
+  network_available: bool | None,
+) -> bool:
+  # Every attempted wait is bounded by the process-start deadline.  An
+  # explicit offline observation no longer creates a separate, arbitrary
+  # early cutoff because networkType.none cannot distinguish "offline" from
+  # Wi-Fi that is still establishing its default route.
+  del network_available
+  return wait_attempted
+
+
+def navigation_database_process_start_wait_seconds(
+  cycle_started_at: float,
+  now: float,
+) -> float:
+  return max(
+    0.0,
+    cycle_started_at
+    + NAVIGATION_DATABASE_PROCESS_START_TIME_DEADLINE_SECONDS
+    - now,
+  )
+
+
+def pre_start_remaining_seconds(pre_start_deadline: float) -> float:
+  if (
+    isinstance(pre_start_deadline, bool)
+    or not isinstance(pre_start_deadline, (int, float))
+    or not isfinite(float(pre_start_deadline))
+  ):
+    raise ValueError("pre_start_deadline must be finite")
+  return max(0.0, float(pre_start_deadline) - time.monotonic())
+
+
 def wait_for_current_independent_network_time(
   authority: TimeAuthority,
   host_time_observation: HostTimeObservation | None,
@@ -4692,15 +4967,23 @@ def wait_for_current_independent_network_time(
   evaluator: Callable[[TimeAuthority, HostTimeObservation | None], TimeAuthorityEvaluation] = evaluate_time_authority,
   monotonic: Callable[[], float] = time.monotonic,
   sleeper: Callable[[float], None] = time.sleep,
+  initial_network_available: bool | None = None,
+  network_available_reader: Callable[[], bool | None] | None = None,
 ) -> tuple[HostTimeObservation | None, TimeAuthorityEvaluation]:
+  # networkType.none cannot distinguish a definitely offline device from one
+  # whose Wi-Fi route is still coming up.  Keep the observation for callers'
+  # telemetry, but let the single bounded time deadline govern the wait.
+  del initial_network_available
   authorized = authority_evaluation.authorized_time
   if authorized is not None and is_current_independent_network_time(authorized):
     return host_time_observation, authority_evaluation
-  deadline = monotonic() + timeout_seconds
+  started_at = monotonic()
+  deadline = started_at + timeout_seconds
   latest_observation = host_time_observation
   latest_evaluation = authority_evaluation
   while True:
-    remaining = deadline - monotonic()
+    now = monotonic()
+    remaining = deadline - now
     if remaining <= 0.0:
       return latest_observation, latest_evaluation
     sleeper(min(poll_seconds, remaining))
@@ -4709,6 +4992,9 @@ def wait_for_current_independent_network_time(
     authorized = latest_evaluation.authorized_time
     if authorized is not None and is_current_independent_network_time(authorized):
       return latest_observation, latest_evaluation
+
+    if network_available_reader is not None:
+      network_available_reader()
 
 
 def send_yuma_with_durable_claim(
@@ -4738,9 +5024,21 @@ def initialize_receiver_cycle(
   position_assistance_retry: PositionAssistancePostStartRetryController | None = None,
   transport_mon_ver_info: MonVerInfo | None = None,
   cycle_started_at: float | None = None,
+  allow_database_trusted_time_wait: bool = False,
+  network_available: bool | None = False,
+  network_available_reader: Callable[[], bool | None] | None = None,
 ) -> ReceiverCycleInitialization:
   if cycle_started_at is None:
     cycle_started_at = time.monotonic()
+  if not isinstance(allow_database_trusted_time_wait, bool):
+    raise ValueError("allow_database_trusted_time_wait must be a bool")
+  if network_available is not None and not isinstance(network_available, bool):
+    raise ValueError("network_available must be a bool or None")
+  if (
+    network_available_reader is not None
+    and not callable(network_available_reader)
+  ):
+    raise ValueError("network_available_reader must be callable")
   startup_diagnostics.start_cycle(reason, cycle_started_at)
   provenance = time_provenance or ReceiverTimeProvenanceTracker()
   cycle_id = getattr(
@@ -4777,6 +5075,14 @@ def initialize_receiver_cycle(
   )
   trusted_time_wait_started_at: float | None = None
   trusted_time_wait_completed_at: float | None = None
+  trusted_time_wait_deadline: float | None = None
+  trusted_time_wait_error_type: str | None = None
+  trusted_time_wait_error: str | None = None
+  trusted_time_wait_failed = False
+  pre_start_deadline = (
+    cycle_started_at
+    + NAVIGATION_DATABASE_PROCESS_START_TIME_DEADLINE_SECONDS
+  )
   acquisition_start_claimed_at: float | None = None
   try:
     database_runtime = (
@@ -4872,7 +5178,23 @@ def initialize_receiver_cycle(
     nonlocal independent_network_time_seen_at
     nonlocal trusted_time_wait_started_at
     nonlocal trusted_time_wait_completed_at
+    nonlocal trusted_time_wait_deadline
+    nonlocal trusted_time_wait_error_type
+    nonlocal trusted_time_wait_error
+    nonlocal trusted_time_wait_failed
     nonlocal acquisition_start_claimed_at
+    nonlocal network_available
+
+    def observe_network_available() -> bool | None:
+      nonlocal network_available
+      if network_available_reader is None:
+        return network_available
+      observed = network_available_reader()
+      if observed is True:
+        network_available = True
+      elif observed is False and network_available is not True:
+        network_available = False
+      return observed
 
     mon_ver_info = resolve_pre_acquisition_mon_ver(
       pigeon,
@@ -4882,48 +5204,109 @@ def initialize_receiver_cycle(
     log_navx5_ack_aiding_support(mon_ver_info)
     configure_navx5_ack_aiding(pigeon, mon_ver_info)
     ack_aiding_configuration_attempted = True
-    if (
-      database_runtime.controller.pending
-      and (
-        authorized_time is None
-        or not is_current_independent_network_time(authorized_time)
+    current_network_time = (
+      authorized_time is not None
+      and is_current_independent_network_time(authorized_time)
+    )
+    should_wait_for_database_time = (
+      should_wait_for_navigation_database_trusted_time(
+        restore_pending=database_runtime.controller.pending,
+        state_available=database_runtime.state_available,
+        candidate_available=(
+          database_runtime.has_prequalified_database_candidate
+        ),
+        allow_wait=allow_database_trusted_time_wait,
+        network_available=network_available,
+        network_recheck_available=(network_available_reader is not None),
+        acquisition_started=database_runtime.acquisition_started,
+        current_network_time=current_network_time,
       )
-    ):
+    )
+    if should_wait_for_database_time:
       trusted_time_wait_started_at = time.monotonic()
-      host_time_observation, authority_evaluation = (
-        wait_for_current_independent_network_time(
-          authority,
-          host_time_observation,
-          authority_evaluation,
-          timeout_seconds=NAVIGATION_DATABASE_PRESTART_TRUSTED_TIME_WAIT_SECONDS,
+      trusted_time_wait_deadline = (
+        cycle_started_at
+        + NAVIGATION_DATABASE_PROCESS_START_TIME_DEADLINE_SECONDS
+      )
+      remaining_wait_seconds = (
+        navigation_database_process_start_wait_seconds(
+          cycle_started_at,
+          trusted_time_wait_started_at,
         )
       )
+      try:
+        host_time_observation, authority_evaluation = (
+          wait_for_current_independent_network_time(
+            authority,
+            host_time_observation,
+            authority_evaluation,
+            timeout_seconds=remaining_wait_seconds,
+            initial_network_available=network_available,
+            network_available_reader=observe_network_available,
+          )
+        )
+      except Exception as exc:
+        trusted_time_wait_failed = True
+        trusted_time_wait_error_type = type(exc).__name__
+        trusted_time_wait_error = str(exc)[:512]
+        cloudlog.exception(
+          "GPS DBD trusted-time wait failed; startup continues"
+        )
       trusted_time_wait_completed_at = time.monotonic()
       authorized_time = authority_evaluation.authorized_time
+      current_network_time = (
+        authorized_time is not None
+        and is_current_independent_network_time(authorized_time)
+      )
+      if current_network_time:
+        network_available = True
       if (
         independent_network_time_seen_at is None
-        and _startup_timeline_has_current_network_time(
-          authorized_time
-        )
+        and current_network_time
       ):
         independent_network_time_seen_at = (
           trusted_time_wait_completed_at
         )
+
+    if database_runtime.controller.pending and not current_network_time:
+      if trusted_time_wait_failed:
+        operation = "close_restore_window_wait_error"
+        close_result = database_runtime.close_restore_window_wait_error()
+      else:
+        trusted_time_wait_expired = (
+          navigation_database_trusted_time_wait_expired(
+            wait_attempted=should_wait_for_database_time,
+            network_available=network_available,
+          )
+        )
+        operation = (
+          "close_restore_window_wait_timeout"
+          if trusted_time_wait_expired
+          else "close_restore_window_no_trusted_time"
+        )
+        close_result = (
+          database_runtime.close_restore_window_wait_timeout()
+          if trusted_time_wait_expired
+          else database_runtime.close_restore_window_no_trusted_time()
+        )
+      if not close_result:
+        note_assistance_state_unavailable(operation)
+
     if (
       database_runtime.controller.pending
-      and (
-        authorized_time is None
-        or not is_current_independent_network_time(authorized_time)
-      )
+      and current_network_time
     ):
-      if not database_runtime.close_restore_window_unverified():
-        note_assistance_state_unavailable(
-          "close_restore_window_unverified"
+      assert authorized_time is not None
+      try:
+        drain_receiver_before_database_restore(pigeon)
+      except Exception as exc:
+        cloudlog.exception(
+          "GPS DBD pre-restore input drain failed; restore suppressed"
         )
-    if database_runtime.controller.pending:
-      if not database_runtime.close_restore_window_for_early_acquisition():
-        note_assistance_state_unavailable(
-          "close_restore_window_for_early_acquisition"
+        database_runtime.record_pre_restore_transport_error(
+          authorized_time=authorized_time,
+          error=exc,
+          phase="pre_restore_drain",
         )
     attempt_started_at = time.monotonic()
     if authorized_time is not None:
@@ -4948,6 +5331,24 @@ def initialize_receiver_cycle(
       ),
       navigation_database_runtime=database_runtime,
       authorized_time=authorized_time,
+      database_trusted_time_wait_allowed=(
+        allow_database_trusted_time_wait
+      ),
+      database_network_available=(network_available is True),
+      database_trusted_time_wait_started_at=(
+        trusted_time_wait_started_at
+      ),
+      database_trusted_time_wait_completed_at=(
+        trusted_time_wait_completed_at
+      ),
+      database_trusted_time_wait_deadline=(
+        trusted_time_wait_deadline
+      ),
+      database_trusted_time_wait_error_type=(
+        trusted_time_wait_error_type
+      ),
+      database_trusted_time_wait_error=trusted_time_wait_error,
+      pre_start_deadline=pre_start_deadline,
     )
     navigation_assistance_restore_attempted = True
 
@@ -4985,22 +5386,32 @@ def initialize_receiver_cycle(
 
     if authorized_time is not None:
       time_assistance_utc = authorized_time.utc
-      trusted_time_assistance_sent = send_time_assistance(
-        pigeon,
-        assistance_time=authorized_time.utc,
-        accuracy_seconds=authorized_time.mga_accuracy_seconds,
-        source=authorized_time.evidence.value,
-        diagnostic_context=diagnostic_context,
-        time_provenance=provenance,
-        assistance_boottime_seconds=getattr(
-          authorized_time,
-          "observed_boottime_seconds",
-          None,
-        ),
-        independent=authorized_time.independent,
-        source_provenance=authorized_time.provenance,
-        diagnostic_callback=note_time_assistance_attempt,
+      time_assistance_timeout = min(
+        GPS_ASSISTANCE_ACK_TIMEOUT,
+        pre_start_remaining_seconds(pre_start_deadline),
       )
+      if time_assistance_timeout > 0.0:
+        trusted_time_assistance_sent = send_time_assistance(
+          pigeon,
+          assistance_time=authorized_time.utc,
+          accuracy_seconds=authorized_time.mga_accuracy_seconds,
+          source=authorized_time.evidence.value,
+          diagnostic_context=diagnostic_context,
+          ack_timeout=time_assistance_timeout,
+          time_provenance=provenance,
+          assistance_boottime_seconds=getattr(
+            authorized_time,
+            "observed_boottime_seconds",
+            None,
+          ),
+          independent=authorized_time.independent,
+          source_provenance=authorized_time.provenance,
+          diagnostic_callback=note_time_assistance_attempt,
+        )
+      else:
+        cloudlog.info(
+          "GPS time assistance skipped: pre-START deadline exhausted"
+        )
       if trusted_time_assistance_sent:
         time_assistance_source = authorized_time.evidence.value
       next_time_assistance_attempt = (
@@ -5222,7 +5633,32 @@ def yuma_database_restore_state(
     return YumaDatabaseRestoreState.PENDING
   if disposition.database_available:
     return YumaDatabaseRestoreState.COMPLETE
-  return YumaDatabaseRestoreState.FAILED
+  mapping = {
+    NavigationDatabaseRestoreDisposition.RESTORE_PARTIAL: (
+      YumaDatabaseRestoreState.PARTIAL
+    ),
+    NavigationDatabaseRestoreDisposition.RESTORE_REJECTED: (
+      YumaDatabaseRestoreState.REJECTED
+    ),
+    NavigationDatabaseRestoreDisposition.RESTORE_RESPONSE_TIMEOUT: (
+      YumaDatabaseRestoreState.RESPONSE_TIMEOUT
+    ),
+    NavigationDatabaseRestoreDisposition.RESTORE_TRANSFER_DEADLINE: (
+      YumaDatabaseRestoreState.TRANSFER_DEADLINE
+    ),
+    NavigationDatabaseRestoreDisposition.RESTORE_TRANSPORT_ERROR: (
+      YumaDatabaseRestoreState.TRANSPORT_ERROR
+    ),
+    NavigationDatabaseRestoreDisposition.RESTORE_CACHE_EXPIRED: (
+      YumaDatabaseRestoreState.EXPIRED
+    ),
+    NavigationDatabaseRestoreDisposition.SKIPPED_EXPIRED: (
+      YumaDatabaseRestoreState.EXPIRED
+    ),
+  }
+  if disposition.intentionally_skipped:
+    return YumaDatabaseRestoreState.SKIPPED
+  return mapping.get(disposition, YumaDatabaseRestoreState.FAILED)
 
 
 def log_cross_boot_rtc_observation(
@@ -6262,11 +6698,14 @@ class YumaSupplementationFeature:
     *,
     now: float,
     reliable_fix_available: bool,
+    database_restore_pending: bool = False,
   ) -> ProvisionalYumaTransmissionOutcome | None:
     if not isinstance(reliable_fix_available, bool):
       raise ValueError(
         "reliable_fix_available must be a bool"
       )
+    if not isinstance(database_restore_pending, bool):
+      raise ValueError("database_restore_pending must be a bool")
     enabled = self._refresh_enabled(now)
     reference = self._provisional_reference
     if reliable_fix_available and reference is not None:
@@ -6280,6 +6719,7 @@ class YumaSupplementationFeature:
       or self._provisional_attempted
       or self._cycle_injection_consumed
       or self._time_anchor_utc is not None
+      or database_restore_pending
     ):
       return None
 
@@ -6676,6 +7116,8 @@ class ReceiverAcquisitionStateGuard:
     self.handled = True
     if navigation_database_runtime.acquisition_started:
       return True
+    if navigation_database_runtime.database_restore_pending:
+      return navigation_database_runtime.note_early_acquisition_started()
     return navigation_database_runtime.note_acquisition_started()
 
 
@@ -6711,6 +7153,21 @@ def create_receiver_cycle_navigation_state(
       receiver_fingerprint,
       str(exc),
     )
+
+
+def device_network_available(
+  sm: messaging.SubMaster,
+) -> bool | None:
+  try:
+    sm.update(0)
+    if not sm.alive["deviceState"] or not sm.valid["deviceState"]:
+      return None
+    return (
+      sm["deviceState"].networkType
+      != log.DeviceState.NetworkType.none
+    )
+  except Exception:
+    return None
 
 
 def run_receiving(duration: int = 0):
@@ -6848,7 +7305,11 @@ def run_receiving(duration: int = 0):
       ),
       message,
     )
-  def reject_live_database_write(_message: bytes, _frame_index: int) -> None:
+  def reject_live_database_write(
+    _message: bytes,
+    _frame_index: int,
+    _mark_write_attempt: Callable[[], None],
+  ) -> None:
     raise RuntimeError("DBD restore is restricted to pre-acquisition initialization")
   time_authority = TimeAuthority()
   rtc_observer = (
@@ -6866,6 +7327,9 @@ def run_receiving(duration: int = 0):
     position_assistance_retry=position_assistance_retry,
     transport_mon_ver_info=process_start_mon_ver_info,
     cycle_started_at=process_start_cycle_started_at,
+    allow_database_trusted_time_wait=True,
+    network_available=device_network_available(sm),
+    network_available_reader=lambda: device_network_available(sm),
   )
   execute_position_assistance_retry()
   startup_diagnostics.initialization_complete(
@@ -7439,12 +7903,15 @@ def run_receiving(duration: int = 0):
         now,
       )
 
-    # Provisional YUMA deliberately has first YUMA priority; the shared
-    # wrapper durably consumes the DBD/YUMA boot choice before frame 0.
+    # Provisional YUMA has first YUMA priority only after the durable DBD
+    # decision is terminal; the shared wrapper claims ownership before frame 0.
     provisional_yuma_outcome = yuma_feature.evaluate_provisional(
       send_yuma_message,
       now=now,
       reliable_fix_available=stable_fix is not None,
+      database_restore_pending=(
+        navigation_database_runtime.database_restore_pending
+      ),
     )
     if provisional_yuma_outcome is not None:
       log_provisional_yuma_outcome(provisional_yuma_outcome)

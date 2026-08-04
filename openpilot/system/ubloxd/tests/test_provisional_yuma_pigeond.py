@@ -133,6 +133,31 @@ def test_provisional_transmission_consumes_cycle_and_blocks_duplicate(monkeypatc
   assert runtime.evaluate_calls == 0
 
 
+def test_pending_database_restore_blocks_provisional_transmission(monkeypatch):
+  feature, runtime = make_feature(monkeypatch)
+  ref = reference()
+  calls = []
+  monkeypatch.setattr(
+    pigeond,
+    "transmit_provisional_yuma_reference",
+    lambda *args, **kwargs: calls.append(True),
+  )
+
+  assert feature.set_provisional_reference(ref)
+  assert (
+    feature.evaluate_provisional(
+      lambda _message: True,
+      now=2.1,
+      reliable_fix_available=False,
+      database_restore_pending=True,
+    )
+    is None
+  )
+  assert calls == []
+  assert not feature.cycle_injection_consumed
+  assert runtime.evaluate_calls == 0
+
+
 def test_authorized_time_overrides_pending_provisional_reference(monkeypatch):
   feature, _runtime = make_feature(monkeypatch)
   ref = reference()

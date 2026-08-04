@@ -12,6 +12,12 @@ class YumaDatabaseRestoreState(StrEnum):
   PENDING = "pending"
   COMPLETE = "complete"
   PARTIAL = "partial"
+  SKIPPED = "skipped"
+  REJECTED = "rejected"
+  RESPONSE_TIMEOUT = "response_timeout"
+  TRANSFER_DEADLINE = "transfer_deadline"
+  TRANSPORT_ERROR = "transport_error"
+  EXPIRED = "expired"
   FAILED = "failed"
 
 
@@ -36,6 +42,13 @@ class YumaSupplementationReason(StrEnum):
   MISSING_VISIBLE_PRNS_NOT_IN_YUMA = "missing_visible_prns_not_in_yuma"
   WAITING_FOR_DATABASE_RESTORE = "waiting_for_database_restore"
   DATABASE_RESTORE_INCOMPLETE = "database_restore_incomplete"
+  DATABASE_RESTORE_PARTIAL = "database_restore_partial"
+  DATABASE_RESTORE_SKIPPED = "database_restore_skipped"
+  DATABASE_RESTORE_REJECTED = "database_restore_rejected"
+  DATABASE_RESTORE_RESPONSE_TIMEOUT = "database_restore_response_timeout"
+  DATABASE_RESTORE_TRANSFER_DEADLINE = "database_restore_transfer_deadline"
+  DATABASE_RESTORE_TRANSPORT_ERROR = "database_restore_transport_error"
+  DATABASE_RESTORE_EXPIRED = "database_restore_expired"
   RESTORED_GPS_ALMANAC_INCOMPLETE = "restored_gps_almanac_incomplete"
   RESTORED_GPS_ALMANAC_UNKNOWN = "restored_gps_almanac_unknown"
   RESTORED_GPS_ALMANAC_PRNS_MISSING = "restored_gps_almanac_prns_missing"
@@ -195,13 +208,37 @@ def plan_yuma_supplementation(
       YumaSupplementationReason.WAITING_FOR_DATABASE_RESTORE,
     )
 
-  if database_state in (
-    YumaDatabaseRestoreState.FAILED,
-    YumaDatabaseRestoreState.PARTIAL,
-  ):
+  incomplete_database_reasons = {
+    YumaDatabaseRestoreState.PARTIAL: (
+      YumaSupplementationReason.DATABASE_RESTORE_PARTIAL
+    ),
+    YumaDatabaseRestoreState.SKIPPED: (
+      YumaSupplementationReason.DATABASE_RESTORE_SKIPPED
+    ),
+    YumaDatabaseRestoreState.REJECTED: (
+      YumaSupplementationReason.DATABASE_RESTORE_REJECTED
+    ),
+    YumaDatabaseRestoreState.RESPONSE_TIMEOUT: (
+      YumaSupplementationReason.DATABASE_RESTORE_RESPONSE_TIMEOUT
+    ),
+    YumaDatabaseRestoreState.TRANSFER_DEADLINE: (
+      YumaSupplementationReason.DATABASE_RESTORE_TRANSFER_DEADLINE
+    ),
+    YumaDatabaseRestoreState.TRANSPORT_ERROR: (
+      YumaSupplementationReason.DATABASE_RESTORE_TRANSPORT_ERROR
+    ),
+    YumaDatabaseRestoreState.EXPIRED: (
+      YumaSupplementationReason.DATABASE_RESTORE_EXPIRED
+    ),
+    YumaDatabaseRestoreState.FAILED: (
+      YumaSupplementationReason.DATABASE_RESTORE_INCOMPLETE
+    ),
+  }
+  incomplete_reason = incomplete_database_reasons.get(database_state)
+  if incomplete_reason is not None:
     return YumaSupplementationPlan(
       YumaSupplementationAction.SEND_ALL,
-      YumaSupplementationReason.DATABASE_RESTORE_INCOMPLETE,
+      incomplete_reason,
       satellite_ids=yuma_prns,
     )
 
