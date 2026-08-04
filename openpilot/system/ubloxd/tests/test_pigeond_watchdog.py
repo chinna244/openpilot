@@ -12,10 +12,7 @@ def test_watchdog_waits_for_timeout():
   assert not watchdog.check(109.999)
   assert watchdog.check(110.0)
   assert watchdog.recoveries == 1
-  assert (
-    watchdog.last_recovery_reason
-    is pigeond.ReceiverRecoveryReason.NO_DATA
-  )
+  assert watchdog.last_recovery_reason is pigeond.ReceiverRecoveryReason.NO_DATA
 
 
 def test_watchdog_raises_after_failed_recovery():
@@ -192,9 +189,10 @@ def test_long_reinitialization_restarts_no_data_timeout_at_completion():
   assert watchdog.check(160.0)
 
 
-def test_init_raises_when_receiver_configuration_fails(
+def test_init_continues_when_receiver_configuration_fails(
   monkeypatch,
 ):
+  post_start_calls = []
   monkeypatch.setattr(
     pigeond.signal,
     "signal",
@@ -225,16 +223,19 @@ def test_init_raises_when_receiver_configuration_fails(
     "init_pigeon",
     lambda _pigeon: False,
   )
+  monkeypatch.setattr(
+    pigeond,
+    "run_post_start_legacy_assistance",
+    lambda _pigeon: post_start_calls.append(True),
+  )
 
   class Pigeon:
     def send(self, _message: bytes) -> None:
       pass
 
-  with pytest.raises(
-    RuntimeError,
-    match="Failed to initialize pigeon",
-  ):
-    pigeond.init(Pigeon())
+  pigeond.init(Pigeon())
+
+  assert post_start_calls == [True]
 
 
 def test_zero_prefixed_ublox_payload_is_not_all_zero():

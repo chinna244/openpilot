@@ -1,5 +1,6 @@
 import struct
 from datetime import UTC, datetime
+from typing import cast
 
 import pytest
 
@@ -267,6 +268,150 @@ def test_ack_aiding_failure_results_are_distinct(monkeypatch, ack, readback, exp
   monkeypatch.setattr(pigeond, "wait_for_cfg_ack", lambda *args: ack)
   pigeon = type("Pigeon", (), {"send": lambda self, message: None})()
   assert pigeond.configure_navx5_ack_aiding(pigeon, HPG_1_40_ROVER_MON_VER) is expected
+
+
+def test_ack_aiding_deadline_is_rechecked_after_transaction_setup(monkeypatch):
+  clock = Clock()
+  clock.value = 44.0
+  writes: list[bytes] = []
+  monkeypatch.setattr(pigeond.time, "monotonic", clock)
+  monkeypatch.setattr(pigeond, "poll_navx5_config", lambda _pigeon, timeout: navx5_config())
+
+  def begin(
+    _pigeon,
+    message,
+    operation=None,
+    before_send=None,
+    deadline=None,
+  ):
+    assert deadline == 45.0
+    clock.value = 45.0
+    assert before_send is not None
+    before_send()
+    writes.append(message)
+    return pigeond.ResponseTransaction(pigeond.UbxStreamParser())
+
+  monkeypatch.setattr(pigeond, "_begin_response_transaction", begin)
+
+  result = pigeond.configure_navx5_ack_aiding(
+    cast(pigeond.TTYPigeon, object()),
+    HPG_1_40_ROVER_MON_VER,
+    pre_start_deadline=45.0,
+  )
+
+  assert result is pigeond.Navx5AckAidingConfigurationResult.DEADLINE_EXHAUSTED
+  assert writes == []
+
+
+def test_navx5_poll_deadline_is_rechecked_at_poll_uart_boundary(monkeypatch):
+  clock = Clock()
+  clock.value = 44.0
+
+  class Pigeon:
+    def __init__(self):
+      self.sent: list[bytes] = []
+
+    def begin_response_transaction(self, message, operation, before_send):
+      clock.value = 45.0
+      before_send()
+      self.sent.append(message)
+      return pigeond.ResponseTransaction(pigeond.UbxStreamParser())
+
+  monkeypatch.setattr(pigeond.time, "monotonic", clock)
+  pigeon = Pigeon()
+
+  with pytest.raises(TimeoutError, match="before UART write"):
+    pigeond.poll_navx5_config(
+      pigeon,  # type: ignore[arg-type, ty:invalid-argument-type]
+      pre_start_deadline=45.0,
+    )
+
+  assert pigeon.sent == []
+
+
+def test_ack_aiding_ack_wait_is_clipped_to_absolute_deadline(monkeypatch):
+  clock = Clock()
+  clock.value = 44.0
+  ack_timeouts: list[float] = []
+  monkeypatch.setattr(pigeond.time, "monotonic", clock)
+  monkeypatch.setattr(pigeond, "poll_navx5_config", lambda _pigeon, timeout: navx5_config())
+
+  def begin(
+    _pigeon,
+    _message,
+    operation=None,
+    before_send=None,
+    deadline=None,
+  ):
+    assert deadline == 45.0
+    clock.value = 44.8
+    assert before_send is not None
+    before_send()
+    return pigeond.ResponseTransaction(pigeond.UbxStreamParser())
+
+  def wait(
+    _pigeon,
+    _transaction,
+    _message_class,
+    _message_id,
+    timeout,
+    deadline=None,
+  ):
+    assert deadline == 45.0
+    ack_timeouts.append(timeout)
+    clock.value += timeout
+    return None
+
+  monkeypatch.setattr(pigeond, "_begin_response_transaction", begin)
+  monkeypatch.setattr(pigeond, "wait_for_cfg_ack", wait)
+
+  result = pigeond.configure_navx5_ack_aiding(
+    cast(pigeond.TTYPigeon, object()),
+    HPG_1_40_ROVER_MON_VER,
+    pre_start_deadline=45.0,
+  )
+
+  assert result is pigeond.Navx5AckAidingConfigurationResult.DEADLINE_EXHAUSTED
+  assert ack_timeouts == [pytest.approx(0.2)]
+  assert clock.value == pytest.approx(45.0)
+
+
+def test_ack_aiding_initial_and_verification_polls_share_deadline(monkeypatch):
+  clock = Clock()
+  clock.value = 44.0
+  poll_timeouts: list[float] = []
+  configs = iter((navx5_config(), navx5_config(ack_aiding=True)))
+  monkeypatch.setattr(pigeond.time, "monotonic", clock)
+
+  def poll(_pigeon, timeout):
+    poll_timeouts.append(timeout)
+    return next(configs)
+
+  def begin(
+    _pigeon,
+    _message,
+    operation=None,
+    before_send=None,
+    deadline=None,
+  ):
+    assert deadline == 45.0
+    clock.value = 44.7
+    assert before_send is not None
+    before_send()
+    return pigeond.ResponseTransaction(pigeond.UbxStreamParser())
+
+  monkeypatch.setattr(pigeond, "poll_navx5_config", poll)
+  monkeypatch.setattr(pigeond, "_begin_response_transaction", begin)
+  monkeypatch.setattr(pigeond, "wait_for_cfg_ack", lambda *_args, **_kwargs: True)
+
+  result = pigeond.configure_navx5_ack_aiding(
+    cast(pigeond.TTYPigeon, object()),
+    HPG_1_40_ROVER_MON_VER,
+    pre_start_deadline=45.0,
+  )
+
+  assert result is pigeond.Navx5AckAidingConfigurationResult.ENABLED_AND_VERIFIED
+  assert poll_timeouts == [pytest.approx(0.5), pytest.approx(0.3)]
 
 
 def test_ack_aiding_navx5_poll_unavailable_is_distinct(monkeypatch):
@@ -558,6 +703,7 @@ def test_nav_sat_reports_autonomous_available_and_used():
 
 def test_startup_orders_ack_aiding_before_time_and_autonomous_skip_after_restore(monkeypatch):
   events = []
+  ack_deadlines: list[float] = []
 
   class Diagnostics:
     def start_cycle(self, reason, now):
@@ -570,7 +716,17 @@ def test_startup_orders_ack_aiding_before_time_and_autonomous_skip_after_restore
   monkeypatch.setattr(pigeond, "log_mon_ver_diagnostics", lambda pigeon: events.append("mon_ver") or HPG_1_40_ROVER_MON_VER)
   monkeypatch.setattr(pigeond, "log_navx5_ack_aiding_support", lambda info: events.append("ack_support") or True)
   monkeypatch.setattr(pigeond, "log_assistnow_autonomous_support", lambda info: events.append("aop_support") or False)
-  monkeypatch.setattr(pigeond, "configure_navx5_ack_aiding", lambda *args: events.append("ack_aiding"))
+
+  def configure_ack_aiding(*_args, **kwargs):
+    events.append("ack_aiding")
+    ack_deadlines.append(kwargs["pre_start_deadline"])
+    return pigeond.Navx5AckAidingConfigurationResult.WRITE_TIMED_OUT
+
+  monkeypatch.setattr(
+    pigeond,
+    "configure_navx5_ack_aiding",
+    configure_ack_aiding,
+  )
   monkeypatch.setattr(pigeond, "read_host_time_observation", network_host_observation)
   monkeypatch.setattr(pigeond, "send_time_assistance", lambda *args, **kwargs: events.append("time") or True)
   monkeypatch.setattr(pigeond, "restore_navigation_assistance", lambda *args, **kwargs: events.append("restore"))
@@ -594,6 +750,9 @@ def test_startup_orders_ack_aiding_before_time_and_autonomous_skip_after_restore
     "configure",
   ]
   assert result.ack_aiding_configuration_attempted
+  assert result.ack_aiding_configuration_result is pigeond.Navx5AckAidingConfigurationResult.WRITE_TIMED_OUT
+  assert len(ack_deadlines) == 1
+  assert ack_deadlines[0] > 0.0
   assert result.navigation_assistance_restore_attempted
   assert not result.assistnow_autonomous_supported
   assert result.assistnow_autonomous_configuration_attempted
@@ -615,7 +774,7 @@ def test_autonomous_configuration_never_requires_online_token(monkeypatch, auton
     ("online-token", True),
   ],
 )
-def test_legacy_assistnow_online_path_is_unchanged(monkeypatch, token, online_error):
+def test_legacy_assistnow_online_path_runs_after_strict_configuration(monkeypatch, token, online_error):
   online_calls = []
 
   class Params:
@@ -660,6 +819,11 @@ def test_legacy_assistnow_online_path_is_unchanged(monkeypatch, token, online_er
   )
   pigeon = Pigeon()
   assert pigeond.init_pigeon(pigeon)
+  assert online_calls == []
+  assert pigeon.ack_writes == []
+
+  pigeond.run_post_start_legacy_assistance(cast(pigeond.TTYPigeon, pigeon))
+
   online_writes = [entry for entry in pigeon.ack_writes if entry[1] == pigeond.UBLOX_ASSIST_ACK]
   if token is None:
     assert online_calls == []
@@ -710,7 +874,7 @@ def test_receiver_recovery_cycle_does_not_retry_aop_transaction(monkeypatch):
   monkeypatch.setattr(pigeond, "poll_mon_ver", lambda pigeon: HPG_1_40_ROVER_MON_VER)
   monkeypatch.setattr(pigeond, "log_navx5_ack_aiding_support", lambda info: True)
   monkeypatch.setattr(pigeond, "poll_navx5_config", lambda pigeon: pytest.fail("AOP must not poll NAVX5"))
-  monkeypatch.setattr(pigeond, "configure_navx5_ack_aiding", lambda *args: events.append("ack"))
+  monkeypatch.setattr(pigeond, "configure_navx5_ack_aiding", lambda *args, **kwargs: events.append("ack"))
   monkeypatch.setattr(pigeond, "read_host_time_observation", network_host_observation)
   monkeypatch.setattr(pigeond, "send_time_assistance", lambda *args, **kwargs: events.append("time") or True)
   monkeypatch.setattr(pigeond, "restore_navigation_assistance", lambda *args, **kwargs: events.append("restore"))
@@ -744,7 +908,7 @@ def test_navx5_poll_failure_does_not_block_normal_startup(monkeypatch):
   monkeypatch.setattr(pigeond, "log_mon_ver_diagnostics", lambda pigeon: HPG_1_40_ROVER_MON_VER)
   monkeypatch.setattr(pigeond, "log_navx5_ack_aiding_support", lambda info: True)
   monkeypatch.setattr(pigeond, "log_assistnow_autonomous_support", lambda info: False)
-  monkeypatch.setattr(pigeond, "configure_navx5_ack_aiding", lambda *args: events.append("ack_aiding"))
+  monkeypatch.setattr(pigeond, "configure_navx5_ack_aiding", lambda *args, **kwargs: events.append("ack_aiding"))
   monkeypatch.setattr(pigeond, "read_host_time_observation", network_host_observation)
   monkeypatch.setattr(pigeond, "send_time_assistance", lambda *args, **kwargs: events.append("time") or True)
   monkeypatch.setattr(pigeond, "restore_navigation_assistance", lambda *args, **kwargs: events.append("restore"))

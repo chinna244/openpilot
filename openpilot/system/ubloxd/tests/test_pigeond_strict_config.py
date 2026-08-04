@@ -1,16 +1,22 @@
 from collections import deque
 from datetime import UTC, datetime
+import json
 from types import SimpleNamespace
+from typing import cast
 
 import pytest
 
 from openpilot.system.ubloxd import pigeond
 from openpilot.system.ubloxd.gps_assistance import (
+  GnssConfig,
+  GnssConfigBlock,
   ItfmConfig,
   MessageRateConfig,
   Nav5Config,
   OdoConfig,
   RateConfig,
+  RxmConfig,
+  Pm2Config,
   UbxStreamParser,
   add_ubx_checksum,
   build_cfg_itfm_poll_message,
@@ -123,6 +129,65 @@ def nav_pvt_frame() -> bytes:
   payload[21] = 1
   payload[23] = 7
   return ubx_frame(0x01, 0x07, bytes(payload))
+
+
+def verified_configuration_items(
+  *,
+  expected_value: str = "expected",
+) -> tuple[pigeond.ReceiverConfigurationItemResult, ...]:
+  return tuple(
+    pigeond.ReceiverConfigurationItemResult(
+      item_name=item_name,
+      mandatory=mandatory,
+      attempted=False,
+      write_attempt_count=0,
+      ack_status=pigeond.ReceiverConfigurationAckStatus.NOT_REQUIRED,
+      poll_attempt_count=1,
+      readback_status=pigeond.ReceiverConfigurationReadbackStatus.VERIFIED,
+      verified=True,
+      expected_value=expected_value,
+      observed_value="verified",
+      failure_kind=None,
+      failure_phase=None,
+      error_type=None,
+      error=None,
+    )
+    for item_name, mandatory in pigeond.RECEIVER_CONFIGURATION_ITEM_INVENTORY
+  )
+
+
+def complete_configuration_summary(
+  *,
+  receiver_cycle: int = 3,
+  receiver_fingerprint: str = "unidentified",
+  started_at: float = 1.0,
+  completed_at: float = 2.0,
+  items: tuple[pigeond.ReceiverConfigurationItemResult, ...] | None = None,
+  gnss_start_attempted: bool = True,
+  gnss_start_sent: bool = True,
+  navx5_ack_aiding_result: pigeond.Navx5AckAidingConfigurationResult | None = (pigeond.Navx5AckAidingConfigurationResult.ALREADY_ENABLED),
+) -> pigeond.ReceiverConfigurationSummary:
+  return pigeond.ReceiverConfigurationSummary(
+    receiver_cycle=receiver_cycle,
+    transport_verified=True,
+    configuration_started_at=started_at,
+    configuration_completed_at=completed_at,
+    items=(verified_configuration_items() if items is None else items),
+    gnss_start_attempted=gnss_start_attempted,
+    gnss_start_sent=gnss_start_sent,
+    receiver_fingerprint=receiver_fingerprint,
+    navx5_ack_aiding_result=navx5_ack_aiding_result,
+  )
+
+
+def persist_current_configuration_summary(
+  summary: pigeond.ReceiverConfigurationSummary,
+) -> bool:
+  pigeond.set_receiver_configuration_context(
+    summary.receiver_cycle,
+    summary.receiver_fingerprint,
+  )
+  return pigeond.persist_receiver_configuration_summary(summary)
 
 
 def rawx_frame() -> bytes:
@@ -311,7 +376,7 @@ def test_same_key_ack_after_official_response_window_is_not_reused(monkeypatch):
     )
     is None
   )
-  assert clock.now > 1.1
+  assert clock.now == pytest.approx(1.1)
 
   pigeon.available.append(cfg_ack(0x08))
   pigeon.reset_response_state()
@@ -445,6 +510,39 @@ def test_corrupt_cfg_poll_response_is_ignored_until_timeout():
   pigeon = ScriptedPigeon((bytes(corrupt),))
   with pytest.raises(TimeoutError, match="No valid CFG response"):
     pigeond.poll_cfg_rate(pigeon, timeout=0.005)
+
+
+@pytest.mark.parametrize(
+  ("message_id", "poll"),
+  (
+    (0x00, lambda pigeon: pigeond.poll_cfg_prt(pigeon, 1, timeout=0.01)),
+    (0x08, lambda pigeon: pigeond.poll_cfg_rate(pigeon, timeout=0.01)),
+    (0x24, lambda pigeon: pigeond.poll_cfg_nav5(pigeon, timeout=0.01)),
+    (0x1E, lambda pigeon: pigeond.poll_cfg_odo(pigeon, timeout=0.01)),
+    (0x39, lambda pigeon: pigeond.poll_cfg_itfm(pigeon, timeout=0.01)),
+    (0x01, lambda pigeon: pigeond.poll_cfg_msg(pigeon, 0x01, 0x07, timeout=0.01)),
+  ),
+)
+def test_real_malformed_mandatory_cfg_response_is_parser_error(message_id, poll):
+  malformed_response = ubx_frame(0x06, message_id, b"\x00")
+  pigeon = ScriptedPigeon((malformed_response,))
+
+  result = pigeond.run_receiver_configuration_item(
+    item_name=f"CFG-{message_id:02X}",
+    mandatory=True,
+    expected_value="expected",
+    poll=lambda: poll(pigeon),
+    verify=lambda _value: None,
+    write=lambda: None,
+    max_write_attempts=0,
+  )
+
+  assert not result.verified
+  assert result.poll_attempt_count == 1
+  assert result.failure_kind is pigeond.ReceiverConfigurationFailureKind.PARSER_ERROR
+  assert result.readback_status is pigeond.ReceiverConfigurationReadbackStatus.PARSER_ERROR
+  assert result.failure_phase == "initial_readback"
+  assert result.error_type == "ReceiverConfigurationParserError"
 
 
 def test_cfg_poll_timeout():
@@ -767,6 +865,71 @@ def test_init_resets_response_state_before_receiver_power_cycle(monkeypatch):
   assert pigeon.published == [nav[:8]]
 
 
+def test_legacy_backup_and_assistnow_run_only_after_gnss_start(monkeypatch):
+  events: list[str] = []
+
+  class Pigeon:
+    def send(self, message):
+      if message == pigeond.CONTROLLED_GNSS_STOP_MESSAGE:
+        events.append("gnss_stop")
+      elif message == pigeond.CONTROLLED_GNSS_START_MESSAGE:
+        events.append("gnss_start")
+
+  initialization = pigeond.PreAcquisitionInitialization(
+    callback=lambda: events.append("assistance"),
+    transport_already_started=True,
+  )
+  monkeypatch.setattr(pigeond, "_ACTIVE_PRE_ACQUISITION_INITIALIZATION", initialization)
+  monkeypatch.setattr(pigeond.time, "sleep", lambda _duration: None)
+  monkeypatch.setattr(pigeond, "finish_pigeon_initialization", lambda _pigeon: events.append("strict_configuration"))
+  monkeypatch.setattr(pigeond, "run_post_start_legacy_assistance", lambda _pigeon: events.append("legacy_assistance"))
+
+  pigeond.init(cast(pigeond.TTYPigeon, Pigeon()))
+
+  assert events == [
+    "gnss_stop",
+    "assistance",
+    "strict_configuration",
+    "gnss_start",
+    "legacy_assistance",
+  ]
+
+
+def test_mandatory_configuration_failure_is_degraded_but_not_fatal(monkeypatch):
+  errors: list[str] = []
+  monkeypatch.setattr(pigeond, "init_pigeon", lambda *_args, **_kwargs: False)
+  monkeypatch.setattr(pigeond.cloudlog, "error", errors.append)
+
+  assert not pigeond.finish_pigeon_initialization(cast(pigeond.TTYPigeon, object()))
+  assert len(errors) == 1
+  assert "degraded" in errors[0]
+  assert "continues" in errors[0]
+
+
+def test_mandatory_configuration_failure_still_starts_and_continues(monkeypatch):
+  events: list[str] = []
+
+  class Pigeon:
+    def send(self, message):
+      if message == pigeond.CONTROLLED_GNSS_STOP_MESSAGE:
+        events.append("gnss_stop")
+      elif message == pigeond.CONTROLLED_GNSS_START_MESSAGE:
+        events.append("gnss_start")
+
+  initialization = pigeond.PreAcquisitionInitialization(
+    callback=lambda: events.append("assistance"),
+    transport_already_started=True,
+  )
+  monkeypatch.setattr(pigeond, "_ACTIVE_PRE_ACQUISITION_INITIALIZATION", initialization)
+  monkeypatch.setattr(pigeond, "init_pigeon", lambda *_args, **_kwargs: False)
+  monkeypatch.setattr(pigeond, "run_post_start_legacy_assistance", lambda _pigeon: events.append("post_start"))
+  monkeypatch.setattr(pigeond.time, "sleep", lambda _duration: None)
+
+  pigeond.init(cast(pigeond.TTYPigeon, Pigeon()))
+
+  assert events == ["gnss_stop", "assistance", "gnss_start", "post_start"]
+
+
 def test_pending_frames_were_already_published_before_reset():
   nav = nav_pvt_frame()
   pigeon = ScriptedPigeon(pre_transaction=(nav,))
@@ -801,7 +964,7 @@ def test_queue_overflow_during_initialization_is_controlled(monkeypatch):
   assert pigeon.sent == []
   assert len(pigeon._pending_frames) == 2
   assert "frame_count=2" in logs[0]
-  assert "operation=cfg_write_06_00" in logs[0]
+  assert "operation=ubx_06_00" in logs[0]
   assert "receiver_cycle=0" in logs[0]
   assert "frame_limit" in logs[0]
 
@@ -884,97 +1047,398 @@ def test_effective_startup_configuration_logging(monkeypatch):
   assert any("CFG-MSG RXM-RAWX effective" in message and "uart1_rate=1" in message for message in logs)
 
 
-@pytest.mark.parametrize("failures", [1, 3])
-def test_init_pigeon_retries_after_matching_nak(monkeypatch, failures):
-  class RetryingPigeon:
-    def __init__(self):
-      self.ack_writes = []
+def test_configuration_item_retries_only_its_own_write_after_mismatch():
+  observed = [0, 1]
+  writes: list[str] = []
 
-    def send_with_ack(self, message, **kwargs):
-      self.ack_writes.append(message)
-      if len(self.ack_writes) <= failures:
-        raise pigeond.CfgNakError("matching CFG NAK")
-
-    def send(self, message):
-      pass
-
-    def poll_backup_restore_status(self):
-      return 3
-
-  monkeypatch.setattr(pigeond, "poll_cfg_prt", lambda _pigeon, port_id: expected_port_config(port_id))
-  monkeypatch.setattr(pigeond, "poll_cfg_rate", lambda *args: RateConfig(100, 1, 0))
-  monkeypatch.setattr(pigeond, "poll_cfg_nav5", lambda *args: Nav5Config(4, 3))
-  monkeypatch.setattr(pigeond, "poll_cfg_odo", lambda *args: OdoConfig(0, 1, 3))
-  monkeypatch.setattr(pigeond, "poll_cfg_itfm", lambda *args: ItfmConfig(0xAD62ADFF, 0x0000631E))
-  monkeypatch.setattr(
-    pigeond,
-    "poll_cfg_msg",
-    lambda _pigeon, message_class, message_id: MessageRateConfig(
-      message_class,
-      message_id,
-      (0, 1, 0, 0, 0, 0),
-    ),
+  result = pigeond.run_receiver_configuration_item(
+    item_name="CFG-MSG-NAV-PVT",
+    mandatory=True,
+    expected_value="uart1_rate=1",
+    poll=lambda: observed.pop(0),
+    verify=lambda value: (_ for _ in ()).throw(pigeond.ReceiverConfigurationError("rate mismatch")) if value != 1 else None,
+    write=lambda: writes.append("uart_write"),
   )
-  monkeypatch.setattr(pigeond, "Params", lambda: type("Params", (), {"get": lambda self, key: None})())
 
-  pigeon = RetryingPigeon()
-  assert pigeond.init_pigeon(pigeon)
-  assert pigeon.ack_writes[:failures] == [pigeon.ack_writes[0]] * failures
-  assert pigeon.ack_writes[failures] == pigeon.ack_writes[0]
+  assert result.verified
+  assert result.write_attempt_count == 1
+  assert result.poll_attempt_count == 2
+  assert writes == ["uart_write"]
 
 
-def test_init_pigeon_timeout_then_successful_retry(monkeypatch):
-  class RetryingPigeon:
-    def __init__(self):
-      self.writes = 0
-
-    def send_with_ack(self, _message, **_kwargs):
-      self.writes += 1
-      if self.writes == 1:
-        raise TimeoutError("matching CFG ACK timed out")
-
-    def send(self, _message):
-      pass
-
-    def poll_backup_restore_status(self):
-      return 3
-
-  monkeypatch.setattr(pigeond, "poll_cfg_prt", lambda _pigeon, port_id: expected_port_config(port_id))
-  monkeypatch.setattr(pigeond, "poll_cfg_rate", lambda *args: RateConfig(100, 1, 0))
-  monkeypatch.setattr(pigeond, "poll_cfg_nav5", lambda *args: Nav5Config(4, 3))
-  monkeypatch.setattr(pigeond, "poll_cfg_odo", lambda *args: OdoConfig(0, 1, 3))
-  monkeypatch.setattr(pigeond, "poll_cfg_itfm", lambda *args: ItfmConfig(0xAD62ADFF, 0x0000631E))
-  monkeypatch.setattr(
-    pigeond,
-    "poll_cfg_msg",
-    lambda _pigeon, message_class, message_id: MessageRateConfig(
-      message_class,
-      message_id,
-      (0, 1, 0, 0, 0, 0),
-    ),
+@pytest.mark.parametrize(
+  "stream_name",
+  ("NAV-PVT", "RXM-RAWX", "RXM-SFRBX", "NAV-SAT", "MON-HW", "MON-HW2"),
+)
+def test_each_required_stream_is_verified_on_uart1(stream_name):
+  result = pigeond.run_receiver_configuration_item(
+    item_name=f"CFG-MSG-{stream_name}",
+    mandatory=stream_name in ("NAV-PVT", "RXM-RAWX", "RXM-SFRBX"),
+    expected_value="uart1_rate=1",
+    poll=lambda: MessageRateConfig(1, 7, (0, 1, 0, 0, 0, 0)),
+    verify=lambda value: (_ for _ in ()).throw(pigeond.ReceiverConfigurationError("wrong UART1 rate")) if value.rates[1] != 1 else None,
+    write=lambda: pytest.fail("already-correct stream must not be rewritten"),
   )
-  monkeypatch.setattr(pigeond, "Params", lambda: type("Params", (), {"get": lambda self, key: None})())
 
-  pigeon = RetryingPigeon()
-  assert pigeond.init_pigeon(pigeon)
-  assert pigeon.writes > 1
+  assert result.verified
+  assert result.write_attempt_count == 0
+
+
+def test_cfg_gnss_conservative_validation_requires_enabled_gps_and_valid_channels():
+  config = GnssConfig(
+    version=0,
+    hardware_tracking_channels=16,
+    configured_tracking_channels=12,
+    blocks=(GnssConfigBlock(0, 8, 8, True, 0, 1), GnssConfigBlock(6, 4, 8, True, 0, 1)),
+  )
+  pigeond.verify_cfg_gnss_conservatively(config)
+  with pytest.raises(pigeond.ReceiverConfigurationError, match="GPS is disabled"):
+    pigeond.verify_cfg_gnss_conservatively(
+      GnssConfig(0, 16, 8, (GnssConfigBlock(0, 8, 8, False, 0, 0),)),
+    )
+
+
+def test_cfg_rxm_and_pm2_conservative_validation_reject_unsupported_values():
+  pigeond.verify_cfg_rxm_conservatively(RxmConfig(0))
+  pigeond.verify_cfg_rxm_conservatively(RxmConfig(4))
+  with pytest.raises(pigeond.ReceiverConfigurationError, match="continuous acquisition"):
+    pigeond.verify_cfg_rxm_conservatively(RxmConfig(1))
+  with pytest.raises(pigeond.ReceiverConfigurationError, match="unsupported"):
+    pigeond.verify_cfg_rxm_conservatively(RxmConfig(2))
+  pigeond.verify_cfg_pm2_conservatively(Pm2Config(1, 0, 0, 0, 0, 0, 0, 0, None))
+  with pytest.raises(pigeond.ReceiverConfigurationError, match="inactive power-management"):
+    pigeond.verify_cfg_pm2_conservatively(Pm2Config(1, 0, 1 << 17, 10_000, 10_000, 0, 1, 5, None))
+  with pytest.raises(pigeond.ReceiverConfigurationError, match="unsupported"):
+    pigeond.verify_cfg_pm2_conservatively(Pm2Config(3, 0, 0, 0, 0, 0, 0, 0, None))
+
+
+@pytest.mark.parametrize(
+  ("item_name", "observed", "verifier"),
+  (
+    ("CFG-RXM", RxmConfig(1), pigeond.verify_cfg_rxm_conservatively),
+    (
+      "CFG-PM2",
+      Pm2Config(1, 0, 1 << 17, 10_000, 10_000, 0, 1, 5, None),
+      pigeond.verify_cfg_pm2_conservatively,
+    ),
+  ),
+)
+def test_supported_but_unwanted_power_state_is_diagnostic_mismatch(item_name, observed, verifier):
+  result = pigeond.run_receiver_configuration_item(
+    item_name=item_name,
+    mandatory=False,
+    expected_value="continuous_inactive_power_management",
+    poll=lambda: observed,
+    verify=verifier,
+    write=lambda: None,
+    max_write_attempts=0,
+  )
+
+  assert not result.verified
+  assert result.failure_kind is pigeond.ReceiverConfigurationFailureKind.READBACK_MISMATCH
+  assert result.readback_status is pigeond.ReceiverConfigurationReadbackStatus.MISMATCHED
+  assert result.ack_status is pigeond.ReceiverConfigurationAckStatus.NOT_REQUIRED
+
+
+def test_configuration_deadline_prevents_another_uart_write(monkeypatch):
+  monkeypatch.setattr(pigeond.time, "monotonic", lambda: 45.0)
+  writes: list[str] = []
+  result = pigeond.run_receiver_configuration_item(
+    item_name="CFG-MSG-NAV-PVT",
+    mandatory=True,
+    expected_value="uart1_rate=1",
+    poll=lambda: 0,
+    verify=lambda value: (_ for _ in ()).throw(pigeond.ReceiverConfigurationError("mismatch")) if value != 1 else None,
+    write=lambda: writes.append("unexpected"),
+    pre_start_deadline=45.0,
+  )
+
+  assert not result.verified
+  assert result.failure_kind is pigeond.ReceiverConfigurationFailureKind.DEADLINE_EXHAUSTED
+  assert writes == []
+
+
+def test_configuration_deadline_is_rechecked_at_uart_write_boundary(monkeypatch):
+  clock = SimpleNamespace(now=44.0)
+
+  class DeadlineDrainPigeon(ScriptedPigeon):
+    def drain_before_transaction(
+      self,
+      operation="pre_transaction_drain",
+      deadline=None,
+    ):
+      clock.now = 45.0
+
+  monkeypatch.setattr(pigeond.time, "monotonic", lambda: clock.now)
+  pigeon = DeadlineDrainPigeon()
+
+  with pytest.raises(TimeoutError, match="before UART write") as exc_info:
+    pigeond.send_configuration_with_ack(
+      pigeon,
+      cfg_write(0x08),
+      pre_start_deadline=45.0,
+    )
+
+  assert not exc_info.value.receiver_write_attempted
+  assert pigeon.sent == []
+
+
+def test_configuration_ack_wait_uses_remaining_absolute_deadline(monkeypatch):
+  clock = SimpleNamespace(now=44.0)
+
+  class DeadlineDrainPigeon(ScriptedPigeon):
+    def drain_before_transaction(
+      self,
+      operation="pre_transaction_drain",
+      deadline=None,
+    ):
+      clock.now = 44.8
+
+  monkeypatch.setattr(pigeond.time, "monotonic", lambda: clock.now)
+  monkeypatch.setattr(pigeond.time, "sleep", lambda duration: setattr(clock, "now", clock.now + duration))
+  pigeon = DeadlineDrainPigeon()
+
+  with pytest.raises(TimeoutError):
+    pigeond.send_configuration_with_ack(
+      pigeon,
+      cfg_write(0x08),
+      pre_start_deadline=45.0,
+    )
+
+  assert pigeon.sent == [cfg_write(0x08)]
+  assert 45.0 <= clock.now < 45.01
+
+
+def test_slow_transaction_drain_starts_gnss_at_absolute_deadline(
+  monkeypatch,
+):
+  clock = SimpleNamespace(now=44.9)
+  start_times: list[float] = []
+
+  class SlowDrainPigeon(ScriptedPigeon):
+    def _read_stream(self):
+      clock.now = 45.0
+      return b"stale", []
+
+    def send(self, data):
+      self.sent.append(data)
+      if data == pigeond.CONTROLLED_GNSS_START_MESSAGE:
+        start_times.append(clock.now)
+
+  monkeypatch.setattr(pigeond.time, "monotonic", lambda: clock.now)
+  monkeypatch.setattr(pigeond.time, "sleep", lambda _duration: None)
+  pigeon = SlowDrainPigeon()
+
+  def configure() -> None:
+    pigeond.send_configuration_with_ack(
+      pigeon,
+      cfg_write(0x08),
+      pre_start_deadline=45.0,
+    )
+
+  with pytest.raises(TimeoutError, match="during receiver read"):
+    with pigeond.install_pre_acquisition_initialization(
+      configure,
+      pre_start_deadline=45.0,
+    ) as initialization:
+      with pigeond.paused_gnss_acquisition(pigeon):
+        initialization.run()
+
+  assert start_times == [45.0]
+  assert cfg_write(0x08) not in pigeon.sent
+
+
+def test_slow_configuration_readback_starts_gnss_at_absolute_deadline(
+  monkeypatch,
+):
+  clock = SimpleNamespace(now=44.9)
+  start_times: list[float] = []
+
+  class SlowReadbackPigeon(ScriptedPigeon):
+    def send(self, data):
+      self.sent.append(data)
+      if data == pigeond.CONTROLLED_GNSS_START_MESSAGE:
+        start_times.append(clock.now)
+
+    def receive_transaction_data(self, transaction):
+      clock.now = 45.0
+      response = cfg_rate_frame()
+      return response, [response], [response]
+
+  monkeypatch.setattr(pigeond.time, "monotonic", lambda: clock.now)
+  monkeypatch.setattr(pigeond.time, "sleep", lambda _duration: None)
+  pigeon = SlowReadbackPigeon()
+
+  def poll() -> None:
+    pigeond.poll_cfg_rate(
+      pigeon,
+      timeout=0.5,
+      deadline=45.0,
+    )
+
+  with pytest.raises(TimeoutError, match="during readback"):
+    with pigeond.install_pre_acquisition_initialization(
+      poll,
+      pre_start_deadline=45.0,
+    ) as initialization:
+      with pigeond.paused_gnss_acquisition(pigeon):
+        initialization.run()
+
+  assert start_times == [45.0]
+  assert pigeond.build_cfg_rate_poll_message() in pigeon.sent
+
+
+def test_configuration_item_retries_matching_nak_without_replaying_prior_items():
+  writes: list[str] = []
+
+  def write() -> None:
+    writes.append("CFG-MSG-RXM-RAWX")
+    if len(writes) == 1:
+      raise pigeond.CfgNakError("matching CFG NAK")
+
+  values = [0, 0, 1]
+  result = pigeond.run_receiver_configuration_item(
+    item_name="CFG-MSG-RXM-RAWX",
+    mandatory=True,
+    expected_value="uart1_rate=1",
+    poll=lambda: values.pop(0),
+    verify=lambda value: (_ for _ in ()).throw(pigeond.ReceiverConfigurationError("rate mismatch")) if value != 1 else None,
+    write=write,
+  )
+
+  assert result.verified
+  assert result.write_attempt_count == 2
+  assert writes == ["CFG-MSG-RXM-RAWX", "CFG-MSG-RXM-RAWX"]
+
+
+def test_configuration_item_ack_timeout_then_success():
+  writes = 0
+  values = [0, 0, 1]
+
+  def write() -> None:
+    nonlocal writes
+    writes += 1
+    if writes == 1:
+      raise TimeoutError("matching CFG ACK timed out")
+
+  result = pigeond.run_receiver_configuration_item(
+    item_name="CFG-RATE",
+    mandatory=True,
+    expected_value="100ms/1",
+    poll=lambda: values.pop(0),
+    verify=lambda value: (_ for _ in ()).throw(pigeond.ReceiverConfigurationError("mismatch")) if value != 1 else None,
+    write=write,
+  )
+
+  assert result.verified
+  assert result.write_attempt_count == 2
+
+
+def test_ack_timeout_then_verified_readback_preserves_exact_ack_status():
+  observed = iter((0, 1))
+
+  def write() -> None:
+    raise TimeoutError("matching CFG ACK timed out")
+
+  result = pigeond.run_receiver_configuration_item(
+    item_name="CFG-RATE",
+    mandatory=True,
+    expected_value="100ms/1",
+    poll=observed.__next__,
+    verify=lambda value: (_ for _ in ()).throw(pigeond.ReceiverConfigurationError("mismatch")) if value != 1 else None,
+    write=write,
+  )
+
+  assert result.verified
+  assert result.write_attempt_count == 1
+  assert result.poll_attempt_count == 2
+  assert result.ack_status is pigeond.ReceiverConfigurationAckStatus.TIMED_OUT
+  assert result.readback_status is pigeond.ReceiverConfigurationReadbackStatus.VERIFIED
+
+
+def test_successful_retry_clears_stale_write_error_for_terminal_result():
+  writes = 0
+
+  def write() -> None:
+    nonlocal writes
+    writes += 1
+    if writes == 1:
+      raise TimeoutError("first matching CFG ACK timed out")
+
+  result = pigeond.run_receiver_configuration_item(
+    item_name="CFG-RATE",
+    mandatory=True,
+    expected_value="100ms/1",
+    poll=lambda: 0,
+    verify=lambda _value: (_ for _ in ()).throw(pigeond.ReceiverConfigurationError("final mismatch")),
+    write=write,
+  )
+
+  assert not result.verified
+  assert result.write_attempt_count == 2
+  assert result.poll_attempt_count == 3
+  assert result.failure_kind is pigeond.ReceiverConfigurationFailureKind.READBACK_MISMATCH
+  assert result.failure_phase == "readback"
+  assert result.ack_status is pigeond.ReceiverConfigurationAckStatus.ACKNOWLEDGED
+  assert result.error == "final mismatch"
+
+
+@pytest.mark.parametrize(
+  ("readback_error", "expected_kind", "expected_status"),
+  (
+    (
+      pigeond.CfgPollTimeoutError("terminal CFG readback timed out"),
+      pigeond.ReceiverConfigurationFailureKind.POLL_TIMEOUT,
+      pigeond.ReceiverConfigurationReadbackStatus.TIMED_OUT,
+    ),
+    (
+      pigeond.ReceiverConfigurationParserError("terminal CFG readback malformed"),
+      pigeond.ReceiverConfigurationFailureKind.PARSER_ERROR,
+      pigeond.ReceiverConfigurationReadbackStatus.PARSER_ERROR,
+    ),
+  ),
+)
+def test_ack_timeout_and_terminal_readback_failure_preserve_both_outcomes(
+  readback_error,
+  expected_kind,
+  expected_status,
+):
+  polls = 0
+
+  def poll():
+    nonlocal polls
+    polls += 1
+    if polls == 1:
+      return 0
+    raise readback_error
+
+  def write() -> None:
+    raise TimeoutError("matching CFG ACK timed out")
+
+  result = pigeond.run_receiver_configuration_item(
+    item_name="CFG-PRT-3",
+    mandatory=True,
+    expected_value="port3",
+    poll=poll,
+    verify=lambda value: (_ for _ in ()).throw(pigeond.ReceiverConfigurationError("initial mismatch")) if value != 1 else None,
+    write=write,
+    max_write_attempts=1,
+  )
+
+  assert not result.verified
+  assert result.write_attempt_count == 1
+  assert result.poll_attempt_count == 2
+  assert result.ack_status is pigeond.ReceiverConfigurationAckStatus.TIMED_OUT
+  assert result.readback_status is expected_status
+  assert result.failure_kind is expected_kind
+  assert result.failure_phase == "readback"
+  assert result.error_type == type(readback_error).__name__
+  assert result.error == str(readback_error)
 
 
 def test_cfg_nak_retry_waits_for_complete_official_response_window(monkeypatch):
   clock = SimpleNamespace(now=0.0)
-
-  class BoundaryPigeon:
-    def __init__(self):
-      self.write_times = []
-
-    def send_with_ack(self, _message, **_kwargs):
-      self.write_times.append(clock.now)
-      if len(self.write_times) == 1:
-        raise pigeond.CfgNakError(
-          "matching CFG NAK",
-          clock.now + pigeond.CFG_ACK_TIMEOUT,
-        )
-      raise pigeond.ResponseTransactionError("stop second cycle")
+  write_times: list[float] = []
 
   monkeypatch.setattr(pigeond.time, "monotonic", lambda: clock.now)
   monkeypatch.setattr(
@@ -982,10 +1446,49 @@ def test_cfg_nak_retry_waits_for_complete_official_response_window(monkeypatch):
     "sleep",
     lambda duration: setattr(clock, "now", clock.now + duration),
   )
-  pigeon = BoundaryPigeon()
 
-  assert not pigeond.init_pigeon(pigeon)
-  assert pigeon.write_times == [0.0, pigeond.CFG_ACK_TIMEOUT]
+  def write() -> None:
+    write_times.append(clock.now)
+    if len(write_times) == 1:
+      raise pigeond.CfgNakError("matching CFG NAK", clock.now + pigeond.CFG_ACK_TIMEOUT)
+
+  result = pigeond.run_receiver_configuration_item(
+    item_name="CFG-MSG-NAV-PVT",
+    mandatory=True,
+    expected_value="uart1_rate=1",
+    poll=iter((0, 0, 1)).__next__,
+    verify=lambda value: (_ for _ in ()).throw(pigeond.ReceiverConfigurationError("mismatch")) if value != 1 else None,
+    write=write,
+  )
+
+  assert result.verified
+  assert write_times == [0.0, pigeond.CFG_ACK_TIMEOUT]
+
+
+def test_cfg_nak_retry_sleep_is_clipped_to_pre_start_deadline(monkeypatch):
+  clock = SimpleNamespace(now=0.0)
+  writes: list[float] = []
+  monkeypatch.setattr(pigeond.time, "monotonic", lambda: clock.now)
+  monkeypatch.setattr(pigeond.time, "sleep", lambda duration: setattr(clock, "now", clock.now + duration))
+
+  def write() -> None:
+    writes.append(clock.now)
+    raise pigeond.CfgNakError("matching CFG NAK", clock.now + pigeond.CFG_ACK_TIMEOUT)
+
+  result = pigeond.run_receiver_configuration_item(
+    item_name="CFG-MSG-NAV-PVT",
+    mandatory=True,
+    expected_value="uart1_rate=1",
+    poll=lambda: 0,
+    verify=lambda _value: (_ for _ in ()).throw(pigeond.ReceiverConfigurationError("mismatch")),
+    write=write,
+    pre_start_deadline=0.25,
+  )
+
+  assert writes == [0.0]
+  assert clock.now == pytest.approx(0.25)
+  assert result.failure_kind is pigeond.ReceiverConfigurationFailureKind.DEADLINE_EXHAUSTED
+  assert result.write_attempt_count == 1
 
 
 def test_cfg_nak_retry_boundary_uses_post_send_timestamp(monkeypatch):
@@ -1008,57 +1511,531 @@ def test_cfg_nak_retry_boundary_uses_post_send_timestamp(monkeypatch):
   assert exc_info.value.retry_not_before != pytest.approx(11.1)
 
 
-def test_cfg_poll_timeout_aborts_current_initialization_cycle(monkeypatch):
-  class PollTimeoutPigeon:
-    def __init__(self):
-      self.writes = []
+def test_cfg_poll_timeout_is_bounded_to_the_failing_item():
+  writes: list[str] = []
 
-    def send_with_ack(self, message, **_kwargs):
-      self.writes.append(message)
+  result = pigeond.run_receiver_configuration_item(
+    item_name="CFG-PRT-1",
+    mandatory=True,
+    expected_value="uart1",
+    poll=lambda: (_ for _ in ()).throw(pigeond.CfgPollTimeoutError("CFG-PRT response timed out")),
+    verify=lambda _value: None,
+    write=lambda: writes.append("CFG-PRT-1"),
+  )
 
-  polled_ports = []
-
-  def poll_timeout(_pigeon, port_id):
-    polled_ports.append(port_id)
-    raise pigeond.CfgPollTimeoutError("CFG-PRT response timed out")
-
-  monkeypatch.setattr(pigeond, "poll_cfg_prt", poll_timeout)
-  pigeon = PollTimeoutPigeon()
-
-  assert not pigeond.init_pigeon(pigeon)
-  assert len(pigeon.writes) == 4
-  assert polled_ports == [0]
+  assert not result.verified
+  assert result.failure_kind is pigeond.ReceiverConfigurationFailureKind.POLL_TIMEOUT
+  assert result.write_attempt_count == pigeond.RECEIVER_CONFIGURATION_ITEM_MAX_WRITE_ATTEMPTS
+  assert result.poll_attempt_count == pigeond.RECEIVER_CONFIGURATION_ITEM_MAX_WRITE_ATTEMPTS + 1
+  assert writes == ["CFG-PRT-1"] * pigeond.RECEIVER_CONFIGURATION_ITEM_MAX_WRITE_ATTEMPTS
 
 
-def test_ten_consecutive_initialization_failures_are_bounded():
-  class AlwaysRejectingPigeon:
-    def __init__(self):
-      self.writes = 0
+def test_permanent_item_rejection_is_bounded():
+  writes: list[str] = []
+  result = pigeond.run_receiver_configuration_item(
+    item_name="CFG-RATE",
+    mandatory=True,
+    expected_value="100ms/1",
+    poll=lambda: (_ for _ in ()).throw(pigeond.CfgPollTimeoutError("no readback")),
+    verify=lambda _value: None,
+    write=lambda: (writes.append("CFG-RATE"), (_ for _ in ()).throw(pigeond.CfgNakError("matching CFG NAK")))[1],
+  )
 
-    def send_with_ack(self, _message, **_kwargs):
-      self.writes += 1
-      raise pigeond.CfgNakError("matching CFG NAK")
+  assert not result.verified
+  assert result.failure_kind is pigeond.ReceiverConfigurationFailureKind.POLL_TIMEOUT
+  assert result.failure_phase == "readback"
+  assert result.ack_status is pigeond.ReceiverConfigurationAckStatus.REJECTED
+  assert result.readback_status is pigeond.ReceiverConfigurationReadbackStatus.TIMED_OUT
+  assert result.poll_attempt_count == pigeond.RECEIVER_CONFIGURATION_ITEM_MAX_WRITE_ATTEMPTS + 1
+  assert len(writes) == pigeond.RECEIVER_CONFIGURATION_ITEM_MAX_WRITE_ATTEMPTS
 
-  pigeon = AlwaysRejectingPigeon()
-  assert not pigeond.init_pigeon(pigeon)
-  assert pigeon.writes == 10
+
+def test_receiver_configuration_summary_round_trips_as_complete_json(monkeypatch, tmp_path):
+  monkeypatch.setattr(pigeond, "GPS_ASSISTANCE_CACHE_PATH", str(tmp_path / "assistance-cache.json"))
+  summary = complete_configuration_summary(
+    receiver_cycle=7,
+    started_at=10.0,
+    completed_at=11.0,
+    items=verified_configuration_items(
+      expected_value="expected" * 1000,
+    ),
+  )
+
+  assert persist_current_configuration_summary(summary)
+  path = pigeond.receiver_configuration_summary_path()
+  raw_record = json.loads(path.read_text())
+
+  assert pigeond.load_receiver_configuration_summary_record() == raw_record
+  assert raw_record["schema_version"] == pigeond.RECEIVER_CONFIGURATION_SUMMARY_SCHEMA_VERSION
+  assert raw_record["boot_id"] == pigeond.RECEIVER_CONFIGURATION_BOOT_ID
+  assert raw_record["process_start_id"] == pigeond.RECEIVER_CONFIGURATION_PROCESS_START_ID
+  assert raw_record["receiver_fingerprint"] == "unidentified"
+  assert raw_record["receiver_cycle"] == 7
+  assert raw_record["total_items"] == len(pigeond.RECEIVER_CONFIGURATION_ITEM_INVENTORY)
+  assert raw_record["verified_items"] == len(pigeond.RECEIVER_CONFIGURATION_ITEM_INVENTORY)
+  assert raw_record["failed_items"] == 0
+  assert raw_record["mandatory_failures"] == []
+  assert raw_record["all_mandatory_items_verified"]
+  assert len(path.read_bytes()) <= 16384
+  assert raw_record["items"][0]["item_name"] == "CFG-PRT-3"
+  assert len(raw_record["items"][0]["expected_value"]) == 128
+
+
+def test_combined_ack_and_readback_failures_round_trip_durably(monkeypatch, tmp_path):
+  monkeypatch.setattr(pigeond, "GPS_ASSISTANCE_CACHE_PATH", str(tmp_path / "assistance-cache.json"))
+  failed_item = pigeond.ReceiverConfigurationItemResult(
+    item_name="CFG-PRT-3",
+    mandatory=True,
+    attempted=True,
+    write_attempt_count=1,
+    ack_status=pigeond.ReceiverConfigurationAckStatus.TIMED_OUT,
+    poll_attempt_count=2,
+    readback_status=pigeond.ReceiverConfigurationReadbackStatus.PARSER_ERROR,
+    verified=False,
+    expected_value="port3",
+    observed_value="initial mismatch",
+    failure_kind=pigeond.ReceiverConfigurationFailureKind.PARSER_ERROR,
+    failure_phase="readback",
+    error_type="ReceiverConfigurationParserError",
+    error="terminal CFG readback malformed",
+  )
+  summary = complete_configuration_summary(
+    receiver_cycle=8,
+    items=(failed_item, *verified_configuration_items()[1:]),
+  )
+
+  assert persist_current_configuration_summary(summary)
+  record = pigeond.load_receiver_configuration_summary_record()
+  assert record is not None
+  persisted_item = cast(list[dict[str, object]], record["items"])[0]
+  assert persisted_item["ack_status"] == "timed_out"
+  assert persisted_item["readback_status"] == "parser_error"
+  assert persisted_item["failure_kind"] == "parser_error"
+  assert persisted_item["failure_phase"] == "readback"
+
+
+@pytest.mark.parametrize(
+  ("identity_field", "stale_value"),
+  (
+    ("boot_id", "previous-boot"),
+    ("process_start_id", "previous-process"),
+    ("receiver_fingerprint", "different-receiver"),
+  ),
+)
+def test_receiver_configuration_loader_rejects_stale_identity(
+  monkeypatch,
+  tmp_path,
+  identity_field,
+  stale_value,
+):
+  monkeypatch.setattr(pigeond, "GPS_ASSISTANCE_CACHE_PATH", str(tmp_path / "assistance-cache.json"))
+  summary = complete_configuration_summary(
+    receiver_fingerprint="current-receiver",
+  )
+  assert persist_current_configuration_summary(summary)
+  path = pigeond.receiver_configuration_summary_path()
+  record = json.loads(path.read_text())
+  record[identity_field] = stale_value
+  path.write_text(json.dumps(record))
+
+  assert (
+    pigeond.load_receiver_configuration_summary_record(
+      "current-receiver",
+      3,
+    )
+    is None
+  )
+
+
+def test_receiver_configuration_loader_rejects_stale_cycle_and_missing_context(
+  monkeypatch,
+  tmp_path,
+):
+  monkeypatch.setattr(pigeond, "GPS_ASSISTANCE_CACHE_PATH", str(tmp_path / "assistance-cache.json"))
+  summary = complete_configuration_summary(
+    receiver_fingerprint="receiver",
+  )
+  assert persist_current_configuration_summary(summary)
+
+  assert pigeond.load_receiver_configuration_summary_record("receiver", 4) is None
+  monkeypatch.setattr(
+    pigeond,
+    "_current_receiver_configuration_fingerprint",
+    None,
+  )
+  monkeypatch.setattr(
+    pigeond,
+    "_current_receiver_configuration_cycle",
+    None,
+  )
+  assert pigeond.load_receiver_configuration_summary_record() is None
+
+
+def test_new_receiver_cycle_clears_cycle_scoped_configuration_state(
+  monkeypatch,
+):
+  previous_summary = complete_configuration_summary(
+    receiver_cycle=3,
+    receiver_fingerprint="previous-receiver",
+  )
+  monkeypatch.setattr(
+    pigeond,
+    "_last_receiver_configuration_summary",
+    previous_summary,
+  )
+  monkeypatch.setattr(
+    pigeond,
+    "_last_receiver_configuration_persistence_status",
+    pigeond.ReceiverConfigurationPersistenceStatus("old", True),
+  )
+  pigeon = SimpleNamespace(
+    _receiver_cycle=4,
+    _transport_verified_for_receiver_cycle=True,
+  )
+
+  pigeond.begin_receiver_configuration_cycle(
+    pigeon,
+    "current-receiver",
+    transport_verified=False,
+  )
+
+  assert pigeond.last_receiver_configuration_summary() is None
+  assert pigeond.last_receiver_configuration_persistence_status() is None
+  assert not pigeond._current_receiver_configuration_record_ready
+  assert pigeond._current_receiver_configuration_cycle == 4
+  assert pigeond._current_receiver_configuration_fingerprint == "current-receiver"
+  assert not pigeon._transport_verified_for_receiver_cycle
+
+
+def test_new_cycle_rejects_old_record_even_when_numeric_identity_repeats(
+  monkeypatch,
+  tmp_path,
+):
+  monkeypatch.setattr(pigeond, "GPS_ASSISTANCE_CACHE_PATH", str(tmp_path / "assistance-cache.json"))
+  old_summary = complete_configuration_summary(
+    receiver_cycle=4,
+    receiver_fingerprint="same-receiver",
+  )
+  assert persist_current_configuration_summary(old_summary)
+  assert pigeond.load_receiver_configuration_summary_record() is not None
+
+  pigeond.begin_receiver_configuration_cycle(
+    SimpleNamespace(_receiver_cycle=4),
+    "same-receiver",
+    transport_verified=False,
+  )
+
+  assert pigeond.load_receiver_configuration_summary_record() is None
+
+
+def test_previous_cycle_summary_cannot_mutate_or_persist_in_current_cycle(
+  monkeypatch,
+  tmp_path,
+):
+  monkeypatch.setattr(pigeond, "GPS_ASSISTANCE_CACHE_PATH", str(tmp_path / "assistance-cache.json"))
+  previous_summary = complete_configuration_summary(
+    receiver_cycle=3,
+    receiver_fingerprint="previous-receiver",
+    gnss_start_attempted=False,
+    gnss_start_sent=False,
+  )
+  pigeond.set_receiver_configuration_context(3, "previous-receiver")
+  monkeypatch.setattr(
+    pigeond,
+    "_last_receiver_configuration_summary",
+    previous_summary,
+  )
+  current_pigeon = SimpleNamespace(_receiver_cycle=4)
+  pigeond.begin_receiver_configuration_cycle(
+    current_pigeon,
+    "current-receiver",
+    transport_verified=False,
+  )
+
+  monkeypatch.setattr(
+    pigeond,
+    "_last_receiver_configuration_summary",
+    previous_summary,
+  )
+  initialization = pigeond.PreAcquisitionInitialization(lambda: None)
+  initialization.note_gnss_start_attempted()
+  initialization.mark_gnss_start_sent()
+
+  assert pigeond.last_receiver_configuration_summary() is previous_summary
+  assert not previous_summary.gnss_start_attempted
+  assert not previous_summary.gnss_start_sent
+  assert not pigeond.persist_receiver_configuration_summary(previous_summary)
+  assert pigeond._current_receiver_configuration_cycle == 4
+  assert pigeond._current_receiver_configuration_fingerprint == "current-receiver"
+  assert pigeond.load_receiver_configuration_summary_record() is None
+
+
+def test_start_cleanup_never_persists_previous_cycle_summary(monkeypatch):
+  persisted: list[pigeond.ReceiverConfigurationSummary] = []
+  previous_summary = complete_configuration_summary(
+    receiver_cycle=3,
+    receiver_fingerprint="previous-receiver",
+    gnss_start_attempted=False,
+    gnss_start_sent=False,
+  )
+  pigeond.set_receiver_configuration_context(4, "current-receiver")
+  monkeypatch.setattr(
+    pigeond,
+    "_last_receiver_configuration_summary",
+    previous_summary,
+  )
+  monkeypatch.setattr(pigeond.time, "sleep", lambda _delay: None)
+  monkeypatch.setattr(
+    pigeond,
+    "persist_receiver_configuration_summary",
+    lambda summary: persisted.append(summary) or True,
+  )
+
+  class Pigeon:
+    def send(self, _message):
+      pass
+
+  with pigeond.install_pre_acquisition_initialization(lambda: None):
+    with pigeond.paused_gnss_acquisition(cast(pigeond.TTYPigeon, Pigeon())):
+      pass
+
+  assert persisted == []
+  assert pigeond.last_receiver_configuration_summary() is previous_summary
+  assert not previous_summary.gnss_start_attempted
+  assert not previous_summary.gnss_start_sent
+
+
+def test_loader_rejects_incomplete_but_internally_consistent_inventory(
+  monkeypatch,
+  tmp_path,
+):
+  monkeypatch.setattr(pigeond, "GPS_ASSISTANCE_CACHE_PATH", str(tmp_path / "assistance-cache.json"))
+  summary = complete_configuration_summary()
+  assert persist_current_configuration_summary(summary)
+  path = pigeond.receiver_configuration_summary_path()
+  record = json.loads(path.read_text())
+  record["items"] = record["items"][:-1]
+  record["total_items"] -= 1
+  record["verified_items"] -= 1
+  path.write_text(json.dumps(record))
+
+  assert pigeond.load_receiver_configuration_summary_record() is None
+
+
+def test_loader_rejects_wrong_inventory_classification_and_order(
+  monkeypatch,
+  tmp_path,
+):
+  monkeypatch.setattr(pigeond, "GPS_ASSISTANCE_CACHE_PATH", str(tmp_path / "assistance-cache.json"))
+  summary = complete_configuration_summary()
+  assert persist_current_configuration_summary(summary)
+  path = pigeond.receiver_configuration_summary_path()
+
+  wrong_classification = json.loads(path.read_text())
+  wrong_classification["items"][-1]["mandatory"] = True
+  path.write_text(json.dumps(wrong_classification))
+  assert pigeond.load_receiver_configuration_summary_record() is None
+
+  wrong_order = json.loads(json.dumps(wrong_classification))
+  wrong_order["items"][-1]["mandatory"] = False
+  wrong_order["items"][0], wrong_order["items"][1] = (
+    wrong_order["items"][1],
+    wrong_order["items"][0],
+  )
+  path.write_text(json.dumps(wrong_order))
+  assert pigeond.load_receiver_configuration_summary_record() is None
+
+
+def test_navx5_failure_is_visible_in_durable_summary(monkeypatch, tmp_path):
+  monkeypatch.setattr(pigeond, "GPS_ASSISTANCE_CACHE_PATH", str(tmp_path / "assistance-cache.json"))
+  summary = complete_configuration_summary(
+    receiver_fingerprint="receiver",
+    navx5_ack_aiding_result=(pigeond.Navx5AckAidingConfigurationResult.WRITE_TIMED_OUT),
+  )
+
+  assert persist_current_configuration_summary(summary)
+  record = pigeond.load_receiver_configuration_summary_record("receiver", 3)
+
+  assert record is not None
+  assert record["navx5_ack_aiding_result"] == "write_timed_out"
+  assert record["configuration_degraded"] is True
+
+
+def test_configuration_summary_persistence_occurs_only_after_start_write(monkeypatch):
+  events: list[object] = []
+  summary = complete_configuration_summary(
+    gnss_start_attempted=False,
+    gnss_start_sent=False,
+  )
+  pigeond.set_receiver_configuration_context(3, "unidentified")
+  monkeypatch.setattr(pigeond, "_last_receiver_configuration_summary", summary)
+  monkeypatch.setattr(pigeond.time, "sleep", lambda _delay: None)
+
+  def persist(final_summary):
+    events.append(
+      (
+        "persist",
+        final_summary.gnss_start_attempted,
+        final_summary.gnss_start_sent,
+      )
+    )
+    return True
+
+  monkeypatch.setattr(pigeond, "persist_receiver_configuration_summary", persist)
+
+  class Pigeon:
+    def send(self, message):
+      if message == pigeond.CONTROLLED_GNSS_START_MESSAGE:
+        events.append("start_write")
+
+  with pigeond.install_pre_acquisition_initialization(lambda: None) as initialization:
+    with pigeond.paused_gnss_acquisition(cast(pigeond.TTYPigeon, Pigeon())):
+      initialization.run()
+
+  assert events == ["start_write", ("persist", True, True)]
+
+
+def test_failed_start_write_persists_attempted_but_not_sent(monkeypatch):
+  persisted: list[pigeond.ReceiverConfigurationSummary] = []
+  pigeond.set_receiver_configuration_context(3, "unidentified")
+  monkeypatch.setattr(
+    pigeond,
+    "_last_receiver_configuration_summary",
+    complete_configuration_summary(
+      gnss_start_attempted=False,
+      gnss_start_sent=False,
+    ),
+  )
+  monkeypatch.setattr(pigeond.time, "sleep", lambda _delay: None)
+  monkeypatch.setattr(
+    pigeond,
+    "persist_receiver_configuration_summary",
+    lambda summary: persisted.append(summary) or True,
+  )
+
+  class Pigeon:
+    def send(self, message):
+      if message == pigeond.CONTROLLED_GNSS_START_MESSAGE:
+        raise OSError("START write failed")
+
+  with pytest.raises(OSError, match="START write failed"):
+    with pigeond.install_pre_acquisition_initialization(lambda: None) as initialization:
+      with pigeond.paused_gnss_acquisition(cast(pigeond.TTYPigeon, Pigeon())):
+        initialization.run()
+
+  assert len(persisted) == 1
+  assert persisted[0].gnss_start_attempted
+  assert not persisted[0].gnss_start_sent
+
+
+def test_expired_deadline_skips_optional_final_drain_before_start(monkeypatch):
+  events: list[str] = []
+  monkeypatch.setattr(pigeond.time, "monotonic", lambda: 45.0)
+  monkeypatch.setattr(pigeond.time, "sleep", lambda _delay: None)
+  monkeypatch.setattr(pigeond, "_last_receiver_configuration_summary", None)
+
+  class Pigeon:
+    def drain_before_transaction(self, _operation):
+      events.append("drain")
+
+    def send(self, message):
+      if message == pigeond.CONTROLLED_GNSS_START_MESSAGE:
+        events.append("start")
+
+  with pigeond.install_pre_acquisition_initialization(
+    lambda: None,
+    pre_start_deadline=45.0,
+  ) as initialization:
+    initialization.require_pre_gnss_start_drain()
+    with pigeond.paused_gnss_acquisition(cast(pigeond.TTYPigeon, Pigeon())):
+      initialization.run()
+
+  assert events == ["start"]
+
+
+@pytest.mark.parametrize(
+  ("field", "invalid_value"),
+  (
+    ("receiver_cycle", None),
+    ("transport_verified", 1),
+    ("transport_verified", False),
+    ("total_items", 2),
+    ("navx5_ack_aiding_result", None),
+    ("gnss_start_attempted", False),
+  ),
+)
+def test_receiver_configuration_summary_loader_rejects_invalid_schema(monkeypatch, tmp_path, field, invalid_value):
+  monkeypatch.setattr(pigeond, "GPS_ASSISTANCE_CACHE_PATH", str(tmp_path / "assistance-cache.json"))
+  summary = complete_configuration_summary()
+  assert persist_current_configuration_summary(summary)
+  path = pigeond.receiver_configuration_summary_path()
+  record = json.loads(path.read_text())
+  record[field] = invalid_value
+  path.write_text(json.dumps(record))
+
+  assert pigeond.load_receiver_configuration_summary_record() is None
+
+
+def test_receiver_configuration_summary_loader_rejects_invalid_item_enum(monkeypatch, tmp_path):
+  monkeypatch.setattr(pigeond, "GPS_ASSISTANCE_CACHE_PATH", str(tmp_path / "assistance-cache.json"))
+  summary = complete_configuration_summary()
+  assert persist_current_configuration_summary(summary)
+  path = pigeond.receiver_configuration_summary_path()
+  record = json.loads(path.read_text())
+  record["items"][0]["ack_status"] = "invented"
+  path.write_text(json.dumps(record))
+
+  assert pigeond.load_receiver_configuration_summary_record() is None
+
+
+def test_persistence_failure_invalidates_old_summary_and_is_observable(monkeypatch, tmp_path):
+  monkeypatch.setattr(pigeond, "GPS_ASSISTANCE_CACHE_PATH", str(tmp_path / "assistance-cache.json"))
+  old_summary = complete_configuration_summary(receiver_cycle=3)
+  new_summary = complete_configuration_summary(
+    receiver_cycle=4,
+    started_at=3.0,
+    completed_at=4.0,
+  )
+  assert persist_current_configuration_summary(old_summary)
+  path = pigeond.receiver_configuration_summary_path()
+  original_write_text = type(path).write_text
+
+  def fail_write(self, *_args, **_kwargs):
+    if self == path.with_suffix(".tmp"):
+      raise OSError("storage unavailable")
+    return original_write_text(self, *_args, **_kwargs)
+
+  monkeypatch.setattr(type(path), "write_text", fail_write)
+
+  pigeond.set_receiver_configuration_context(4, "unidentified")
+  assert not pigeond.persist_receiver_configuration_summary(new_summary)
+  status = pigeond.last_receiver_configuration_persistence_status()
+  assert status is not None
+  assert not status.succeeded
+  assert status.error_type == "OSError"
+  assert not path.exists()
+  assert path.with_suffix(".stale").exists()
+  assert pigeond.load_receiver_configuration_summary_record() is None
+
+
+def test_receiver_configuration_cycle_uses_public_then_private_identity():
+  assert pigeond.receiver_configuration_cycle_id(SimpleNamespace(receiver_cycle=8, _receiver_cycle=7)) == 8
+  assert pigeond.receiver_configuration_cycle_id(SimpleNamespace(_receiver_cycle=7)) == 7
 
 
 def test_end_to_end_hpg_1_40_protocol_20_30_initialization(monkeypatch):
   responses = [
-    *(cfg_ack(0x00) for _ in range(4)),
-    *(cfg_prt_frame(expected_port_config(port)) for port in (0, 1, 3, 4)),
-    cfg_ack(0x08),
+    *(cfg_prt_frame(expected_port_config(port)) for port in (3, 0, 1, 4)),
     cfg_rate_frame(),
-    cfg_ack(0x24),
-    cfg_ack(0x1E),
-    cfg_ack(0x39),
     cfg_nav5_frame(),
     cfg_odo_frame(),
     cfg_itfm_frame(),
-    *(cfg_ack(0x01) for _ in range(6)),
     cfg_msg_frame(0x01, 0x07),
     cfg_msg_frame(0x02, 0x15),
+    cfg_msg_frame(0x02, 0x13),
+    cfg_msg_frame(0x01, 0x35),
+    cfg_msg_frame(0x0A, 0x09),
+    cfg_msg_frame(0x0A, 0x0B),
     sos_frame(3, 3),
   ]
   monkeypatch.setattr(
@@ -1066,12 +2043,38 @@ def test_end_to_end_hpg_1_40_protocol_20_30_initialization(monkeypatch):
     "Params",
     lambda: SimpleNamespace(get=lambda _key: None),
   )
+  monkeypatch.setattr(
+    pigeond,
+    "poll_cfg_gnss",
+    lambda _pigeon, timeout: GnssConfig(0, 16, 12, (GnssConfigBlock(0, 8, 8, True, 0, 1),)),
+  )
+  monkeypatch.setattr(pigeond, "poll_cfg_rxm", lambda _pigeon, timeout: RxmConfig(0))
+  monkeypatch.setattr(pigeond, "poll_cfg_pm2", lambda _pigeon, timeout: Pm2Config(1, 0, 0, 0, 0, 0, 0, 0, None))
+  monkeypatch.setattr(
+    pigeond,
+    "_ACTIVE_PRE_ACQUISITION_INITIALIZATION",
+    pigeond.PreAcquisitionInitialization(
+      lambda: None,
+      receiver_fingerprint="receiver-fingerprint",
+      navx5_ack_aiding_result=(pigeond.Navx5AckAidingConfigurationResult.WRITE_TIMED_OUT),
+    ),
+  )
   pigeon = ScriptedPigeon(responses)
 
   assert pigeond.init_pigeon(pigeon)
+  summary = pigeond.last_receiver_configuration_summary()
+  assert summary is not None
+  assert summary.receiver_fingerprint == "receiver-fingerprint"
+  assert summary.navx5_ack_aiding_result is pigeond.Navx5AckAidingConfigurationResult.WRITE_TIMED_OUT
+  assert summary.configuration_degraded
+  assert tuple((item.item_name, item.mandatory) for item in summary.items) == pigeond.RECEIVER_CONFIGURATION_ITEM_INVENTORY
   cfg_prt_polls = [message for message in pigeon.sent if message[2:4] == b"\x06\x00" and message[4:6] == b"\x01\x00"]
-  assert cfg_prt_polls == [pigeond.build_cfg_prt_poll_message(port) for port in (0, 1, 3, 4)]
+  assert cfg_prt_polls == [pigeond.build_cfg_prt_poll_message(port) for port in (3, 0, 1, 4)]
   assert not any(message[2:6] == b"\x06\x00\x00\x00" for message in pigeon.sent)
+  assert len(pigeon.responses) == 1
+
+  pigeond.run_post_start_legacy_assistance(pigeon)
+
   assert not pigeon.responses
   assert not pigeon.available
 
@@ -1126,7 +2129,7 @@ def test_cache_restore_is_independent_of_time_assistance_ack(
   monkeypatch.setattr(pigeond, "init", lambda pigeon: None)
   monkeypatch.setattr(pigeond, "poll_mon_ver", lambda pigeon: None)
   monkeypatch.setattr(pigeond, "log_navx5_ack_aiding_support", lambda info: False)
-  monkeypatch.setattr(pigeond, "configure_navx5_ack_aiding", lambda *args: None)
+  monkeypatch.setattr(pigeond, "configure_navx5_ack_aiding", lambda *args, **kwargs: None)
   monkeypatch.setattr(pigeond, "read_host_time_observation", network_host_observation)
   monkeypatch.setattr(pigeond, "wait_for_matching_mga_ack", lambda *args, **kwargs: acknowledgment)
   monkeypatch.setattr(
