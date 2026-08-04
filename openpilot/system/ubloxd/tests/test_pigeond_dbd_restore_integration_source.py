@@ -95,6 +95,18 @@ def test_live_loop_creates_fresh_state_for_each_receiver_cycle() -> None:
   )
 
 
+def test_process_start_dbd_wait_rechecks_unready_network_state() -> None:
+  source, tree = source_tree(PIGEOND)
+  node = named_node(tree, "run_receiving")
+  segment = ast.get_source_segment(source, node)
+  assert segment is not None
+  assert "network_available=device_network_available(sm)" in segment
+  assert (
+    "network_available_reader=lambda: device_network_available(sm)"
+    in segment
+  )
+
+
 def test_acquisition_latch_is_updated_before_receiver_processing() -> None:
   source, tree = source_tree(PIGEOND)
   node = named_node(tree, "run_receiving")
@@ -121,6 +133,8 @@ def test_database_decision_runs_before_yuma_transmission() -> None:
   )
 
   assert "provisional_yuma_outcome = yuma_feature.evaluate_provisional(\n      send_yuma_message," in segment
+  assert "database_restore_pending=(" in segment
+  assert "navigation_database_runtime.database_restore_pending" in segment
   assert "yuma_outcome = yuma_feature.evaluate(\n      send_yuma_message," in segment
   assert "navigation_database_runtime.note_yuma_sent()" not in segment
 
@@ -130,6 +144,18 @@ def test_database_decision_runs_before_yuma_transmission() -> None:
   assert helper_segment.index(
     "navigation_database_runtime.claim_yuma_transmission()"
   ) < helper_segment.index("send_message(message)")
+
+  runtime_node = named_node(
+    source_tree(RUNTIME)[1],
+    "NavigationDatabaseRestoreRuntime",
+  )
+  runtime_source = RUNTIME.read_text(encoding="utf-8")
+  runtime_segment = ast.get_source_segment(runtime_source, runtime_node)
+  assert runtime_segment is not None
+  claim = runtime_segment.index("def claim_yuma_transmission")
+  pending = runtime_segment.index("self.database_restore_pending", claim)
+  persist = runtime_segment.index("self._persist_state()", claim)
+  assert claim < pending < persist
   assert "raise YumaAssistanceStateUnavailableError(" in helper_segment
   assert "return False" not in helper_segment
 
@@ -255,12 +281,13 @@ def test_controlled_stop_start_brackets_pre_database_window() -> None:
 
   stop = segment.index("pigeon.send(CONTROLLED_GNSS_STOP_MESSAGE)")
   yielded = segment.index("yield")
-  failure_path = segment.index("except BaseException:")
-  success_path = segment.index("else:")
+  failure_path = segment.index("except BaseException as exc:")
+  finalizer = segment.index("finally:")
   start = segment.index("pigeon.send(CONTROLLED_GNSS_START_MESSAGE)")
 
-  assert stop < yielded < failure_path < success_path < start
-  assert "raise" in segment[failure_path:success_path]
+  assert stop < yielded < failure_path < finalizer < start
+  assert "body_error = exc" in segment[failure_path:finalizer]
+  assert "if body_error is not None:" in segment[start:]
 
 
 def test_power_on_stop_precedes_baud_transition_and_transactions() -> None:

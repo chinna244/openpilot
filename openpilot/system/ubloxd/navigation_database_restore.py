@@ -14,7 +14,40 @@ from openpilot.system.ubloxd.trusted_time_authority import (
 )
 
 
+# MGA-DBD is opaque and cannot be filtered by constellation or record age.
+# This restore foundation therefore authorizes only whole caches no older than
+# one hour.  It intentionally does not make a roughly two-hour d8 -> d9 cache
+# eligible; that field case needs a separate safe cache-freshness mechanism.
 NAVIGATION_DATABASE_RESTORE_MAX_AGE_SECONDS = 60.0 * 60.0
+
+
+@dataclass(frozen=True)
+class NavigationDatabaseRestoreAgePolicy:
+  maximum_age_seconds: float = NAVIGATION_DATABASE_RESTORE_MAX_AGE_SECONDS
+
+  def __post_init__(self) -> None:
+    value = self.maximum_age_seconds
+    if (
+      isinstance(value, bool)
+      or not isinstance(value, (int, float))
+      or not isfinite(float(value))
+      or float(value) < 0.0
+    ):
+      raise ValueError("maximum cache age is invalid")
+    object.__setattr__(self, "maximum_age_seconds", float(value))
+
+  def accepts(self, cache_age_seconds: float | None) -> bool:
+    return (
+      not isinstance(cache_age_seconds, bool)
+      and isinstance(cache_age_seconds, (int, float))
+      and isfinite(float(cache_age_seconds))
+      and 0.0 <= float(cache_age_seconds) <= self.maximum_age_seconds
+    )
+
+
+DEFAULT_NAVIGATION_DATABASE_RESTORE_AGE_POLICY = (
+  NavigationDatabaseRestoreAgePolicy()
+)
 
 
 class NavigationDatabaseRestoreDisposition(StrEnum):
@@ -22,13 +55,25 @@ class NavigationDatabaseRestoreDisposition(StrEnum):
 
   PENDING = "pending"
   RESTORED = "restored"
+  RESTORE_PARTIAL = "restore_partial"
+  RESTORE_REJECTED = "restore_rejected"
+  RESTORE_RESPONSE_TIMEOUT = "restore_response_timeout"
+  RESTORE_TRANSFER_DEADLINE = "restore_transfer_deadline"
+  RESTORE_TRANSPORT_ERROR = "restore_transport_error"
+  RESTORE_CACHE_EXPIRED = "restore_cache_expired"
   SKIPPED_EXPIRED = "skipped_expired"
   SKIPPED_UNVERIFIED = "skipped_unverified"
+  SKIPPED_NO_TRUSTED_TIME = "skipped_no_trusted_time"
+  SKIPPED_WAIT_TIMEOUT = "skipped_wait_timeout"
+  SKIPPED_WAIT_ERROR = "skipped_wait_error"
+  SKIPPED_STATE_UNAVAILABLE = "skipped_state_unavailable"
   SKIPPED_EARLY_ACQUISITION = "skipped_early_acquisition"
   SKIPPED_LATE_RECEIVER_TIME = "skipped_late_receiver_time"
   SKIPPED_ACQUISITION_ALREADY_STARTED = "skipped_acquisition_already_started"
   SKIPPED_RELIABLE_FIX = "skipped_reliable_fix"
   SKIPPED_YUMA_ALREADY_SENT = "skipped_yuma_already_sent"
+  SKIPPED_NO_CACHE = "skipped_no_cache"
+  SKIPPED_CACHE_UNQUALIFIED = "skipped_cache_unqualified"
   SKIPPED_NO_USABLE_CACHE = "skipped_no_usable_cache"
   WRITE_FAILED = "write_failed"
 
@@ -46,7 +91,15 @@ class NavigationDatabaseRestoreDisposition(StrEnum):
 
   @property
   def write_failed(self) -> bool:
-    return self is NavigationDatabaseRestoreDisposition.WRITE_FAILED
+    return self in (
+      NavigationDatabaseRestoreDisposition.RESTORE_PARTIAL,
+      NavigationDatabaseRestoreDisposition.RESTORE_REJECTED,
+      NavigationDatabaseRestoreDisposition.RESTORE_RESPONSE_TIMEOUT,
+      NavigationDatabaseRestoreDisposition.RESTORE_TRANSFER_DEADLINE,
+      NavigationDatabaseRestoreDisposition.RESTORE_TRANSPORT_ERROR,
+      NavigationDatabaseRestoreDisposition.RESTORE_CACHE_EXPIRED,
+      NavigationDatabaseRestoreDisposition.WRITE_FAILED,
+    )
 
 
 class NavigationDatabaseRestoreDecisionAction(StrEnum):
@@ -140,8 +193,17 @@ class NavigationDatabaseRestoreBootController:
     return True
 
   def finish_restore(self, disposition: NavigationDatabaseRestoreDisposition) -> bool:
-    if disposition not in (NavigationDatabaseRestoreDisposition.RESTORED, NavigationDatabaseRestoreDisposition.WRITE_FAILED):
-      raise ValueError("restore completion must be RESTORED or WRITE_FAILED")
+    if disposition not in (
+      NavigationDatabaseRestoreDisposition.RESTORED,
+      NavigationDatabaseRestoreDisposition.RESTORE_PARTIAL,
+      NavigationDatabaseRestoreDisposition.RESTORE_REJECTED,
+      NavigationDatabaseRestoreDisposition.RESTORE_RESPONSE_TIMEOUT,
+      NavigationDatabaseRestoreDisposition.RESTORE_TRANSFER_DEADLINE,
+      NavigationDatabaseRestoreDisposition.RESTORE_TRANSPORT_ERROR,
+      NavigationDatabaseRestoreDisposition.RESTORE_CACHE_EXPIRED,
+      NavigationDatabaseRestoreDisposition.WRITE_FAILED,
+    ):
+      raise ValueError("restore completion disposition is invalid")
     if self.terminal or not self._restore_attempted:
       return False
     self._disposition = disposition
@@ -174,7 +236,7 @@ def evaluate_navigation_database_restore(
   authorized_time: AuthorizedTime | None,
   cache_age_seconds: float | None,
   gnss_acquisition_started: bool,
-  maximum_cache_age_seconds: float = (NAVIGATION_DATABASE_RESTORE_MAX_AGE_SECONDS),
+  age_policy: NavigationDatabaseRestoreAgePolicy = DEFAULT_NAVIGATION_DATABASE_RESTORE_AGE_POLICY,
 ) -> NavigationDatabaseRestoreDecision:
   for name, value in (
     ("reliable_fix_available", reliable_fix_available),
@@ -185,13 +247,8 @@ def evaluate_navigation_database_restore(
       raise ValueError(f"{name} must be a bool")
   if authorized_time is not None and not isinstance(authorized_time, AuthorizedTime):
     raise ValueError("authorized_time is invalid")
-  if (
-    isinstance(maximum_cache_age_seconds, bool)
-    or not isinstance(maximum_cache_age_seconds, (int, float))
-    or not isfinite(float(maximum_cache_age_seconds))
-    or float(maximum_cache_age_seconds) < 0.0
-  ):
-    raise ValueError("maximum cache age is invalid")
+  if not isinstance(age_policy, NavigationDatabaseRestoreAgePolicy):
+    raise ValueError("age_policy is invalid")
 
   if reliable_fix_available:
     return NavigationDatabaseRestoreDecision(
@@ -225,7 +282,7 @@ def evaluate_navigation_database_restore(
       NavigationDatabaseRestoreDecisionAction.SKIP,
       NavigationDatabaseRestoreDisposition.SKIPPED_UNVERIFIED,
     )
-  if float(cache_age_seconds) > float(maximum_cache_age_seconds):
+  if not age_policy.accepts(cache_age_seconds):
     return NavigationDatabaseRestoreDecision(
       NavigationDatabaseRestoreDecisionAction.SKIP,
       NavigationDatabaseRestoreDisposition.SKIPPED_EXPIRED,

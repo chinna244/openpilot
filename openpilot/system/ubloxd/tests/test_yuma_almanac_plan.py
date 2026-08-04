@@ -238,19 +238,51 @@ def test_sufficient_restored_count_and_visible_coverage_skips():
 
 
 @pytest.mark.parametrize(
-  "database_state",
+  ("database_state", "expected_reason"),
   (
-    YumaDatabaseRestoreState.FAILED,
-    YumaDatabaseRestoreState.PARTIAL,
+    (
+      YumaDatabaseRestoreState.FAILED,
+      YumaSupplementationReason.DATABASE_RESTORE_INCOMPLETE,
+    ),
+    (
+      YumaDatabaseRestoreState.PARTIAL,
+      YumaSupplementationReason.DATABASE_RESTORE_PARTIAL,
+    ),
+    (
+      YumaDatabaseRestoreState.SKIPPED,
+      YumaSupplementationReason.DATABASE_RESTORE_SKIPPED,
+    ),
+    (
+      YumaDatabaseRestoreState.REJECTED,
+      YumaSupplementationReason.DATABASE_RESTORE_REJECTED,
+    ),
+    (
+      YumaDatabaseRestoreState.RESPONSE_TIMEOUT,
+      YumaSupplementationReason.DATABASE_RESTORE_RESPONSE_TIMEOUT,
+    ),
+    (
+      YumaDatabaseRestoreState.TRANSFER_DEADLINE,
+      YumaSupplementationReason.DATABASE_RESTORE_TRANSFER_DEADLINE,
+    ),
+    (
+      YumaDatabaseRestoreState.TRANSPORT_ERROR,
+      YumaSupplementationReason.DATABASE_RESTORE_TRANSPORT_ERROR,
+    ),
+    (
+      YumaDatabaseRestoreState.EXPIRED,
+      YumaSupplementationReason.DATABASE_RESTORE_EXPIRED,
+    ),
   ),
 )
-def test_incomplete_database_restore_sends_all_immediately(database_state):
+def test_noncomplete_database_restore_sends_all_with_exact_reason(
+  database_state,
+  expected_reason,
+):
   result = plan(database_state=database_state)
 
   assert result.action is YumaSupplementationAction.SEND_ALL
-  assert result.reason is YumaSupplementationReason.DATABASE_RESTORE_INCOMPLETE
+  assert result.reason is expected_reason
   assert result.satellite_ids == YUMA_PRNS
-
 
 def test_recent_complete_database_without_nav_sat_skips():
   result = plan(
