@@ -628,7 +628,7 @@ def test_configuration_traffic_closes_database_window_before_write(
   assert database_indexes == []
   assert events.index("gnss_stop") < events.index("configuration_traffic")
   assert events.index("configuration_traffic") < events.index("gnss_start")
-  assert events.index("gnss_start") < events.index("normal_configuration")
+  assert events.index("normal_configuration") < events.index("gnss_start")
   assert result.navigation_assistance_restore_attempted
 
 
@@ -1390,7 +1390,7 @@ def test_observed_c4_network_delay_restores_before_start_with_absolute_deadline(
   assert events.index("network_state_arrived") < events.index("trusted_time_arrived")
   assert events.index("trusted_time_arrived") < events.index("dbd_write")
   assert events.index("dbd_write") < events.index("gnss_start")
-  assert events.index("gnss_start") < events.index("normal_configuration")
+  assert events.index("normal_configuration") < events.index("gnss_start")
   assert len(timeline_calls) == 1
   timeline = timeline_calls[0]
   assert timeline["restore_result"] is restore
@@ -1470,7 +1470,7 @@ def test_pre_restore_drain_failure_is_terminal_and_gnss_starts(
   assert restore.database_restore_execution_error == "OSError:drain failed"
   assert database_writes == []
   assert events.index("navigation_database_post_time_wait") < events.index("gnss_start")
-  assert events.index("gnss_start") < events.index("normal_configuration")
+  assert events.index("normal_configuration") < events.index("gnss_start")
 
 
 def test_pending_dbd_blocks_yuma_until_terminal_then_survives_restart(
@@ -2123,9 +2123,7 @@ def test_assistance_state_initialization_failure_still_starts_gnss(
   assert retry_controller.runtime is None
   assert events.index("gnss_stop") < events.index("time_assistance")
   assert events.index("time_assistance") < events.index("gnss_start")
-  assert events.index("gnss_start") < events.index(
-    "normal_configuration"
-  )
+  assert events.index("normal_configuration") < events.index("gnss_start")
   restore = result.navigation_assistance_restore_result
   assert restore is not None
   assert restore.database_restore_state_error == (
@@ -2237,9 +2235,7 @@ def test_restore_state_persistence_failure_does_not_block_gnss_start(
   assert not runtime.state_available
   assert assistance_writes == []
   assert events.index("gnss_stop") < events.index("gnss_start")
-  assert events.index("gnss_start") < events.index(
-    "normal_configuration"
-  )
+  assert events.index("normal_configuration") < events.index("gnss_start")
   restore = result.navigation_assistance_restore_result
   assert restore is not None
   assert restore.database_restore_state_error is not None

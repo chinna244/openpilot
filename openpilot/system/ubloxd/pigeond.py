@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 import re
+import json
+import os
 import sys
 import time
 import signal
@@ -13,6 +15,8 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, UTC
 from enum import StrEnum
 from math import ceil, isfinite
+from pathlib import Path
+from typing import Any, cast
 
 from openpilot.cereal import log, messaging
 from openpilot.common.time_helpers import (
@@ -238,6 +242,13 @@ NAVIGATION_DATABASE_TRUSTED_TIME_POLL_SECONDS = 0.25
 # 512 small navigation frames if a dispatcher is temporarily unavailable.
 PENDING_FRAME_MAX_COUNT = 512
 PENDING_FRAME_MAX_BYTES = 256 * 1024
+RECEIVER_CONFIGURATION_PROCESS_START_ID = (
+  f"{os.getpid()}:{time.monotonic_ns()}"
+)
+RECEIVER_CONFIGURATION_BOOT_ID = (
+  read_boot_id()
+  or f"unavailable:{RECEIVER_CONFIGURATION_PROCESS_START_ID}"
+)
 
 NAVX5_ACK_AIDING_SOFTWARE_VERSION_PATTERN = re.compile(
   r"EXT CORE 3\.01(?: \([A-Z0-9][A-Z0-9._-]{0,31}\))?"
@@ -245,6 +256,14 @@ NAVX5_ACK_AIDING_SOFTWARE_VERSION_PATTERN = re.compile(
 
 
 class ReceiverConfigurationError(RuntimeError):
+  pass
+
+
+class ReceiverConfigurationParserError(ReceiverConfigurationError):
+  pass
+
+
+class ReceiverConfigurationUnsupportedError(ReceiverConfigurationError):
   pass
 
 
@@ -452,13 +471,34 @@ class TTYPigeon:
   def drain_before_transaction(
     self,
     operation: str = "pre_transaction_drain",
+    deadline: float | None = None,
   ) -> None:
+    if deadline is not None and time.monotonic() >= deadline:
+      raise TimeoutError(
+        f"{operation} deadline exhausted before pending-frame dispatch"
+      )
     self.dispatch_pending_frames()
+    if deadline is not None and time.monotonic() >= deadline:
+      raise TimeoutError(
+        f"{operation} deadline exhausted during pending-frame dispatch"
+      )
     drained_bytes = 0
     while True:
+      if deadline is not None and time.monotonic() >= deadline:
+        raise TimeoutError(
+          f"{operation} deadline exhausted before receiver read"
+        )
       data, frames = self._read_stream()
       self.queue_pending_frames(frames, operation)
+      if deadline is not None and time.monotonic() >= deadline:
+        raise TimeoutError(
+          f"{operation} deadline exhausted during receiver read"
+        )
       self.dispatch_pending_frames()
+      if deadline is not None and time.monotonic() >= deadline:
+        raise TimeoutError(
+          f"{operation} deadline exhausted during pending-frame dispatch"
+        )
       if not data:
         return
       drained_bytes += len(data)
@@ -472,10 +512,19 @@ class TTYPigeon:
     data: bytes,
     operation: str = "response_transaction",
     before_send: Callable[[], None] | None = None,
+    deadline: float | None = None,
   ) -> ResponseTransaction:
-    self.drain_before_transaction(operation)
+    self.drain_before_transaction(operation, deadline=deadline)
+    if deadline is not None and time.monotonic() >= deadline:
+      raise TimeoutError(
+        f"{operation} deadline exhausted before UART write"
+      )
     if before_send is not None:
       before_send()
+    if deadline is not None and time.monotonic() >= deadline:
+      raise TimeoutError(
+        f"{operation} deadline exhausted before UART write"
+      )
     parser = UbxStreamParser()
     self.send(data)
     sent_at = time.monotonic()
@@ -560,7 +609,15 @@ class TTYPigeon:
 
       time.sleep(0.001)
 
-  def send_with_ack(self, dat: bytes, ack: bytes = UBLOX_ACK, nack: bytes = UBLOX_NACK) -> None:
+  def send_with_ack(
+    self,
+    dat: bytes,
+    ack: bytes = UBLOX_ACK,
+    nack: bytes = UBLOX_NACK,
+    before_send: Callable[[], None] | None = None,
+    timeout: float | None = None,
+    deadline: float | None = None,
+  ) -> None:
     if (
       ack == UBLOX_ACK
       and nack == UBLOX_NACK
@@ -570,9 +627,19 @@ class TTYPigeon:
       if not validate_ubx_frame(dat):
         raise ReceiverConfigurationError("Attempted to send an invalid UBX CFG frame")
       transaction = self.begin_response_transaction(
-        dat, f"cfg_write_{dat[2]:02x}_{dat[3]:02x}",
+        dat,
+        f"cfg_write_{dat[2]:02x}_{dat[3]:02x}",
+        before_send=before_send,
+        deadline=deadline,
       )
-      acknowledgment = wait_for_cfg_ack(self, transaction, dat[2], dat[3])
+      ack_timeout = CFG_ACK_TIMEOUT if timeout is None else timeout
+      if deadline is not None:
+        ack_timeout = min(ack_timeout, max(0.0, deadline - time.monotonic()))
+      acknowledgment = wait_for_cfg_ack(
+        self, transaction, dat[2], dat[3],
+        ack_timeout,
+        deadline=deadline,
+      )
       if acknowledgment is False:
         raise CfgNakError(
           f"u-blox rejected CFG message 0x{dat[2]:02X} 0x{dat[3]:02X}",
@@ -699,14 +766,30 @@ def _begin_response_transaction(
   message: bytes,
   operation: str | None = None,
   before_send: Callable[[], None] | None = None,
+  deadline: float | None = None,
 ) -> ResponseTransaction:
   operation = operation or f"ubx_{message[2]:02x}_{message[3]:02x}"
   if hasattr(pigeon, "begin_response_transaction"):
+    if isinstance(pigeon, TTYPigeon):
+      return pigeon.begin_response_transaction(
+        message,
+        operation,
+        before_send=before_send,
+        deadline=deadline,
+      )
     if before_send is None:
       return pigeon.begin_response_transaction(message, operation)
     return pigeon.begin_response_transaction(message, operation, before_send)
+  if deadline is not None and time.monotonic() >= deadline:
+    raise TimeoutError(
+      f"{operation} deadline exhausted before UART write"
+    )
   if before_send is not None:
     before_send()
+  if deadline is not None and time.monotonic() >= deadline:
+    raise TimeoutError(
+      f"{operation} deadline exhausted before UART write"
+    )
   pigeon.send(message)
   return ResponseTransaction(UbxStreamParser(), message, operation, time.monotonic())
 
@@ -723,13 +806,37 @@ def _wait_for_parsed_response[Response](
   message_id: int,
   timeout: float,
   response_matches: Callable[[Response], bool] | None = None,
+  malformed_response_name: str | None = None,
+  deadline: float | None = None,
 ) -> Response | None:
-  deadline = time.monotonic() + timeout
-  while time.monotonic() < deadline:
+  expected_key = bytes((message_class, message_id))
+
+  def parse_response(frame: bytes) -> Response | None:
+    is_expected = len(frame) >= 4 and frame[2:4] == expected_key
+    try:
+      parsed = response_parser(frame)
+    except Exception as exc:
+      if is_expected and malformed_response_name is not None:
+        raise ReceiverConfigurationParserError(
+          f"Malformed {malformed_response_name} response"
+        ) from exc
+      raise
+    if is_expected and parsed is None and malformed_response_name is not None:
+      raise ReceiverConfigurationParserError(
+        f"Malformed {malformed_response_name} response"
+      )
+    return parsed
+
+  response_deadline = time.monotonic() + timeout
+  if deadline is not None:
+    response_deadline = min(response_deadline, deadline)
+  while time.monotonic() < response_deadline:
     result = None
     _, stream_frames, transaction_frames = _receive_transaction_data(pigeon, transaction)
+    if deadline is not None and time.monotonic() >= deadline:
+      return None
     for frame in transaction_frames:
-      parsed = response_parser(frame)
+      parsed = parse_response(frame)
       if parsed is not None:
         matches = response_matches is None or response_matches(parsed)
         if result is None and matches:
@@ -738,15 +845,19 @@ def _wait_for_parsed_response[Response](
       pigeon,
       stream_frames,
       lambda frame: (
-        frame[2:4] == bytes((message_class, message_id))
-        and (parsed := response_parser(frame)) is not None
+        frame[2:4] == expected_key
+        and (parsed := parse_response(frame)) is not None
         and (response_matches is None or response_matches(parsed))
       ),
       transaction.operation,
     )
+    if deadline is not None and time.monotonic() >= deadline:
+      return None
     if result is not None:
       return result
-    time.sleep(0.001)
+    remaining = response_deadline - time.monotonic()
+    if remaining > 0.0:
+      time.sleep(min(0.001, remaining))
   return None
 
 
@@ -765,51 +876,72 @@ def _poll_acquisition_config[AcquisitionConfig](
   poll_message: bytes,
   response_parser: Callable[[bytes], AcquisitionConfig | None],
   timeout: float,
+  deadline: float | None = None,
 ) -> AcquisitionConfig | None:
-  transaction = _begin_response_transaction(pigeon, poll_message)
-  return _wait_for_parsed_response(
+  transaction = _begin_response_transaction(
+    pigeon,
+    poll_message,
+    deadline=deadline,
+  )
+  config = _wait_for_parsed_response(
     pigeon,
     transaction,
     response_parser,
     poll_message[2],
     poll_message[3],
     timeout,
+    deadline=deadline,
   )
+  if (
+    config is None
+    and deadline is not None
+    and time.monotonic() >= deadline
+  ):
+    raise TimeoutError(
+      "receiver configuration pre-START deadline exhausted during readback"
+    )
+  return config
 
 
 def poll_cfg_gnss(
   pigeon: TTYPigeon,
   timeout: float = ACQUISITION_CONFIG_POLL_TIMEOUT,
+  deadline: float | None = None,
 ) -> GnssConfig | None:
   return _poll_acquisition_config(
     pigeon,
     build_cfg_gnss_poll_message(),
     parse_cfg_gnss,
     timeout,
+    deadline,
   )
 
 
 def poll_cfg_rxm(
   pigeon: TTYPigeon,
   timeout: float = ACQUISITION_CONFIG_POLL_TIMEOUT,
+  deadline: float | None = None,
 ) -> RxmConfig | None:
   return _poll_acquisition_config(
     pigeon,
     build_cfg_rxm_poll_message(),
     parse_cfg_rxm,
     timeout,
+    deadline,
   )
 
 
 def poll_cfg_pm2(
   pigeon: TTYPigeon,
   timeout: float = ACQUISITION_CONFIG_POLL_TIMEOUT,
+  deadline: float | None = None,
 ) -> Pm2Config | None:
   return _poll_acquisition_config(
     pigeon,
     build_cfg_pm2_poll_message(),
     parse_cfg_pm2,
     timeout,
+    deadline,
   )
 
 
@@ -898,6 +1030,44 @@ def _log_cfg_pm2(config: Pm2Config) -> None:
       f"external_interrupt_inactivity_ms={config.external_interrupt_inactivity_ms}",
     ))
   cloudlog.info(", ".join(fields))
+
+
+def verify_cfg_gnss_conservatively(config: GnssConfig) -> None:
+  if config.version != 0:
+    raise ReceiverConfigurationUnsupportedError("CFG-GNSS unsupported version")
+  if not config.blocks or config.configured_tracking_channels > config.hardware_tracking_channels:
+    raise ReceiverConfigurationError("CFG-GNSS invalid channel totals")
+  if len({block.gnss_id for block in config.blocks}) != len(config.blocks):
+    raise ReceiverConfigurationError("CFG-GNSS duplicate constellation block")
+  if any(block.reserved_tracking_channels > block.maximum_tracking_channels for block in config.blocks):
+    raise ReceiverConfigurationError("CFG-GNSS invalid block channels")
+  if sum(block.maximum_tracking_channels for block in config.blocks) > config.hardware_tracking_channels:
+    raise ReceiverConfigurationError("CFG-GNSS allocated channels exceed hardware")
+  if not any(block.gnss_id == 0 and block.enabled for block in config.blocks):
+    raise ReceiverConfigurationError("CFG-GNSS GPS is disabled")
+
+
+def verify_cfg_rxm_conservatively(config: RxmConfig) -> None:
+  if config.low_power_mode not in (0, 1, 4):
+    raise ReceiverConfigurationUnsupportedError("CFG-RXM unsupported low-power mode")
+  if config.low_power_mode not in (0, 4):
+    raise ReceiverConfigurationError("CFG-RXM power-save mode does not match intended continuous acquisition")
+
+
+def verify_cfg_pm2_conservatively(config: Pm2Config) -> None:
+  if config.version not in (1, 2):
+    raise ReceiverConfigurationUnsupportedError("CFG-PM2 unsupported version")
+  if (
+    config.maximum_startup_state_duration_s != 0
+    or config.flags != 0
+    or config.update_period_ms != 0
+    or config.search_period_ms != 0
+    or config.grid_offset_ms != 0
+    or config.on_time_s != 0
+    or config.minimum_acquisition_time_s != 0
+    or config.external_interrupt_inactivity_ms not in (None, 0)
+  ):
+    raise ReceiverConfigurationError("CFG-PM2 does not match intended inactive power-management state")
 
 
 def _is_hpg_product(info: MonVerInfo | None) -> bool:
@@ -1040,10 +1210,31 @@ def log_assistnow_autonomous_support(info: MonVerInfo | None) -> bool:
 def poll_navx5_config(
   pigeon: TTYPigeon,
   timeout: float = NAVX5_POLL_TIMEOUT,
+  pre_start_deadline: float | None = None,
 ) -> Navx5Config | None:
-  transaction = _begin_response_transaction(pigeon, build_navx5_poll_message())
+  def verify_poll_deadline() -> None:
+    if pre_start_deadline is not None and time.monotonic() >= pre_start_deadline:
+      raise TimeoutError("NAVX5 poll pre-START deadline exhausted before UART write")
+
+  transaction = _begin_response_transaction(
+    pigeon,
+    build_navx5_poll_message(),
+    before_send=verify_poll_deadline if pre_start_deadline is not None else None,
+    deadline=pre_start_deadline,
+  )
+  if pre_start_deadline is not None:
+    remaining = pre_start_deadline - time.monotonic()
+    if remaining <= 0.0:
+      raise TimeoutError("NAVX5 poll pre-START deadline exhausted")
+    timeout = min(timeout, remaining)
   return _wait_for_parsed_response(
-    pigeon, transaction, parse_navx5, 0x06, 0x23, timeout,
+    pigeon,
+    transaction,
+    parse_navx5,
+    0x06,
+    0x23,
+    timeout,
+    deadline=pre_start_deadline,
   )
 
 
@@ -1053,11 +1244,16 @@ def wait_for_cfg_ack(
   message_class: int,
   message_id: int,
   timeout: float = NAVX5_ACK_TIMEOUT,
+  deadline: float | None = None,
 ) -> bool | None:
-  deadline = time.monotonic() + timeout
-  while time.monotonic() < deadline:
+  response_deadline = time.monotonic() + timeout
+  if deadline is not None:
+    response_deadline = min(response_deadline, deadline)
+  while time.monotonic() < response_deadline:
     result: bool | None = None
     _, stream_frames, transaction_frames = _receive_transaction_data(pigeon, transaction)
+    if deadline is not None and time.monotonic() >= deadline:
+      return None
     for frame in transaction_frames:
       if (
         result is None
@@ -1079,9 +1275,13 @@ def wait_for_cfg_ack(
       ),
       transaction.operation,
     )
+    if deadline is not None and time.monotonic() >= deadline:
+      return None
     if result is not None:
       return result
-    time.sleep(0.001)
+    remaining = response_deadline - time.monotonic()
+    if remaining > 0.0:
+      time.sleep(min(0.001, remaining))
   return None
 
 
@@ -1097,6 +1297,7 @@ class Navx5AckAidingConfigurationResult(StrEnum):
   READBACK_ACK_AIDING_FALSE = "readback_ack_aiding_false"
   READBACK_AOP_FIELD_CHANGED = "readback_aop_field_changed"
   READBACK_UNRELATED_FIELDS_CHANGED = "readback_unrelated_fields_changed"
+  DEADLINE_EXHAUSTED = "deadline_exhausted"
   ERROR = "error"
 
 
@@ -1118,15 +1319,52 @@ class AssistNowAutonomousConfigurationResult(StrEnum):
 def configure_navx5_ack_aiding(
   pigeon: TTYPigeon,
   info: MonVerInfo | None,
+  pre_start_deadline: float | None = None,
 ) -> Navx5AckAidingConfigurationResult:
   supported, support_reason = navx5_ack_aiding_compatibility(info)
   if not supported:
     cloudlog.warning(f"GPS NAVX5 ACK aiding configuration skipped, reason={support_reason}")
     return Navx5AckAidingConfigurationResult.UNSUPPORTED
 
+  def remaining_timeout(maximum: float) -> float:
+    if pre_start_deadline is None:
+      return maximum
+    remaining = pre_start_deadline - time.monotonic()
+    if remaining <= 0.0:
+      raise TimeoutError("NAVX5 ACK-aiding pre-START deadline exhausted")
+    return min(maximum, remaining)
+
+  def deadline_expired() -> bool:
+    return pre_start_deadline is not None and time.monotonic() >= pre_start_deadline
+
+  def poll_with_deadline() -> Navx5Config | None:
+    timeout = remaining_timeout(NAVX5_POLL_TIMEOUT)
+    try:
+      return poll_navx5_config(
+        pigeon,
+        timeout=timeout,
+        pre_start_deadline=pre_start_deadline,
+      )
+    except TypeError as exc:
+      if "unexpected keyword argument 'pre_start_deadline'" in str(exc):
+        try:
+          return poll_navx5_config(pigeon, timeout=timeout)
+        except TypeError as timeout_exc:
+          if "unexpected keyword argument 'timeout'" not in str(timeout_exc):
+            raise
+          return poll_navx5_config(pigeon)
+      if "unexpected keyword argument 'timeout'" not in str(exc):
+        raise
+      return poll_navx5_config(pigeon)
+
+  def verify_write_deadline() -> None:
+    remaining_timeout(NAVX5_ACK_TIMEOUT)
+
   try:
-    current = poll_navx5_config(pigeon)
+    current = poll_with_deadline()
     if current is None:
+      if deadline_expired():
+        return Navx5AckAidingConfigurationResult.DEADLINE_EXHAUSTED
       cloudlog.warning("GPS NAVX5 ACK aiding configuration failed, result=poll_unavailable")
       return Navx5AckAidingConfigurationResult.POLL_UNAVAILABLE
     if current.version != 2:
@@ -1149,18 +1387,36 @@ def configure_navx5_ack_aiding(
       return Navx5AckAidingConfigurationResult.ALREADY_ENABLED
 
     transaction = _begin_response_transaction(
-      pigeon, build_navx5_ack_aiding_enable_message(current),
+      pigeon,
+      build_navx5_ack_aiding_enable_message(current),
+      before_send=verify_write_deadline,
+      deadline=pre_start_deadline,
     )
-    acknowledgment = wait_for_cfg_ack(pigeon, transaction, 0x06, 0x23)
+    acknowledgment = (
+      wait_for_cfg_ack(pigeon, transaction, 0x06, 0x23)
+      if pre_start_deadline is None
+      else wait_for_cfg_ack(
+        pigeon,
+        transaction,
+        0x06,
+        0x23,
+        timeout=remaining_timeout(NAVX5_ACK_TIMEOUT),
+        deadline=pre_start_deadline,
+      )
+    )
     if acknowledgment is False:
       cloudlog.warning(f"GPS NAVX5 ACK aiding configuration rejected, mask1=0x{NAVX5_MASK1_ACK_AIDING:04X}, result=write_rejected")
       return Navx5AckAidingConfigurationResult.WRITE_REJECTED
     if acknowledgment is None:
+      if deadline_expired():
+        return Navx5AckAidingConfigurationResult.DEADLINE_EXHAUSTED
       cloudlog.warning(f"GPS NAVX5 ACK aiding configuration timed out, mask1=0x{NAVX5_MASK1_ACK_AIDING:04X}, result=write_timed_out")
       return Navx5AckAidingConfigurationResult.WRITE_TIMED_OUT
 
-    resulting = poll_navx5_config(pigeon)
+    resulting = poll_with_deadline()
     if resulting is None:
+      if deadline_expired():
+        return Navx5AckAidingConfigurationResult.DEADLINE_EXHAUSTED
       cloudlog.warning("GPS NAVX5 ACK aiding verification failed, result=readback_unavailable")
       return Navx5AckAidingConfigurationResult.READBACK_UNAVAILABLE
     if not resulting.ack_aiding:
@@ -1186,6 +1442,9 @@ def configure_navx5_ack_aiding(
       "result=enabled_and_verified",
     )))
     return Navx5AckAidingConfigurationResult.ENABLED_AND_VERIFIED
+  except TimeoutError:
+    cloudlog.warning("GPS NAVX5 ACK aiding configuration skipped, result=deadline_exhausted")
+    return Navx5AckAidingConfigurationResult.DEADLINE_EXHAUSTED
   except Exception:
     cloudlog.exception("GPS NAVX5 ACK aiding configuration failed, reason=unexpected_error")
     return Navx5AckAidingConfigurationResult.ERROR
@@ -1346,8 +1605,13 @@ def _poll_cfg[Config](
   response_parser: Callable[[bytes], Config | None],
   timeout: float = 0.5,
   response_matches: Callable[[Config], bool] | None = None,
+  deadline: float | None = None,
 ) -> Config:
-  transaction = _begin_response_transaction(pigeon, poll_message)
+  transaction = _begin_response_transaction(
+    pigeon,
+    poll_message,
+    deadline=deadline,
+  )
   config = _wait_for_parsed_response(
     pigeon,
     transaction,
@@ -1356,35 +1620,61 @@ def _poll_cfg[Config](
     poll_message[3],
     timeout,
     response_matches,
+    f"CFG 0x{poll_message[2]:02X} 0x{poll_message[3]:02X}",
+    deadline,
   )
   if config is None:
+    if deadline is not None and time.monotonic() >= deadline:
+      raise TimeoutError(
+        "receiver configuration pre-START deadline exhausted during readback"
+      )
     raise CfgPollTimeoutError(
       f"No valid CFG response for message 0x{poll_message[2]:02X} 0x{poll_message[3]:02X}"
     )
   return config
 
 
-def poll_cfg_rate(pigeon: TTYPigeon, timeout: float = 0.5) -> RateConfig:
+def poll_cfg_rate(
+  pigeon: TTYPigeon,
+  timeout: float = 0.5,
+  deadline: float | None = None,
+) -> RateConfig:
   return _poll_cfg(
     pigeon, build_cfg_rate_poll_message(), parse_cfg_rate, timeout,
+    deadline=deadline,
   )
 
 
-def poll_cfg_nav5(pigeon: TTYPigeon, timeout: float = 0.5) -> Nav5Config:
+def poll_cfg_nav5(
+  pigeon: TTYPigeon,
+  timeout: float = 0.5,
+  deadline: float | None = None,
+) -> Nav5Config:
   return _poll_cfg(
     pigeon, build_cfg_nav5_poll_message(), parse_cfg_nav5, timeout,
+    deadline=deadline,
   )
 
 
-def poll_cfg_odo(pigeon: TTYPigeon, timeout: float = 0.5) -> OdoConfig:
+def poll_cfg_odo(
+  pigeon: TTYPigeon,
+  timeout: float = 0.5,
+  deadline: float | None = None,
+) -> OdoConfig:
   return _poll_cfg(
     pigeon, build_cfg_odo_poll_message(), parse_cfg_odo, timeout,
+    deadline=deadline,
   )
 
 
-def poll_cfg_itfm(pigeon: TTYPigeon, timeout: float = 0.5) -> ItfmConfig:
+def poll_cfg_itfm(
+  pigeon: TTYPigeon,
+  timeout: float = 0.5,
+  deadline: float | None = None,
+) -> ItfmConfig:
   return _poll_cfg(
     pigeon, build_cfg_itfm_poll_message(), parse_cfg_itfm, timeout,
+    deadline=deadline,
   )
 
 
@@ -1393,6 +1683,7 @@ def poll_cfg_msg(
   message_class: int,
   message_id: int,
   timeout: float = 0.5,
+  deadline: float | None = None,
 ) -> MessageRateConfig:
   poll_message = build_cfg_msg_poll_message(message_class, message_id)
   return _poll_cfg(
@@ -1404,6 +1695,7 @@ def poll_cfg_msg(
       config.message_class == message_class
       and config.message_id == message_id
     ),
+    deadline,
   )
 
 
@@ -1411,6 +1703,7 @@ def poll_cfg_prt(
   pigeon: TTYPigeon,
   port_id: int,
   timeout: float = 0.5,
+  deadline: float | None = None,
 ) -> PortConfig:
   poll_message = build_cfg_prt_poll_message(port_id)
   return _poll_cfg(
@@ -1419,6 +1712,7 @@ def poll_cfg_prt(
     parse_cfg_prt,
     timeout,
     lambda response: response.port_id == port_id,
+    deadline,
   )
 
 
@@ -1509,101 +1803,1049 @@ def log_startup_configuration(
     )))
 
 
-def init_pigeon(pigeon: TTYPigeon) -> bool:
-  # try initializing a few times
-  for _ in range(10):
-    try:
+RECEIVER_CONFIGURATION_ITEM_MAX_WRITE_ATTEMPTS = 2
 
-      # setup port config
-      port_configuration_messages = (
-        b"\xb5\x62\x06\x00\x14\x00\x03\xFF\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01\x00\x01\x00\x00\x00\x00\x00\x1E\x7F",
-        b"\xb5\x62\x06\x00\x14\x00\x00\xFF\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x19\x35",
-        b"\xb5\x62\x06\x00\x14\x00\x01\x00\x00\x00\xC0\x08\x00\x00\x00\x08\x07\x00\x01\x00\x01\x00\x00\x00\x00\x00\xF4\x80",
-        b"\xb5\x62\x06\x00\x14\x00\x04\xFF\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x1D\x85",
-      )
-      expected_port_configurations = {}
-      for message in port_configuration_messages:
-        pigeon.send_with_ack(message)
-        config = parse_cfg_prt(message)
-        if config is None:
-          raise ReceiverConfigurationError("Invalid built-in CFG-PRT configuration message")
-        expected_port_configurations[config.port_id] = config
-      for port_id in (0, 1, 3, 4):
-        verify_cfg_prt_config(
-          poll_cfg_prt(pigeon, port_id),
-          expected_port_configurations[port_id],
-        )
 
-      # UBX-CFG-RATE (0x06 0x08)
-      pigeon.send_with_ack(b"\xB5\x62\x06\x08\x06\x00\x64\x00\x01\x00\x00\x00\x79\x10")
-      rate = poll_cfg_rate(pigeon)
+class ReceiverConfigurationFailureKind(StrEnum):
+  ACK_REJECTED = "ack_rejected"
+  ACK_TIMEOUT = "ack_timeout"
+  WRITE_ERROR = "write_error"
+  POLL_TIMEOUT = "poll_timeout"
+  UNSUPPORTED = "unsupported"
+  READBACK_MISMATCH = "readback_mismatch"
+  PARSER_ERROR = "parser_error"
+  TRANSACTION_ERROR = "transaction_error"
+  DEADLINE_EXHAUSTED = "deadline_exhausted"
 
-      # UBX-CFG-NAV5 (0x06 0x24)
-      pigeon.send_with_ack(b"\xB5\x62\x06\x24\x24\x00\x05\x00\x04\x03\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x5A\x63")
 
-      # UBX-CFG-ODO (0x06 0x1E)
-      pigeon.send_with_ack(b"\xB5\x62\x06\x1E\x14\x00\x00\x00\x00\x00\x01\x03\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x3C\x37")
-      pigeon.send_with_ack(b"\xB5\x62\x06\x39\x08\x00\xFF\xAD\x62\xAD\x1E\x63\x00\x00\x83\x0C")
+class ReceiverConfigurationAckStatus(StrEnum):
+  NOT_REQUIRED = "not_required"
+  NOT_SENT = "not_sent"
+  ACKNOWLEDGED = "acknowledged"
+  REJECTED = "rejected"
+  TIMED_OUT = "timed_out"
+  WRITE_ERROR = "write_error"
 
-      nav5 = poll_cfg_nav5(pigeon)
-      odo = poll_cfg_odo(pigeon)
-      itfm = poll_cfg_itfm(pigeon)
 
-      # UBX-CFG-MSG (set message rate)
-      pigeon.send_with_ack(b"\xB5\x62\x06\x01\x03\x00\x01\x07\x01\x13\x51")
-      pigeon.send_with_ack(b"\xB5\x62\x06\x01\x03\x00\x02\x15\x01\x22\x70")
-      pigeon.send_with_ack(b"\xB5\x62\x06\x01\x03\x00\x02\x13\x01\x20\x6C")
-      pigeon.send_with_ack(b"\xB5\x62\x06\x01\x03\x00\x0A\x09\x01\x1E\x70")
-      pigeon.send_with_ack(b"\xB5\x62\x06\x01\x03\x00\x0A\x0B\x01\x20\x74")
-      pigeon.send_with_ack(b"\xB5\x62\x06\x01\x03\x00\x01\x35\x01\x41\xAD")
-      nav_pvt = poll_cfg_msg(pigeon, 0x01, 0x07)
-      rawx = poll_cfg_msg(pigeon, 0x02, 0x15)
-      verify_startup_configuration(rate, nav5, odo, itfm, nav_pvt, rawx)
-      log_startup_configuration(rate, nav5, odo, itfm, nav_pvt, rawx)
-      cloudlog.debug("pigeon configured")
+class ReceiverConfigurationReadbackStatus(StrEnum):
+  VERIFIED = "verified"
+  MISMATCHED = "mismatched"
+  TIMED_OUT = "timed_out"
+  PARSER_ERROR = "parser_error"
+  NOT_SUPPORTED = "not_supported"
+  DEADLINE_EXHAUSTED = "deadline_exhausted"
 
-      # try restoring almanac backup
-      restore_status = pigeon.poll_backup_restore_status()
-      if restore_status == 2:
-        cloudlog.warning("almanac backup restored")
-      elif restore_status == 3:
-        cloudlog.warning("no almanac backup found")
-      else:
-        cloudlog.error(f"failed to restore almanac backup, status: {restore_status}")
 
-      # try getting AssistNow if we have a token
-      token = Params().get('AssistNowToken')
-      if token is not None:
-        try:
-          for msg in get_assistnow_messages(token):
-            pigeon.send_with_ack(msg, ack=UBLOX_ASSIST_ACK)
-          cloudlog.warning("AssistNow messages sent")
-        except Exception:
-          cloudlog.warning("failed to get AssistNow messages")
+@dataclass(frozen=True)
+class ReceiverConfigurationItemResult:
+  item_name: str
+  mandatory: bool
+  attempted: bool
+  write_attempt_count: int
+  ack_status: ReceiverConfigurationAckStatus
+  poll_attempt_count: int
+  readback_status: ReceiverConfigurationReadbackStatus
+  verified: bool
+  expected_value: str
+  observed_value: str | None
+  failure_kind: ReceiverConfigurationFailureKind | None
+  failure_phase: str | None
+  error_type: str | None
+  error: str | None
 
-      cloudlog.warning("Pigeon GPS on!")
+
+@dataclass(frozen=True)
+class ReceiverConfigurationItemDefinition:
+  item_name: str
+  message_class: int
+  message_id: int
+  mandatory: bool
+  expected_value: str
+  maximum_attempts: int = RECEIVER_CONFIGURATION_ITEM_MAX_WRITE_ATTEMPTS
+
+
+RECEIVER_OUTPUT_STREAM_ITEMS = (
+  ReceiverConfigurationItemDefinition("CFG-MSG-NAV-PVT", 0x01, 0x07, True, "uart1_rate=1"),
+  ReceiverConfigurationItemDefinition("CFG-MSG-RXM-RAWX", 0x02, 0x15, True, "uart1_rate=1"),
+  ReceiverConfigurationItemDefinition("CFG-MSG-RXM-SFRBX", 0x02, 0x13, True, "uart1_rate=1"),
+  ReceiverConfigurationItemDefinition("CFG-MSG-NAV-SAT", 0x01, 0x35, False, "uart1_rate=1"),
+  ReceiverConfigurationItemDefinition("CFG-MSG-MON-HW", 0x0A, 0x09, False, "uart1_rate=1"),
+  ReceiverConfigurationItemDefinition("CFG-MSG-MON-HW2", 0x0A, 0x0B, False, "uart1_rate=1"),
+)
+
+
+RECEIVER_CONFIGURATION_ITEM_INVENTORY = (
+  ("CFG-PRT-3", True),
+  ("CFG-PRT-0", True),
+  ("CFG-PRT-1", True),
+  ("CFG-PRT-4", True),
+  ("CFG-RATE", True),
+  ("CFG-NAV5", True),
+  ("CFG-ODO", True),
+  ("CFG-ITFM", True),
+  *((definition.item_name, definition.mandatory) for definition in RECEIVER_OUTPUT_STREAM_ITEMS),
+  ("CFG-GNSS", False),
+  ("CFG-RXM", False),
+  ("CFG-PM2", False),
+)
+
+
+def _configuration_failure_kind(exc: Exception) -> ReceiverConfigurationFailureKind:
+  if isinstance(exc, ReceiverConfigurationParserError):
+    return ReceiverConfigurationFailureKind.PARSER_ERROR
+  if isinstance(exc, ReceiverConfigurationUnsupportedError):
+    return ReceiverConfigurationFailureKind.UNSUPPORTED
+  if isinstance(exc, CfgNakError):
+    return ReceiverConfigurationFailureKind.ACK_REJECTED
+  if isinstance(exc, CfgPollTimeoutError):
+    return ReceiverConfigurationFailureKind.POLL_TIMEOUT
+  if isinstance(exc, TimeoutError):
+    return ReceiverConfigurationFailureKind.ACK_TIMEOUT
+  if isinstance(exc, ResponseTransactionError):
+    return ReceiverConfigurationFailureKind.TRANSACTION_ERROR
+  if isinstance(exc, ReceiverConfigurationError):
+    return ReceiverConfigurationFailureKind.READBACK_MISMATCH
+  return ReceiverConfigurationFailureKind.WRITE_ERROR
+
+
+def receiver_configuration_ack_status(
+  write_attempt_count: int,
+  last_write_error: Exception | None,
+  failure_phase: str | None = None,
+) -> ReceiverConfigurationAckStatus:
+  if write_attempt_count == 0:
+    return ReceiverConfigurationAckStatus.WRITE_ERROR if failure_phase == "write" else ReceiverConfigurationAckStatus.NOT_REQUIRED
+  if last_write_error is None:
+    return ReceiverConfigurationAckStatus.ACKNOWLEDGED
+  if isinstance(last_write_error, CfgNakError):
+    return ReceiverConfigurationAckStatus.REJECTED
+  if isinstance(last_write_error, TimeoutError):
+    return ReceiverConfigurationAckStatus.TIMED_OUT
+  return ReceiverConfigurationAckStatus.WRITE_ERROR
+
+
+def run_receiver_configuration_item(
+  *,
+  item_name: str,
+  mandatory: bool,
+  expected_value: str,
+  poll: Callable[[], object],
+  verify: Callable[[object], None],
+  write: Callable[[], bool | None],
+  max_write_attempts: int = RECEIVER_CONFIGURATION_ITEM_MAX_WRITE_ATTEMPTS,
+  pre_start_deadline: float | None = None,
+) -> ReceiverConfigurationItemResult:
+  """Read, correct, and verify exactly one receiver configuration item."""
+  if max_write_attempts < 0:
+    raise ValueError("max_write_attempts must not be negative")
+  writes = 0
+  polls = 0
+  observed_value = None
+  last_write_error: Exception | None = None
+  terminal_readback_error: Exception | None = None
+  terminal_readback_phase: str | None = None
+  deadline_error: Exception | None = None
+  failure_phase = "initial_readback"
+  for attempt in range(max_write_attempts + 1):
+    if pre_start_deadline is not None and time.monotonic() >= pre_start_deadline:
+      deadline_error = TimeoutError("receiver configuration pre-START deadline exhausted")
+      failure_phase = "deadline"
       break
-    except (CfgPollTimeoutError, ResponseTransactionError) as exc:
-      if hasattr(pigeon, "dispatch_pending_frames"):
-        pigeon.dispatch_pending_frames()
-      cloudlog.warning(f"Receiver cycle initialization aborted: {exc}")
-      return False
-    except (ReceiverConfigurationError, TimeoutError) as exc:
-      # UBX-ACK-ACK/NAK is documented to arrive within one second. The
-      # retry boundary below expires that response window even when a matching
-      # NAK classified the attempt immediately. The next transaction then
-      # performs a bounded input drain before retrying.
-      if isinstance(exc, CfgNakError) and exc.retry_not_before is not None:
-        retry_delay = exc.retry_not_before - time.monotonic()
-        if retry_delay > 0:
-          time.sleep(retry_delay)
-      if hasattr(pigeon, "dispatch_pending_frames"):
-        pigeon.dispatch_pending_frames()
-      cloudlog.warning(f"Initialization failed, trying again: {exc}")
+    failure_phase = "initial_readback" if attempt == 0 else "readback"
+    polls += 1
+    try:
+      observed = poll()
+      observed_value = repr(observed)[:512]
+      verify(observed)
+      return ReceiverConfigurationItemResult(
+        item_name=item_name, mandatory=mandatory, attempted=writes > 0,
+        write_attempt_count=writes,
+        ack_status=receiver_configuration_ack_status(writes, last_write_error),
+        poll_attempt_count=polls,
+        readback_status=ReceiverConfigurationReadbackStatus.VERIFIED,
+        verified=True, expected_value=expected_value, observed_value=observed_value,
+        failure_kind=None, failure_phase=None, error_type=None, error=None,
+      )
+    except Exception as exc:
+      terminal_readback_error = exc
+      terminal_readback_phase = failure_phase
+      if attempt == max_write_attempts:
+        break
+      if pre_start_deadline is not None and time.monotonic() >= pre_start_deadline:
+        deadline_error = TimeoutError("receiver configuration pre-START deadline exhausted")
+        failure_phase = "deadline"
+        break
+      failure_phase = "write"
+      try:
+        # A real TTYPigeon reports this at its send boundary. Test doubles
+        # that cannot expose that boundary retain the conservative legacy
+        # interpretation: invoking write means one receiver attempt.
+        write_attempted = write()
+        if write_attempted is not False:
+          writes += 1
+        last_write_error = None
+        failure_phase = "readback"
+      except Exception as write_exc:
+        last_write_error = write_exc
+        # send_configuration_with_ack marks the attempt before UART I/O, so
+        # an exception after that boundary still counts exactly once.
+        if getattr(write_exc, "receiver_write_attempted", True):
+          writes += 1
+        if isinstance(write_exc, CfgNakError) and write_exc.retry_not_before is not None:
+          delay = write_exc.retry_not_before - time.monotonic()
+          if pre_start_deadline is not None:
+            delay = min(delay, max(0.0, pre_start_deadline - time.monotonic()))
+          if delay > 0.0:
+            time.sleep(delay)
+  if failure_phase == "deadline":
+    assert deadline_error is not None
+    terminal_error = deadline_error
+    terminal_failure_phase = failure_phase
+  elif terminal_readback_error is not None:
+    terminal_error = terminal_readback_error
+    assert terminal_readback_phase is not None
+    terminal_failure_phase = terminal_readback_phase
   else:
-    cloudlog.warning("Failed to initialize pigeon")
+    assert last_write_error is not None
+    terminal_error = last_write_error
+    terminal_failure_phase = "write"
+  kind = ReceiverConfigurationFailureKind.DEADLINE_EXHAUSTED if terminal_failure_phase == "deadline" else _configuration_failure_kind(terminal_error)
+  ack_status = receiver_configuration_ack_status(
+    writes,
+    last_write_error,
+    "write" if last_write_error is not None else terminal_failure_phase,
+  )
+  readback_status = ReceiverConfigurationReadbackStatus.MISMATCHED
+  if isinstance(terminal_error, CfgPollTimeoutError):
+    readback_status = ReceiverConfigurationReadbackStatus.TIMED_OUT
+  elif isinstance(terminal_error, ReceiverConfigurationParserError):
+    readback_status = ReceiverConfigurationReadbackStatus.PARSER_ERROR
+  elif isinstance(terminal_error, ReceiverConfigurationUnsupportedError):
+    readback_status = ReceiverConfigurationReadbackStatus.NOT_SUPPORTED
+  elif terminal_failure_phase == "deadline":
+    readback_status = ReceiverConfigurationReadbackStatus.DEADLINE_EXHAUSTED
+  result = ReceiverConfigurationItemResult(
+    item_name=item_name, mandatory=mandatory, attempted=writes > 0,
+    write_attempt_count=writes, ack_status=ack_status, poll_attempt_count=polls,
+    readback_status=readback_status, verified=False, expected_value=expected_value,
+    observed_value=observed_value, failure_kind=kind, failure_phase=terminal_failure_phase,
+    error_type=type(terminal_error).__name__, error=str(terminal_error)[:512],
+  )
+  cloudlog.warning(
+    "GPS receiver configuration item failed, "
+    + f"item={item_name}, mandatory={str(mandatory).lower()}, "
+    + f"writes={writes}, polls={polls}, failure_kind={kind.value}, "
+    + f"error={result.error}"
+  )
+  return result
+
+
+def configuration_poll_timeout(pre_start_deadline: float | None) -> float:
+  """Bound a configuration readback by the remaining shared pre-START time."""
+  if pre_start_deadline is None:
+    return 0.5
+  remaining = pre_start_deadline - time.monotonic()
+  if remaining <= 0.0:
+    raise TimeoutError("receiver configuration pre-START deadline exhausted")
+  return min(0.5, remaining)
+
+
+def configuration_ack_timeout(pre_start_deadline: float | None) -> float:
+  if pre_start_deadline is None:
+    return CFG_ACK_TIMEOUT
+  remaining = pre_start_deadline - time.monotonic()
+  if remaining <= 0.0:
+    raise TimeoutError("receiver configuration pre-START deadline exhausted")
+  return min(CFG_ACK_TIMEOUT, remaining)
+
+
+def send_configuration_with_ack(
+  pigeon: TTYPigeon,
+  message: bytes,
+  pre_start_deadline: float | None = None,
+) -> bool:
+  """Send one CFG item and report whether its UART write boundary was crossed."""
+  write_attempted = False
+
+  def mark_write_attempt() -> None:
+    nonlocal write_attempted
+    if pre_start_deadline is not None and time.monotonic() >= pre_start_deadline:
+      raise TimeoutError("receiver configuration pre-START deadline exhausted before UART write")
+    write_attempted = True
+
+  if isinstance(pigeon, TTYPigeon):
+    try:
+      pigeon.send_with_ack(
+        message,
+        before_send=mark_write_attempt,
+        timeout=configuration_ack_timeout(pre_start_deadline),
+        deadline=pre_start_deadline,
+      )
+    except Exception as exc:
+      exc.receiver_write_attempted = write_attempted
+      raise
+  else:
+    # Test/fake pigeons implement send_with_ack as their physical boundary.
+    mark_write_attempt()
+    try:
+      pigeon.send_with_ack(message)
+    except Exception as exc:
+      exc.receiver_write_attempted = write_attempted
+      raise
+  return write_attempted
+
+
+@dataclass(frozen=True)
+class ReceiverConfigurationSummary:
+  receiver_cycle: int
+  transport_verified: bool
+  configuration_started_at: float
+  configuration_completed_at: float
+  items: tuple[ReceiverConfigurationItemResult, ...]
+  gnss_start_attempted: bool = False
+  gnss_start_sent: bool = False
+  boot_id: str = RECEIVER_CONFIGURATION_BOOT_ID
+  process_start_id: str = RECEIVER_CONFIGURATION_PROCESS_START_ID
+  receiver_fingerprint: str = "unidentified"
+  navx5_ack_aiding_result: Navx5AckAidingConfigurationResult | None = None
+
+  @property
+  def configuration_elapsed_seconds(self) -> float:
+    return self.configuration_completed_at - self.configuration_started_at
+
+  @property
+  def total_items(self) -> int:
+    return len(self.items)
+
+  @property
+  def verified_items(self) -> int:
+    return sum(item.verified for item in self.items)
+
+  @property
+  def failed_items(self) -> int:
+    return self.total_items - self.verified_items
+
+  @property
+  def unsupported_items(self) -> int:
+    return sum(
+      item.failure_kind is ReceiverConfigurationFailureKind.UNSUPPORTED
+      for item in self.items
+    )
+
+  @property
+  def mandatory_failures(self) -> tuple[ReceiverConfigurationItemResult, ...]:
+    return tuple(item for item in self.items if item.mandatory and not item.verified)
+
+  @property
+  def optional_failures(self) -> tuple[ReceiverConfigurationItemResult, ...]:
+    return tuple(item for item in self.items if not item.mandatory and not item.verified)
+
+  @property
+  def all_mandatory_items_verified(self) -> bool:
+    return all(item.verified for item in self.items if item.mandatory)
+
+  @property
+  def configuration_degraded(self) -> bool:
+    navx5_failed = self.navx5_ack_aiding_result not in (
+      Navx5AckAidingConfigurationResult.ENABLED_AND_VERIFIED,
+      Navx5AckAidingConfigurationResult.ALREADY_ENABLED,
+      Navx5AckAidingConfigurationResult.UNSUPPORTED,
+    )
+    return not self.all_mandatory_items_verified or navx5_failed
+
+
+@dataclass(frozen=True)
+class ReceiverConfigurationPersistenceStatus:
+  path: str
+  succeeded: bool
+  error_type: str | None = None
+  error: str | None = None
+
+
+RECEIVER_CONFIGURATION_SUMMARY_SCHEMA_VERSION = 2
+RECEIVER_CONFIGURATION_SUMMARY_MAX_BYTES = 16384
+
+
+_last_receiver_configuration_summary: ReceiverConfigurationSummary | None = None
+_last_receiver_configuration_persistence_status: ReceiverConfigurationPersistenceStatus | None = None
+_current_receiver_configuration_fingerprint: str | None = None
+_current_receiver_configuration_cycle: int | None = None
+_current_receiver_configuration_record_ready = False
+
+
+def last_receiver_configuration_summary() -> ReceiverConfigurationSummary | None:
+  return _last_receiver_configuration_summary
+
+
+def last_receiver_configuration_persistence_status() -> ReceiverConfigurationPersistenceStatus | None:
+  return _last_receiver_configuration_persistence_status
+
+
+def receiver_configuration_summary_path() -> Path:
+  return Path(GPS_ASSISTANCE_CACHE_PATH).with_name("receiver_configuration_summary.json")
+
+
+def validate_receiver_configuration_summary_record(record: object) -> None:
+  if not isinstance(record, dict):
+    raise ReceiverConfigurationError("receiver configuration summary must be an object")
+  record = cast(dict[str, Any], record)
+  required_fields = {
+    "schema_version",
+    "boot_id",
+    "process_start_id",
+    "receiver_fingerprint",
+    "receiver_cycle",
+    "transport_verified",
+    "configuration_started_at",
+    "configuration_completed_at",
+    "configuration_elapsed_seconds",
+    "total_items",
+    "verified_items",
+    "failed_items",
+    "unsupported_items",
+    "mandatory_failures",
+    "optional_failures",
+    "all_mandatory_items_verified",
+    "configuration_degraded",
+    "navx5_ack_aiding_result",
+    "gnss_start_attempted",
+    "gnss_start_sent",
+    "items",
+  }
+  if set(record) != required_fields:
+    raise ReceiverConfigurationError("receiver configuration summary fields are invalid")
+  if type(record["schema_version"]) is not int or record["schema_version"] != RECEIVER_CONFIGURATION_SUMMARY_SCHEMA_VERSION:
+    raise ReceiverConfigurationError("receiver configuration summary schema version is invalid")
+  for field, maximum_length in (
+    ("boot_id", 256),
+    ("process_start_id", 256),
+    ("receiver_fingerprint", 128),
+  ):
+    if (
+      not isinstance(record[field], str)
+      or not record[field]
+      or len(record[field]) > maximum_length
+    ):
+      raise ReceiverConfigurationError(
+        f"receiver configuration summary {field} is invalid"
+      )
+  receiver_cycle = record["receiver_cycle"]
+  if type(receiver_cycle) is not int or receiver_cycle < 0:
+    raise ReceiverConfigurationError("receiver configuration summary cycle is invalid")
+  for field in (
+    "transport_verified",
+    "all_mandatory_items_verified",
+    "configuration_degraded",
+    "gnss_start_attempted",
+    "gnss_start_sent",
+  ):
+    if type(record[field]) is not bool:
+      raise ReceiverConfigurationError(f"receiver configuration summary {field} is invalid")
+  started_at = record["configuration_started_at"]
+  completed_at = record["configuration_completed_at"]
+  elapsed = record["configuration_elapsed_seconds"]
+  if any(type(value) not in (int, float) or not isfinite(float(value)) for value in (started_at, completed_at, elapsed)):
+    raise ReceiverConfigurationError("receiver configuration summary timing is invalid")
+  if completed_at < started_at or abs(float(elapsed) - (float(completed_at) - float(started_at))) > 1e-9:
+    raise ReceiverConfigurationError("receiver configuration summary elapsed time is inconsistent")
+  if record["gnss_start_sent"] and not record["gnss_start_attempted"]:
+    raise ReceiverConfigurationError("receiver configuration summary START state is inconsistent")
+  navx5_result = record["navx5_ack_aiding_result"]
+  if (
+    not isinstance(navx5_result, str)
+    or navx5_result not in {
+      result.value for result in Navx5AckAidingConfigurationResult
+    }
+  ):
+    raise ReceiverConfigurationError(
+      "receiver configuration summary NAVX5 result is invalid"
+    )
+  items = record["items"]
+  if not isinstance(items, list) or len(items) != len(RECEIVER_CONFIGURATION_ITEM_INVENTORY):
+    raise ReceiverConfigurationError("receiver configuration summary item list is invalid")
+  item_fields = {
+    "item_name",
+    "mandatory",
+    "attempted",
+    "write_attempt_count",
+    "ack_status",
+    "poll_attempt_count",
+    "readback_status",
+    "expected_value",
+    "observed_value",
+    "verified",
+    "failure_kind",
+    "failure_phase",
+    "error_type",
+    "error",
+  }
+  ack_values = {status.value for status in ReceiverConfigurationAckStatus}
+  readback_values = {status.value for status in ReceiverConfigurationReadbackStatus}
+  failure_values = {kind.value for kind in ReceiverConfigurationFailureKind}
+  for item in items:
+    if not isinstance(item, dict) or set(item) != item_fields:
+      raise ReceiverConfigurationError("receiver configuration item fields are invalid")
+    item = cast(dict[str, Any], item)
+    for field in ("item_name", "expected_value"):
+      if not isinstance(item[field], str) or not item[field] or len(item[field]) > 128:
+        raise ReceiverConfigurationError(f"receiver configuration item {field} is invalid")
+    for field in ("observed_value", "failure_phase", "error_type", "error"):
+      if item[field] is not None and (not isinstance(item[field], str) or len(item[field]) > 128):
+        raise ReceiverConfigurationError(f"receiver configuration item {field} is invalid")
+    for field in ("mandatory", "attempted", "verified"):
+      if type(item[field]) is not bool:
+        raise ReceiverConfigurationError(f"receiver configuration item {field} is invalid")
+    for field in ("write_attempt_count", "poll_attempt_count"):
+      if type(item[field]) is not int or item[field] < 0:
+        raise ReceiverConfigurationError(f"receiver configuration item {field} is invalid")
+    if item["attempted"] != (item["write_attempt_count"] > 0):
+      raise ReceiverConfigurationError("receiver configuration write accounting is inconsistent")
+    if (
+      not isinstance(item["ack_status"], str)
+      or item["ack_status"] not in ack_values
+      or not isinstance(item["readback_status"], str)
+      or item["readback_status"] not in readback_values
+    ):
+      raise ReceiverConfigurationError("receiver configuration item status enum is invalid")
+    if item["failure_kind"] is not None and (not isinstance(item["failure_kind"], str) or item["failure_kind"] not in failure_values):
+      raise ReceiverConfigurationError("receiver configuration failure enum is invalid")
+    if item["verified"]:
+      if (
+        item["readback_status"] != ReceiverConfigurationReadbackStatus.VERIFIED.value
+        or item["failure_kind"] is not None
+        or item["failure_phase"] is not None
+        or item["error_type"] is not None
+        or item["error"] is not None
+      ):
+        raise ReceiverConfigurationError("verified receiver configuration item is inconsistent")
+    elif (
+      item["readback_status"] == ReceiverConfigurationReadbackStatus.VERIFIED.value
+      or item["failure_kind"] is None
+      or not item["failure_phase"]
+      or not item["error_type"]
+      or item["error"] is None
+    ):
+      raise ReceiverConfigurationError("failed receiver configuration item is inconsistent")
+    if item["write_attempt_count"] == 0 and item["ack_status"] == ReceiverConfigurationAckStatus.ACKNOWLEDGED.value:
+      raise ReceiverConfigurationError("receiver configuration ACK accounting is inconsistent")
+    if item["write_attempt_count"] > 0 and item["ack_status"] in (
+      ReceiverConfigurationAckStatus.NOT_REQUIRED.value,
+      ReceiverConfigurationAckStatus.NOT_SENT.value,
+    ):
+      raise ReceiverConfigurationError("receiver configuration ACK status is inconsistent")
+    expected_readback_for_failure = {
+      ReceiverConfigurationFailureKind.UNSUPPORTED.value: ReceiverConfigurationReadbackStatus.NOT_SUPPORTED.value,
+      ReceiverConfigurationFailureKind.PARSER_ERROR.value: ReceiverConfigurationReadbackStatus.PARSER_ERROR.value,
+      ReceiverConfigurationFailureKind.POLL_TIMEOUT.value: ReceiverConfigurationReadbackStatus.TIMED_OUT.value,
+      ReceiverConfigurationFailureKind.DEADLINE_EXHAUSTED.value: ReceiverConfigurationReadbackStatus.DEADLINE_EXHAUSTED.value,
+    }
+    if item["failure_kind"] in expected_readback_for_failure and item["readback_status"] != expected_readback_for_failure[item["failure_kind"]]:
+      raise ReceiverConfigurationError("receiver configuration failure/readback state is inconsistent")
+    expected_ack_for_failure = {
+      ReceiverConfigurationFailureKind.ACK_REJECTED.value: ReceiverConfigurationAckStatus.REJECTED.value,
+      ReceiverConfigurationFailureKind.ACK_TIMEOUT.value: ReceiverConfigurationAckStatus.TIMED_OUT.value,
+      ReceiverConfigurationFailureKind.WRITE_ERROR.value: ReceiverConfigurationAckStatus.WRITE_ERROR.value,
+    }
+    if item["failure_kind"] in expected_ack_for_failure and item["ack_status"] != expected_ack_for_failure[item["failure_kind"]]:
+      raise ReceiverConfigurationError("receiver configuration failure/ACK state is inconsistent")
+  verified_items = sum(item["verified"] for item in items)
+  unsupported_items = sum(item["failure_kind"] == ReceiverConfigurationFailureKind.UNSUPPORTED.value for item in items)
+  mandatory_failures = [item["item_name"] for item in items if item["mandatory"] and not item["verified"]]
+  optional_failures = [item["item_name"] for item in items if not item["mandatory"] and not item["verified"]]
+  observed_inventory = tuple(
+    (item["item_name"], item["mandatory"])
+    for item in items
+  )
+  if observed_inventory != RECEIVER_CONFIGURATION_ITEM_INVENTORY:
+    raise ReceiverConfigurationError(
+      "receiver configuration summary inventory is incomplete or invalid"
+    )
+  expected_counts = {
+    "total_items": len(items),
+    "verified_items": verified_items,
+    "failed_items": len(items) - verified_items,
+    "unsupported_items": unsupported_items,
+  }
+  if any(type(record[field]) is not int or record[field] != value for field, value in expected_counts.items()):
+    raise ReceiverConfigurationError("receiver configuration summary counts are inconsistent")
+  if (
+    not isinstance(record["mandatory_failures"], list)
+    or not isinstance(record["optional_failures"], list)
+    or record["mandatory_failures"] != mandatory_failures
+    or record["optional_failures"] != optional_failures
+  ):
+    raise ReceiverConfigurationError("receiver configuration failure lists are inconsistent")
+  if record["all_mandatory_items_verified"] != (not mandatory_failures):
+    raise ReceiverConfigurationError("receiver configuration mandatory status is inconsistent")
+  if not record["transport_verified"] or not record["gnss_start_attempted"]:
+    raise ReceiverConfigurationError(
+      "receiver configuration summary is not terminal"
+    )
+  navx5_degraded = navx5_result not in (
+    Navx5AckAidingConfigurationResult.ENABLED_AND_VERIFIED.value,
+    Navx5AckAidingConfigurationResult.ALREADY_ENABLED.value,
+    Navx5AckAidingConfigurationResult.UNSUPPORTED.value,
+  )
+  if record["configuration_degraded"] != (
+    bool(mandatory_failures) or navx5_degraded
+  ):
+    raise ReceiverConfigurationError(
+      "receiver configuration degraded status is inconsistent"
+    )
+
+
+def load_receiver_configuration_summary_record(
+  expected_receiver_fingerprint: str | None = None,
+  expected_receiver_cycle: int | None = None,
+) -> dict[str, object] | None:
+  """Load the durable terminal record when it is a complete JSON object."""
+  path = receiver_configuration_summary_path()
+  if not _current_receiver_configuration_record_ready:
+    return None
+  persistence_status = last_receiver_configuration_persistence_status()
+  if persistence_status is not None and persistence_status.path == str(path) and not persistence_status.succeeded:
+    return None
+  try:
+    payload = path.read_text()
+    if len(payload.encode()) > RECEIVER_CONFIGURATION_SUMMARY_MAX_BYTES:
+      raise ReceiverConfigurationError("receiver configuration summary exceeds 16 KiB")
+    record = json.loads(payload)
+    validate_receiver_configuration_summary_record(record)
+    expected_fingerprint = (
+      expected_receiver_fingerprint
+      or _current_receiver_configuration_fingerprint
+    )
+    expected_cycle = (
+      expected_receiver_cycle
+      if expected_receiver_cycle is not None
+      else _current_receiver_configuration_cycle
+    )
+    if (
+      expected_fingerprint is None
+      or expected_cycle is None
+      or type(expected_cycle) is not int
+      or expected_cycle < 0
+      or record["boot_id"] != RECEIVER_CONFIGURATION_BOOT_ID
+      or record["process_start_id"]
+      != RECEIVER_CONFIGURATION_PROCESS_START_ID
+      or record["receiver_fingerprint"]
+      != expected_fingerprint[:128]
+      or record["receiver_cycle"] != expected_cycle
+    ):
+      raise ReceiverConfigurationError(
+        "receiver configuration summary identity is stale"
+      )
+    return record
+  except FileNotFoundError:
+    return None
+  except Exception:
+    cloudlog.warning("GPS receiver configuration summary load failed")
+    return None
+
+
+def persist_receiver_configuration_summary(summary: ReceiverConfigurationSummary) -> bool:
+  """Persist a bounded, restart-survivable terminal configuration record."""
+  global _current_receiver_configuration_record_ready
+  global _last_receiver_configuration_persistence_status
+
+  def bounded(value: str | None) -> str | None:
+    return value[:128] if value is not None else None
+
+  path = receiver_configuration_summary_path()
+  temporary_path = path.with_suffix(".tmp")
+  stale_path = path.with_suffix(".stale")
+  _current_receiver_configuration_record_ready = False
+  try:
+    if not receiver_configuration_summary_matches_active_cycle(summary):
+      raise ReceiverConfigurationError(
+        "receiver configuration summary does not match the active cycle"
+      )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+      os.replace(path, stale_path)
+    items = [
+      {
+        "item_name": bounded(item.item_name),
+        "mandatory": item.mandatory,
+        "attempted": item.attempted,
+        "write_attempt_count": item.write_attempt_count,
+        "ack_status": item.ack_status.value,
+        "poll_attempt_count": item.poll_attempt_count,
+        "readback_status": item.readback_status.value,
+        "expected_value": bounded(item.expected_value),
+        "observed_value": bounded(item.observed_value),
+        "verified": item.verified,
+        "failure_kind": item.failure_kind.value if item.failure_kind is not None else None,
+        "failure_phase": bounded(item.failure_phase),
+        "error_type": bounded(item.error_type),
+        "error": bounded(item.error),
+      }
+      for item in summary.items
+    ]
+    mandatory_failures = [item["item_name"] for item in items if item["mandatory"] and not item["verified"]]
+    optional_failures = [item["item_name"] for item in items if not item["mandatory"] and not item["verified"]]
+    record = {
+      "schema_version": RECEIVER_CONFIGURATION_SUMMARY_SCHEMA_VERSION,
+      "boot_id": summary.boot_id,
+      "process_start_id": summary.process_start_id,
+      "receiver_fingerprint": bounded(summary.receiver_fingerprint),
+      "receiver_cycle": summary.receiver_cycle,
+      "transport_verified": summary.transport_verified,
+      "configuration_started_at": summary.configuration_started_at,
+      "configuration_completed_at": summary.configuration_completed_at,
+      "configuration_elapsed_seconds": summary.configuration_elapsed_seconds,
+      "total_items": len(items),
+      "verified_items": sum(item["verified"] for item in items),
+      "failed_items": sum(not item["verified"] for item in items),
+      "unsupported_items": sum(item["failure_kind"] == ReceiverConfigurationFailureKind.UNSUPPORTED.value for item in items),
+      "mandatory_failures": mandatory_failures,
+      "optional_failures": optional_failures,
+      "all_mandatory_items_verified": not mandatory_failures,
+      "configuration_degraded": summary.configuration_degraded,
+      "navx5_ack_aiding_result": (
+        summary.navx5_ack_aiding_result.value
+        if summary.navx5_ack_aiding_result is not None
+        else None
+      ),
+      "gnss_start_attempted": summary.gnss_start_attempted,
+      "gnss_start_sent": summary.gnss_start_sent,
+      "items": items,
+    }
+    validate_receiver_configuration_summary_record(record)
+    payload = json.dumps(record, separators=(",", ":"))
+    if len(payload.encode()) > RECEIVER_CONFIGURATION_SUMMARY_MAX_BYTES:
+      raise ReceiverConfigurationError("bounded receiver configuration summary exceeds 16 KiB")
+    temporary_path.write_text(payload)
+    validate_receiver_configuration_summary_record(json.loads(temporary_path.read_text()))
+    os.replace(temporary_path, path)
+    try:
+      stale_path.unlink(missing_ok=True)
+    except OSError:
+      cloudlog.warning("GPS stale receiver configuration summary cleanup failed")
+    _last_receiver_configuration_persistence_status = ReceiverConfigurationPersistenceStatus(
+      str(path),
+      True,
+    )
+    _current_receiver_configuration_record_ready = True
+    return True
+  except Exception as exc:
+    try:
+      temporary_path.unlink(missing_ok=True)
+    except OSError:
+      pass
+    _last_receiver_configuration_persistence_status = ReceiverConfigurationPersistenceStatus(
+      str(path),
+      False,
+      type(exc).__name__,
+      str(exc)[:128],
+    )
+    cloudlog.warning("GPS receiver configuration summary persistence failed, " + f"error_type={type(exc).__name__}, error={str(exc)[:128]}")
     return False
+
+
+
+def receiver_configuration_cycle_id(pigeon: object) -> int:
+  for attribute in ("receiver_cycle", "_receiver_cycle"):
+    try:
+      value = getattr(pigeon, attribute)
+    except Exception:
+      continue
+    if type(value) is int and value >= 0:
+      return value
+  cloudlog.warning("GPS receiver configuration cycle unavailable; using startup cycle 0")
+  return 0
+
+
+def receiver_configuration_fingerprint(pigeon: object) -> str:
+  initialization = _ACTIVE_PRE_ACQUISITION_INITIALIZATION
+  candidate = (
+    initialization.receiver_fingerprint
+    if initialization is not None
+    else getattr(pigeon, "receiver_fingerprint", "unidentified")
+  )
+  if not isinstance(candidate, str) or not candidate.strip():
+    return "unidentified"
+  return candidate[:128]
+
+
+def set_receiver_configuration_context(
+  receiver_cycle: int,
+  receiver_fingerprint: str,
+) -> None:
+  global _current_receiver_configuration_cycle
+  global _current_receiver_configuration_fingerprint
+  if type(receiver_cycle) is not int or receiver_cycle < 0:
+    raise ValueError("receiver configuration cycle must be non-negative")
+  if not isinstance(receiver_fingerprint, str):
+    raise ValueError("receiver configuration fingerprint must be a string")
+  _current_receiver_configuration_cycle = receiver_cycle
+  _current_receiver_configuration_fingerprint = (
+    receiver_fingerprint.strip()[:128] or "unidentified"
+  )
+
+
+def receiver_configuration_summary_matches_active_cycle(
+  summary: ReceiverConfigurationSummary,
+) -> bool:
+  return (
+    summary.boot_id == RECEIVER_CONFIGURATION_BOOT_ID
+    and summary.process_start_id == RECEIVER_CONFIGURATION_PROCESS_START_ID
+    and _current_receiver_configuration_cycle is not None
+    and summary.receiver_cycle == _current_receiver_configuration_cycle
+    and _current_receiver_configuration_fingerprint is not None
+    and summary.receiver_fingerprint[:128]
+    == _current_receiver_configuration_fingerprint
+  )
+
+
+def begin_receiver_configuration_cycle(
+  pigeon: object,
+  receiver_fingerprint: str,
+  *,
+  transport_verified: bool,
+) -> None:
+  global _current_receiver_configuration_record_ready
+  global _last_receiver_configuration_persistence_status
+  global _last_receiver_configuration_summary
+  _last_receiver_configuration_summary = None
+  _last_receiver_configuration_persistence_status = None
+  _current_receiver_configuration_record_ready = False
+  set_receiver_configuration_context(
+    receiver_configuration_cycle_id(pigeon),
+    receiver_fingerprint,
+  )
+  try:
+    cast(Any, pigeon)._transport_verified_for_receiver_cycle = (
+      transport_verified
+    )
+  except (AttributeError, TypeError):
+    pass
+
+
+def init_pigeon(
+  pigeon: TTYPigeon,
+  *,
+  pre_start_deadline: float | None = None,
+) -> bool:
+  """Configure independent receiver items without replaying earlier items."""
+  global _last_receiver_configuration_summary
+  _last_receiver_configuration_summary = None
+  started_at = time.monotonic()
+  receiver_cycle = receiver_configuration_cycle_id(pigeon)
+  fingerprint = receiver_configuration_fingerprint(pigeon)
+  set_receiver_configuration_context(receiver_cycle, fingerprint)
+  port_messages = (
+    b"\xb5\x62\x06\x00\x14\x00\x03\xFF\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01\x00\x01\x00\x00\x00\x00\x00\x1E\x7F",
+    b"\xb5\x62\x06\x00\x14\x00\x00\xFF\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x19\x35",
+    b"\xb5\x62\x06\x00\x14\x00\x01\x00\x00\x00\xC0\x08\x00\x00\x00\x08\x07\x00\x01\x00\x01\x00\x00\x00\x00\x00\xF4\x80",
+    b"\xb5\x62\x06\x00\x14\x00\x04\xFF\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x1D\x85",
+  )
+  results: list[ReceiverConfigurationItemResult] = []
+
+  def add(item: ReceiverConfigurationItemResult) -> None:
+    results.append(item)
+
+  def poll_with_remaining_deadline(
+    poll_function: Callable[..., object],
+    *args: object,
+  ) -> object:
+    timeout = configuration_poll_timeout(pre_start_deadline)
+    try:
+      return poll_function(
+        pigeon,
+        *args,
+        timeout=timeout,
+        deadline=pre_start_deadline,
+      )
+    except TypeError as exc:
+      # Lightweight legacy test doubles predate timeout support. Production
+      # poll functions all accept it, so this compatibility path cannot
+      # weaken the receiver's actual pre-START deadline.
+      if not any(
+        keyword in str(exc)
+        for keyword in (
+          "unexpected keyword argument 'timeout'",
+          "unexpected keyword argument 'deadline'",
+        )
+      ):
+        raise
+      return poll_function(pigeon, *args)
+
+  for message in port_messages:
+    expected = parse_cfg_prt(message)
+    if expected is None:
+      raise ReceiverConfigurationError("Invalid built-in CFG-PRT configuration message")
+    add(run_receiver_configuration_item(
+      item_name=f"CFG-PRT-{expected.port_id}", mandatory=True,
+      expected_value=repr(expected),
+      poll=lambda port_id=expected.port_id: poll_with_remaining_deadline(poll_cfg_prt, port_id),
+      verify=lambda observed, expected=expected: verify_cfg_prt_config(cast(PortConfig, observed), expected),
+      write=lambda message=message: send_configuration_with_ack(pigeon, message, pre_start_deadline),
+      pre_start_deadline=pre_start_deadline,
+    ))
+
+  def exact_item(
+    name: str, message: bytes, poll: Callable[[], object], verify: Callable[[object], None], expected: str,
+    mandatory: bool = True,
+  ) -> None:
+    add(run_receiver_configuration_item(
+      item_name=name, mandatory=mandatory, expected_value=expected,
+      poll=poll, verify=verify,
+      write=lambda: send_configuration_with_ack(pigeon, message, pre_start_deadline),
+      pre_start_deadline=pre_start_deadline,
+    ))
+
+  exact_item(
+    "CFG-RATE", b"\xB5\x62\x06\x08\x06\x00\x64\x00\x01\x00\x00\x00\x79\x10", lambda: poll_with_remaining_deadline(poll_cfg_rate),
+    lambda value: (_ for _ in ()).throw(ReceiverConfigurationError("CFG-RATE mismatch"))
+    if value != RateConfig(100, 1, 0) else None, "100ms/1",
+  )
+  nav5_message = (
+    b"\xB5\x62\x06\x24\x24\x00\x05\x00\x04\x03\x00\x00\x00\x00\x00\x00"
+    + b"\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"
+    + b"\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x5A\x63"
+  )
+  exact_item(
+    "CFG-NAV5", nav5_message, lambda: poll_with_remaining_deadline(poll_cfg_nav5),
+    lambda value: (_ for _ in ()).throw(ReceiverConfigurationError("CFG-NAV5 mismatch"))
+    if value.dynamic_model != 4 or value.fix_mode != 3 else None, "dynamic=4,fix=3",
+  )
+  odo_message = (
+    b"\xB5\x62\x06\x1E\x14\x00\x00\x00\x00\x00\x01\x03\x00\x00"
+    + b"\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x3C\x37"
+  )
+  exact_item(
+    "CFG-ODO", odo_message, lambda: poll_with_remaining_deadline(poll_cfg_odo),
+    lambda value: (_ for _ in ()).throw(ReceiverConfigurationError("CFG-ODO mismatch"))
+    if (value.flags & 0x0F) != 1 or value.profile != 3 else None, "flags=1,profile=3",
+  )
+  exact_item(
+    "CFG-ITFM", b"\xB5\x62\x06\x39\x08\x00\xFF\xAD\x62\xAD\x1E\x63\x00\x00\x83\x0C", lambda: poll_with_remaining_deadline(poll_cfg_itfm),
+    lambda value: (_ for _ in ()).throw(ReceiverConfigurationError("CFG-ITFM mismatch"))
+    if value != ItfmConfig(0xAD62ADFF, 0x0000631E) else None, "0xAD62ADFF/0x0000631E",
+  )
+  for definition in RECEIVER_OUTPUT_STREAM_ITEMS:
+    message = bytes((
+      0xB5, 0x62, 0x06, 0x01, 0x03, 0x00,
+      definition.message_class, definition.message_id, 0x01,
+    ))
+    message = add_ubx_checksum(message)
+    exact_item(
+      definition.item_name, message,
+      lambda cls=definition.message_class, msg=definition.message_id: poll_with_remaining_deadline(poll_cfg_msg, cls, msg),
+      lambda value: (_ for _ in ()).throw(ReceiverConfigurationError("CFG-MSG UART1 rate mismatch"))
+      if value.rates[1] != 1 else None,
+      definition.expected_value, definition.mandatory,
+    )
+
+  def verify_diagnostic_readback(
+    value: object,
+    expected_type: type,
+    name: str,
+    verifier: Callable[[object], None],
+  ) -> None:
+    if not isinstance(value, expected_type):
+      raise ReceiverConfigurationParserError(
+        f"{name} response unavailable, malformed, or unsupported layout"
+      )
+    verifier(value)
+
+  for name, expected, poll, verify in (
+    (
+      "CFG-GNSS",
+      "gps_enabled_valid_channels",
+      lambda: poll_with_remaining_deadline(poll_cfg_gnss),
+      lambda value: verify_diagnostic_readback(value, GnssConfig, "CFG-GNSS", lambda parsed: verify_cfg_gnss_conservatively(cast(GnssConfig, parsed))),
+    ),
+    (
+      "CFG-RXM",
+      "continuous_mode=0_or_4",
+      lambda: poll_with_remaining_deadline(poll_cfg_rxm),
+      lambda value: verify_diagnostic_readback(value, RxmConfig, "CFG-RXM", lambda parsed: verify_cfg_rxm_conservatively(cast(RxmConfig, parsed))),
+    ),
+    (
+      "CFG-PM2",
+      "inactive_power_management",
+      lambda: poll_with_remaining_deadline(poll_cfg_pm2),
+      lambda value: verify_diagnostic_readback(value, Pm2Config, "CFG-PM2", lambda parsed: verify_cfg_pm2_conservatively(cast(Pm2Config, parsed))),
+    ),
+  ):
+    add(
+      run_receiver_configuration_item(
+        item_name=name,
+        mandatory=False,
+        expected_value=expected,
+        poll=poll,
+        verify=verify,
+        write=lambda: None,
+        max_write_attempts=0,
+        pre_start_deadline=pre_start_deadline,
+      )
+    )
+  _last_receiver_configuration_summary = ReceiverConfigurationSummary(
+    receiver_cycle,
+    (
+      getattr(pigeon, "_transport_verified_for_receiver_cycle", False)
+      or (
+        _ACTIVE_PRE_ACQUISITION_INITIALIZATION is not None
+        and _ACTIVE_PRE_ACQUISITION_INITIALIZATION.transport_mon_ver_info is not None
+      )
+    ),
+    started_at,
+    time.monotonic(),
+    tuple(results),
+    boot_id=RECEIVER_CONFIGURATION_BOOT_ID,
+    process_start_id=RECEIVER_CONFIGURATION_PROCESS_START_ID,
+    receiver_fingerprint=fingerprint,
+    navx5_ack_aiding_result=(
+      _ACTIVE_PRE_ACQUISITION_INITIALIZATION.navx5_ack_aiding_result
+      if _ACTIVE_PRE_ACQUISITION_INITIALIZATION is not None
+      else None
+    ),
+  )
+  mandatory_failures = [result for result in results if result.mandatory and not result.verified]
+  if mandatory_failures:
+    cloudlog.warning(
+      "GPS receiver configuration summary, "
+      + f"total_items={len(results)}, "
+      + f"verified_items={sum(result.verified for result in results)}, "
+      + f"failed_items={sum(not result.verified for result in results)}, "
+      + "mandatory_failures="
+      + ",".join(result.item_name for result in mandatory_failures)
+    )
+    return False
+  cloudlog.info(
+    "GPS receiver configuration summary, "
+    + f"total_items={len(results)}, verified_items={sum(result.verified for result in results)}, "
+    + "mandatory_failures=0"
+  )
   return True
+
+
+def run_post_start_legacy_assistance(pigeon: TTYPigeon) -> None:
+  """Run legacy backup diagnostics and online AssistNow after GNSS START."""
+  try:
+    restore_status = pigeon.poll_backup_restore_status()
+    if restore_status == 2:
+      cloudlog.warning("almanac backup restored")
+    elif restore_status == 3:
+      cloudlog.warning("no almanac backup found")
+    else:
+      cloudlog.error(f"failed to restore almanac backup, status: {restore_status}")
+  except Exception:
+    cloudlog.exception("GPS almanac backup status poll failed")
+  # Keep AssistNow policy unchanged: it is best-effort and must never turn a
+  # receiver-configuration result into a GNSS acquisition failure.
+  token = Params().get("AssistNowToken")
+  if token is not None:
+    try:
+      for msg in get_assistnow_messages(token):
+        pigeon.send_with_ack(msg, ack=UBLOX_ASSIST_ACK)
+      cloudlog.warning("AssistNow messages sent")
+    except Exception:
+      cloudlog.warning("failed to get AssistNow messages")
+  cloudlog.warning("Pigeon GPS on!")
+
 
 def deinitialize_and_exit(pigeon: TTYPigeon | None):
   if pigeon is not None:
@@ -1623,6 +2865,9 @@ class PreAcquisitionInitialization:
   executed: bool = False
   gnss_start_sent_at: float | None = None
   pre_gnss_start_drain_required: bool = False
+  pre_start_deadline: float | None = None
+  receiver_fingerprint: str = "unidentified"
+  navx5_ack_aiding_result: Navx5AckAidingConfigurationResult | None = None
 
   def run(self) -> None:
     if self.executed:
@@ -1632,8 +2877,36 @@ class PreAcquisitionInitialization:
 
   def note_gnss_start_sent(self, now: float) -> None:
     self.gnss_start_sent_at = now
+    self.mark_gnss_start_sent()
     if self.gnss_start_callback is not None:
       self.gnss_start_callback(now)
+
+  def mark_gnss_start_sent(self) -> None:
+    global _last_receiver_configuration_summary
+    if (
+      _last_receiver_configuration_summary is not None
+      and receiver_configuration_summary_matches_active_cycle(
+        _last_receiver_configuration_summary
+      )
+    ):
+      _last_receiver_configuration_summary = replace(
+        _last_receiver_configuration_summary,
+        gnss_start_attempted=True,
+        gnss_start_sent=True,
+      )
+
+  def note_gnss_start_attempted(self) -> None:
+    global _last_receiver_configuration_summary
+    if (
+      _last_receiver_configuration_summary is not None
+      and receiver_configuration_summary_matches_active_cycle(
+        _last_receiver_configuration_summary
+      )
+    ):
+      _last_receiver_configuration_summary = replace(
+        _last_receiver_configuration_summary,
+        gnss_start_attempted=True,
+      )
 
   def require_pre_gnss_start_drain(self) -> None:
     self.pre_gnss_start_drain_required = True
@@ -1650,6 +2923,8 @@ def install_pre_acquisition_initialization(
   gnss_start_callback: Callable[[float], None] | None = None,
   transport_already_started: bool = False,
   transport_mon_ver_info: MonVerInfo | None = None,
+  pre_start_deadline: float | None = None,
+  receiver_fingerprint: str = "unidentified",
 ) -> Iterator[PreAcquisitionInitialization]:
   global _ACTIVE_PRE_ACQUISITION_INITIALIZATION
   if _ACTIVE_PRE_ACQUISITION_INITIALIZATION is not None:
@@ -1658,11 +2933,18 @@ def install_pre_acquisition_initialization(
     raise ValueError(
       "transport_mon_ver_info is required when transport is already started"
     )
+  if not isinstance(receiver_fingerprint, str):
+    raise ValueError("receiver_fingerprint must be a string")
+  normalized_receiver_fingerprint = (
+    receiver_fingerprint.strip()[:128] or "unidentified"
+  )
   state = PreAcquisitionInitialization(
     callback,
     gnss_start_callback,
     transport_already_started=transport_already_started,
     transport_mon_ver_info=transport_mon_ver_info,
+    pre_start_deadline=pre_start_deadline,
+    receiver_fingerprint=normalized_receiver_fingerprint,
   )
   _ACTIVE_PRE_ACQUISITION_INITIALIZATION = state
   try:
@@ -1769,6 +3051,7 @@ def start_pigeon_transport(pigeon: TTYPigeon) -> None:
     pigeon,
     RUNTIME_RECOVERY_RECEIVER_TRANSPORT_MAX_ATTEMPTS,
   )
+  pigeon._transport_verified_for_receiver_cycle = True
   initialization = _ACTIVE_PRE_ACQUISITION_INITIALIZATION
   if initialization is not None:
     initialization.transport_mon_ver_info = mon_ver_info
@@ -1821,15 +3104,42 @@ def paused_gnss_acquisition(pigeon: TTYPigeon) -> Iterator[None]:
     ):
       try:
         drain = getattr(pigeon, "drain_before_transaction", None)
-        if callable(drain):
-          drain("position_assistance_pre_gnss_start_boundary")
-      except BaseException as exc:
-        drain_error = exc
-        cloudlog.exception(
-          "GPS pre-START input drain failed; GNSS START still attempted"
+        drain_deadline_expired = (
+          initialization.pre_start_deadline is not None
+          and time.monotonic() >= initialization.pre_start_deadline
         )
+        if drain_deadline_expired:
+          cloudlog.warning(
+            "GPS pre-START input drain skipped: shared deadline exhausted"
+          )
+        elif callable(drain):
+          if isinstance(pigeon, TTYPigeon):
+            drain(
+              "position_assistance_pre_gnss_start_boundary",
+              deadline=initialization.pre_start_deadline,
+            )
+          else:
+            drain("position_assistance_pre_gnss_start_boundary")
+      except BaseException as exc:
+        if (
+          isinstance(exc, TimeoutError)
+          and initialization.pre_start_deadline is not None
+        ):
+          cloudlog.warning(
+            "GPS pre-START input drain ended at shared deadline; "
+            + "GNSS START continues"
+          )
+        else:
+          drain_error = exc
+          cloudlog.exception(
+            "GPS pre-START input drain failed; GNSS START still attempted"
+          )
     try:
+      if initialization is not None:
+        initialization.note_gnss_start_attempted()
       pigeon.send(CONTROLLED_GNSS_START_MESSAGE)
+      if initialization is not None:
+        initialization.mark_gnss_start_sent()
       started_at = time.monotonic()
       prestart_elapsed_seconds = (
         max(0.0, started_at - stopped_at)
@@ -1852,6 +3162,16 @@ def paused_gnss_acquisition(pigeon: TTYPigeon) -> Iterator[None]:
     except BaseException as exc:
       start_error = exc
       cloudlog.exception("GPS controlled GNSS START failed")
+    if (
+      initialization is not None
+      and _last_receiver_configuration_summary is not None
+      and receiver_configuration_summary_matches_active_cycle(
+        _last_receiver_configuration_summary
+      )
+    ):
+      persist_receiver_configuration_summary(
+        _last_receiver_configuration_summary
+      )
 
   if body_error is not None:
     raise body_error.with_traceback(body_error.__traceback__)
@@ -1861,9 +3181,16 @@ def paused_gnss_acquisition(pigeon: TTYPigeon) -> Iterator[None]:
     raise start_error.with_traceback(start_error.__traceback__)
 
 
-def finish_pigeon_initialization(pigeon: TTYPigeon) -> None:
-  if not init_pigeon(pigeon):
-    raise RuntimeError("Failed to initialize pigeon")
+def finish_pigeon_initialization(pigeon: TTYPigeon) -> bool:
+  initialization = _ACTIVE_PRE_ACQUISITION_INITIALIZATION
+  initialized = (
+    init_pigeon(pigeon, pre_start_deadline=initialization.pre_start_deadline)
+    if initialization is not None
+    else init_pigeon(pigeon)
+  )
+  if not initialized:
+    cloudlog.error("GPS receiver configuration degraded; bounded mandatory failures " + "were recorded and GNSS acquisition continues")
+  return initialized
 
 
 def init(pigeon: TTYPigeon) -> None:
@@ -1873,7 +3200,11 @@ def init(pigeon: TTYPigeon) -> None:
   if initialization is not None:
     with paused_gnss_acquisition(pigeon):
       initialization.run()
+      finish_pigeon_initialization(pigeon)
+    run_post_start_legacy_assistance(pigeon)
+    return
   finish_pigeon_initialization(pigeon)
+  run_post_start_legacy_assistance(pigeon)
 
 
 class TimeAssistanceWriteStatus(StrEnum):
@@ -4614,6 +5945,9 @@ class ReceiverCycleInitialization:
   assistnow_autonomous_supported: bool
   assistnow_autonomous_configuration_attempted: bool
   completed_at: float
+  ack_aiding_configuration_result: (
+    Navx5AckAidingConfigurationResult | None
+  ) = None
   navigation_assistance_restore_result: (
     NavigationAssistanceRestoreResult | None
   ) = None
@@ -5039,6 +6373,11 @@ def initialize_receiver_cycle(
     and not callable(network_available_reader)
   ):
     raise ValueError("network_available_reader must be callable")
+  begin_receiver_configuration_cycle(
+    pigeon,
+    receiver_fingerprint,
+    transport_verified=transport_mon_ver_info is not None,
+  )
   startup_diagnostics.start_cycle(reason, cycle_started_at)
   provenance = time_provenance or ReceiverTimeProvenanceTracker()
   cycle_id = getattr(
@@ -5107,6 +6446,9 @@ def initialize_receiver_cycle(
 
   mon_ver_info: MonVerInfo | None = None
   ack_aiding_configuration_attempted = False
+  ack_aiding_configuration_result: (
+    Navx5AckAidingConfigurationResult | None
+  ) = None
   trusted_time_assistance_sent = False
   time_assistance_source = None
   time_assistance_utc = None
@@ -5161,6 +6503,7 @@ def initialize_receiver_cycle(
   def pre_acquisition_initialization() -> None:
     nonlocal mon_ver_info
     nonlocal ack_aiding_configuration_attempted
+    nonlocal ack_aiding_configuration_result
     nonlocal trusted_time_assistance_sent
     nonlocal time_assistance_source
     nonlocal time_assistance_utc
@@ -5202,8 +6545,23 @@ def initialize_receiver_cycle(
       collect_mon_ver_diagnostics,
     )
     log_navx5_ack_aiding_support(mon_ver_info)
-    configure_navx5_ack_aiding(pigeon, mon_ver_info)
+    try:
+      ack_aiding_configuration_result = configure_navx5_ack_aiding(
+        pigeon,
+        mon_ver_info,
+        pre_start_deadline=pre_start_deadline,
+      )
+    except TypeError as exc:
+      if "unexpected keyword argument 'pre_start_deadline'" not in str(exc):
+        raise
+      ack_aiding_configuration_result = configure_navx5_ack_aiding(
+        pigeon,
+        mon_ver_info,
+      )
     ack_aiding_configuration_attempted = True
+    initialization.navx5_ack_aiding_result = (
+      ack_aiding_configuration_result
+    )
     current_network_time = (
       authorized_time is not None
       and is_current_independent_network_time(authorized_time)
@@ -5441,6 +6799,8 @@ def initialize_receiver_cycle(
     note_gnss_start_sent,
     transport_already_started=transport_mon_ver_info is not None,
     transport_mon_ver_info=transport_mon_ver_info,
+    pre_start_deadline=pre_start_deadline,
+    receiver_fingerprint=receiver_fingerprint,
   ) as initialization:
     init(pigeon)
 
@@ -5519,6 +6879,9 @@ def initialize_receiver_cycle(
       assistnow_autonomous_configuration_attempted
     ),
     completed_at=time.monotonic(),
+    ack_aiding_configuration_result=(
+      ack_aiding_configuration_result
+    ),
     navigation_assistance_restore_result=(
       navigation_assistance_restore_result
     ),

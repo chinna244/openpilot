@@ -234,7 +234,8 @@ def test_pre_database_setup_does_not_ignore_acquisition_frames() -> None:
   assert segment is not None
   assert "resolve_pre_acquisition_mon_ver(" in segment
   assert "initialization.transport_mon_ver_info" in segment
-  assert "configure_navx5_ack_aiding(pigeon, mon_ver_info)" in segment
+  assert "configure_navx5_ack_aiding(" in segment
+  assert "pre_start_deadline=pre_start_deadline" in segment
 
   unrelated = named_node(tree, "_queue_unrelated_frames")
   unrelated_segment = ast.get_source_segment(source, unrelated)
@@ -480,3 +481,55 @@ def test_yuma_assistance_state_unavailable_is_terminal_without_retry() -> None:
   assert "retry_pending=False" in feature_segment
   assert "if outcome.receiver_write_attempted:" in feature_segment
   assert "self._provisional_reference_used = reference" in feature_segment
+
+
+def test_configuration_summary_persistence_is_strictly_post_start() -> None:
+  source, tree = source_tree(PIGEOND)
+  strict_configuration = named_node(tree, "init_pigeon")
+  strict_segment = ast.get_source_segment(source, strict_configuration)
+  assert strict_segment is not None
+  assert "persist_receiver_configuration_summary(" not in strict_segment
+
+  start_boundary = named_node(tree, "paused_gnss_acquisition")
+  start_segment = ast.get_source_segment(source, start_boundary)
+  assert start_segment is not None
+  attempted = start_segment.index(
+    "initialization.note_gnss_start_attempted()"
+  )
+  start_write = start_segment.index(
+    "pigeon.send(CONTROLLED_GNSS_START_MESSAGE)"
+  )
+  persisted = start_segment.index(
+    "persist_receiver_configuration_summary("
+  )
+  assert attempted < start_write < persisted
+
+
+def test_obsolete_whole_sequence_configuration_retry_is_removed() -> None:
+  source, tree = source_tree(PIGEOND)
+  strict_configuration = named_node(tree, "init_pigeon")
+
+  assert "for _ in range(10):" not in source
+  assert "try initializing a few times" not in source
+  assert "removed legacy CFG-PRT-3 sequence" not in source
+  assert len(calls(strict_configuration, "run_receiver_configuration_item")) >= 2
+
+
+def test_strict_configuration_uses_one_absolute_transaction_deadline() -> None:
+  source, tree = source_tree(PIGEOND)
+
+  transaction = named_node(tree, "_begin_response_transaction")
+  transaction_segment = ast.get_source_segment(source, transaction)
+  assert transaction_segment is not None
+  assert "deadline=deadline" in transaction_segment
+
+  poll = named_node(tree, "_poll_cfg")
+  poll_segment = ast.get_source_segment(source, poll)
+  assert poll_segment is not None
+  assert "deadline=deadline" in poll_segment
+  assert "time.monotonic() >= deadline" in poll_segment
+
+  strict_configuration = named_node(tree, "init_pigeon")
+  strict_segment = ast.get_source_segment(source, strict_configuration)
+  assert strict_segment is not None
+  assert "deadline=pre_start_deadline" in strict_segment
