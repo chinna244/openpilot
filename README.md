@@ -9,12 +9,12 @@ This is what I run on my own 2022 CX-5 every day. There's a nicer tour of all of
 When your comma device asks for a custom software URL during setup, type:
 
 ```
-zoompilot/develop
+zoompilot/main
 ```
 
-`develop` is where the work happens and what I drive on. `main` will carry validated releases once the first one is cut; until then it's just this README.
+`main` carries the releases, built ahead of time so the device doesn't have to compile on install. `develop` is where the day to day work lands if you want it earlier. Devices installed from my old personal fork move themselves to `main` on their next start.
 
-**This is experimental software from a development branch.** You drive the car, you follow the law where you live, and you carry the risk. It ships with no warranty and no liability for any damage or injury.
+**This is experimental software.** You drive the car, you follow the law where you live, and you carry the risk. It ships with no warranty and no liability for any damage or injury.
 
 ## steering improvements
 
