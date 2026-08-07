@@ -40,6 +40,7 @@ class TestLocationdProc:
     if name == "gpsLocationExternal":
       msg.gpsLocationExternal.flags = 1
       msg.gpsLocationExternal.hasFix = True
+      msg.gpsLocationExternal.horizontalAccuracy = 1.0
       msg.gpsLocationExternal.verticalAccuracy = 1.0
       msg.gpsLocationExternal.speedAccuracy = 1.0
       msg.gpsLocationExternal.bearingAccuracyDeg = 1.0

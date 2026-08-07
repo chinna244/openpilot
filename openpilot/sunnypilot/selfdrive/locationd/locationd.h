@@ -1,6 +1,7 @@
 #pragma once
 
 #include <eigen3/Eigen/Dense>
+#include <cstdint>
 #include <deque>
 #include <fstream>
 #include <memory>
@@ -24,6 +25,36 @@
 
 enum LocalizerGnssSource {
   UBLOX, QCOM
+};
+
+// Passive diagnostics for GPS measurement accept/reject paths in handle_gps().
+enum class GpsInputRejectReason : int32_t {
+  None = 0,
+  Accepted = 1,
+  NoFix = 2,
+  NonFiniteInput = 3,
+  InvalidLatLonAlt = 4,
+  InvalidHorizontalAccuracy = 5,
+  InvalidVerticalAccuracy = 6,
+  InvalidSpeedAccuracy = 7,
+  InvalidBearingAccuracy = 8,
+  UnreasonableUncertainty = 9,
+  UnreasonableVelocity = 10,
+};
+
+struct GpsInputStats {
+  uint64_t received = 0;
+  uint64_t accepted = 0;
+  uint64_t rejected_no_fix = 0;
+  uint64_t rejected_non_finite = 0;
+  uint64_t rejected_lat_lon_alt = 0;
+  uint64_t rejected_horizontal_accuracy = 0;
+  uint64_t rejected_vertical_accuracy = 0;
+  uint64_t rejected_speed_accuracy = 0;
+  uint64_t rejected_bearing_accuracy = 0;
+  uint64_t rejected_unreasonable_uncertainty = 0;
+  uint64_t rejected_unreasonable_velocity = 0;
+  GpsInputRejectReason last_reason = GpsInputRejectReason::None;
 };
 
 class Localizer {
@@ -52,6 +83,7 @@ public:
   Eigen::VectorXd get_position_geodetic();
   Eigen::VectorXd get_state();
   Eigen::VectorXd get_stdev();
+  MatrixXdr get_cov();
 
   void handle_msg_bytes(const char *data, const size_t size);
   void handle_msg(const cereal::Event::Reader& log);
@@ -63,6 +95,10 @@ public:
   void handle_live_calib(double current_time, const cereal::LiveCalibrationData::Reader& log);
 
   void input_fake_gps_observations(double current_time);
+
+  // Passive GPS accept/reject diagnostics (no effect on filter behavior).
+  const GpsInputStats &get_gps_input_stats() const { return this->gps_input_stats; }
+  bool gps_course_used_for_last_reset() const { return this->last_reset_used_gps_course; }
 
 private:
   std::unique_ptr<LiveKalman> kf;
@@ -96,5 +132,12 @@ private:
   double gps_time_offset;
   Eigen::VectorXd camodo_yawrate_distribution = Eigen::Vector2d(0.0, 10.0); // mean, std
 
+  GpsInputStats gps_input_stats;
+  double last_gps_input_diag_log_t = NAN;
+  bool last_reset_used_gps_course = false;
+
   void configure_gnss_source(const LocalizerGnssSource &source);
+  void reject_gps_input(double current_time, GpsInputRejectReason reason);
+  void maybe_log_gps_input_stats(double current_time);
+  bool gps_course_usable_for_yaw_reset(double ecef_speed_mps, double bearing_accuracy_deg) const;
 };

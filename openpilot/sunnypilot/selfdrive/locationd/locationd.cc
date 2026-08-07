@@ -39,6 +39,14 @@ const float  GPS_VEL_STD_RESET_THRESHOLD = 0.5;
 const float  GPS_ORIENTATION_ERROR_RESET_THRESHOLD = 1.0;
 const int    GPS_ORIENTATION_ERROR_RESET_CNT = 3;
 
+// Same ground-speed gate already used for GPS-vs-filter orientation mismatch resets.
+// Below this, GNSS course is unreliable for yaw initialization (parked/crawling).
+const double GPS_COURSE_MIN_SPEED_FOR_YAW_RESET = 5.0; // m/s
+// Yaw re-init is stricter than the ordinary >0 bearingAccuracyDeg fusion gate: a bad
+// initial heading is hard to unwind, so reject coarse bearing reports for reset-only use.
+const double GPS_COURSE_MAX_BEARING_ACC_DEG = 45.0;
+const double GPS_INPUT_DIAG_LOG_INTERVAL_S = 10.0;
+
 const bool   DEBUG = getenv("DEBUG") != nullptr && std::string(getenv("DEBUG")) != "0";
 
 static VectorXd floatlist2vector(const capnp::List<float, capnp::Kind::PRIMITIVE>::Reader& floatlist) {
@@ -217,6 +225,10 @@ VectorXd Localizer::get_state() {
   return this->kf->get_x();
 }
 
+MatrixXdr Localizer::get_cov() {
+  return this->kf->get_P();
+}
+
 VectorXd Localizer::get_stdev() {
   return this->kf->get_P().diagonal().array().sqrt();
 }
@@ -307,38 +319,175 @@ void Localizer::input_fake_gps_observations(double current_time) {
   this->kf->predict_and_observe(current_time, OBSERVATION_ECEF_VEL, { ecef_vel }, { ecef_vel_R });
 }
 
-void Localizer::handle_gps(double current_time, const cereal::GpsLocationData::Reader& log, const double sensor_time_offset) {
-  bool gps_unreasonable = (Vector2d(log.getHorizontalAccuracy(), log.getVerticalAccuracy()).norm() >= SANE_GPS_UNCERTAINTY);
-  bool gps_accuracy_insane = ((log.getVerticalAccuracy() <= 0) || (log.getSpeedAccuracy() <= 0) || (log.getBearingAccuracyDeg() <= 0));
-  bool gps_lat_lng_alt_insane = ((std::abs(log.getLatitude()) > 90) || (std::abs(log.getLongitude()) > 180) || (std::abs(log.getAltitude()) > ALTITUDE_SANITY_CHECK));
-  bool gps_vel_insane = (floatlist2vector(log.getVNED()).norm() > TRANS_SANITY_CHECK);
-
-  if (!log.getHasFix() || gps_unreasonable || gps_accuracy_insane || gps_lat_lng_alt_insane || gps_vel_insane) {
-    //this->gps_valid = false;
+void Localizer::reject_gps_input(double current_time, GpsInputRejectReason reason) {
+  this->gps_input_stats.last_reason = reason;
+  switch (reason) {
+    case GpsInputRejectReason::NoFix:
+      this->gps_input_stats.rejected_no_fix++;
+      break;
+    case GpsInputRejectReason::NonFiniteInput:
+      this->gps_input_stats.rejected_non_finite++;
+      break;
+    case GpsInputRejectReason::InvalidLatLonAlt:
+      this->gps_input_stats.rejected_lat_lon_alt++;
+      break;
+    case GpsInputRejectReason::InvalidHorizontalAccuracy:
+      this->gps_input_stats.rejected_horizontal_accuracy++;
+      break;
+    case GpsInputRejectReason::InvalidVerticalAccuracy:
+      this->gps_input_stats.rejected_vertical_accuracy++;
+      break;
+    case GpsInputRejectReason::InvalidSpeedAccuracy:
+      this->gps_input_stats.rejected_speed_accuracy++;
+      break;
+    case GpsInputRejectReason::InvalidBearingAccuracy:
+      this->gps_input_stats.rejected_bearing_accuracy++;
+      break;
+    case GpsInputRejectReason::UnreasonableUncertainty:
+      this->gps_input_stats.rejected_unreasonable_uncertainty++;
+      break;
+    case GpsInputRejectReason::UnreasonableVelocity:
+      this->gps_input_stats.rejected_unreasonable_velocity++;
+      break;
+    default:
+      break;
+  }
+  this->maybe_log_gps_input_stats(current_time);
+  // Never drive KF prediction/reset/fake-GPS recovery with a non-finite timestamp.
+  if (std::isfinite(current_time)) {
     this->determine_gps_mode(current_time);
+  }
+}
+
+void Localizer::maybe_log_gps_input_stats(double current_time) {
+  if (!std::isfinite(current_time)) {
+    return;
+  }
+  if (std::isfinite(this->last_gps_input_diag_log_t) &&
+      (current_time - this->last_gps_input_diag_log_t) < GPS_INPUT_DIAG_LOG_INTERVAL_S) {
+    return;
+  }
+  this->last_gps_input_diag_log_t = current_time;
+  const GpsInputStats &s = this->gps_input_stats;
+  LOGW("locationd GPS inputs: recv=%llu acc=%llu rej(nofix=%llu nonfinite=%llu lla=%llu hAcc=%llu vAcc=%llu sAcc=%llu bAcc=%llu unc=%llu vel=%llu) last=%d",
+       (unsigned long long)s.received,
+       (unsigned long long)s.accepted,
+       (unsigned long long)s.rejected_no_fix,
+       (unsigned long long)s.rejected_non_finite,
+       (unsigned long long)s.rejected_lat_lon_alt,
+       (unsigned long long)s.rejected_horizontal_accuracy,
+       (unsigned long long)s.rejected_vertical_accuracy,
+       (unsigned long long)s.rejected_speed_accuracy,
+       (unsigned long long)s.rejected_bearing_accuracy,
+       (unsigned long long)s.rejected_unreasonable_uncertainty,
+       (unsigned long long)s.rejected_unreasonable_velocity,
+       (int)s.last_reason);
+}
+
+bool Localizer::gps_course_usable_for_yaw_reset(double ecef_speed_mps, double bearing_accuracy_deg) const {
+  // Require meaningful motion and a usable bearing uncertainty estimate.
+  // bearing_accuracy_deg must already be finite and > 0 from handle_gps validation.
+  return (ecef_speed_mps > GPS_COURSE_MIN_SPEED_FOR_YAW_RESET) &&
+         (bearing_accuracy_deg <= GPS_COURSE_MAX_BEARING_ACC_DEG);
+}
+
+void Localizer::handle_gps(double current_time, const cereal::GpsLocationData::Reader& log, const double sensor_time_offset) {
+  this->gps_input_stats.received++;
+
+  // Reject non-finite filter time before any measurement math. NaN comparisons are not safe gates.
+  if (!std::isfinite(current_time) || !std::isfinite(sensor_time_offset)) {
+    this->reject_gps_input(current_time, GpsInputRejectReason::NonFiniteInput);
+    return;
+  }
+
+  if (!log.getHasFix()) {
+    this->reject_gps_input(current_time, GpsInputRejectReason::NoFix);
+    return;
+  }
+
+  const double latitude = log.getLatitude();
+  const double longitude = log.getLongitude();
+  const double altitude = log.getAltitude();
+  const float horizontal_accuracy = log.getHorizontalAccuracy();
+  const float vertical_accuracy = log.getVerticalAccuracy();
+  const float speed_accuracy = log.getSpeedAccuracy();
+  const float bearing_accuracy_deg = log.getBearingAccuracyDeg();
+  const float bearing_deg = log.getBearingDeg();
+  const auto vned = log.getVNED();
+
+  if (!std::isfinite(latitude) || !std::isfinite(longitude) || !std::isfinite(altitude) ||
+      !std::isfinite(horizontal_accuracy) || !std::isfinite(vertical_accuracy) ||
+      !std::isfinite(speed_accuracy) || !std::isfinite(bearing_accuracy_deg) ||
+      !std::isfinite(bearing_deg) || vned.size() < 3 ||
+      !std::isfinite(vned[0]) || !std::isfinite(vned[1]) || !std::isfinite(vned[2])) {
+    this->reject_gps_input(current_time, GpsInputRejectReason::NonFiniteInput);
+    return;
+  }
+
+  if ((std::abs(latitude) > 90.0) || (std::abs(longitude) > 180.0) || (std::abs(altitude) > ALTITUDE_SANITY_CHECK)) {
+    this->reject_gps_input(current_time, GpsInputRejectReason::InvalidLatLonAlt);
+    return;
+  }
+
+  // Accuracies used as positive std-dev / covariance inputs must be > 0.
+  // QCOM currently sets gps_variance_factor=0 so horizontalAccuracy is unused in position
+  // covariance; qcomgpsd also leaves it at the default 0. Preserve that legacy path until
+  // the dedicated QCOM accuracy rehabilitation PR. Still require finite for every source.
+  if (this->gps_variance_factor > 0.0f && horizontal_accuracy <= 0.0f) {
+    this->reject_gps_input(current_time, GpsInputRejectReason::InvalidHorizontalAccuracy);
+    return;
+  }
+  if (vertical_accuracy <= 0.0f) {
+    this->reject_gps_input(current_time, GpsInputRejectReason::InvalidVerticalAccuracy);
+    return;
+  }
+  if (speed_accuracy <= 0.0f) {
+    this->reject_gps_input(current_time, GpsInputRejectReason::InvalidSpeedAccuracy);
+    return;
+  }
+  if (bearing_accuracy_deg <= 0.0f) {
+    this->reject_gps_input(current_time, GpsInputRejectReason::InvalidBearingAccuracy);
+    return;
+  }
+
+  if (Vector2d(horizontal_accuracy, vertical_accuracy).norm() >= SANE_GPS_UNCERTAINTY) {
+    this->reject_gps_input(current_time, GpsInputRejectReason::UnreasonableUncertainty);
+    return;
+  }
+
+  VectorXd vned_vec = floatlist2vector(vned);
+  if (vned_vec.norm() > TRANS_SANITY_CHECK) {
+    this->reject_gps_input(current_time, GpsInputRejectReason::UnreasonableVelocity);
     return;
   }
 
   double sensor_time = current_time - sensor_time_offset;
+  if (!std::isfinite(sensor_time)) {
+    this->reject_gps_input(current_time, GpsInputRejectReason::NonFiniteInput);
+    return;
+  }
+
+  this->gps_input_stats.accepted++;
+  this->gps_input_stats.last_reason = GpsInputRejectReason::Accepted;
+  this->maybe_log_gps_input_stats(current_time);
 
   // Process message
-  //this->gps_valid = true;
   this->gps_mode = true;
-  Geodetic geodetic = { log.getLatitude(), log.getLongitude(), log.getAltitude() };
+  Geodetic geodetic = { latitude, longitude, altitude };
   this->converter = std::make_unique<LocalCoord>(geodetic);
 
   VectorXd ecef_pos = this->converter->ned2ecef({ 0.0, 0.0, 0.0 }).to_vector();
-  VectorXd ecef_vel = this->converter->ned2ecef({ log.getVNED()[0], log.getVNED()[1], log.getVNED()[2] }).to_vector() - ecef_pos;
-  float ecef_pos_std = std::sqrt(this->gps_variance_factor * std::pow(log.getHorizontalAccuracy(), 2) + this->gps_vertical_variance_factor * std::pow(log.getVerticalAccuracy(), 2));
+  VectorXd ecef_vel = this->converter->ned2ecef({ vned[0], vned[1], vned[2] }).to_vector() - ecef_pos;
+  float ecef_pos_std = std::sqrt(this->gps_variance_factor * std::pow(horizontal_accuracy, 2) + this->gps_vertical_variance_factor * std::pow(vertical_accuracy, 2));
   MatrixXdr ecef_pos_R = Vector3d::Constant(std::pow(this->gps_std_factor * ecef_pos_std, 2)).asDiagonal();
-  MatrixXdr ecef_vel_R = Vector3d::Constant(std::pow(this->gps_std_factor * log.getSpeedAccuracy(), 2)).asDiagonal();
+  MatrixXdr ecef_vel_R = Vector3d::Constant(std::pow(this->gps_std_factor * speed_accuracy, 2)).asDiagonal();
 
   this->unix_timestamp_millis = log.getUnixTimestampMillis();
   double gps_est_error = (this->kf->get_x().segment<STATE_ECEF_POS_LEN>(STATE_ECEF_POS_START) - ecef_pos).norm();
 
   VectorXd orientation_ecef = quat2euler(vector2quat(this->kf->get_x().segment<STATE_ECEF_ORIENTATION_LEN>(STATE_ECEF_ORIENTATION_START)));
   VectorXd orientation_ned = ned_euler_from_ecef({ ecef_pos(0), ecef_pos(1), ecef_pos(2) }, orientation_ecef);
-  VectorXd orientation_ned_gps = Vector3d(0.0, 0.0, DEG2RAD(log.getBearingDeg()));
+  VectorXd orientation_ned_gps = Vector3d(0.0, 0.0, DEG2RAD(bearing_deg));
   VectorXd orientation_error = (orientation_ned - orientation_ned_gps).array() - M_PI;
   for (int i = 0; i < orientation_error.size(); i++) {
     orientation_error(i) = std::fmod(orientation_error(i), 2.0 * M_PI);
@@ -348,14 +497,22 @@ void Localizer::handle_gps(double current_time, const cereal::GpsLocationData::R
     orientation_error(i) -= M_PI;
   }
   VectorXd initial_pose_ecef_quat = quat2vector(euler2quat(ecef_euler_from_ned({ ecef_pos(0), ecef_pos(1), ecef_pos(2) }, orientation_ned_gps)));
+  VectorXd current_pose_ecef_quat = this->kf->get_x().segment<STATE_ECEF_ORIENTATION_LEN>(STATE_ECEF_ORIENTATION_START);
 
-  if (ecef_vel.norm() > 5.0 && orientation_error.norm() > 1.0) {
+  const double ecef_speed = ecef_vel.norm();
+  const bool course_usable = this->gps_course_usable_for_yaw_reset(ecef_speed, bearing_accuracy_deg);
+  // Position recovery must still run when course is unusable; only yaw init is gated.
+  VectorXd reset_orient = course_usable ? initial_pose_ecef_quat : current_pose_ecef_quat;
+
+  if (course_usable && orientation_error.norm() > GPS_ORIENTATION_ERROR_RESET_THRESHOLD) {
     LOGE("Locationd vs ubloxLocation orientation difference too large, kalman reset");
+    this->last_reset_used_gps_course = true;
     this->reset_kalman(NAN, initial_pose_ecef_quat, ecef_pos, ecef_vel, ecef_pos_R, ecef_vel_R);
     this->kf->predict_and_observe(sensor_time, OBSERVATION_ECEF_ORIENTATION_FROM_GPS, { initial_pose_ecef_quat });
   } else if (gps_est_error > 100.0) {
     LOGE("Locationd vs ubloxLocation position difference too large, kalman reset");
-    this->reset_kalman(NAN, initial_pose_ecef_quat, ecef_pos, ecef_vel, ecef_pos_R, ecef_vel_R);
+    this->last_reset_used_gps_course = course_usable;
+    this->reset_kalman(NAN, reset_orient, ecef_pos, ecef_vel, ecef_pos_R, ecef_vel_R);
   }
 
   this->last_gps_msg = sensor_time;
@@ -520,7 +677,8 @@ void Localizer::reset_kalman(double current_time) {
 }
 
 void Localizer::finite_check(double current_time) {
-  bool all_finite = this->kf->get_x().array().isFinite().all() or this->kf->get_P().array().isFinite().all();
+  // Both state and covariance must be finite. OR would allow a non-finite x or P to continue.
+  bool all_finite = this->kf->get_x().array().isFinite().all() and this->kf->get_P().array().isFinite().all();
   if (!all_finite) {
     LOGE("Non-finite values detected, kalman reset");
     this->reset_kalman(current_time);
@@ -742,9 +900,11 @@ int Localizer::locationd_thread() {
   return 0;
 }
 
+#ifndef LOCATIOND_UNIT_TEST
 int main() {
   util::set_realtime_priority(5);
 
   Localizer localizer;
   return localizer.locationd_thread();
 }
+#endif
