@@ -15,7 +15,7 @@ class FakeParams:
     return self.enabled
 
 
-def test_yuma_downloader_is_off_by_default(monkeypatch):
+def test_yuma_downloader_kill_switch_disables_refresh(monkeypatch):
   monkeypatch.setattr(
     process_config,
     "ublox_available",
@@ -25,6 +25,20 @@ def test_yuma_downloader_is_off_by_default(monkeypatch):
   assert not process_config.yuma_almanac_refresh(
     False,
     FakeParams(False),
+    SimpleNamespace(),
+  )
+
+
+def test_yuma_downloader_enabled_by_default_gate(monkeypatch):
+  monkeypatch.setattr(
+    process_config,
+    "ublox_available",
+    lambda: True,
+  )
+
+  assert process_config.yuma_almanac_refresh(
+    False,
+    FakeParams(True),
     SimpleNamespace(),
   )
 
