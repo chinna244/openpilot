@@ -300,6 +300,14 @@ def _stub_receiver_initialization_dependencies(
   send_time_result: bool,
   rtc_assistance=None,
 ):
+  class InlineThread:
+    def __init__(self, *, target, **_kwargs):
+      self.target = target
+
+    def start(self):
+      self.target()
+
+  monkeypatch.setattr(pigeond, "Thread", InlineThread)
   monkeypatch.setattr(pigeond, "init", lambda pigeon: None)
   monkeypatch.setattr(pigeond, "poll_mon_ver", lambda pigeon: None)
   monkeypatch.setattr(
@@ -444,8 +452,8 @@ def test_cross_boot_rtc_is_not_authorized_for_yuma(
   assert initialization.yuma_time_anchor_source is None
   assert initialization.yuma_time_anchor_monotonic is None
   assert runtime.time_anchor_source is None
-  assert len(restore_calls) == 1
-  assert restore_calls[0]["trusted_now"] is None
+  assert restore_calls == []
+  assert initialization.poll_deferred_assistance_state is not None
 
 
 def test_capture_tracker_exposes_latest_nav_sat_and_time():

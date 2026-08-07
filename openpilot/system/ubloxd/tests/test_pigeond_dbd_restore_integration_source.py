@@ -44,17 +44,15 @@ def test_live_loop_creates_fresh_state_for_each_receiver_cycle() -> None:
   node = named_node(tree, "run_receiving")
   segment = ast.get_source_segment(source, node)
   assert segment is not None
-  assert len(
-    calls(node, "create_receiver_cycle_assistance_state")
-  ) == 2
-  assert len(
-    calls(node, "prepare_receiver_cycle_response_state")
-  ) == 1
+  assert not calls(node, "create_receiver_cycle_assistance_state")
+  assert len(calls(node, "prepare_receiver_cycle_response_state")) == 1
   initialize_calls = calls(node, "initialize_receiver_cycle")
   assert len(initialize_calls) == 2
   for call in initialize_calls:
     keywords = {keyword.arg for keyword in call.keywords}
-    assert "navigation_database_runtime" in keywords
+    assert "navigation_database_runtime" not in keywords
+    assert "assistance_state_factory" in keywords
+    assert "assistance_state_ready_callback" in keywords
     assert "response_state_prepared" not in keywords
 
   navigation_factory = named_node(
@@ -67,20 +65,10 @@ def test_live_loop_creates_fresh_state_for_each_receiver_cycle() -> None:
   )
   assert len(navigation_calls) == 1
   assert any(
-    keyword.arg == "new_receiver_cycle"
-    and isinstance(keyword.value, ast.Constant)
-    and keyword.value.value is True
-    for keyword in navigation_calls[0].keywords
+    keyword.arg == "new_receiver_cycle" and isinstance(keyword.value, ast.Constant) and keyword.value.value is True for keyword in navigation_calls[0].keywords
   )
 
-  assistance_factories = [
-    item
-    for item in node.body
-    if (
-      isinstance(item, ast.FunctionDef)
-      and item.name == "create_receiver_cycle_assistance_state"
-    )
-  ]
+  assistance_factories = [item for item in node.body if (isinstance(item, ast.FunctionDef) and item.name == "create_receiver_cycle_assistance_state")]
   assert len(assistance_factories) == 1
   retry_calls = calls(
     assistance_factories[0],
@@ -88,23 +76,60 @@ def test_live_loop_creates_fresh_state_for_each_receiver_cycle() -> None:
   )
   assert len(retry_calls) == 1
   assert any(
-    keyword.arg == "new_receiver_cycle"
-    and isinstance(keyword.value, ast.Constant)
-    and keyword.value.value is True
-    for keyword in retry_calls[0].keywords
+    keyword.arg == "new_receiver_cycle" and isinstance(keyword.value, ast.Constant) and keyword.value.value is True for keyword in retry_calls[0].keywords
   )
 
 
-def test_process_start_dbd_wait_rechecks_unready_network_state() -> None:
+def test_process_start_never_installs_a_pre_start_network_wait() -> None:
   source, tree = source_tree(PIGEOND)
   node = named_node(tree, "run_receiving")
   segment = ast.get_source_segment(source, node)
   assert segment is not None
   assert "network_available=device_network_available(sm)" in segment
-  assert (
-    "network_available_reader=lambda: device_network_available(sm)"
-    in segment
+  assert "allow_database_trusted_time_wait=False" in segment
+  assert "network_available_reader=" not in segment
+
+
+def test_deferred_assistance_worker_is_polled_without_unbounded_wait() -> None:
+  source, tree = source_tree(PIGEOND)
+  initialize = named_node(tree, "initialize_receiver_cycle")
+  wait_calls = calls(initialize, "wait")
+  assert len(wait_calls) == 1
+  assert any(
+    keyword.arg == "timeout"
+    for keyword in wait_calls[0].keywords
   )
+  initialize_segment = ast.get_source_segment(source, initialize)
+  assert initialize_segment is not None
+  assert "assistance_state_task_complete.is_set()" in initialize_segment
+  assert "assistance_state_task_complete.wait()" not in initialize_segment
+  assert "if assistance_state_task_started:" in initialize_segment
+
+  receiving = named_node(tree, "run_receiving")
+  receiving_segment = ast.get_source_segment(source, receiving)
+  assert receiving_segment is not None
+  loop = receiving_segment.index("while (")
+  poll = receiving_segment.index(
+    "deferred_result = deferred_assistance_poll()",
+    loop,
+  )
+  receive = receiving_segment.index("pigeon.receive()", loop)
+  assert loop < poll < receive
+  assert receiving_segment.count(
+    "if navigation_database_runtime is not None"
+  ) >= 3
+
+
+def test_late_network_time_remains_a_post_start_assistance_path() -> None:
+  source, tree = source_tree(PIGEOND)
+  node = named_node(tree, "run_receiving")
+  segment = ast.get_source_segment(source, node)
+  assert segment is not None
+  initialization = segment.index("cycle_initialization = initialize_receiver_cycle(")
+  receiving_loop = segment.index("authority_evaluation_for_loop:", initialization)
+  authority_refresh = segment.index("evaluate_time_authority(", receiving_loop)
+  late_time_assistance = segment.index("send_time_assistance(", authority_refresh)
+  assert initialization < receiving_loop < authority_refresh < late_time_assistance
 
 
 def test_acquisition_latch_is_updated_before_receiver_processing() -> None:
@@ -122,28 +147,25 @@ def test_database_decision_runs_before_yuma_transmission() -> None:
   segment = ast.get_source_segment(source, node)
   assert segment is not None
 
-  database_decision = segment.index(
-    "navigation_database_runtime.evaluate("
-  )
-  assert database_decision < segment.index(
-    "yuma_feature.evaluate_provisional("
-  )
-  assert database_decision < segment.index(
-    "yuma_feature.evaluate("
-  )
+  database_decision = segment.index("navigation_database_runtime.evaluate(")
+  assert database_decision < segment.index("yuma_feature.evaluate_provisional(")
+  assert database_decision < segment.index("yuma_feature.evaluate(")
 
-  assert "provisional_yuma_outcome = yuma_feature.evaluate_provisional(\n      send_yuma_message," in segment
+  assert "provisional_yuma_outcome = (" in segment
+  assert "yuma_feature.evaluate_provisional(" in segment
   assert "database_restore_pending=(" in segment
   assert "navigation_database_runtime.database_restore_pending" in segment
-  assert "yuma_outcome = yuma_feature.evaluate(\n      send_yuma_message," in segment
+  assert "yuma_outcome = (" in segment
+  assert "yuma_feature.evaluate(" in segment
+  assert segment.count(
+    "if navigation_database_runtime is not None"
+  ) >= 3
   assert "navigation_database_runtime.note_yuma_sent()" not in segment
 
   helper = named_node(tree, "send_yuma_with_durable_claim")
   helper_segment = ast.get_source_segment(source, helper)
   assert helper_segment is not None
-  assert helper_segment.index(
-    "navigation_database_runtime.claim_yuma_transmission()"
-  ) < helper_segment.index("send_message(message)")
+  assert helper_segment.index("navigation_database_runtime.claim_yuma_transmission()") < helper_segment.index("send_message(message)")
 
   runtime_node = named_node(
     source_tree(RUNTIME)[1],
@@ -185,13 +207,17 @@ def test_yuma_database_state_preserves_pending_disposition() -> None:
   assert "if disposition.database_available" in segment
 
 
-def test_initial_dbd_decision_precedes_time_and_normal_configuration() -> None:
+def test_mandatory_configuration_precedes_assistance_and_optional_work() -> None:
   source, tree = source_tree(PIGEOND)
   init_node = named_node(tree, "init")
   init_segment = ast.get_source_segment(source, init_node)
   assert init_segment is not None
   assert init_segment.index("start_pigeon_transport(pigeon)") < init_segment.index("initialization.run()")
-  assert init_segment.index("initialization.run()") < init_segment.index("finish_pigeon_initialization(pigeon)")
+  mandatory = init_segment.index("finish_pigeon_initialization(pigeon)")
+  assistance = init_segment.index("initialization.run()")
+  optional = init_segment.index("finish_post_start_receiver_configuration(pigeon)")
+  legacy = init_segment.index("run_post_start_legacy_assistance(pigeon)")
+  assert mandatory < assistance < optional < legacy
 
   node = named_node(tree, "initialize_receiver_cycle")
   segment = ast.get_source_segment(source, node)
@@ -200,6 +226,7 @@ def test_initial_dbd_decision_precedes_time_and_normal_configuration() -> None:
   time_assistance = segment.index("send_time_assistance(")
   observations = segment.index("provenance.enable_receiver_observations(")
   assert restore < time_assistance < observations
+  assert not calls(node, "wait_for_current_independent_network_time")
   assert "install_pre_acquisition_initialization(" in segment
 
 
@@ -210,21 +237,31 @@ def test_process_start_transport_precedes_pr66_state_creation() -> None:
   assert segment is not None
   disable_dispatch = segment.index("pigeon.set_frame_dispatcher(None)")
   bootstrap = segment.index("bootstrap_process_start_transport(pigeon)")
-  state = segment.index(") = create_receiver_cycle_assistance_state()")
   enable_dispatch = segment.index("pigeon.set_frame_dispatcher(dispatch_frames)")
   initialize = segment.index("initialize_receiver_cycle(")
-  assert disable_dispatch < bootstrap < state < enable_dispatch < initialize
+  factory = segment.index(
+    "assistance_state_factory=new_receiver_cycle_assistance_state_factory()",
+    initialize,
+  )
+  assert disable_dispatch < bootstrap < enable_dispatch < initialize < factory
 
 
-def test_successful_bootstrap_frames_reach_fresh_pr66_state_before_assistance() -> None:
+def test_bootstrap_frames_dispatch_only_after_mandatory_configuration() -> None:
   source, tree = source_tree(PIGEOND)
   node = named_node(tree, "initialize_receiver_cycle")
-  segment = ast.get_source_segment(source, node)
+  callback = next(
+    item for item in node.body
+    if isinstance(item, ast.FunctionDef)
+    and item.name == "pre_acquisition_initialization"
+  )
+  segment = ast.get_source_segment(source, callback)
   assert segment is not None
-  prepare = segment.index("database_runtime.prepare()")
+  navx5 = segment.index("configure_navx5_ack_aiding(")
+  trusted_time = segment.index("read_host_time_observation()")
+  prepare = segment.index("prepare_assistance_state_before_start(")
   dispatch = segment.index("pigeon.dispatch_pending_frames()")
-  assistance = segment.index("resolve_pre_acquisition_mon_ver(")
-  assert prepare < dispatch < assistance
+  restore = segment.index("restore_navigation_assistance(")
+  assert navx5 < trusted_time < prepare < dispatch < restore
 
 
 def test_pre_database_setup_does_not_ignore_acquisition_frames() -> None:
@@ -313,25 +350,15 @@ def test_structured_telemetry_keeps_assistance_command_order() -> None:
   paused = named_node(tree, "paused_gnss_acquisition")
   paused_segment = ast.get_source_segment(source, paused)
   assert paused_segment is not None
-  assert paused_segment.index(
-    "pigeon.send(CONTROLLED_GNSS_STOP_MESSAGE)"
-  ) < paused_segment.index("yield")
-  assert paused_segment.index("yield") < paused_segment.index(
-    "pigeon.send(CONTROLLED_GNSS_START_MESSAGE)"
-  )
+  assert paused_segment.index("pigeon.send(CONTROLLED_GNSS_STOP_MESSAGE)") < paused_segment.index("yield")
+  assert paused_segment.index("yield") < paused_segment.index("pigeon.send(CONTROLLED_GNSS_START_MESSAGE)")
 
   initialize = named_node(tree, "initialize_receiver_cycle")
   initialize_segment = ast.get_source_segment(source, initialize)
   assert initialize_segment is not None
-  restore = initialize_segment.index(
-    "restore_navigation_assistance("
-  )
-  time_assistance = initialize_segment.index(
-    "send_time_assistance("
-  )
-  acquisition_claim = initialize_segment.index(
-    "claim_acquisition_start("
-  )
+  restore = initialize_segment.index("restore_navigation_assistance(")
+  time_assistance = initialize_segment.index("send_time_assistance(")
+  acquisition_claim = initialize_segment.index("claim_acquisition_start(")
   assert restore < time_assistance < acquisition_claim
 
   restore_helper = named_node(
@@ -343,30 +370,22 @@ def test_structured_telemetry_keeps_assistance_command_order() -> None:
     restore_helper,
   )
   assert restore_segment is not None
-  database_restore = restore_segment.index(
-    "navigation_database_runtime.evaluate("
-  )
-  position_restore = restore_segment.index(
-    "navigation_database_runtime.send_position_once("
-  )
+  database_restore = restore_segment.index("navigation_database_runtime.evaluate(")
+  position_restore = restore_segment.index("navigation_database_runtime.send_position_once(")
   assert database_restore < position_restore
 
   run_receiving = named_node(tree, "run_receiving")
   run_segment = ast.get_source_segment(source, run_receiving)
   assert run_segment is not None
-  receiver_start = run_segment.index(
-    "initialize_receiver_cycle("
-  )
-  runtime_yuma = run_segment.index(
-    "yuma_feature.evaluate("
-  )
+  receiver_start = run_segment.index("initialize_receiver_cycle(")
+  runtime_yuma = run_segment.index("yuma_feature.evaluate(")
   assert receiver_start < runtime_yuma
 
 
 # COMMIT9_DBD_RUNTIME_BEFORE_RECEIVER_TEST
 
 
-def test_dbd_runtime_initialization_precedes_receiver_construction_and_io() -> None:
+def test_dbd_runtime_initialization_is_deferred_until_after_configuration() -> None:
   source, tree = source_tree(PIGEOND)
   node = named_node(tree, "run_receiving")
   segment = ast.get_source_segment(source, node)
@@ -374,35 +393,39 @@ def test_dbd_runtime_initialization_precedes_receiver_construction_and_io() -> N
 
   pigeon = segment.index("pigeon = TTYPigeon(")
   bootstrap = segment.index("bootstrap_process_start_transport(pigeon)")
-  assistance_state = segment.index(
-    "create_receiver_cycle_assistance_state(",
-    bootstrap,
+  first_cycle = segment.index("initialize_receiver_cycle(", bootstrap)
+  assistance_factory = segment.index(
+    "assistance_state_factory=new_receiver_cycle_assistance_state_factory()",
+    first_cycle,
   )
-  first_cycle = segment.index(
-    "initialize_receiver_cycle(",
-    assistance_state,
-  )
-  assert pigeon < bootstrap < assistance_state < first_cycle
+  assert pigeon < bootstrap < first_cycle < assistance_factory
 
   recovery = segment.index("def recover_receiver(")
-  recovery_state = segment.index(
-    "create_receiver_cycle_assistance_state()",
-    recovery,
+  recovery_cycle = segment.index("initialize_receiver_cycle(", recovery)
+  recovery_factory = segment.index(
+    "assistance_state_factory=new_receiver_cycle_assistance_state_factory()",
+    recovery_cycle,
   )
-  recovery_cycle = segment.index(
-    "initialize_receiver_cycle(",
-    recovery_state,
-  )
-  assert recovery < recovery_state < recovery_cycle
+  assert recovery < recovery_cycle < recovery_factory
 
   initialize = named_node(tree, "initialize_receiver_cycle")
   initialize_segment = ast.get_source_segment(source, initialize)
   assert initialize_segment is not None
-  fallback_runtime = initialize_segment.index(
-    "or NavigationDatabaseRestoreRuntime(receiver_fingerprint)"
+  callbacks = [
+    item
+    for item in initialize.body
+    if isinstance(item, ast.FunctionDef)
+    and item.name == "pre_acquisition_initialization"
+  ]
+  assert len(callbacks) == 1
+  callback_segment = ast.get_source_segment(source, callbacks[0])
+  assert callback_segment is not None
+  navx5 = callback_segment.index("configure_navx5_ack_aiding(")
+  trusted_time = callback_segment.index("read_host_time_observation()")
+  assistance_state = callback_segment.index(
+    "prepare_assistance_state_before_start("
   )
-  receiver_start = initialize_segment.index("init(pigeon)")
-  assert fallback_runtime < receiver_start
+  assert navx5 < trusted_time < assistance_state
 
 
 def test_recovery_paths_share_one_bounded_receiver_reset_helper() -> None:
@@ -411,46 +434,29 @@ def test_recovery_paths_share_one_bounded_receiver_reset_helper() -> None:
   segment = ast.get_source_segment(source, node)
   assert segment is not None
 
-  recovery_helpers = [
-    item
-    for item in node.body
-    if (
-      isinstance(item, ast.FunctionDef)
-      and item.name == "recover_receiver"
-    )
-  ]
+  recovery_helpers = [item for item in node.body if (isinstance(item, ast.FunctionDef) and item.name == "recover_receiver")]
   assert len(recovery_helpers) == 1
   helper = recovery_helpers[0]
   helper_segment = ast.get_source_segment(source, helper)
   assert helper_segment is not None
 
-  cancel = helper_segment.index(
-    "position_assistance_retry.cancel_receiver_cycle("
-  )
-  response_reset = helper_segment.index(
-    "prepare_receiver_cycle_response_state(pigeon)"
-  )
+  cancel = helper_segment.index("position_assistance_retry.cancel_receiver_cycle(")
+  response_reset = helper_segment.index("prepare_receiver_cycle_response_state(pigeon)")
+  receiver_cycle = helper_segment.index("initialize_receiver_cycle(")
   fresh_state = helper_segment.index(
-    "create_receiver_cycle_assistance_state()"
+    "assistance_state_factory=new_receiver_cycle_assistance_state_factory()",
+    receiver_cycle,
   )
-  completed = helper_segment.index(
-    "data_watchdog.recovery_completed("
-  )
-  assert cancel < response_reset < fresh_state < completed
-  assert len(
-    calls(helper, "create_receiver_cycle_assistance_state")
-  ) == 1
+  completed = helper_segment.index("data_watchdog.recovery_completed(")
+  assert cancel < response_reset < receiver_cycle < fresh_state < completed
+  assert not calls(helper, "create_receiver_cycle_assistance_state")
   assert "GPS receiver recovery started" in helper_segment
   assert "GPS receiver recovery completed" in helper_segment
   assert 'f"reason={reason_value}"' in helper_segment
   assert 'f"attempt={attempt}"' in helper_segment
 
-  assert segment.count(
-    "recover_receiver(\n        ReceiverRecoveryReason.NO_DATA,"
-  ) == 1
-  assert segment.count(
-    "recover_receiver(\n          ReceiverRecoveryReason.ALL_ZERO_DATA,"
-  ) == 1
+  assert segment.count("recover_receiver(\n        ReceiverRecoveryReason.NO_DATA,") == 1
+  assert segment.count("recover_receiver(\n          ReceiverRecoveryReason.ALL_ZERO_DATA,") == 1
   assert "data_watchdog.request_recovery(" in segment
 
 
@@ -472,9 +478,7 @@ def test_yuma_assistance_state_unavailable_is_terminal_without_retry() -> None:
   feature = named_node(tree, "YumaSupplementationFeature")
   feature_segment = ast.get_source_segment(source, feature)
   assert feature_segment is not None
-  assert feature_segment.count(
-    "yuma_assistance_state_unavailable_outcome("
-  ) >= 2
+  assert feature_segment.count("yuma_assistance_state_unavailable_outcome(") >= 2
   assert "self._cycle_injection_consumed = True" in feature_segment
   assert "self._runtime = None" in feature_segment
   assert "terminal=True" in feature_segment
@@ -493,15 +497,9 @@ def test_configuration_summary_persistence_is_strictly_post_start() -> None:
   start_boundary = named_node(tree, "paused_gnss_acquisition")
   start_segment = ast.get_source_segment(source, start_boundary)
   assert start_segment is not None
-  attempted = start_segment.index(
-    "initialization.note_gnss_start_attempted()"
-  )
-  start_write = start_segment.index(
-    "pigeon.send(CONTROLLED_GNSS_START_MESSAGE)"
-  )
-  persisted = start_segment.index(
-    "persist_receiver_configuration_summary("
-  )
+  attempted = start_segment.index("initialization.note_gnss_start_attempted()")
+  start_write = start_segment.index("pigeon.send(CONTROLLED_GNSS_START_MESSAGE)")
+  persisted = start_segment.index("persist_receiver_configuration_summary(")
   assert attempted < start_write < persisted
 
 

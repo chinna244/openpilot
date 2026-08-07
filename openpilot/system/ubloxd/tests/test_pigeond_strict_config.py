@@ -882,15 +882,21 @@ def test_legacy_backup_and_assistnow_run_only_after_gnss_start(monkeypatch):
   monkeypatch.setattr(pigeond, "_ACTIVE_PRE_ACQUISITION_INITIALIZATION", initialization)
   monkeypatch.setattr(pigeond.time, "sleep", lambda _duration: None)
   monkeypatch.setattr(pigeond, "finish_pigeon_initialization", lambda _pigeon: events.append("strict_configuration"))
+  monkeypatch.setattr(
+    pigeond,
+    "finish_post_start_receiver_configuration",
+    lambda _pigeon: events.append("optional_configuration"),
+  )
   monkeypatch.setattr(pigeond, "run_post_start_legacy_assistance", lambda _pigeon: events.append("legacy_assistance"))
 
   pigeond.init(cast(pigeond.TTYPigeon, Pigeon()))
 
   assert events == [
     "gnss_stop",
-    "assistance",
     "strict_configuration",
+    "assistance",
     "gnss_start",
+    "optional_configuration",
     "legacy_assistance",
   ]
 
@@ -904,6 +910,105 @@ def test_mandatory_configuration_failure_is_degraded_but_not_fatal(monkeypatch):
   assert len(errors) == 1
   assert "degraded" in errors[0]
   assert "continues" in errors[0]
+
+
+def test_pre_start_configuration_runs_only_mandatory_inventory(monkeypatch):
+  calls: list[tuple[str, bool, float | None]] = []
+
+  def run_item(**kwargs):
+    calls.append(
+      (
+        kwargs["item_name"],
+        kwargs["mandatory"],
+        kwargs.get("pre_start_deadline"),
+      )
+    )
+    return pigeond.ReceiverConfigurationItemResult(
+      item_name=kwargs["item_name"],
+      mandatory=kwargs["mandatory"],
+      attempted=False,
+      write_attempt_count=0,
+      ack_status=pigeond.ReceiverConfigurationAckStatus.NOT_REQUIRED,
+      poll_attempt_count=1,
+      readback_status=pigeond.ReceiverConfigurationReadbackStatus.VERIFIED,
+      verified=True,
+      expected_value=kwargs["expected_value"],
+      observed_value="verified",
+      failure_kind=None,
+      failure_phase=None,
+      error_type=None,
+      error=None,
+    )
+
+  monkeypatch.setattr(pigeond, "run_receiver_configuration_item", run_item)
+  monkeypatch.setattr(
+    pigeond,
+    "run_optional_receiver_configuration_items",
+    lambda _pigeon: (_ for _ in ()).throw(AssertionError("optional configuration ran before START")),
+  )
+  pigeon = SimpleNamespace(
+    _receiver_cycle=4,
+    receiver_fingerprint="receiver",
+    _transport_verified_for_receiver_cycle=True,
+  )
+
+  assert pigeond.init_pigeon(
+    cast(pigeond.TTYPigeon, pigeon),
+    pre_start_deadline=45.0,
+    include_optional=False,
+  )
+
+  mandatory_inventory = tuple(item for item in pigeond.RECEIVER_CONFIGURATION_ITEM_INVENTORY if item[1])
+  assert tuple((name, mandatory) for name, mandatory, _ in calls) == mandatory_inventory
+  assert all(deadline == 45.0 for _, _, deadline in calls)
+  summary = pigeond.last_receiver_configuration_summary()
+  assert summary is not None
+  assert tuple((item.item_name, item.mandatory) for item in summary.items) == pigeond.RECEIVER_CONFIGURATION_ITEM_INVENTORY
+  assert all(item.verified for item in summary.items if item.mandatory)
+  assert all(item.failure_kind is pigeond.ReceiverConfigurationFailureKind.DEFERRED_POST_START for item in summary.items if not item.mandatory)
+
+
+def test_optional_inventory_replaces_deferred_results_after_start(monkeypatch):
+  summary = complete_configuration_summary(
+    receiver_cycle=4,
+    receiver_fingerprint="receiver",
+    items=tuple(
+      item
+      if item.mandatory
+      else pigeond.deferred_post_start_configuration_result(
+        item.item_name,
+        item.expected_value,
+      )
+      for item in verified_configuration_items()
+    ),
+  )
+  optional_results = tuple(item for item in verified_configuration_items() if not item.mandatory)
+  monkeypatch.setattr(
+    pigeond,
+    "_current_receiver_configuration_cycle",
+    summary.receiver_cycle,
+  )
+  monkeypatch.setattr(
+    pigeond,
+    "_current_receiver_configuration_fingerprint",
+    summary.receiver_fingerprint,
+  )
+  monkeypatch.setattr(
+    pigeond,
+    "_last_receiver_configuration_summary",
+    summary,
+  )
+  monkeypatch.setattr(
+    pigeond,
+    "run_optional_receiver_configuration_items",
+    lambda _pigeon: optional_results,
+  )
+
+  pigeond.finish_post_start_receiver_configuration(cast(pigeond.TTYPigeon, object()))
+
+  completed = pigeond.last_receiver_configuration_summary()
+  assert completed is not None
+  assert all(item.verified for item in completed.items)
 
 
 def test_mandatory_configuration_failure_still_starts_and_continues(monkeypatch):

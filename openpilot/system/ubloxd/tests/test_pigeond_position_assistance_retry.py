@@ -561,7 +561,7 @@ def test_live_integration_uses_safe_retry_boundaries() -> None:
   assert "note_gnss_start_sent" in initialize_source
   assert "position_assistance_retry.observe_frames(" in run_source
   assert "position_assistance_retry.process_frames(" not in run_source
-  assert run_source.count("execute_position_assistance_retry()") == 4
+  assert run_source.count("execute_position_assistance_retry()") == 5
   assert run_source.count("position_assistance_retry=position_assistance_retry") == 2
   assert run_source.count("recover_receiver(") == 3
 
