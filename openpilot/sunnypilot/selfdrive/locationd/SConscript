@@ -28,3 +28,16 @@ lenv["RPATH"].append(Dir(rednose_gen_dir).abspath)
 locationd = lenv.Program("locationd", locationd_sources, LIBS=["live", "ekf_sym"] + loc_libs + transformations)
 lenv.Depends(locationd, rednose)
 lenv.Depends(locationd, live_ekf)
+
+if GetOption('extras'):
+  test_env = lenv.Clone()
+  test_env.Append(CPPDEFINES=['LOCATIOND_UNIT_TEST'])
+  test_env.Program(
+    'tests/test_locationd_gps_input_safety',
+    [
+      'tests/test_locationd_gps_input_safety.cc',
+      test_env.Object('tests/locationd_ut', 'locationd.cc'),
+      test_env.Object('tests/live_kf_ut', 'models/live_kf.cc'),
+    ],
+    LIBS=["live", "ekf_sym"] + loc_libs + transformations,
+  )
