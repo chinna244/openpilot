@@ -12,6 +12,9 @@ from openpilot.system.ubloxd.rtc_time_observation import (
   RtcObservationReason,
   RtcObservationState,
 )
+from openpilot.system.ubloxd.trusted_time_authority import (
+  TimeAuthorizationEvidence,
+)
 
 
 def network_host_observation(
@@ -209,6 +212,11 @@ def run_receiving_with_fakes(
   rtc_assistance=None,
   send_success: bool = True,
   restore_result=None,
+  inline_assistance_worker: bool = True,
+  cycle_initializer=None,
+  frame_processor=None,
+  yuma_feature_class=None,
+  parsed_frames=(),
 ):
   events = []
   send_calls = []
@@ -270,7 +278,7 @@ def run_receiving_with_fakes(
       events.append(("parser_reset",))
 
     def feed(self, received):
-      return []
+      return list(parsed_frames)
 
   class FakeFixTracker:
     def reset(self):
@@ -327,8 +335,19 @@ def run_receiving_with_fakes(
     def send(self, service, message):
       pass
 
+  class InlineThread:
+    def __init__(self, *, target, **_kwargs):
+      self.target = target
+
+    def start(self):
+      self.target()
+
   def fake_init(pigeon):
     events.append(("init",))
+    initialization = pigeond._ACTIVE_PRE_ACQUISITION_INITIALIZATION
+    if initialization is not None:
+      initialization.run()
+      initialization.note_gnss_start_sent(clock())
 
   def fake_restore(
     pigeon,
@@ -376,12 +395,10 @@ def run_receiving_with_fakes(
       )
       if host_independent:
         utc_value = datetime(2026, 7, 10, tzinfo=UTC)
-        source = "system_synchronized"
         uncertainty = 30
         independent = True
       elif rtc_assistance is not None:
         utc_value, uncertainty = rtc_assistance
-        source = "same_boot_boottime"
         independent = False
       else:
         return SimpleNamespace(
@@ -394,14 +411,13 @@ def run_receiving_with_fakes(
           anchor_write_reason=None,
           anchor_comparison=None,
         )
-      authorized = SimpleNamespace(
+      authorized = pigeond.AuthorizedTime(
         utc=utc_value,
         uncertainty_seconds=float(uncertainty),
-        source=SimpleNamespace(value="system_synchronized"),
-        provenance=SimpleNamespace(value="network_independent"),
+        source=pigeond.TrustedTimeSource.SYSTEM_SYNCHRONIZED,
+        provenance=(pigeond.TimeProvenance.NETWORK_INDEPENDENT if independent else pigeond.TimeProvenance.EXTERNAL_OR_UNKNOWN),
         independent=independent,
-        evidence=SimpleNamespace(value=source),
-        mga_accuracy_seconds=uncertainty,
+        evidence=(TimeAuthorizationEvidence.SYSTEM_SYNCHRONIZED if independent else TimeAuthorizationEvidence.SAME_BOOT_BOOTTIME),
         observed_boottime_seconds=100.0,
       )
       return SimpleNamespace(
@@ -432,6 +448,8 @@ def run_receiving_with_fakes(
     lambda params: "receiver",
   )
   monkeypatch.setattr(pigeond, "TTYPigeon", FakePigeon)
+  if inline_assistance_worker:
+    monkeypatch.setattr(pigeond, "Thread", InlineThread)
   monkeypatch.setattr(pigeond, "init", fake_init)
   monkeypatch.setattr(pigeond, "log_mon_ver_diagnostics", lambda pigeon: None)
   monkeypatch.setattr(
@@ -447,6 +465,24 @@ def run_receiving_with_fakes(
     FakeDumpCollector,
   )
   monkeypatch.setattr(pigeond, "UbloxDataWatchdog", FakeWatchdog)
+  if cycle_initializer is not None:
+    monkeypatch.setattr(
+      pigeond,
+      "initialize_receiver_cycle",
+      cycle_initializer,
+    )
+  if frame_processor is not None:
+    monkeypatch.setattr(
+      pigeond,
+      "process_receiver_frames",
+      frame_processor,
+    )
+  if yuma_feature_class is not None:
+    monkeypatch.setattr(
+      pigeond,
+      "YumaSupplementationFeature",
+      yuma_feature_class,
+    )
 
   def current_host_time():
     trusted = trusted_time() if callable(trusted_time) else trusted_time
@@ -1092,7 +1128,7 @@ def test_startup_diagnostics_initial_cycle_timing(
   assert "cycle_initialization_elapsed_seconds=5.0" in logs[1]
 
 
-def test_run_receiving_wires_initial_cycle_before_init(
+def test_run_receiving_configures_before_initial_time_evaluation(
   monkeypatch,
 ):
   events, _ = run_receiving_with_fakes(
@@ -1103,14 +1139,77 @@ def test_run_receiving_wires_initial_cycle_before_init(
 
   assert [event[0] for event in events] == [
     "cycle_start",
-    "time_authority_evaluate",
     "init",
+    "time_authority_evaluate",
     "restore",
     "time_assistance_send",
     "cycle_complete",
   ]
   assert events[0][1:3] == (1, "process_start")
   assert events[5][1:3] == (1, "process_start")
+
+
+def test_pending_deferred_assistance_does_not_block_receiver_processing_or_yuma(
+  monkeypatch,
+):
+  initializer_calls = []
+  poll_calls = []
+  processed_batches = []
+  yuma_calls = []
+
+  def initialize_cycle(*_args, **_kwargs):
+    initializer_calls.append("initialize")
+
+    def poll_pending_worker():
+      poll_calls.append("poll")
+      return None
+
+    return pigeond.ReceiverCycleInitialization(
+      trusted_time_assistance_sent=False,
+      next_time_assistance_attempt=1_000_000.0,
+      navigation_assistance_restore_attempted=False,
+      mon_ver_info=None,
+      ack_aiding_configuration_attempted=False,
+      assistnow_autonomous_supported=False,
+      assistnow_autonomous_configuration_attempted=False,
+      completed_at=0.0,
+      gnss_start_sent_at=0.0,
+      poll_deferred_assistance_state=poll_pending_worker,
+    )
+
+  def process_frames(frames, *_args, **_kwargs):
+    processed_batches.append(tuple(frames))
+    return None
+
+  class NoYumaBeforeAdoption:
+    cycle_injection_consumed = False
+
+    def __init__(self, *_args, **_kwargs):
+      pass
+
+    def evaluate_provisional(self, *_args, **_kwargs):
+      yuma_calls.append("provisional")
+
+    def evaluate(self, *_args, **_kwargs):
+      yuma_calls.append("normal")
+
+  events, _ = run_receiving_with_fakes(
+    monkeypatch,
+    duration=10,
+    data=b"\x01",
+    inline_assistance_worker=False,
+    cycle_initializer=initialize_cycle,
+    frame_processor=process_frames,
+    yuma_feature_class=NoYumaBeforeAdoption,
+    parsed_frames=(b"NAV-PVT", b"RXM-RAWX"),
+  )
+
+  assert initializer_calls == ["initialize"]
+  assert poll_calls
+  assert processed_batches
+  assert all(batch == (b"NAV-PVT", b"RXM-RAWX") for batch in processed_batches)
+  assert yuma_calls == []
+  assert not any(event[0] == "watchdog_recovery_complete" for event in events)
 
 
 @pytest.mark.parametrize(
@@ -1120,8 +1219,8 @@ def test_run_receiving_wires_initial_cycle_before_init(
       True,
       None,
       [
-        "time_authority_evaluate",
         "init",
+        "time_authority_evaluate",
         "restore",
         "time_assistance_send",
       ],
@@ -1130,16 +1229,14 @@ def test_run_receiving_wires_initial_cycle_before_init(
       False,
       (datetime(2026, 7, 10, tzinfo=UTC), 60),
       [
-        "time_authority_evaluate",
         "init",
-        "restore",
-        "time_assistance_send",
+        "time_authority_evaluate",
       ],
     ),
     (
       False,
       None,
-      ["time_authority_evaluate", "init", "restore"],
+      ["init", "time_authority_evaluate"],
     ),
   ],
 )
@@ -1158,7 +1255,7 @@ def test_run_receiving_restores_cache_only_after_acceptable_time(
   event_names = [event[0] for event in events]
 
   assert event_names[1:-1] == expected_events
-  assert event_names.count("restore") == 1
+  assert event_names.count("restore") == expected_events.count("restore")
 
 
 @pytest.mark.parametrize(
@@ -1186,8 +1283,8 @@ def test_run_receiving_wires_recovery_cycle_and_reset_order(
 
   expected_order = [
     "cycle_start",
-    "time_authority_evaluate",
     "init",
+    "time_authority_evaluate",
     "restore",
     "time_assistance_send",
     "parser_reset",
@@ -1234,17 +1331,20 @@ def test_run_receiving_passes_cycle_context_to_time_assistance(
   assert send_calls[0]["diagnostic_context"] == ("cycle=1, reason=process_start")
 
 
-def test_same_boot_time_is_forwarded_exactly_to_cache_age_selection(monkeypatch):
+def test_same_boot_time_is_forwarded_exactly_to_post_start_assistance(monkeypatch):
   estimated_utc = datetime(2026, 7, 10, 12, 34, 56, tzinfo=UTC)
-  events, _ = run_receiving_with_fakes(
+  events, send_calls = run_receiving_with_fakes(
     monkeypatch,
-    duration=-1,
+    duration=20,
+    data=b"\x01",
     trusted_time=False,
     rtc_assistance=(estimated_utc, 60),
   )
 
-  restore_event = next(event for event in events if event[0] == "restore")
-  assert restore_event[1] == estimated_utc
+  assert not any(event[0] == "restore" for event in events)
+  assert len(send_calls) == 1
+  assert send_calls[0]["assistance_time"] == estimated_utc
+  assert send_calls[0]["source"] == "same_boot_boottime"
 
 
 def test_run_receiving_retries_failed_same_boot_assistance_at_interval(
@@ -1258,9 +1358,11 @@ def test_run_receiving_retries_failed_same_boot_assistance_at_interval(
     send_success=False,
   )
   evaluation_times = [event[1] for event in events if event[0] == "time_authority_evaluate"]
+  send_times = [event[2] for event in events if event[0] == "time_assistance_send"]
 
   assert len(evaluation_times) >= 2
-  assert 30 <= evaluation_times[1] - evaluation_times[0] <= 36
+  assert len(send_times) >= 2
+  assert 30 <= send_times[1] - send_times[0] <= 36
 
 
 def test_run_receiving_retries_failed_synchronized_assistance_at_interval(
@@ -1292,26 +1394,23 @@ def test_run_receiving_restores_cache_after_later_synchronized_time(
   )
   event_names = [event[0] for event in events]
 
-  assert event_names.index("time_authority_evaluate") < (event_names.index("restore"))
-  assert event_names.index("restore") < (event_names.index("time_assistance_send"))
-  assert event_names.count("restore") == 1
+  assert event_names.index("time_authority_evaluate") < (event_names.index("time_assistance_send"))
+  assert event_names.count("restore") == 0
 
 
 def test_run_receiving_does_not_restore_cache_twice_after_rtc_time(
   monkeypatch,
 ):
-  trusted_checks = iter((False, True))
-
   events, send_calls = run_receiving_with_fakes(
     monkeypatch,
     duration=20,
     data=b"\x01",
-    trusted_time=lambda: next(trusted_checks, True),
+    trusted_time=False,
     rtc_assistance=(datetime(2026, 7, 10, tzinfo=UTC), 60),
   )
 
   assert [call.get("source") for call in send_calls] == ["same_boot_boottime"]
-  assert sum(event[0] == "restore" for event in events) == 1
+  assert sum(event[0] == "restore" for event in events) == 0
 
 
 def test_mga_info_code_255_remains_a_strict_failure():
@@ -1618,7 +1717,6 @@ def test_partial_navigation_restore_does_not_delete_cache(
 def test_partial_navigation_restore_is_not_repeated_in_cycle(
   monkeypatch,
 ):
-  trusted_checks = iter((False, True))
   partial_result = pigeond.NavigationAssistanceRestoreResult(
     status=pigeond.NavigationAssistanceRestoreStatus.PARTIAL,
     total_frame_count=3,
@@ -1630,12 +1728,11 @@ def test_partial_navigation_restore_is_not_repeated_in_cycle(
     monkeypatch,
     duration=20,
     data=b"\x01",
-    trusted_time=lambda: next(trusted_checks, True),
-    rtc_assistance=(datetime(2026, 7, 10, tzinfo=UTC), 60),
+    trusted_time=True,
     restore_result=partial_result,
   )
 
-  assert [call.get("source") for call in send_calls] == ["same_boot_boottime"]
+  assert [call.get("source") for call in send_calls] == ["system_synchronized"]
   assert sum(event[0] == "restore" for event in events) == 1
 
 
@@ -1938,22 +2035,24 @@ def test_startup_diagnostics_logs_signal_milestones_once_and_resets(
 def test_time_assistance_rejection_and_later_acceptance_are_separate(
   monkeypatch,
 ):
-  acknowledgments = iter((
-    SimpleNamespace(
-      accepted=False,
-      acknowledgment_type=0,
-      version=0,
-      info_code=5,
-      message_id=0x40,
-    ),
-    SimpleNamespace(
-      accepted=True,
-      acknowledgment_type=1,
-      version=0,
-      info_code=0,
-      message_id=0x40,
-    ),
-  ))
+  acknowledgments = iter(
+    (
+      SimpleNamespace(
+        accepted=False,
+        acknowledgment_type=0,
+        version=0,
+        info_code=5,
+        message_id=0x40,
+      ),
+      SimpleNamespace(
+        accepted=True,
+        acknowledgment_type=1,
+        version=0,
+        info_code=0,
+        message_id=0x40,
+      ),
+    )
+  )
   sent_at = iter((10.1, 40.1))
   monotonic_values = iter((10.0, 10.2, 40.0, 40.2))
   attempts = []
@@ -1961,9 +2060,7 @@ def test_time_assistance_rejection_and_later_acceptance_are_separate(
   monkeypatch.setattr(
     pigeond,
     "_begin_response_transaction",
-    lambda _pigeon, _message: SimpleNamespace(
-      sent_at=next(sent_at)
-    ),
+    lambda _pigeon, _message: SimpleNamespace(sent_at=next(sent_at)),
   )
   monkeypatch.setattr(
     pigeond,
@@ -1996,36 +2093,21 @@ def test_time_assistance_rejection_and_later_acceptance_are_separate(
   assert rejected.attempted_at == 10.0
   assert rejected.written_at == 10.1
   assert rejected.ack_observed_at == 10.2
-  assert (
-    rejected.write_status
-    is pigeond.TimeAssistanceWriteStatus.SUCCEEDED
-  )
-  assert (
-    rejected.ack_status
-    is pigeond.TimeAssistanceAckStatus.REJECTED
-  )
+  assert rejected.write_status is pigeond.TimeAssistanceWriteStatus.SUCCEEDED
+  assert rejected.ack_status is pigeond.TimeAssistanceAckStatus.REJECTED
   assert rejected.ack_info_code == 5
   assert rejected.accepted_at is None
   assert rejected.message_id == 0x40
   assert rejected.message_type == 0x10
-  assert (
-    rejected.diagnostic_context
-    == "cycle=1, reason=process_start"
-  )
+  assert rejected.diagnostic_context == "cycle=1, reason=process_start"
 
   assert accepted.attempted_at == 40.0
   assert accepted.written_at == 40.1
   assert accepted.ack_observed_at == 40.2
-  assert (
-    accepted.ack_status
-    is pigeond.TimeAssistanceAckStatus.ACCEPTED
-  )
+  assert accepted.ack_status is pigeond.TimeAssistanceAckStatus.ACCEPTED
   assert accepted.ack_info_code == 0
   assert accepted.accepted_at == 40.2
-  assert (
-    accepted.diagnostic_context
-    == "cycle=1, reason=runtime_retry"
-  )
+  assert accepted.diagnostic_context == "cycle=1, reason=runtime_retry"
 
 
 def test_time_assistance_diagnostic_callback_is_fail_open(
@@ -2047,9 +2129,7 @@ def test_time_assistance_diagnostic_callback_is_fail_open(
     source="system_synchronized",
     diagnostic_callback=fail_callback,
   )
-  assert callback_errors == [
-    "GPS time assistance diagnostic callback failed"
-  ]
+  assert callback_errors == ["GPS time assistance diagnostic callback failed"]
 
 
 def test_time_assistance_log_includes_cycle_context(

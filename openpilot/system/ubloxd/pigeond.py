@@ -14,8 +14,10 @@ from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, UTC
 from enum import StrEnum
+from functools import partial
 from math import ceil, isfinite
 from pathlib import Path
+from threading import Event, Lock, Thread
 from typing import Any, cast
 
 from openpilot.cereal import log, messaging
@@ -129,11 +131,14 @@ from openpilot.system.ubloxd.navigation_database_restore_runtime import (
   PositionAssistanceAckStatus,
   PositionAssistanceFailureKind,
   PositionAssistanceWriteStatus,
+  quarantine_navigation_database_restore_boot_state,
+  store_navigation_database_restore_boot_state,
 )
 from openpilot.system.ubloxd.position_assistance_retry import (
   PositionAssistanceRetryResult,
   PositionAssistanceRetryRuntime,
   PositionAssistanceRetryState,
+  store_position_assistance_retry_state,
 )
 from openpilot.system.ubloxd.receiver_time_provenance import (
   ReceiverTimeProvenanceTracker,
@@ -230,12 +235,16 @@ PRE_TRANSACTION_DRAIN_MAX_BYTES = 64 * 1024
 CONTROLLED_GNSS_STOP_MESSAGE = b"\xB5\x62\x06\x04\x04\x00\x00\x00\x08\x00\x16\x74"
 CONTROLLED_GNSS_START_MESSAGE = b"\xB5\x62\x06\x04\x04\x00\x00\x00\x09\x00\x17\x76"
 CONTROLLED_GNSS_TRANSITION_DELAY = 0.05
-# General callers may still use a bounded wait for independent network time.
+# General post-START callers may still use a bounded wait for independent
+# network time. Receiver initialization samples trusted time once and never
+# waits for it before GNSS START.
 NAVIGATION_DATABASE_TRUSTED_TIME_WAIT_SECONDS = 40.0
-# Only a prequalified process-start DBD candidate may wait for current
-# independent network time. The absolute deadline is measured from receiver
-# cycle start, so transport/configuration time consumes the same budget.
+# The absolute pre-START deadline is measured from receiver cycle start.
 NAVIGATION_DATABASE_PROCESS_START_TIME_DEADLINE_SECONDS = 45.0
+# Leave enough time to return from a bounded assistance-setup wait and reach
+# the GNSS START UART boundary. Unbounded factory/cache work never runs on the
+# startup thread.
+PRE_START_ASSISTANCE_SETUP_RESERVE_SECONDS = 0.5
 NAVIGATION_DATABASE_TRUSTED_TIME_POLL_SECONDS = 0.25
 # A validated MGA-DBD cache is capped at 64 KiB. Frequent dispatch between
 # transactions is the primary bound; these limits retain four cache volumes or
@@ -1816,6 +1825,7 @@ class ReceiverConfigurationFailureKind(StrEnum):
   PARSER_ERROR = "parser_error"
   TRANSACTION_ERROR = "transaction_error"
   DEADLINE_EXHAUSTED = "deadline_exhausted"
+  DEFERRED_POST_START = "deferred_post_start"
 
 
 class ReceiverConfigurationAckStatus(StrEnum):
@@ -1834,6 +1844,7 @@ class ReceiverConfigurationReadbackStatus(StrEnum):
   PARSER_ERROR = "parser_error"
   NOT_SUPPORTED = "not_supported"
   DEADLINE_EXHAUSTED = "deadline_exhausted"
+  DEFERRED_POST_START = "deferred_post_start"
 
 
 @dataclass(frozen=True)
@@ -2162,7 +2173,7 @@ class ReceiverConfigurationPersistenceStatus:
   error: str | None = None
 
 
-RECEIVER_CONFIGURATION_SUMMARY_SCHEMA_VERSION = 2
+RECEIVER_CONFIGURATION_SUMMARY_SCHEMA_VERSION = 3
 RECEIVER_CONFIGURATION_SUMMARY_MAX_BYTES = 16384
 
 
@@ -2338,6 +2349,7 @@ def validate_receiver_configuration_summary_record(record: object) -> None:
       ReceiverConfigurationFailureKind.PARSER_ERROR.value: ReceiverConfigurationReadbackStatus.PARSER_ERROR.value,
       ReceiverConfigurationFailureKind.POLL_TIMEOUT.value: ReceiverConfigurationReadbackStatus.TIMED_OUT.value,
       ReceiverConfigurationFailureKind.DEADLINE_EXHAUSTED.value: ReceiverConfigurationReadbackStatus.DEADLINE_EXHAUSTED.value,
+      ReceiverConfigurationFailureKind.DEFERRED_POST_START.value: ReceiverConfigurationReadbackStatus.DEFERRED_POST_START.value,
     }
     if item["failure_kind"] in expected_readback_for_failure and item["readback_status"] != expected_readback_for_failure[item["failure_kind"]]:
       raise ReceiverConfigurationError("receiver configuration failure/readback state is inconsistent")
@@ -2622,10 +2634,147 @@ def begin_receiver_configuration_cycle(
     pass
 
 
+def deferred_post_start_configuration_result(
+  item_name: str,
+  expected_value: str,
+) -> ReceiverConfigurationItemResult:
+  return ReceiverConfigurationItemResult(
+    item_name=item_name,
+    mandatory=False,
+    attempted=False,
+    write_attempt_count=0,
+    ack_status=ReceiverConfigurationAckStatus.NOT_REQUIRED,
+    poll_attempt_count=0,
+    readback_status=(
+      ReceiverConfigurationReadbackStatus.DEFERRED_POST_START
+    ),
+    verified=False,
+    expected_value=expected_value,
+    observed_value=None,
+    failure_kind=(
+      ReceiverConfigurationFailureKind.DEFERRED_POST_START
+    ),
+    failure_phase="post_start",
+    error_type="DeferredPostStart",
+    error="optional receiver configuration deferred until after GNSS START",
+  )
+
+
+def run_optional_receiver_configuration_items(
+  pigeon: TTYPigeon,
+) -> tuple[ReceiverConfigurationItemResult, ...]:
+  """Run optional output and diagnostic checks only after GNSS START."""
+  results: list[ReceiverConfigurationItemResult] = []
+
+  def poll(poll_function: Callable[..., object], *args: object) -> object:
+    try:
+      return poll_function(pigeon, *args, timeout=0.5, deadline=None)
+    except TypeError as exc:
+      if not any(
+        keyword in str(exc)
+        for keyword in (
+          "unexpected keyword argument 'timeout'",
+          "unexpected keyword argument 'deadline'",
+        )
+      ):
+        raise
+      return poll_function(pigeon, *args)
+
+  for definition in RECEIVER_OUTPUT_STREAM_ITEMS:
+    if definition.mandatory:
+      continue
+    message = add_ubx_checksum(bytes((
+      0xB5, 0x62, 0x06, 0x01, 0x03, 0x00,
+      definition.message_class, definition.message_id, 0x01,
+    )))
+    results.append(run_receiver_configuration_item(
+      item_name=definition.item_name,
+      mandatory=False,
+      expected_value=definition.expected_value,
+      poll=lambda cls=definition.message_class, msg=definition.message_id: poll(
+        poll_cfg_msg, cls, msg,
+      ),
+      verify=lambda value: (
+        (_ for _ in ()).throw(
+          ReceiverConfigurationError("CFG-MSG UART1 rate mismatch")
+        )
+        if value.rates[1] != 1 else None
+      ),
+      write=lambda message=message: send_configuration_with_ack(
+        pigeon, message,
+      ),
+    ))
+
+  def verify_diagnostic_readback(
+    value: object,
+    expected_type: type,
+    name: str,
+    verifier: Callable[[object], None],
+  ) -> None:
+    if not isinstance(value, expected_type):
+      raise ReceiverConfigurationParserError(
+        f"{name} response unavailable, malformed, or unsupported layout"
+      )
+    verifier(value)
+
+  for name, expected, poll_item, verify in (
+    (
+      "CFG-GNSS",
+      "gps_enabled_valid_channels",
+      lambda: poll(poll_cfg_gnss),
+      lambda value: verify_diagnostic_readback(
+        value,
+        GnssConfig,
+        "CFG-GNSS",
+        lambda parsed: verify_cfg_gnss_conservatively(
+          cast(GnssConfig, parsed)
+        ),
+      ),
+    ),
+    (
+      "CFG-RXM",
+      "continuous_mode=0_or_4",
+      lambda: poll(poll_cfg_rxm),
+      lambda value: verify_diagnostic_readback(
+        value,
+        RxmConfig,
+        "CFG-RXM",
+        lambda parsed: verify_cfg_rxm_conservatively(
+          cast(RxmConfig, parsed)
+        ),
+      ),
+    ),
+    (
+      "CFG-PM2",
+      "inactive_power_management",
+      lambda: poll(poll_cfg_pm2),
+      lambda value: verify_diagnostic_readback(
+        value,
+        Pm2Config,
+        "CFG-PM2",
+        lambda parsed: verify_cfg_pm2_conservatively(
+          cast(Pm2Config, parsed)
+        ),
+      ),
+    ),
+  ):
+    results.append(run_receiver_configuration_item(
+      item_name=name,
+      mandatory=False,
+      expected_value=expected,
+      poll=poll_item,
+      verify=verify,
+      write=lambda: None,
+      max_write_attempts=0,
+    ))
+  return tuple(results)
+
+
 def init_pigeon(
   pigeon: TTYPigeon,
   *,
   pre_start_deadline: float | None = None,
+  include_optional: bool = True,
 ) -> bool:
   """Configure independent receiver items without replaying earlier items."""
   global _last_receiver_configuration_summary
@@ -2725,6 +2874,8 @@ def init_pigeon(
     if value != ItfmConfig(0xAD62ADFF, 0x0000631E) else None, "0xAD62ADFF/0x0000631E",
   )
   for definition in RECEIVER_OUTPUT_STREAM_ITEMS:
+    if not definition.mandatory:
+      continue
     message = bytes((
       0xB5, 0x62, 0x06, 0x01, 0x03, 0x00,
       definition.message_class, definition.message_id, 0x01,
@@ -2737,51 +2888,25 @@ def init_pigeon(
       if value.rates[1] != 1 else None,
       definition.expected_value, definition.mandatory,
     )
-
-  def verify_diagnostic_readback(
-    value: object,
-    expected_type: type,
-    name: str,
-    verifier: Callable[[object], None],
-  ) -> None:
-    if not isinstance(value, expected_type):
-      raise ReceiverConfigurationParserError(
-        f"{name} response unavailable, malformed, or unsupported layout"
-      )
-    verifier(value)
-
-  for name, expected, poll, verify in (
-    (
-      "CFG-GNSS",
-      "gps_enabled_valid_channels",
-      lambda: poll_with_remaining_deadline(poll_cfg_gnss),
-      lambda value: verify_diagnostic_readback(value, GnssConfig, "CFG-GNSS", lambda parsed: verify_cfg_gnss_conservatively(cast(GnssConfig, parsed))),
-    ),
-    (
-      "CFG-RXM",
-      "continuous_mode=0_or_4",
-      lambda: poll_with_remaining_deadline(poll_cfg_rxm),
-      lambda value: verify_diagnostic_readback(value, RxmConfig, "CFG-RXM", lambda parsed: verify_cfg_rxm_conservatively(cast(RxmConfig, parsed))),
-    ),
-    (
-      "CFG-PM2",
-      "inactive_power_management",
-      lambda: poll_with_remaining_deadline(poll_cfg_pm2),
-      lambda value: verify_diagnostic_readback(value, Pm2Config, "CFG-PM2", lambda parsed: verify_cfg_pm2_conservatively(cast(Pm2Config, parsed))),
-    ),
-  ):
-    add(
-      run_receiver_configuration_item(
-        item_name=name,
-        mandatory=False,
-        expected_value=expected,
-        poll=poll,
-        verify=verify,
-        write=lambda: None,
-        max_write_attempts=0,
-        pre_start_deadline=pre_start_deadline,
-      )
-    )
+  if include_optional:
+    results.extend(run_optional_receiver_configuration_items(pigeon))
+  else:
+    optional_expected_values = {
+      definition.item_name: definition.expected_value
+      for definition in RECEIVER_OUTPUT_STREAM_ITEMS
+      if not definition.mandatory
+    }
+    optional_expected_values.update({
+      "CFG-GNSS": "gps_enabled_valid_channels",
+      "CFG-RXM": "continuous_mode=0_or_4",
+      "CFG-PM2": "inactive_power_management",
+    })
+    for item_name, mandatory in RECEIVER_CONFIGURATION_ITEM_INVENTORY:
+      if not mandatory:
+        add(deferred_post_start_configuration_result(
+          item_name,
+          optional_expected_values[item_name],
+        ))
   _last_receiver_configuration_summary = ReceiverConfigurationSummary(
     receiver_cycle,
     (
@@ -2820,6 +2945,45 @@ def init_pigeon(
     + "mandatory_failures=0"
   )
   return True
+
+
+def finish_post_start_receiver_configuration(
+  pigeon: TTYPigeon,
+) -> None:
+  """Replace deferred optional results without delaying GNSS START."""
+  global _last_receiver_configuration_summary
+  summary = _last_receiver_configuration_summary
+  if (
+    summary is None
+    or not receiver_configuration_summary_matches_active_cycle(summary)
+  ):
+    return
+  optional_results = {
+    result.item_name: result
+    for result in run_optional_receiver_configuration_items(pigeon)
+  }
+  expected_optional_names = {
+    item_name
+    for item_name, mandatory in RECEIVER_CONFIGURATION_ITEM_INVENTORY
+    if not mandatory
+  }
+  if set(optional_results) != expected_optional_names:
+    raise ReceiverConfigurationError(
+      "post-START receiver configuration inventory is incomplete"
+    )
+  _last_receiver_configuration_summary = replace(
+    summary,
+    configuration_completed_at=time.monotonic(),
+    items=tuple(
+      optional_results.get(result.item_name, result)
+      for result in summary.items
+    ),
+    navx5_ack_aiding_result=(
+      _ACTIVE_PRE_ACQUISITION_INITIALIZATION.navx5_ack_aiding_result
+      if _ACTIVE_PRE_ACQUISITION_INITIALIZATION is not None
+      else summary.navx5_ack_aiding_result
+    ),
+  )
 
 
 def run_post_start_legacy_assistance(pigeon: TTYPigeon) -> None:
@@ -2893,6 +3057,7 @@ class PreAcquisitionInitialization:
         _last_receiver_configuration_summary,
         gnss_start_attempted=True,
         gnss_start_sent=True,
+        navx5_ack_aiding_result=self.navx5_ack_aiding_result,
       )
 
   def note_gnss_start_attempted(self) -> None:
@@ -2906,6 +3071,7 @@ class PreAcquisitionInitialization:
       _last_receiver_configuration_summary = replace(
         _last_receiver_configuration_summary,
         gnss_start_attempted=True,
+        navx5_ack_aiding_result=self.navx5_ack_aiding_result,
       )
 
   def require_pre_gnss_start_drain(self) -> None:
@@ -3088,10 +3254,24 @@ def paused_gnss_acquisition(pigeon: TTYPigeon) -> Iterator[None]:
   body_error: BaseException | None = None
   drain_error: BaseException | None = None
   start_error: BaseException | None = None
+  initialization = _ACTIVE_PRE_ACQUISITION_INITIALIZATION
   try:
     stopped_at = time.monotonic()
     cloudlog.info(f"GPS acquisition transition: phase=stop_sent monotonic={stopped_at:.6f}")
-    time.sleep(CONTROLLED_GNSS_TRANSITION_DELAY)
+    transition_delay = CONTROLLED_GNSS_TRANSITION_DELAY
+    if (
+      initialization is not None
+      and initialization.pre_start_deadline is not None
+    ):
+      transition_delay = min(
+        transition_delay,
+        max(
+          0.0,
+          initialization.pre_start_deadline - time.monotonic(),
+        ),
+      )
+    if transition_delay > 0.0:
+      time.sleep(transition_delay)
     yield
   except BaseException as exc:
     body_error = exc
@@ -3184,7 +3364,11 @@ def paused_gnss_acquisition(pigeon: TTYPigeon) -> Iterator[None]:
 def finish_pigeon_initialization(pigeon: TTYPigeon) -> bool:
   initialization = _ACTIVE_PRE_ACQUISITION_INITIALIZATION
   initialized = (
-    init_pigeon(pigeon, pre_start_deadline=initialization.pre_start_deadline)
+    init_pigeon(
+      pigeon,
+      pre_start_deadline=initialization.pre_start_deadline,
+      include_optional=False,
+    )
     if initialization is not None
     else init_pigeon(pigeon)
   )
@@ -3199,8 +3383,23 @@ def init(pigeon: TTYPigeon) -> None:
     start_pigeon_transport(pigeon)
   if initialization is not None:
     with paused_gnss_acquisition(pigeon):
-      initialization.run()
       finish_pigeon_initialization(pigeon)
+      initialization.run()
+    try:
+      finish_post_start_receiver_configuration(pigeon)
+    except Exception:
+      cloudlog.exception(
+        "GPS optional post-START receiver configuration failed"
+      )
+    if (
+      _last_receiver_configuration_summary is not None
+      and receiver_configuration_summary_matches_active_cycle(
+        _last_receiver_configuration_summary
+      )
+    ):
+      persist_receiver_configuration_summary(
+        _last_receiver_configuration_summary
+      )
     run_post_start_legacy_assistance(pigeon)
     return
   finish_pigeon_initialization(pigeon)
@@ -5964,6 +6163,9 @@ class ReceiverCycleInitialization:
     ...,
   ] = ()
   gnss_start_sent_at: float | None = None
+  poll_deferred_assistance_state: (
+    Callable[[], NavigationAssistanceRestoreResult | None] | None
+  ) = None
 
 
 def _startup_timeline_elapsed(
@@ -6361,6 +6563,16 @@ def initialize_receiver_cycle(
   allow_database_trusted_time_wait: bool = False,
   network_available: bool | None = False,
   network_available_reader: Callable[[], bool | None] | None = None,
+  assistance_state_factory: Callable[[], tuple[
+    NavigationDatabaseRestoreRuntime,
+    PositionAssistancePostStartRetryController,
+    "ReceiverAcquisitionStateGuard",
+  ]] | None = None,
+  assistance_state_ready_callback: Callable[[
+    NavigationDatabaseRestoreRuntime,
+    PositionAssistancePostStartRetryController,
+    "ReceiverAcquisitionStateGuard",
+  ], None] | None = None,
 ) -> ReceiverCycleInitialization:
   if cycle_started_at is None:
     cycle_started_at = time.monotonic()
@@ -6373,6 +6585,21 @@ def initialize_receiver_cycle(
     and not callable(network_available_reader)
   ):
     raise ValueError("network_available_reader must be callable")
+  if assistance_state_factory is not None and not callable(
+    assistance_state_factory
+  ):
+    raise ValueError("assistance_state_factory must be callable")
+  if assistance_state_ready_callback is not None and not callable(
+    assistance_state_ready_callback
+  ):
+    raise ValueError("assistance_state_ready_callback must be callable")
+  if (
+    assistance_state_factory is not None
+    and navigation_database_runtime is not None
+  ):
+    raise ValueError(
+      "assistance_state_factory and navigation_database_runtime are mutually exclusive"
+    )
   begin_receiver_configuration_cycle(
     pigeon,
     receiver_fingerprint,
@@ -6398,52 +6625,23 @@ def initialize_receiver_cycle(
     pass
 
   authority = time_authority or TimeAuthority()
-  host_time_observation = read_host_time_observation()
-  authority_evaluation = evaluate_time_authority(
-    authority,
-    host_time_observation,
-  )
-  authorized_time = authority_evaluation.authorized_time
-  authority_evaluated_at = time.monotonic()
-  independent_network_time_seen_at = (
-    authority_evaluated_at
-    if _startup_timeline_has_current_network_time(
-      authorized_time
-    )
-    else None
-  )
+  # Trusted time is deliberately sampled once inside the pre-acquisition
+  # callback, after mandatory receiver configuration and NAVX5 ACK-aiding.
+  host_time_observation: HostTimeObservation | None = None
+  authority_evaluation: TimeAuthorityEvaluation | None = None
+  authorized_time: AuthorizedTime | None = None
+  independent_network_time_seen_at: float | None = None
   trusted_time_wait_started_at: float | None = None
   trusted_time_wait_completed_at: float | None = None
   trusted_time_wait_deadline: float | None = None
   trusted_time_wait_error_type: str | None = None
   trusted_time_wait_error: str | None = None
-  trusted_time_wait_failed = False
   pre_start_deadline = (
     cycle_started_at
     + NAVIGATION_DATABASE_PROCESS_START_TIME_DEADLINE_SECONDS
   )
   acquisition_start_claimed_at: float | None = None
-  try:
-    database_runtime = (
-      navigation_database_runtime
-      or NavigationDatabaseRestoreRuntime(receiver_fingerprint)
-    )
-  except NavigationDatabaseRestoreInitializationError as exc:
-    cloudlog.exception(
-      "GPS assistance state unavailable; assistance disabled while "
-      + "GNSS START continues"
-    )
-    database_runtime = NavigationDatabaseRestoreUnavailableRuntime(
-      receiver_fingerprint,
-      str(exc),
-    )
-  database_runtime.prepare()
-  if (
-    transport_mon_ver_info is not None
-    and hasattr(pigeon, "dispatch_pending_frames")
-  ):
-    pigeon.dispatch_pending_frames()
-
+  database_runtime = navigation_database_runtime
   mon_ver_info: MonVerInfo | None = None
   ack_aiding_configuration_attempted = False
   ack_aiding_configuration_result: (
@@ -6464,11 +6662,22 @@ def initialize_receiver_cycle(
     TimeAssistanceAttemptDiagnostic
   ] = []
   acquisition_start_claimed = False
+  pre_start_assistance_deferred = False
   next_time_assistance_attempt = (
     cycle_started_at + TIME_SYNC_CHECK_INTERVAL
   )
 
   assistance_state_failure_logged = False
+  assistance_state_task_complete = Event()
+  assistance_state_task_started = False
+  assistance_state_task_result: tuple[
+    NavigationDatabaseRestoreRuntime,
+    PositionAssistancePostStartRetryController,
+    ReceiverAcquisitionStateGuard,
+  ] | None = None
+  assistance_state_task_error: Exception | None = None
+  deferred_assistance_state_finalized = False
+  gnss_start_observed_at: float | None = None
 
   def note_time_assistance_attempt(
     diagnostic: TimeAssistanceAttemptDiagnostic,
@@ -6500,7 +6709,128 @@ def initialize_receiver_cycle(
       ))
     )
 
+  def activate_assistance_state(
+    runtime: NavigationDatabaseRestoreRuntime,
+    retry: PositionAssistancePostStartRetryController,
+    guard: ReceiverAcquisitionStateGuard | None,
+  ) -> None:
+    nonlocal database_runtime
+    nonlocal position_assistance_retry
+    database_runtime = runtime
+    position_assistance_retry = retry
+    if assistance_state_ready_callback is not None and guard is not None:
+      assistance_state_ready_callback(runtime, retry, guard)
+
+  def unavailable_assistance_state(exc: Exception) -> tuple[
+    NavigationDatabaseRestoreRuntime,
+    PositionAssistancePostStartRetryController,
+    ReceiverAcquisitionStateGuard,
+  ]:
+    cloudlog.error(
+      "GPS assistance state unavailable; assistance disabled while "
+      + "GNSS START continues, error_type="
+      + type(exc).__name__
+      + ", error="
+      + str(exc)[:512]
+    )
+    retry = (
+      position_assistance_retry
+      or PositionAssistancePostStartRetryController(None)
+    )
+    retry.runtime = None
+    return (
+      NavigationDatabaseRestoreUnavailableRuntime(
+        receiver_fingerprint,
+        str(exc),
+      ),
+      retry,
+      ReceiverAcquisitionStateGuard(),
+    )
+
+  def run_assistance_state_task() -> None:
+    nonlocal assistance_state_task_result
+    nonlocal assistance_state_task_error
+    try:
+      if assistance_state_factory is None:
+        runtime = NavigationDatabaseRestoreRuntime(receiver_fingerprint)
+        retry = (
+          position_assistance_retry
+          or PositionAssistancePostStartRetryController(None)
+        )
+        guard = ReceiverAcquisitionStateGuard()
+      else:
+        runtime, retry, guard = assistance_state_factory()
+      runtime.prepare()
+      assistance_state_task_result = (runtime, retry, guard)
+    except Exception as exc:
+      assistance_state_task_error = exc
+    finally:
+      assistance_state_task_complete.set()
+
+  def start_assistance_state_task() -> None:
+    nonlocal assistance_state_task_started
+    if assistance_state_task_started:
+      return
+    assistance_state_task_started = True
+    thread = Thread(
+      target=run_assistance_state_task,
+      name="pigeond-assistance-state",
+      daemon=True,
+    )
+    thread.start()
+
+  def adopt_completed_assistance_state() -> bool:
+    if not assistance_state_task_complete.is_set():
+      return False
+    if assistance_state_task_error is not None:
+      runtime, retry, guard = unavailable_assistance_state(
+        assistance_state_task_error
+      )
+    else:
+      assert assistance_state_task_result is not None
+      runtime, retry, guard = assistance_state_task_result
+    activate_assistance_state(runtime, retry, guard)
+    return True
+
+  def prepare_assistance_state_before_start(
+    *,
+    current_network_time: bool,
+  ) -> bool:
+    nonlocal database_runtime
+    if database_runtime is not None:
+      try:
+        database_runtime.prepare()
+      except Exception as exc:
+        runtime, retry, guard = unavailable_assistance_state(exc)
+        activate_assistance_state(runtime, retry, guard)
+      return True
+
+    # Production factory/cache work is useful pre-START only when current
+    # trusted time makes DBD restore eligible. Never start it merely to close
+    # an unusable DBD window.
+    if not current_network_time:
+      return False
+    setup_deadline = (
+      pre_start_deadline
+      - PRE_START_ASSISTANCE_SETUP_RESERVE_SECONDS
+    )
+    remaining = setup_deadline - time.monotonic()
+    if remaining <= 0.0:
+      return False
+    start_assistance_state_task()
+    if not assistance_state_task_complete.wait(timeout=remaining):
+      return False
+    if time.monotonic() > setup_deadline:
+      return False
+    return adopt_completed_assistance_state()
+
+  def start_assistance_state_after_start() -> None:
+    if database_runtime is None:
+      start_assistance_state_task()
+
   def pre_acquisition_initialization() -> None:
+    nonlocal database_runtime
+    nonlocal position_assistance_retry
     nonlocal mon_ver_info
     nonlocal ack_aiding_configuration_attempted
     nonlocal ack_aiding_configuration_result
@@ -6524,20 +6854,8 @@ def initialize_receiver_cycle(
     nonlocal trusted_time_wait_deadline
     nonlocal trusted_time_wait_error_type
     nonlocal trusted_time_wait_error
-    nonlocal trusted_time_wait_failed
     nonlocal acquisition_start_claimed_at
-    nonlocal network_available
-
-    def observe_network_available() -> bool | None:
-      nonlocal network_available
-      if network_available_reader is None:
-        return network_available
-      observed = network_available_reader()
-      if observed is True:
-        network_available = True
-      elif observed is False and network_available is not True:
-        network_available = False
-      return observed
+    nonlocal pre_start_assistance_deferred
 
     mon_ver_info = resolve_pre_acquisition_mon_ver(
       pigeon,
@@ -6562,91 +6880,47 @@ def initialize_receiver_cycle(
     initialization.navx5_ack_aiding_result = (
       ack_aiding_configuration_result
     )
+    authority_evaluated_at = time.monotonic()
+    if authority_evaluated_at < pre_start_deadline:
+      host_time_observation = read_host_time_observation()
+      authority_evaluation = evaluate_time_authority(
+        authority,
+        host_time_observation,
+      )
+      authorized_time = authority_evaluation.authorized_time
+      authority_evaluated_at = time.monotonic()
+    else:
+      cloudlog.info(
+        "GPS trusted time check skipped: pre-START deadline exhausted"
+      )
     current_network_time = (
       authorized_time is not None
       and is_current_independent_network_time(authorized_time)
     )
-    should_wait_for_database_time = (
-      should_wait_for_navigation_database_trusted_time(
-        restore_pending=database_runtime.controller.pending,
-        state_available=database_runtime.state_available,
-        candidate_available=(
-          database_runtime.has_prequalified_database_candidate
-        ),
-        allow_wait=allow_database_trusted_time_wait,
-        network_available=network_available,
-        network_recheck_available=(network_available_reader is not None),
-        acquisition_started=database_runtime.acquisition_started,
-        current_network_time=current_network_time,
-      )
+    if current_network_time:
+      independent_network_time_seen_at = authority_evaluated_at
+
+    assistance_state_ready = prepare_assistance_state_before_start(
+      current_network_time=current_network_time,
     )
-    if should_wait_for_database_time:
-      trusted_time_wait_started_at = time.monotonic()
-      trusted_time_wait_deadline = (
-        cycle_started_at
-        + NAVIGATION_DATABASE_PROCESS_START_TIME_DEADLINE_SECONDS
+    if not assistance_state_ready:
+      pre_start_assistance_deferred = True
+      cloudlog.info(
+        "GPS pre-START assistance deferred: no safe bounded setup budget"
       )
-      remaining_wait_seconds = (
-        navigation_database_process_start_wait_seconds(
-          cycle_started_at,
-          trusted_time_wait_started_at,
-        )
-      )
-      try:
-        host_time_observation, authority_evaluation = (
-          wait_for_current_independent_network_time(
-            authority,
-            host_time_observation,
-            authority_evaluation,
-            timeout_seconds=remaining_wait_seconds,
-            initial_network_available=network_available,
-            network_available_reader=observe_network_available,
-          )
-        )
-      except Exception as exc:
-        trusted_time_wait_failed = True
-        trusted_time_wait_error_type = type(exc).__name__
-        trusted_time_wait_error = str(exc)[:512]
-        cloudlog.exception(
-          "GPS DBD trusted-time wait failed; startup continues"
-        )
-      trusted_time_wait_completed_at = time.monotonic()
-      authorized_time = authority_evaluation.authorized_time
-      current_network_time = (
-        authorized_time is not None
-        and is_current_independent_network_time(authorized_time)
-      )
-      if current_network_time:
-        network_available = True
-      if (
-        independent_network_time_seen_at is None
-        and current_network_time
-      ):
-        independent_network_time_seen_at = (
-          trusted_time_wait_completed_at
-        )
+      return
+    assert database_runtime is not None
+    if (
+      transport_mon_ver_info is not None
+      and hasattr(pigeon, "dispatch_pending_frames")
+    ):
+      pigeon.dispatch_pending_frames()
 
     if database_runtime.controller.pending and not current_network_time:
-      if trusted_time_wait_failed:
-        operation = "close_restore_window_wait_error"
-        close_result = database_runtime.close_restore_window_wait_error()
-      else:
-        trusted_time_wait_expired = (
-          navigation_database_trusted_time_wait_expired(
-            wait_attempted=should_wait_for_database_time,
-            network_available=network_available,
-          )
-        )
-        operation = (
-          "close_restore_window_wait_timeout"
-          if trusted_time_wait_expired
-          else "close_restore_window_no_trusted_time"
-        )
-        close_result = (
-          database_runtime.close_restore_window_wait_timeout()
-          if trusted_time_wait_expired
-          else database_runtime.close_restore_window_no_trusted_time()
-        )
+      operation = "close_restore_window_no_trusted_time"
+      close_result = (
+        database_runtime.close_restore_window_no_trusted_time()
+      )
       if not close_result:
         note_assistance_state_unavailable(operation)
 
@@ -6690,7 +6964,7 @@ def initialize_receiver_cycle(
       navigation_database_runtime=database_runtime,
       authorized_time=authorized_time,
       database_trusted_time_wait_allowed=(
-        allow_database_trusted_time_wait
+        False
       ),
       database_network_available=(network_available is True),
       database_trusted_time_wait_started_at=(
@@ -6787,7 +7061,81 @@ def initialize_receiver_cycle(
         )
       acquisition_start_claimed = True
       acquisition_start_claimed_at = time.monotonic()
+  def poll_deferred_assistance_state(
+  ) -> NavigationAssistanceRestoreResult | None:
+    nonlocal acquisition_start_claimed
+    nonlocal acquisition_start_claimed_at
+    nonlocal deferred_assistance_state_finalized
+    nonlocal navigation_assistance_restore_attempted
+    nonlocal navigation_assistance_restore_result
+    if deferred_assistance_state_finalized:
+      return None
+    if not pre_start_assistance_deferred:
+      deferred_assistance_state_finalized = True
+      return None
+    if database_runtime is None:
+      if not assistance_state_task_complete.is_set():
+        return None
+      if not adopt_completed_assistance_state():
+        return None
+    assert database_runtime is not None
+    if database_runtime.controller.pending:
+      if authorized_time is None:
+        terminalized = (
+          database_runtime.close_restore_window_no_trusted_time()
+        )
+        operation = "post_start_close_restore_window_no_trusted_time"
+      else:
+        terminalized = (
+          database_runtime.close_restore_window_for_early_acquisition()
+        )
+        operation = "post_start_close_restore_window_for_early_acquisition"
+      if not terminalized:
+        note_assistance_state_unavailable(operation)
+    if not acquisition_start_claimed:
+      if not database_runtime.note_acquisition_started():
+        note_assistance_state_unavailable(
+          "post_start_note_acquisition_started"
+        )
+      acquisition_start_claimed = True
+      acquisition_start_claimed_at = (
+        gnss_start_observed_at or time.monotonic()
+      )
+    if navigation_assistance_restore_result is None:
+      navigation_assistance_restore_result = replace(
+        navigation_assistance_result_from_database_execution(
+          database_runtime.execution
+        ),
+        database_trusted_time_wait_allowed=False,
+        database_network_available=(network_available is True),
+      )
+      navigation_assistance_restore_attempted = True
+      log_navigation_assistance_restore_result(
+        navigation_assistance_restore_result,
+        diagnostic_context,
+        (
+          authorized_time.evidence.value
+          if authorized_time is not None
+          else None
+        ),
+      )
+    if (
+      position_assistance_retry is not None
+      and gnss_start_observed_at is not None
+    ):
+      position_assistance_retry.begin_receiver_cycle(
+        getattr(pigeon, "receiver_cycle", 0),
+        gnss_start_observed_at,
+      )
+    deferred_assistance_state_finalized = True
+    return navigation_assistance_restore_result
+
   def note_gnss_start_sent(now: float) -> None:
+    nonlocal gnss_start_observed_at
+    gnss_start_observed_at = now
+    if database_runtime is None:
+      start_assistance_state_after_start()
+      return
     if position_assistance_retry is not None:
       position_assistance_retry.begin_receiver_cycle(
         getattr(pigeon, "receiver_cycle", 0),
@@ -6810,12 +7158,15 @@ def initialize_receiver_cycle(
     # compatibility path sends no controlled START itself, so close the
     # in-process DBD window before running the callback without treating
     # unavailable test storage as a receiver-action persistence failure.
-    if not database_runtime.note_acquisition_started():
-      note_assistance_state_unavailable(
-        "compatibility_note_acquisition_started"
-      )
-    acquisition_start_claimed = True
     initialization.run()
+    if database_runtime is None:
+      start_assistance_state_after_start()
+    else:
+      if not database_runtime.note_acquisition_started():
+        note_assistance_state_unavailable(
+          "compatibility_note_acquisition_started"
+        )
+      acquisition_start_claimed = True
   try:
     log_gps_startup_timeline(
       cycle=cycle_id,
@@ -6899,6 +7250,11 @@ def initialize_receiver_cycle(
     authority_evaluation=authority_evaluation,
     time_assistance_attempts=tuple(time_assistance_attempts),
     gnss_start_sent_at=initialization.gnss_start_sent_at,
+    poll_deferred_assistance_state=(
+      poll_deferred_assistance_state
+      if pre_start_assistance_deferred
+      else None
+    ),
   )
 
 
@@ -8466,6 +8822,77 @@ def persist_yuma_supplementation_outcome(
     )
 
 
+class ReceiverCyclePersistenceSupersededError(RuntimeError):
+  pass
+
+
+class ReceiverCyclePersistenceOwnership:
+  """Prevent superseded receiver cycles from committing shared assistance state."""
+
+  def __init__(self) -> None:
+    self._generation = 0
+    self._commit_lock = Lock()
+
+  def begin_cycle(self) -> int:
+    # The lock only serializes ownership changes against the short final commit.
+    # Slow JSON serialization/fsync happens outside this lock on a private path.
+    with self._commit_lock:
+      self._generation += 1
+      return self._generation
+
+  def guarded_state_storer(
+    self,
+    generation: int,
+    state_storer: Callable[[Any, Path], None],
+  ) -> Callable[[Any, Path], None]:
+    if not callable(state_storer):
+      raise ValueError("state_storer must be callable")
+
+    def store_if_current(state: Any, path: Path) -> None:
+      staging_path = path.with_name(
+        f".{path.name}.receiver-cycle-{generation}.staged"
+      )
+      try:
+        # Potentially slow serialization/fsync goes only to this cycle's
+        # private staging path and never holds the ownership lock.
+        state_storer(state, staging_path)
+        with self._commit_lock:
+          if generation != self._generation:
+            raise ReceiverCyclePersistenceSupersededError(
+              f"receiver cycle {generation} was superseded by {self._generation}"
+            )
+          os.replace(staging_path, path)
+          directory_descriptor = os.open(path.parent, os.O_RDONLY)
+          try:
+            os.fsync(directory_descriptor)
+          finally:
+            os.close(directory_descriptor)
+      finally:
+        staging_path.unlink(missing_ok=True)
+
+    return store_if_current
+
+  def guarded_state_quarantiner(
+    self,
+    generation: int,
+    state_quarantiner: Callable[[Path, str], Path],
+  ) -> Callable[[Path, str], Path]:
+    if not callable(state_quarantiner):
+      raise ValueError("state_quarantiner must be callable")
+
+    def quarantine_if_current(path: Path, boot_id: str) -> Path:
+      # Quarantine directly renames the live file, so serialize the ownership
+      # check with that short rename/fsync operation.
+      with self._commit_lock:
+        if generation != self._generation:
+          raise ReceiverCyclePersistenceSupersededError(
+            f"receiver cycle {generation} was superseded by {self._generation}"
+          )
+        return state_quarantiner(path, boot_id)
+
+    return quarantine_if_current
+
+
 @dataclass
 class ReceiverAcquisitionStateGuard:
   handled: bool = False
@@ -8501,11 +8928,20 @@ def handle_receiver_acquisition_state(
 
 def create_receiver_cycle_navigation_state(
   receiver_fingerprint: str,
+  *,
+  state_storer: Callable[[Any, Path], None] | None = None,
+  state_quarantiner: Callable[[Path, str], Path] | None = None,
 ) -> NavigationDatabaseRestoreRuntime:
   try:
+    runtime_kwargs: dict[str, Any] = {}
+    if state_storer is not None:
+      runtime_kwargs["state_storer"] = state_storer
+    if state_quarantiner is not None:
+      runtime_kwargs["state_quarantiner"] = state_quarantiner
     return NavigationDatabaseRestoreRuntime(
       receiver_fingerprint,
       new_receiver_cycle=True,
+      **runtime_kwargs,
     )
   except NavigationDatabaseRestoreInitializationError as exc:
     cloudlog.exception(
@@ -8516,7 +8952,6 @@ def create_receiver_cycle_navigation_state(
       receiver_fingerprint,
       str(exc),
     )
-
 
 def device_network_available(
   sm: messaging.SubMaster,
@@ -8546,23 +8981,35 @@ def run_receiving(duration: int = 0):
     gps_assistance_receiver_fingerprint(params)
   )
 
-  def create_receiver_cycle_assistance_state() -> tuple[
+  receiver_cycle_persistence = ReceiverCyclePersistenceOwnership()
+
+  def create_receiver_cycle_assistance_state(
+    persistence_generation: int,
+  ) -> tuple[
     NavigationDatabaseRestoreRuntime,
     PositionAssistancePostStartRetryController,
     ReceiverAcquisitionStateGuard,
   ]:
-    navigation_database_runtime = (
-      create_receiver_cycle_navigation_state(
-        receiver_fingerprint
-      )
+    navigation_database_runtime = create_receiver_cycle_navigation_state(
+      receiver_fingerprint,
+      state_storer=receiver_cycle_persistence.guarded_state_storer(
+        persistence_generation,
+        store_navigation_database_restore_boot_state,
+      ),
+      state_quarantiner=receiver_cycle_persistence.guarded_state_quarantiner(
+        persistence_generation,
+        quarantine_navigation_database_restore_boot_state,
+      ),
     )
     if navigation_database_runtime.state_available:
       try:
-        position_assistance_retry_runtime = (
-          PositionAssistanceRetryRuntime(
-            receiver_fingerprint,
-            new_receiver_cycle=True,
-          )
+        position_assistance_retry_runtime = PositionAssistanceRetryRuntime(
+          receiver_fingerprint,
+          state_storer=receiver_cycle_persistence.guarded_state_storer(
+            persistence_generation,
+            store_position_assistance_retry_state,
+          ),
+          new_receiver_cycle=True,
         )
       except Exception:
         cloudlog.exception(
@@ -8571,13 +9018,25 @@ def run_receiving(duration: int = 0):
         position_assistance_retry_runtime = None
     else:
       position_assistance_retry_runtime = None
-
     return (
       navigation_database_runtime,
       PositionAssistancePostStartRetryController(
         position_assistance_retry_runtime
       ),
       ReceiverAcquisitionStateGuard(),
+    )
+
+  def new_receiver_cycle_assistance_state_factory() -> Callable[[], tuple[
+    NavigationDatabaseRestoreRuntime,
+    PositionAssistancePostStartRetryController,
+    ReceiverAcquisitionStateGuard,
+  ]]:
+    # Allocate ownership synchronously on the main receiver thread. A worker
+    # that was queued by an older cycle can never become the new owner later.
+    persistence_generation = receiver_cycle_persistence.begin_cycle()
+    return partial(
+      create_receiver_cycle_assistance_state,
+      persistence_generation,
     )
 
   fix_tracker = ReliableFixTracker()
@@ -8616,14 +9075,31 @@ def run_receiving(duration: int = 0):
     if process_start_transport_bootstrap_supported
     else None
   )
-  (
-    navigation_database_runtime,
-    position_assistance_retry,
-    acquisition_state_guard,
-  ) = create_receiver_cycle_assistance_state()
+  navigation_database_runtime: (
+    NavigationDatabaseRestoreRuntime | None
+  ) = None
+  position_assistance_retry = (
+    PositionAssistancePostStartRetryController(None)
+  )
+  acquisition_state_guard = ReceiverAcquisitionStateGuard()
+
+  def activate_receiver_cycle_assistance_state(
+    runtime: NavigationDatabaseRestoreRuntime,
+    retry: PositionAssistancePostStartRetryController,
+    guard: ReceiverAcquisitionStateGuard,
+  ) -> None:
+    nonlocal navigation_database_runtime
+    nonlocal position_assistance_retry
+    nonlocal acquisition_state_guard
+    navigation_database_runtime = runtime
+    position_assistance_retry = retry
+    acquisition_state_guard = guard
 
   def dispatch_frames(frames: list[bytes]) -> None:
-    if receiver_frames_show_gnss_acquisition(frames):
+    if (
+      navigation_database_runtime is not None
+      and receiver_frames_show_gnss_acquisition(frames)
+    ):
       handle_receiver_acquisition_state(
         navigation_database_runtime,
         position_assistance_retry,
@@ -8661,6 +9137,8 @@ def run_receiving(duration: int = 0):
 
 
   def send_yuma_message(message: bytes) -> None:
+    if navigation_database_runtime is None:
+      raise RuntimeError("receiver assistance state is not initialized")
     send_yuma_with_durable_claim(
       navigation_database_runtime,
       lambda claimed_message: send_mga_with_strict_ack(
@@ -8686,13 +9164,18 @@ def run_receiving(duration: int = 0):
     collect_mon_ver_diagnostics=True,
     time_authority=time_authority,
     time_provenance=receiver_time_provenance,
-    navigation_database_runtime=navigation_database_runtime,
     position_assistance_retry=position_assistance_retry,
     transport_mon_ver_info=process_start_mon_ver_info,
     cycle_started_at=process_start_cycle_started_at,
-    allow_database_trusted_time_wait=True,
+    allow_database_trusted_time_wait=False,
     network_available=device_network_available(sm),
-    network_available_reader=lambda: device_network_available(sm),
+    assistance_state_factory=new_receiver_cycle_assistance_state_factory(),
+    assistance_state_ready_callback=(
+      activate_receiver_cycle_assistance_state
+    ),
+  )
+  deferred_assistance_poll = (
+    cycle_initialization.poll_deferred_assistance_state
   )
   execute_position_assistance_retry()
   startup_diagnostics.initialization_complete(
@@ -8763,6 +9246,7 @@ def run_receiving(duration: int = 0):
     nonlocal latest_independent_time
     nonlocal host_time_state
     nonlocal latest_authority_evaluation
+    nonlocal deferred_assistance_poll
 
     reason_value = reason.value
     attempt = data_watchdog.recoveries
@@ -8785,11 +9269,11 @@ def run_receiving(duration: int = 0):
       requested_at
     )
     prepare_receiver_cycle_response_state(pigeon)
-    (
-      navigation_database_runtime,
-      position_assistance_retry,
-      acquisition_state_guard,
-    ) = create_receiver_cycle_assistance_state()
+    navigation_database_runtime = None
+    position_assistance_retry = (
+      PositionAssistancePostStartRetryController(None)
+    )
+    acquisition_state_guard = ReceiverAcquisitionStateGuard()
     cycle_initialization = initialize_receiver_cycle(
       pigeon,
       receiver_fingerprint,
@@ -8797,8 +9281,14 @@ def run_receiving(duration: int = 0):
       reason_value,
       time_authority=time_authority,
       time_provenance=receiver_time_provenance,
-      navigation_database_runtime=navigation_database_runtime,
       position_assistance_retry=position_assistance_retry,
+      assistance_state_factory=new_receiver_cycle_assistance_state_factory(),
+      assistance_state_ready_callback=(
+        activate_receiver_cycle_assistance_state
+      ),
+    )
+    deferred_assistance_poll = (
+      cycle_initialization.poll_deferred_assistance_state
     )
     execute_position_assistance_retry()
     initialization_completed_at = (
@@ -8883,6 +9373,15 @@ def run_receiving(duration: int = 0):
     or time.monotonic() - start_time < duration
   ):
     now = time.monotonic()
+    if deferred_assistance_poll is not None:
+      deferred_result = deferred_assistance_poll()
+      if deferred_result is not None:
+        deferred_assistance_poll = None
+        yuma_feature.update_navigation_assistance_restore_result(
+          deferred_result,
+          now,
+        )
+        execute_position_assistance_retry()
     authority_evaluation_for_loop: (
       TimeAuthorityEvaluation | None
     ) = None
@@ -9229,18 +9728,27 @@ def run_receiving(duration: int = 0):
     stable_fix = fix_tracker.stable_fix(now)
     previous_database_disposition = (
       navigation_database_runtime.controller.disposition
+      if navigation_database_runtime is not None
+      else None
     )
-    database_execution = navigation_database_runtime.evaluate(
-      authorized_time=(
-        latest_authority_evaluation.authorized_time
-        if latest_authority_evaluation is not None
-        else None
-      ),
-      reliable_fix_available=stable_fix is not None,
-      yuma_already_sent=yuma_feature.cycle_injection_consumed,
-      send_database_message=reject_live_database_write,
+    database_execution = (
+      navigation_database_runtime.evaluate(
+        authorized_time=(
+          latest_authority_evaluation.authorized_time
+          if latest_authority_evaluation is not None
+          else None
+        ),
+        reliable_fix_available=stable_fix is not None,
+        yuma_already_sent=yuma_feature.cycle_injection_consumed,
+        send_database_message=reject_live_database_write,
+      )
+      if navigation_database_runtime is not None
+      else None
     )
     if (
+      navigation_database_runtime is not None
+      and database_execution is not None
+      and
       navigation_database_runtime.controller.disposition
       is not previous_database_disposition
     ):
@@ -9268,13 +9776,17 @@ def run_receiving(duration: int = 0):
 
     # Provisional YUMA has first YUMA priority only after the durable DBD
     # decision is terminal; the shared wrapper claims ownership before frame 0.
-    provisional_yuma_outcome = yuma_feature.evaluate_provisional(
-      send_yuma_message,
-      now=now,
-      reliable_fix_available=stable_fix is not None,
-      database_restore_pending=(
-        navigation_database_runtime.database_restore_pending
-      ),
+    provisional_yuma_outcome = (
+      yuma_feature.evaluate_provisional(
+        send_yuma_message,
+        now=now,
+        reliable_fix_available=stable_fix is not None,
+        database_restore_pending=(
+          navigation_database_runtime.database_restore_pending
+        ),
+      )
+      if navigation_database_runtime is not None
+      else None
     )
     if provisional_yuma_outcome is not None:
       log_provisional_yuma_outcome(provisional_yuma_outcome)
@@ -9284,14 +9796,18 @@ def run_receiving(duration: int = 0):
         outcome=provisional_yuma_outcome,
       )
 
-    yuma_outcome = yuma_feature.evaluate(
-      send_yuma_message,
-      now=now,
-      nav_sat=capture_quality_tracker.latest_nav_sat,
-      nav_sat_time=(
-        capture_quality_tracker.latest_nav_sat_time
-      ),
-      reliable_fix_available=stable_fix is not None,
+    yuma_outcome = (
+      yuma_feature.evaluate(
+        send_yuma_message,
+        now=now,
+        nav_sat=capture_quality_tracker.latest_nav_sat,
+        nav_sat_time=(
+          capture_quality_tracker.latest_nav_sat_time
+        ),
+        reliable_fix_available=stable_fix is not None,
+      )
+      if navigation_database_runtime is not None
+      else None
     )
     if yuma_outcome is not None:
       log_yuma_supplementation_outcome(yuma_outcome)
