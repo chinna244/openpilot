@@ -1066,6 +1066,45 @@ def build_cfg_nav5_poll_message() -> bytes:
   return add_ubx_checksum(b"\xb5\x62\x06\x24\x00\x00")
 
 
+def build_cfg_nav5_set_message(
+  *,
+  dynamic_model: int = 4,
+  fix_mode: int = 3,
+  mask: int = 0x0005,
+) -> bytes:
+  """Build a CFG-NAV5 SET with an exact 36-byte payload.
+
+  mask 0x0005 applies dynModel (bit 0) and fixMode (bit 2). Defaults match the
+  automotive dynamic model and auto 2D/3D fix mode used at receiver startup.
+  """
+  if (
+    isinstance(dynamic_model, bool)
+    or not isinstance(dynamic_model, int)
+    or not 0 <= dynamic_model <= 0xFF
+  ):
+    raise ValueError("dynamic_model must be an integer from 0 through 255")
+  if (
+    isinstance(fix_mode, bool)
+    or not isinstance(fix_mode, int)
+    or not 0 <= fix_mode <= 0xFF
+  ):
+    raise ValueError("fix_mode must be an integer from 0 through 255")
+  if (
+    isinstance(mask, bool)
+    or not isinstance(mask, int)
+    or not 0 <= mask <= 0xFFFF
+  ):
+    raise ValueError("mask must be an integer from 0 through 65535")
+
+  payload = bytearray(36)
+  payload[0:2] = mask.to_bytes(2, "little")
+  payload[2] = dynamic_model
+  payload[3] = fix_mode
+  return add_ubx_checksum(
+    b"\xb5\x62\x06\x24" + len(payload).to_bytes(2, "little") + bytes(payload)
+  )
+
+
 def parse_cfg_nav5(frame: bytes) -> Nav5Config | None:
   if (
     not validate_ubx_frame(frame)
