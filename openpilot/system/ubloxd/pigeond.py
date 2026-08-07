@@ -5121,27 +5121,25 @@ def restore_navigation_assistance(
       send_database_message=send_database_frame,
       pre_start_deadline=pre_start_deadline,
     )
-    if (
-      not navigation_database_runtime.acquisition_started
-      or navigation_database_runtime.controller.disposition
-      is NavigationDatabaseRestoreDisposition.SKIPPED_EARLY_ACQUISITION
-    ):
-      position_timeout = (
-        min(
-          GPS_ASSISTANCE_ACK_TIMEOUT,
-          pre_start_remaining_seconds(pre_start_deadline),
-        )
-        if pre_start_deadline is not None
-        else GPS_ASSISTANCE_ACK_TIMEOUT
+    # Position assistance eligibility is independent of DBD disposition and of
+    # whether GNSS acquisition has already started. send_position_once() enforces
+    # snapshot presence, validation, and one-shot claim semantics.
+    position_timeout = (
+      min(
+        GPS_ASSISTANCE_ACK_TIMEOUT,
+        pre_start_remaining_seconds(pre_start_deadline),
       )
-      if position_timeout > 0.0:
-        navigation_database_runtime.send_position_once(
-          lambda message: send_mga_with_strict_ack(
-            pigeon,
-            message,
-            timeout=position_timeout,
-          )
+      if pre_start_deadline is not None
+      else GPS_ASSISTANCE_ACK_TIMEOUT
+    )
+    if position_timeout > 0.0:
+      navigation_database_runtime.send_position_once(
+        lambda message: send_mga_with_strict_ack(
+          pigeon,
+          message,
+          timeout=position_timeout,
         )
+      )
       execution = navigation_database_runtime.execution
     result = navigation_assistance_result_from_database_execution(execution)
     wait_elapsed_seconds = (
@@ -7102,23 +7100,51 @@ def initialize_receiver_cycle(
         gnss_start_observed_at or time.monotonic()
       )
     if navigation_assistance_restore_result is None:
-      navigation_assistance_restore_result = replace(
-        navigation_assistance_result_from_database_execution(
-          database_runtime.execution
-        ),
-        database_trusted_time_wait_allowed=False,
-        database_network_available=(network_available is True),
-      )
-      navigation_assistance_restore_attempted = True
-      log_navigation_assistance_restore_result(
-        navigation_assistance_restore_result,
-        diagnostic_context,
-        (
+      # DBD may already be terminal (e.g. skipped_no_trusted_time) and
+      # acquisition may already be claimed post-START. Position assistance still
+      # runs from the independent snapshot via restore_navigation_assistance().
+      navigation_assistance_restore_result = restore_navigation_assistance(
+        pigeon,
+        receiver_fingerprint,
+        diagnostic_context=diagnostic_context,
+        time_assistance_source=(
           authorized_time.evidence.value
           if authorized_time is not None
           else None
         ),
+        trusted_now=(
+          authorized_time.utc if authorized_time is not None else None
+        ),
+        navigation_database_runtime=database_runtime,
+        authorized_time=authorized_time,
+        database_trusted_time_wait_allowed=False,
+        database_network_available=(network_available is True),
       )
+      navigation_assistance_restore_attempted = True
+      if (
+        position_assistance_retry is not None
+        and database_runtime.state_available
+      ):
+        retry_runtime = position_assistance_retry.runtime
+        if retry_runtime is not None:
+          retry_runtime.arm_from_initial(
+            database_runtime.execution,
+            database_runtime.position_assistance_message,
+          )
+          if (
+            retry_runtime.state.pending
+            or retry_runtime.state.retry_result
+            is PositionAssistanceRetryResult.CLAIM_PERSIST_FAILED
+            or retry_runtime.persistence_error is not None
+          ):
+            log_position_assistance_retry_state(
+              retry_runtime.state,
+              trigger="armed_initial_info_code_5",
+              receiver_cycle=getattr(pigeon, "receiver_cycle", 0),
+              gnss_start_sent_at=gnss_start_observed_at,
+              nav_pvt_observed_at=None,
+              persistence_error=retry_runtime.persistence_error,
+            )
     if (
       position_assistance_retry is not None
       and gnss_start_observed_at is not None

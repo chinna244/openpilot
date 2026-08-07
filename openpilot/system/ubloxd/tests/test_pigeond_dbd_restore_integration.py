@@ -1306,6 +1306,13 @@ def configure_deferred_assistance_startup(
   )
   monkeypatch.setattr(
     pigeond,
+    "send_mga_with_strict_ack",
+    lambda *_args, **_kwargs: None,
+  )
+  monkeypatch.setattr(pigeond, "log_assistnow_autonomous_support", lambda _info: True)
+  monkeypatch.setattr(pigeond, "configure_assistnow_autonomous", lambda *_args: None)
+  monkeypatch.setattr(
+    pigeond,
     "finish_post_start_receiver_configuration",
     lambda _pigeon: None,
   )
@@ -1714,7 +1721,9 @@ def test_drive2_expired_cache_no_time_cannot_starve_configuration(
   assert restore.database_trusted_time_wait_elapsed_seconds is None
   assert restore.database_trusted_time_wait_error_type is None
   assert database_indexes == []
-  assert all(timeout <= 3.0 for timeout in pre_start_ack_timeouts)
+  assert "position_write" in events
+  assert runtime.execution.position_assistance_attempted
+  assert events.index("gnss_start") < events.index("position_write")
   mandatory_items = tuple(
     item_name
     for item_name, mandatory in configuration_items
@@ -1798,6 +1807,13 @@ def test_deadline_boundary_skips_assistance_after_mandatory_configuration(
     events.append("mandatory_configuration")
     clock[0] = 45.0
 
+  position_writes: list[bytes] = []
+
+  def send_mga(_pigeon, message, **kwargs):
+    if kwargs.get("database_frame_index") is not None:
+      raise AssertionError("DBD wrote after pre-START deadline")
+    position_writes.append(message)
+
   monkeypatch.setattr(pigeond.time, "monotonic", lambda: clock[0])
   monkeypatch.setattr(pigeond.time, "sleep", lambda _delay: None)
   monkeypatch.setattr(pigeond, "start_pigeon_transport", lambda _pigeon: None)
@@ -1818,13 +1834,7 @@ def test_deadline_boundary_skips_assistance_after_mandatory_configuration(
       AssertionError("trusted time checked after deadline")
     ),
   )
-  monkeypatch.setattr(
-    pigeond,
-    "send_mga_with_strict_ack",
-    lambda *_args, **_kwargs: (_ for _ in ()).throw(
-      AssertionError("assistance wrote after deadline")
-    ),
-  )
+  monkeypatch.setattr(pigeond, "send_mga_with_strict_ack", send_mga)
   monkeypatch.setattr(
     pigeond,
     "log_navigation_assistance_restore_result",
@@ -1848,8 +1858,12 @@ def test_deadline_boundary_skips_assistance_after_mandatory_configuration(
   assert worker_complete.wait(timeout=1.0)
   poll_deferred = result.poll_deferred_assistance_state
   assert poll_deferred is not None
-  assert poll_deferred() is not None
+  restore = poll_deferred()
+  assert restore is not None
   assert runtime.controller.disposition is NavigationDatabaseRestoreDisposition.SKIPPED_NO_TRUSTED_TIME
+  assert runtime.acquisition_started
+  assert len(position_writes) == 1
+  assert runtime.execution.position_assistance_attempted
   assert events.index("mandatory_configuration") < events.index("gnss_start")
   assert events.index("gnss_start") < events.index("assistance_state_factory")
   assert events.index("assistance_state_factory") < events.index("assistance_state_prepare")
@@ -1920,6 +1934,13 @@ def test_tiny_factory_budget_defers_real_factory_until_after_start(
     "log_navigation_assistance_restore_result",
     lambda *_args, **_kwargs: None,
   )
+  monkeypatch.setattr(
+    pigeond,
+    "send_mga_with_strict_ack",
+    lambda *_args, **_kwargs: None,
+  )
+  monkeypatch.setattr(pigeond, "log_assistnow_autonomous_support", lambda _info: True)
+  monkeypatch.setattr(pigeond, "configure_assistnow_autonomous", lambda *_args: None)
   monkeypatch.setattr(pigeond, "finish_post_start_receiver_configuration", lambda _pigeon: None)
   monkeypatch.setattr(pigeond, "run_post_start_legacy_assistance", lambda _pigeon: None)
 
@@ -1947,6 +1968,7 @@ def test_tiny_factory_budget_defers_real_factory_until_after_start(
   assert events.index("assistance_state_factory") < events.index("assistance_state_prepare")
   assert clock[0] == pytest.approx(45.2)
   assert runtime.controller.disposition is NavigationDatabaseRestoreDisposition.SKIPPED_EARLY_ACQUISITION
+  assert runtime.execution.position_assistance_attempted
 
 
 @pytest.mark.parametrize("failure_phase", ("factory", "prepare"))
@@ -2016,6 +2038,11 @@ def test_factory_or_prepare_exception_is_fail_open_before_deadline(
   monkeypatch.setattr(
     pigeond,
     "log_navigation_assistance_restore_result",
+    lambda *_args, **_kwargs: None,
+  )
+  monkeypatch.setattr(
+    pigeond,
+    "send_mga_with_strict_ack",
     lambda *_args, **_kwargs: None,
   )
   monkeypatch.setattr(pigeond, "finish_post_start_receiver_configuration", lambda _pigeon: None)

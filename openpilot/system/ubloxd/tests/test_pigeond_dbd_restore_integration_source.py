@@ -30,13 +30,20 @@ def test_initialize_receiver_cycle_uses_receiver_cycle_runtime_adapter() -> None
   source, tree = source_tree(PIGEOND)
   node = named_node(tree, "initialize_receiver_cycle")
   restore_calls = calls(node, "restore_navigation_assistance")
-  assert len(restore_calls) == 1
-  keywords = {keyword.arg for keyword in restore_calls[0].keywords}
-  assert "navigation_database_runtime" in keywords
-  assert "authorized_time" in keywords
+  # One pre-START restore path and one deferred post-START path that still
+  # evaluates independent position assistance after DBD is terminalized.
+  assert len(restore_calls) == 2
+  for restore_call in restore_calls:
+    keywords = {keyword.arg for keyword in restore_call.keywords}
+    assert "navigation_database_runtime" in keywords
+    assert "authorized_time" in keywords
   segment = ast.get_source_segment(source, node)
   assert segment is not None
   assert "allow_legacy_direct_restore" not in segment
+  assert "poll_deferred_assistance_state" in segment
+  deferred = segment.index("def poll_deferred_assistance_state(")
+  deferred_restore = segment.index("restore_navigation_assistance(", deferred)
+  assert deferred < deferred_restore
 
 
 def test_live_loop_creates_fresh_state_for_each_receiver_cycle() -> None:

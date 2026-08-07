@@ -1341,7 +1341,9 @@ def test_same_boot_time_is_forwarded_exactly_to_post_start_assistance(monkeypatc
     rtc_assistance=(estimated_utc, 60),
   )
 
-  assert not any(event[0] == "restore" for event in events)
+  # Deferred assistance may call restore once for independent position send;
+  # same-boot RTC must not trigger a second DBD/cache restore path.
+  assert sum(event[0] == "restore" for event in events) == 1
   assert len(send_calls) == 1
   assert send_calls[0]["assistance_time"] == estimated_utc
   assert send_calls[0]["source"] == "same_boot_boottime"
@@ -1395,7 +1397,9 @@ def test_run_receiving_restores_cache_after_later_synchronized_time(
   event_names = [event[0] for event in events]
 
   assert event_names.index("time_authority_evaluate") < (event_names.index("time_assistance_send"))
-  assert event_names.count("restore") == 0
+  # One deferred position-assistance restore is allowed; later synchronized
+  # time must not open a second DBD/cache restore window.
+  assert event_names.count("restore") == 1
 
 
 def test_run_receiving_does_not_restore_cache_twice_after_rtc_time(
@@ -1410,7 +1414,7 @@ def test_run_receiving_does_not_restore_cache_twice_after_rtc_time(
   )
 
   assert [call.get("source") for call in send_calls] == ["same_boot_boottime"]
-  assert sum(event[0] == "restore" for event in events) == 0
+  assert sum(event[0] == "restore" for event in events) == 1
 
 
 def test_mga_info_code_255_remains_a_strict_failure():
