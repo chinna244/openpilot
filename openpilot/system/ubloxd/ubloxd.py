@@ -8,6 +8,8 @@ from dataclasses import dataclass
 
 from openpilot.cereal import log
 from openpilot.cereal import messaging
+from openpilot.common.swaglog import cloudlog
+from openpilot.system.ubloxd.rf_observability import UbloxRfObservability
 from openpilot.common.gps_time import encode_ublox_gps_flags
 from openpilot.system.ubloxd.ubx import Ubx
 from openpilot.system.ubloxd.gps import Gps
@@ -29,6 +31,10 @@ class UbxFramer:
   def __init__(self) -> None:
     self.buf = bytearray()
     self.last_log_time = 0.0
+    self.frames_valid = 0
+    self.checksum_failures = 0
+    self.discarded_prefix_bytes = 0
+    self.resync_events = 0
 
   def reset(self) -> None:
     self.buf.clear()
@@ -56,10 +62,15 @@ class UbxFramer:
       start = self.buf.find(b"\xb5\x62")
       if start < 0:
         # no preamble in buffer
+        if self.buf:
+          self.discarded_prefix_bytes += len(self.buf)
+          self.resync_events += 1
         self.buf.clear()
         break
       if start > 0:
         # drop garbage before preamble
+        self.discarded_prefix_bytes += start
+        self.resync_events += 1
         self.buf = self.buf[start:]
 
       if len(self.buf) < self.HEADER_SIZE:
@@ -72,10 +83,13 @@ class UbxFramer:
 
       candidate = bytes(self.buf[:total_len])
       if self._checksum_ok(candidate):
+        self.frames_valid += 1
         out.append(candidate)
         # consume this frame
         self.buf = self.buf[total_len:]
       else:
+        self.checksum_failures += 1
+        self.resync_events += 1
         # drop first byte and retry
         self.buf = self.buf[1:]
 
@@ -511,6 +525,7 @@ class UbloxMsgParser:
 
 def main():
   parser = UbloxMsgParser()
+  observability = UbloxRfObservability()
   pm = messaging.PubMaster(['ubloxGnss', 'gpsLocationExternal'])
   sock = messaging.sub_sock('ubloxRaw', timeout=100, conflate=False)
 
@@ -522,10 +537,38 @@ def main():
     data = bytes(msg.ubloxRaw)
     log_time = msg.logMonoTime * 1e-9
     frames = parser.framer.add_data(log_time, data)
+    try:
+      framer_line = observability.observe_framer_health(
+        frames_valid=parser.framer.frames_valid,
+        checksum_failures=parser.framer.checksum_failures,
+        discarded_prefix_bytes=parser.framer.discarded_prefix_bytes,
+        resync_events=parser.framer.resync_events,
+        buffered_bytes=len(parser.framer.buf),
+        now=log_time,
+      )
+      if framer_line is not None:
+        cloudlog.info(framer_line)
+    except Exception:
+      # Observability must never interfere with UBX framing or publication.
+      pass
+
     for frame in frames:
       try:
-        res = parser.parse_frame(frame)
+        for telemetry_line in observability.observe_frame(frame, log_time):
+          cloudlog.info(telemetry_line)
       except Exception:
+        # RF diagnostics are read-only and must never interfere with parsing.
+        pass
+      try:
+        res = parser.parse_frame(frame)
+      except Exception as exc:
+        try:
+          parser_error = observability.observe_parser_error(frame, exc, log_time)
+          if parser_error is not None:
+            cloudlog.error(parser_error)
+        except Exception:
+          # Observability must never turn a nonfatal parser error into a daemon failure.
+          pass
         continue
       if not res:
         continue
