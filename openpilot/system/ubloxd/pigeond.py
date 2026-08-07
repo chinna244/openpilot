@@ -77,6 +77,7 @@ from openpilot.system.ubloxd.gps_assistance import (
   build_cfg_itfm_poll_message,
   build_cfg_msg_poll_message,
   build_cfg_nav5_poll_message,
+  build_cfg_nav5_set_message,
   build_cfg_odo_poll_message,
   build_cfg_pm2_poll_message,
   build_cfg_prt_poll_message,
@@ -2849,10 +2850,9 @@ def init_pigeon(
     lambda value: (_ for _ in ()).throw(ReceiverConfigurationError("CFG-RATE mismatch"))
     if value != RateConfig(100, 1, 0) else None, "100ms/1",
   )
-  nav5_message = (
-    b"\xB5\x62\x06\x24\x24\x00\x05\x00\x04\x03\x00\x00\x00\x00\x00\x00"
-    + b"\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"
-    + b"\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x5A\x63"
+  nav5_message = build_cfg_nav5_set_message(
+    dynamic_model=4,
+    fix_mode=3,
   )
   exact_item(
     "CFG-NAV5", nav5_message, lambda: poll_with_remaining_deadline(poll_cfg_nav5),
