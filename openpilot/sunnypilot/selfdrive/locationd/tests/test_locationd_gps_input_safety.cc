@@ -275,9 +275,8 @@ TEST_CASE("handle_gps UBLOX horizontal accuracy semantics", "[pr75][gps][accurac
   }
 }
 
-TEST_CASE("QCOM legacy zero horizontalAccuracy remains accepted", "[pr75][gps][qcom]") {
-  // qcomgpsd leaves horizontalAccuracy at default 0; QCOM gps_variance_factor is 0 so it is
-  // unused in covariance. PR75 must not newly reject this legacy path.
+TEST_CASE("QCOM requires positive horizontalAccuracy for covariance", "[pr75][pr81][gps][qcom]") {
+  // PR81 uses H and V in NED→ECEF covariance for all sources; zero H is reject.
   Localizer loc(LocalizerGnssSource::QCOM);
   loc.reset_kalman(1.0);
   GpsFields f;
@@ -291,9 +290,9 @@ TEST_CASE("QCOM legacy zero horizontalAccuracy remains accepted", "[pr75][gps][q
   auto gps = msg.initEvent().initGpsLocation();
   fill_gps(gps, f);
   loc.handle_gps(2.0, gps.asReader(), 0.630);
-  REQUIRE(loc.get_gps_input_stats().last_reason == GpsInputRejectReason::Accepted);
-  REQUIRE(loc.get_gps_input_stats().accepted == 1);
-  REQUIRE(loc.get_gps_input_stats().rejected_horizontal_accuracy == 0);
+  REQUIRE(loc.get_gps_input_stats().last_reason == GpsInputRejectReason::InvalidHorizontalAccuracy);
+  REQUIRE(loc.get_gps_input_stats().accepted == 0);
+  REQUIRE(loc.get_gps_input_stats().rejected_horizontal_accuracy == 1);
 }
 
 TEST_CASE("handle_gps accuracy semantics", "[pr75][gps][accuracy]") {
@@ -768,5 +767,100 @@ TEST_CASE("PR80 source gating coordinates GPS authority", "[pr80][source]") {
       loc.handle_msg(evt.asReader());
     }
     REQUIRE(loc.get_gps_input_stats().received == before + 1);
+  }
+}
+
+TEST_CASE("PR81 measurement timing and covariance", "[pr81][timing][covariance]") {
+  Localizer loc(LocalizerGnssSource::UBLOX);
+  GpsFields base;
+  seed_filter_near_gps(loc, 1.0, base);
+
+  auto fill_with_meas = [](cereal::GpsLocationData::Builder gps, const GpsFields &f, uint64_t meas_ns) {
+    fill_gps(gps, f);
+    gps.setMeasurementMonoNs(meas_ns);
+  };
+
+  SECTION("measurementMonoNs preferred over empirical offset") {
+    MessageBuilder msg;
+    auto gps = msg.initEvent().initGpsLocationExternal();
+    // Event at 10.0s; measurement at 9.7s — not 10.0-0.095=9.905
+    fill_with_meas(gps, base, 9'700'000'000ULL);
+    loc.handle_gps(10.0, gps.asReader(), 0.095);
+    REQUIRE(loc.get_gps_input_stats().last_reason == GpsInputRejectReason::Accepted);
+  }
+
+  SECTION("future measurement rejected") {
+    MessageBuilder msg;
+    auto gps = msg.initEvent().initGpsLocationExternal();
+    fill_with_meas(gps, base, 11'000'000'000ULL);  // after event 10.0
+    loc.handle_gps(10.0, gps.asReader(), 0.095);
+    REQUIRE(loc.get_gps_input_stats().last_reason == GpsInputRejectReason::FutureMeasurement);
+  }
+
+  SECTION("stale measurement beyond rewind rejected") {
+    MessageBuilder msg;
+    auto gps = msg.initEvent().initGpsLocationExternal();
+    fill_with_meas(gps, base, 8'000'000'000ULL);  // 2.0s before event 10.0 > 0.8s
+    loc.handle_gps(10.0, gps.asReader(), 0.095);
+    REQUIRE(loc.get_gps_input_stats().last_reason == GpsInputRejectReason::StaleMeasurement);
+  }
+
+  SECTION("pre-transition measurement rejected") {
+    MessageBuilder st_msg;
+    auto evt = st_msg.initEvent();
+    evt.setLogMonoTime(5'000'000'000ULL);
+    auto st = evt.initGpsSourceState();
+    st.setSelected(cereal::GpsSourceState::SelectedSource::UBLOX_PRIMARY);
+    st.setGeneration(1);
+    st.setTransitionMonoNs(5'000'000'000ULL);
+    st.setTransitionReason("test");
+    st.setUbloxHealth(cereal::GpsSourceState::SourceHealth::HEALTHY);
+    st.setQcomHealth(cereal::GpsSourceState::SourceHealth::UNKNOWN);
+    st.setUbloxHardwareAvailable(true);
+    loc.handle_msg(evt.asReader());
+
+    MessageBuilder msg;
+    auto gps = msg.initEvent().initGpsLocationExternal();
+    // Within rewind window of event, but at/before transition epoch.
+    fill_with_meas(gps, base, 4'900'000'000ULL);
+    loc.handle_gps(5.5, gps.asReader(), 0.095);
+    REQUIRE(loc.get_gps_input_stats().last_reason == GpsInputRejectReason::PreTransitionMeasurement);
+  }
+
+  SECTION("delayed but within rewind accepted") {
+    MessageBuilder msg;
+    auto gps = msg.initEvent().initGpsLocationExternal();
+    fill_with_meas(gps, base, 9'500'000'000ULL);  // 0.5s delay
+    loc.handle_gps(10.0, gps.asReader(), 0.095);
+    REQUIRE(loc.get_gps_input_stats().last_reason == GpsInputRejectReason::Accepted);
+  }
+
+  SECTION("filter rewind: event fresh but filter ahead rejects") {
+    // Advance filter to 101.2s then apply measurement at 100.0 with event 100.1.
+    loc.reset_kalman(101.2);
+    seed_filter_near_gps(loc, 101.2, base);
+    MessageBuilder msg;
+    auto gps = msg.initEvent().initGpsLocationExternal();
+    fill_with_meas(gps, base, 100'000'000'000ULL);
+    loc.handle_gps(100.1, gps.asReader(), 0.095);
+    REQUIRE(loc.get_gps_input_stats().last_reason == GpsInputRejectReason::StaleMeasurement);
+  }
+
+  SECTION("filter rewind: within window accepted") {
+    // Build rewind history, then apply a mildly delayed measurement still within 0.8s.
+    loc.reset_kalman(99.0);
+    seed_filter_near_gps(loc, 99.0, base);
+    {
+      MessageBuilder warm;
+      auto gps = warm.initEvent().initGpsLocationExternal();
+      fill_with_meas(gps, base, 99'200'000'000ULL);
+      loc.handle_gps(99.2, gps.asReader(), 0.095);
+      REQUIRE(loc.get_gps_input_stats().last_reason == GpsInputRejectReason::Accepted);
+    }
+    MessageBuilder msg;
+    auto gps = msg.initEvent().initGpsLocationExternal();
+    fill_with_meas(gps, base, 99'500'000'000ULL);
+    loc.handle_gps(99.9, gps.asReader(), 0.095);
+    REQUIRE(loc.get_gps_input_stats().last_reason == GpsInputRejectReason::Accepted);
   }
 }

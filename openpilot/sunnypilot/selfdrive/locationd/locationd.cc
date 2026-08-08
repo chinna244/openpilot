@@ -351,6 +351,18 @@ void Localizer::reject_gps_input(double current_time, GpsInputRejectReason reaso
     case GpsInputRejectReason::UnreasonableVelocity:
       this->gps_input_stats.rejected_unreasonable_velocity++;
       break;
+    case GpsInputRejectReason::InvalidMeasurementTime:
+      this->gps_input_stats.rejected_invalid_measurement_time++;
+      break;
+    case GpsInputRejectReason::FutureMeasurement:
+      this->gps_input_stats.rejected_future_measurement++;
+      break;
+    case GpsInputRejectReason::StaleMeasurement:
+      this->gps_input_stats.rejected_stale_measurement++;
+      break;
+    case GpsInputRejectReason::PreTransitionMeasurement:
+      this->gps_input_stats.rejected_pre_transition_measurement++;
+      break;
     default:
       break;
   }
@@ -371,7 +383,7 @@ void Localizer::maybe_log_gps_input_stats(double current_time) {
   }
   this->last_gps_input_diag_log_t = current_time;
   const GpsInputStats &s = this->gps_input_stats;
-  LOGW("locationd GPS inputs: recv=%llu acc=%llu rej(nofix=%llu nonfinite=%llu lla=%llu hAcc=%llu vAcc=%llu sAcc=%llu bAcc=%llu unc=%llu vel=%llu) last=%d",
+  LOGW("locationd GPS inputs: recv=%llu acc=%llu rej(nofix=%llu nonfinite=%llu lla=%llu hAcc=%llu vAcc=%llu sAcc=%llu bAcc=%llu unc=%llu vel=%llu time=%llu future=%llu stale=%llu pre=%llu) last=%d",
        (unsigned long long)s.received,
        (unsigned long long)s.accepted,
        (unsigned long long)s.rejected_no_fix,
@@ -383,6 +395,10 @@ void Localizer::maybe_log_gps_input_stats(double current_time) {
        (unsigned long long)s.rejected_bearing_accuracy,
        (unsigned long long)s.rejected_unreasonable_uncertainty,
        (unsigned long long)s.rejected_unreasonable_velocity,
+       (unsigned long long)s.rejected_invalid_measurement_time,
+       (unsigned long long)s.rejected_future_measurement,
+       (unsigned long long)s.rejected_stale_measurement,
+       (unsigned long long)s.rejected_pre_transition_measurement,
        (int)s.last_reason);
 }
 
@@ -432,10 +448,8 @@ void Localizer::handle_gps(double current_time, const cereal::GpsLocationData::R
   }
 
   // Accuracies used as positive std-dev / covariance inputs must be > 0.
-  // QCOM currently sets gps_variance_factor=0 so horizontalAccuracy is unused in position
-  // covariance; qcomgpsd also leaves it at the default 0. Preserve that legacy path until
-  // the dedicated QCOM accuracy rehabilitation PR. Still require finite for every source.
-  if (this->gps_variance_factor > 0.0f && horizontal_accuracy <= 0.0f) {
+  // Both H and V enter NED→ECEF covariance for all sources (PR81).
+  if (horizontal_accuracy <= 0.0f) {
     this->reject_gps_input(current_time, GpsInputRejectReason::InvalidHorizontalAccuracy);
     return;
   }
@@ -463,11 +477,67 @@ void Localizer::handle_gps(double current_time, const cereal::GpsLocationData::R
     return;
   }
 
-  double sensor_time = current_time - sensor_time_offset;
+  // Measurement epoch: prefer producer measurementMonoNs (transport boundary).
+  // Fall back to publish mono minus empirical offset only when unset (legacy).
+  const uint64_t measurement_mono_ns = log.getMeasurementMonoNs();
+  double sensor_time = NAN;
+  if (measurement_mono_ns > 0) {
+    sensor_time = measurement_mono_ns * 1e-9;
+  } else {
+    sensor_time = current_time - sensor_time_offset;
+  }
   if (!std::isfinite(sensor_time)) {
-    this->reject_gps_input(current_time, GpsInputRejectReason::NonFiniteInput);
+    this->reject_gps_input(current_time, GpsInputRejectReason::InvalidMeasurementTime);
     return;
   }
+  // Measurement cannot be after Event publish time (beyond tiny skew).
+  if (sensor_time > current_time + 1e-3) {
+    this->reject_gps_input(current_time, GpsInputRejectReason::FutureMeasurement);
+    return;
+  }
+  // Source transition epoch is independent of measurement epoch; both must pass.
+  if (this->gps_source_state_seen && std::isfinite(this->gps_source_transition_mono) &&
+      sensor_time <= this->gps_source_transition_mono) {
+    this->reject_gps_input(current_time, GpsInputRejectReason::PreTransitionMeasurement);
+    return;
+  }
+  // Producer publication delay: measurement too old vs Event.logMonoTime.
+  if ((current_time - sensor_time) > MAX_FILTER_REWIND_TIME) {
+    this->reject_gps_input(current_time, GpsInputRejectReason::StaleMeasurement);
+    return;
+  }
+  // KF rewind safety: observation must be within filter history at apply time.
+  const double filter_time = this->kf->get_filter_time();
+  if (std::isfinite(filter_time) && ((filter_time - sensor_time) > MAX_FILTER_REWIND_TIME)) {
+    this->reject_gps_input(current_time, GpsInputRejectReason::StaleMeasurement);
+    return;
+  }
+
+  // Local NED covariance: isotropic horizontal + vertical, then rotate to ECEF.
+  // C_ecef = R_ned2ecef · diag(σ_h², σ_h², σ_v²) · Rᵀ, scaled by gps_std_factor.
+  Geodetic geodetic = { latitude, longitude, altitude };
+  this->converter = std::make_unique<LocalCoord>(geodetic);
+  const double h_std = static_cast<double>(this->gps_std_factor) * static_cast<double>(horizontal_accuracy);
+  const double v_std = static_cast<double>(this->gps_std_factor) * static_cast<double>(vertical_accuracy);
+  if (!std::isfinite(h_std) || !std::isfinite(v_std) || h_std <= 0.0 || v_std <= 0.0) {
+    this->reject_gps_input(current_time, GpsInputRejectReason::UnreasonableUncertainty);
+    return;
+  }
+  MatrixXdr c_ned = MatrixXdr::Zero(3, 3);
+  c_ned(0, 0) = h_std * h_std;
+  c_ned(1, 1) = h_std * h_std;
+  c_ned(2, 2) = v_std * v_std;
+  if (!c_ned.array().isFinite().all()) {
+    this->reject_gps_input(current_time, GpsInputRejectReason::UnreasonableUncertainty);
+    return;
+  }
+  MatrixXdr ecef_pos_R = rotate_cov(this->converter->ned2ecef_matrix, c_ned);
+  ecef_pos_R = 0.5 * (ecef_pos_R + ecef_pos_R.transpose());
+  if (!ecef_pos_R.array().isFinite().all()) {
+    this->reject_gps_input(current_time, GpsInputRejectReason::UnreasonableUncertainty);
+    return;
+  }
+  MatrixXdr ecef_vel_R = Vector3d::Constant(std::pow(this->gps_std_factor * speed_accuracy, 2)).asDiagonal();
 
   this->gps_input_stats.accepted++;
   this->gps_input_stats.last_reason = GpsInputRejectReason::Accepted;
@@ -475,14 +545,9 @@ void Localizer::handle_gps(double current_time, const cereal::GpsLocationData::R
 
   // Process message
   this->gps_mode = true;
-  Geodetic geodetic = { latitude, longitude, altitude };
-  this->converter = std::make_unique<LocalCoord>(geodetic);
 
   VectorXd ecef_pos = this->converter->ned2ecef({ 0.0, 0.0, 0.0 }).to_vector();
   VectorXd ecef_vel = this->converter->ned2ecef({ vned[0], vned[1], vned[2] }).to_vector() - ecef_pos;
-  float ecef_pos_std = std::sqrt(this->gps_variance_factor * std::pow(horizontal_accuracy, 2) + this->gps_vertical_variance_factor * std::pow(vertical_accuracy, 2));
-  MatrixXdr ecef_pos_R = Vector3d::Constant(std::pow(this->gps_std_factor * ecef_pos_std, 2)).asDiagonal();
-  MatrixXdr ecef_vel_R = Vector3d::Constant(std::pow(this->gps_std_factor * speed_accuracy, 2)).asDiagonal();
 
   this->unix_timestamp_millis = log.getUnixTimestampMillis();
   double gps_est_error = (this->kf->get_x().segment<STATE_ECEF_POS_LEN>(STATE_ECEF_POS_START) - ecef_pos).norm();
@@ -517,6 +582,7 @@ void Localizer::handle_gps(double current_time, const cereal::GpsLocationData::R
     this->reset_kalman(NAN, reset_orient, ecef_pos, ecef_vel, ecef_pos_R, ecef_vel_R);
   }
 
+  // Position and velocity share the same measurement epoch (same receiver solution).
   this->last_gps_msg = sensor_time;
   this->kf->predict_and_observe(sensor_time, OBSERVATION_ECEF_POS, { ecef_pos }, { ecef_pos_R });
   this->kf->predict_and_observe(sensor_time, OBSERVATION_ECEF_VEL, { ecef_vel }, { ecef_vel_R });
@@ -852,9 +918,10 @@ void Localizer::configure_gnss_source(const LocalizerGnssSource &source) {
     this->gps_vertical_variance_factor = 1.0;
     this->gps_time_offset = GPS_UBLOX_SENSOR_TIME_OFFSET;
   } else {
+    // QCOM: milder inflation; both H and V enter NED→ECEF covariance (PR81).
     this->gps_std_factor = 2.0;
-    this->gps_variance_factor = 0.0;
-    this->gps_vertical_variance_factor = 3.0;
+    this->gps_variance_factor = 1.0;
+    this->gps_vertical_variance_factor = 1.0;
     this->gps_time_offset = GPS_QUECTEL_SENSOR_TIME_OFFSET;
   }
 }

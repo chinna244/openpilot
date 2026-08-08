@@ -52,9 +52,11 @@ def test_gen_nav_pvt_has_fix_policy(fix_type: int, flags: int, expected: bool) -
   parser = UbloxMsgParser()
   service, dat = parser._gen_nav_pvt(
     _nav_pvt(fix_type=fix_type, flags=flags),  # type: ignore[arg-type, ty:invalid-argument-type]
+    measurement_mono_ns=1_000_000_000,
   )
   assert service == "gpsLocationExternal"
   assert dat.gpsLocationExternal.hasFix is expected
+  assert dat.gpsLocationExternal.measurementMonoNs == 1_000_000_000
   # Position fields are still populated for consumers that ignore hasFix.
   assert dat.gpsLocationExternal.latitude == pytest.approx(28.0)
   assert dat.gpsLocationExternal.longitude == pytest.approx(-82.0)
@@ -64,8 +66,10 @@ def test_gen_nav_pvt_3d_gnss_fix_ok_publishes_normally() -> None:
   parser = UbloxMsgParser()
   _, dat = parser._gen_nav_pvt(
     _nav_pvt(fix_type=3, flags=0x01),  # type: ignore[arg-type, ty:invalid-argument-type]
+    measurement_mono_ns=2_000_000_000,
   )
   gps = dat.gpsLocationExternal
   assert gps.hasFix is True
+  assert gps.measurementMonoNs == 2_000_000_000
   assert gps.satelliteCount == 8
   assert list(gps.vNED) == pytest.approx([0.1, 0.2, 0.0])

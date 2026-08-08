@@ -23,6 +23,7 @@ from openpilot.common.gps_source_arbiter import (
 
 
 def _valid_ublox(t: float, **kwargs) -> GpsSample:
+  meas_ns = kwargs.get("measurement_mono_ns", int(t * 1e9))
   return GpsSample(
     recv_mono=t,
     has_fix=kwargs.get("has_fix", True),
@@ -31,10 +32,16 @@ def _valid_ublox(t: float, **kwargs) -> GpsSample:
     horizontal_accuracy=kwargs.get("horizontal_accuracy", 2.0),
     vertical_accuracy=kwargs.get("vertical_accuracy", 3.0),
     unix_timestamp_millis=kwargs.get("unix_timestamp_millis", 1.7e12),
+    altitude=kwargs.get("altitude", 10.0),
+    speed_accuracy=kwargs.get("speed_accuracy", 0.5),
+    bearing_accuracy_deg=kwargs.get("bearing_accuracy_deg", 5.0),
+    v_ned=kwargs.get("v_ned", (0.0, 0.0, 0.0)),
+    measurement_mono_ns=meas_ns,
   )
 
 
 def _valid_qcom(t: float, **kwargs) -> GpsSample:
+  meas_ns = kwargs.get("measurement_mono_ns", int(t * 1e9))
   return GpsSample(
     recv_mono=t,
     has_fix=kwargs.get("has_fix", True),
@@ -43,6 +50,11 @@ def _valid_qcom(t: float, **kwargs) -> GpsSample:
     horizontal_accuracy=kwargs.get("horizontal_accuracy", 5.0),
     vertical_accuracy=kwargs.get("vertical_accuracy", 8.0),
     unix_timestamp_millis=kwargs.get("unix_timestamp_millis", 1.7e12),
+    altitude=kwargs.get("altitude", 12.0),
+    speed_accuracy=kwargs.get("speed_accuracy", 0.5),
+    bearing_accuracy_deg=kwargs.get("bearing_accuracy_deg", 5.0),
+    v_ned=kwargs.get("v_ned", (0.0, 0.0, 0.0)),
+    measurement_mono_ns=meas_ns,
   )
 
 
@@ -714,6 +726,83 @@ class TestCoordinationHelpers:
     assert STARTUP_HEALTH_CONFIRM_SECONDS == 1.0
     assert STARTUP_HEALTH_CONFIRM_SECONDS < 5.0
     assert math.isfinite(UBLOX_INITIAL_OUTPUT_GRACE_SECONDS)
+
+
+class TestLocationdUsabilityContract:
+  """gpsard HEALTHY must match locationd handle_gps field usability."""
+
+  def test_sane_uncertainty_constant_aligned(self):
+    from pathlib import Path
+
+    from openpilot.common.gps_measurement import (
+      GPS_LOCATIOND_ALTITUDE_SANITY_M,
+      GPS_LOCATIOND_MAX_FILTER_REWIND_SECONDS,
+      GPS_LOCATIOND_SANE_UNCERTAINTY_M,
+      GPS_LOCATIOND_TRANS_SANITY_MPS,
+    )
+
+    assert GPS_LOCATIOND_SANE_UNCERTAINTY_M == 1500.0
+    assert GPS_LOCATIOND_MAX_FILTER_REWIND_SECONDS == 0.8
+    assert GPS_LOCATIOND_ALTITUDE_SANITY_M == 10000.0
+    assert GPS_LOCATIOND_TRANS_SANITY_MPS == 200.0
+    # Mirrored C++ constants must not silently drift.
+    loc = (Path(__file__).resolve().parents[2] / "sunnypilot" / "selfdrive" / "locationd" / "locationd.cc").read_text()
+    assert "const double SANE_GPS_UNCERTAINTY = 1500.0" in loc
+    assert "const double MAX_FILTER_REWIND_TIME = 0.8" in loc
+    assert "const double ALTITUDE_SANITY_CHECK = 10000" in loc
+    assert "const double TRANS_SANITY_CHECK = 200.0" in loc
+
+  def test_qcom_excessive_uncertainty_not_healthy(self):
+    # hAcc=2000, vAcc=500 → hypot ≈ 2061 > 1500; locationd rejects.
+    a = _arbiter()
+    a.reset(now_mono=0.0)
+    t = 1.0
+    for _ in range(5):
+      a.observe_qcom(
+        _valid_qcom(t, horizontal_accuracy=2000.0, vertical_accuracy=500.0),
+        now_mono=t,
+      )
+      a.step(now_mono=t)
+      t += 0.25
+    assert a.state.qcom.health != SourceHealth.HEALTHY
+    assert a.state.selected == SelectedSource.NO_HEALTHY_SOURCE
+
+  def test_invalid_altitude_not_qualified(self):
+    assert not qcom_sample_is_valid_fix(_valid_qcom(1.0, altitude=20_000.0))
+    assert not ublox_sample_is_valid_fix(_valid_ublox(1.0, altitude=-20_000.0))
+
+  def test_invalid_speed_accuracy_not_qualified(self):
+    assert not qcom_sample_is_valid_fix(_valid_qcom(1.0, speed_accuracy=0.0))
+    assert not ublox_sample_is_valid_fix(_valid_ublox(1.0, speed_accuracy=-1.0))
+
+  def test_invalid_bearing_accuracy_not_qualified(self):
+    assert not qcom_sample_is_valid_fix(_valid_qcom(1.0, bearing_accuracy_deg=0.0))
+    assert not ublox_sample_is_valid_fix(_valid_ublox(1.0, bearing_accuracy_deg=float("nan")))
+
+  def test_invalid_vned_not_qualified(self):
+    assert not qcom_sample_is_valid_fix(_valid_qcom(1.0, v_ned=(300.0, 0.0, 0.0)))
+    assert not ublox_sample_is_valid_fix(_valid_ublox(1.0, v_ned=(float("nan"), 0.0, 0.0)))
+
+  def test_stale_measurement_mono_with_fresh_event_not_qualified(self):
+    # Event at t=10, measurement stamped 2s earlier → beyond 0.8s rewind.
+    s = _valid_qcom(10.0, measurement_mono_ns=int(8.0 * 1e9))
+    assert not qcom_sample_is_valid_fix(s)
+    a = _arbiter()
+    a.reset(now_mono=0.0)
+    a.observe_qcom(s, now_mono=10.0)
+    a.step(now_mono=10.0)
+    assert a.state.qcom.health != SourceHealth.HEALTHY
+
+  def test_valid_qcom_and_ublox_remain_eligible(self):
+    assert qcom_sample_is_valid_fix(_valid_qcom(1.0))
+    assert ublox_sample_is_valid_fix(_valid_ublox(1.0))
+    a = _arbiter()
+    a.reset(now_mono=0.0)
+    _establish_qcom_startup(a, 1.0)
+    assert a.state.selected == SelectedSource.QCOM_FALLBACK
+    a.reset(now_mono=50.0)
+    _establish_ublox_primary(a, 50.5)
+    assert a.state.selected == SelectedSource.UBLOX_PRIMARY
 
 
 class TestGpsardTelemetryFailOpen:

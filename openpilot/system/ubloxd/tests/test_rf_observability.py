@@ -285,7 +285,7 @@ def test_framer_health_logs_first_periodic_and_error_change() -> None:
 def test_ubloxd_observes_valid_frames_before_parser_and_retains_publication() -> None:
   source = inspect.getsource(ubloxd.main)
   observe_index = source.index("observability.observe_frame(frame, log_time)")
-  parse_index = source.index("parser.parse_frame(frame)")
+  parse_index = source.index("parser.parse_frame(frame, measurement_mono_ns=int(msg.logMonoTime))")
   assert observe_index < parse_index
   assert "observability.observe_framer_health(" in source
   assert "observability.observe_parser_error(frame, exc, log_time)" in source

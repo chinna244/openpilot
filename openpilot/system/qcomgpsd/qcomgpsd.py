@@ -708,7 +708,13 @@ def process_oemdre_measurement_report(
   return msg
 
 
-def process_position_report(log_payload: bytes, *, unpack_position, size_position: int):
+def process_position_report(
+  log_payload: bytes,
+  *,
+  unpack_position,
+  size_position: int,
+  measurement_mono_ns: int | None = None,
+):
   # Exact size contract for the openpilot/EG25 0x1476 struct layout.
   if len(log_payload) != size_position:
     return None
@@ -741,6 +747,9 @@ def process_position_report(log_payload: bytes, *, unpack_position, size_positio
   gps.hasFix = fields.has_fix
   if hasattr(gps, "satelliteCount"):
     gps.satelliteCount = fields.satellite_count
+  # Host mono when DIAG position payload became available — not later publish time.
+  if measurement_mono_ns is not None and int(measurement_mono_ns) > 0:
+    gps.measurementMonoNs = int(measurement_mono_ns)
   return msg
 
 
@@ -947,10 +956,13 @@ def main() -> NoReturn:
           pm.send("qcomGnss", msg)
 
       elif log_type == LOG_GNSS_POSITION_REPORT:
+        # Capture host mono at DIAG payload availability (before parse/publish delay).
+        measurement_mono_ns = time.monotonic_ns()
         msg = process_position_report(
           log_payload,
           unpack_position=unpack_position,
           size_position=size_position,
+          measurement_mono_ns=measurement_mono_ns,
         )
         if msg is not None:
           pm.send("gpsLocation", msg)

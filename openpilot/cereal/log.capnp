@@ -364,6 +364,11 @@ struct GpsLocationData {
   hasFix @13 :Bool;
   satelliteCount @14 :Int8;
 
+  # Host monotonic nanoseconds at the transport receive / framing boundary for
+  # this position solution (not Event.logMonoTime publication/processing time).
+  # 0 means unset/legacy. Locationd prefers this as the KF measurement epoch.
+  measurementMonoNs @15 :UInt64;
+
   enum SensorSource {
     android @0;
     iOS @1;

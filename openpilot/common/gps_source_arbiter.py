@@ -56,7 +56,7 @@ QCOM_FALLBACK_MIN_DWELL_SECONDS = 5.0
 
 @dataclass(frozen=True)
 class GpsSample:
-  """Normalized position sample for health evaluation."""
+  """Normalized position sample for health evaluation (locationd-usable fields)."""
 
   recv_mono: float
   has_fix: bool
@@ -65,6 +65,11 @@ class GpsSample:
   horizontal_accuracy: float
   vertical_accuracy: float | None = None
   unix_timestamp_millis: float | None = None
+  altitude: float = 0.0
+  speed_accuracy: float = 1.0
+  bearing_accuracy_deg: float = 1.0
+  v_ned: tuple[float, float, float] = (0.0, 0.0, 0.0)
+  measurement_mono_ns: int | None = None
 
 
 @dataclass
@@ -106,53 +111,41 @@ def _finite_number(value: object) -> bool:
   return math.isfinite(value)
 
 
-def sample_coords_valid(sample: GpsSample) -> bool:
-  if not (_finite_number(sample.latitude) and _finite_number(sample.longitude)):
-    return False
-  if not (-90.0 <= float(sample.latitude) <= 90.0):
-    return False
-  if not (-180.0 <= float(sample.longitude) <= 180.0):
-    return False
-  return True
+def sample_is_locationd_usable(sample: GpsSample) -> bool:
+  """Health-qualified fix must be usable by locationd handle_gps field checks."""
+  from openpilot.common.gps_measurement import locationd_position_fields_usable
 
-
-def sample_accuracy_valid(sample: GpsSample, *, require_vertical: bool) -> bool:
-  if not _finite_number(sample.horizontal_accuracy):
+  vert = sample.vertical_accuracy
+  if vert is None:
     return False
-  if float(sample.horizontal_accuracy) <= 0.0:
-    return False
-  if require_vertical:
-    if sample.vertical_accuracy is None or not _finite_number(sample.vertical_accuracy):
-      return False
-    if float(sample.vertical_accuracy) <= 0.0:
-      return False
-  return True
+  return locationd_position_fields_usable(
+    has_fix=sample.has_fix,
+    latitude=sample.latitude,
+    longitude=sample.longitude,
+    altitude=sample.altitude,
+    horizontal_accuracy=sample.horizontal_accuracy,
+    vertical_accuracy=vert,
+    speed_accuracy=sample.speed_accuracy,
+    bearing_accuracy_deg=sample.bearing_accuracy_deg,
+    v_ned=sample.v_ned,
+    measurement_mono_ns=sample.measurement_mono_ns,
+    event_mono_s=sample.recv_mono,
+    require_measurement_mono=True,
+  )
 
 
 def ublox_sample_is_valid_fix(sample: GpsSample) -> bool:
-  """Affirmative valid u-blox fix evidence (fail closed on bad metadata)."""
-  if not sample.has_fix:
-    return False
-  if not sample_coords_valid(sample):
-    return False
-  if not sample_accuracy_valid(sample, require_vertical=False):
-    return False
+  """Affirmative valid u-blox fix evidence usable by locationd (fail closed)."""
   if sample.unix_timestamp_millis is not None and not _finite_number(sample.unix_timestamp_millis):
     return False
-  return True
+  return sample_is_locationd_usable(sample)
 
 
 def qcom_sample_is_valid_fix(sample: GpsSample) -> bool:
-  """PR79-quality QCOM fix required for fallback eligibility."""
-  if not sample.has_fix:
-    return False
-  if not sample_coords_valid(sample):
-    return False
-  if not sample_accuracy_valid(sample, require_vertical=True):
-    return False
+  """PR79/PR81 QCOM fix usable by locationd (fail closed)."""
   if sample.unix_timestamp_millis is not None and not _finite_number(sample.unix_timestamp_millis):
     return False
-  return True
+  return sample_is_locationd_usable(sample)
 
 
 def _age(now_mono: float, then: float | None) -> float | None:
