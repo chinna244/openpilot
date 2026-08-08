@@ -885,3 +885,76 @@ TEST_CASE("PR81 measurement timing and covariance", "[pr81][timing][covariance]"
     REQUIRE(loc.get_gps_input_stats().last_reason == GpsInputRejectReason::Accepted);
   }
 }
+
+TEST_CASE("PR83 GPS reset preserves full ECEF position covariance", "[pr83][covariance][reset]") {
+  Localizer loc;
+  const double t = 10.0;
+  loc.reset_kalman(t);
+
+  SECTION("H != V preserves ECEF off-diagonals on reset") {
+    const double lat = 37.3861;
+    const double lon = -122.0839;
+    const double alt = 10.0;
+    const double h_std = 2.0;
+    const double v_std = 10.0;
+
+    Geodetic geo = {lat, lon, alt};
+    ECEF ecef = geodetic2ecef(geo);
+    LocalCoord converter(geo);
+
+    MatrixXdr c_ned = MatrixXdr::Zero(3, 3);
+    c_ned(0, 0) = h_std * h_std;
+    c_ned(1, 1) = h_std * h_std;
+    c_ned(2, 2) = v_std * v_std;
+    MatrixXdr ecef_pos_R = (converter.ned2ecef_matrix * c_ned) * converter.ned2ecef_matrix.transpose();
+    ecef_pos_R = 0.5 * (ecef_pos_R + ecef_pos_R.transpose());
+    REQUIRE(ecef_pos_R.array().isFinite().all());
+    // Non-axis-aligned lat/lon with H!=V produces off-diagonal ECEF correlation.
+    REQUIRE((ecef_pos_R - MatrixXdr(ecef_pos_R.diagonal().asDiagonal())).norm() > 1e-6);
+
+    MatrixXdr ecef_vel_R = Vector3d::Constant(0.25).asDiagonal();
+    VectorXd pos = Vector3d(ecef.x, ecef.y, ecef.z);
+    VectorXd vel = Vector3d::Zero();
+    VectorXd orient = loc.get_state().segment<STATE_ECEF_ORIENTATION_LEN>(STATE_ECEF_ORIENTATION_START);
+
+    loc.reset_kalman(t, orient, pos, vel, ecef_pos_R, ecef_vel_R);
+
+    MatrixXdr P = loc.get_cov();
+    MatrixXdr pos_block = P.block<STATE_ECEF_POS_ERR_LEN, STATE_ECEF_POS_ERR_LEN>(
+      STATE_ECEF_POS_ERR_START, STATE_ECEF_POS_ERR_START);
+    REQUIRE(pos_block.isApprox(ecef_pos_R, 1e-9));
+    REQUIRE(pos_block.isApprox(pos_block.transpose()));
+    Eigen::SelfAdjointEigenSolver<MatrixXd> es(pos_block);
+    REQUIRE((es.eigenvalues().array() >= -1e-9).all());
+
+    MatrixXdr vel_block = P.block<STATE_ECEF_VELOCITY_ERR_LEN, STATE_ECEF_VELOCITY_ERR_LEN>(
+      STATE_ECEF_VELOCITY_ERR_START, STATE_ECEF_VELOCITY_ERR_START);
+    REQUIRE(vel_block.isApprox(ecef_vel_R, 1e-9));
+  }
+
+  SECTION("isotropic H == V remains isotropic after reset") {
+    const double lat = 37.3861;
+    const double lon = -122.0839;
+    const double alt = 10.0;
+    const double std = 3.0;
+
+    Geodetic geo = {lat, lon, alt};
+    ECEF ecef = geodetic2ecef(geo);
+    LocalCoord converter(geo);
+
+    MatrixXdr c_ned = MatrixXdr::Identity(3, 3) * (std * std);
+    MatrixXdr ecef_pos_R = (converter.ned2ecef_matrix * c_ned) * converter.ned2ecef_matrix.transpose();
+    ecef_pos_R = 0.5 * (ecef_pos_R + ecef_pos_R.transpose());
+    REQUIRE(ecef_pos_R.isApprox(MatrixXdr::Identity(3, 3) * (std * std), 1e-9));
+
+    MatrixXdr ecef_vel_R = Vector3d::Constant(0.25).asDiagonal();
+    VectorXd pos = Vector3d(ecef.x, ecef.y, ecef.z);
+    VectorXd vel = Vector3d::Zero();
+    VectorXd orient = loc.get_state().segment<STATE_ECEF_ORIENTATION_LEN>(STATE_ECEF_ORIENTATION_START);
+
+    loc.reset_kalman(t, orient, pos, vel, ecef_pos_R, ecef_vel_R);
+    MatrixXdr pos_block = loc.get_cov().block<STATE_ECEF_POS_ERR_LEN, STATE_ECEF_POS_ERR_LEN>(
+      STATE_ECEF_POS_ERR_START, STATE_ECEF_POS_ERR_START);
+    REQUIRE(pos_block.isApprox(ecef_pos_R, 1e-9));
+  }
+}

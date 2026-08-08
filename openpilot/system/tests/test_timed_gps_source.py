@@ -104,3 +104,31 @@ def test_timed_equal_epoch_consistent_refresh_ok():
     last_generation=1,
     last_selected="qcomFallback",
   )
+
+
+def test_timed_exclusive_host_time_bounds_match_shared_contract():
+  """timed must reject exact MIN/MAX; shared helper is exclusive on both ends."""
+  from datetime import UTC, timedelta
+
+  from openpilot.common.time_helpers import (
+    MAX_DATE,
+    MIN_DATE,
+    min_date,
+    utc_within_exclusive_supported_range,
+  )
+
+  # Use fixed MIN_DATE for deterministic bounds (min_date() may raise the floor).
+  floor = max(MIN_DATE, min_date()).replace(tzinfo=UTC)
+  ceiling = MAX_DATE.replace(tzinfo=UTC)
+  eps = timedelta(microseconds=1)
+
+  assert not utc_within_exclusive_supported_range(floor - eps)
+  assert not utc_within_exclusive_supported_range(floor)
+  assert utc_within_exclusive_supported_range(floor + eps)
+  assert utc_within_exclusive_supported_range(ceiling - eps)
+  assert not utc_within_exclusive_supported_range(ceiling)
+  assert not utc_within_exclusive_supported_range(ceiling + eps)
+
+  # Mirror timed's former inclusive bug: equality at either bound must not pass.
+  assert not (floor < floor < ceiling)
+  assert not (floor < ceiling < ceiling)

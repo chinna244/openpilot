@@ -1,4 +1,4 @@
-# Final GPS known issues / boundaries (PR82)
+# Final GPS known issues / boundaries (PR82 / PR83)
 
 ## SOLVED SOFTWARE CORRECTNESS
 
@@ -18,10 +18,15 @@
 - Default leap-second authority uses maintained known IERS offset data (no artificial GPS-rollover cutoff); explicit/receiver leap still allowed (PR82)
 - gps_drive_audit consumes PR71/80/81 telemetry with historical-route degradation and conservative evidence-based classification (PR82)
 - Startup NO_HEALTHY is not a failure classification; runtime authority loss is (PR82)
+- locationd_llk restarts after unexpected crash while still required (PR83)
+- gpsard↔locationd bearingDeg finite usability contract completed (PR83)
+- timed exclusive host/GPS time bounds match shared `min < t < max` contract (PR83)
+- Trusted-UTC GPS-week resolution and YUMA GPS→UTC conversion are leap-aware via maintained table (PR83)
+- GPS-triggered Kalman reset preserves full ECEF position covariance (off-diagonals) (PR83)
 
 ## FIELD VALIDATION PENDING
 
-- Complete QCOM C4 live fallback/recovery proof after PR82 merge
+- Complete C4 live validation after PR83 deterministic cleanup
   (see `gps_c4_field_validation_plan.md`)
 
 ## ARCHITECTURAL / EXTERNAL LIMITATIONS
@@ -50,7 +55,8 @@
 
 ## FREEZE RULE
 
-After PR82, the GPS software correctness/hardening series (PR69–PR82) is **COMPLETE**.
+Software deterministic cleanup through PR83 is **COMPLETE**.
+Field validation on C4 remains pending.
 
 Future GPS behavioral PRs require one of:
 
@@ -60,3 +66,4 @@ Future GPS behavioral PRs require one of:
 4. a clearly defined new feature with a real supported data source
 
 “TTFF is sometimes slow” alone is **not** enough justification to reopen startup policy.
+Leap-second tables are updated only after an actual standards/IERS change.

@@ -34,6 +34,7 @@ def _valid_ublox(t: float, **kwargs) -> GpsSample:
     unix_timestamp_millis=kwargs.get("unix_timestamp_millis", 1.7e12),
     altitude=kwargs.get("altitude", 10.0),
     speed_accuracy=kwargs.get("speed_accuracy", 0.5),
+    bearing_deg=kwargs.get("bearing_deg", 90.0),
     bearing_accuracy_deg=kwargs.get("bearing_accuracy_deg", 5.0),
     v_ned=kwargs.get("v_ned", (0.0, 0.0, 0.0)),
     measurement_mono_ns=meas_ns,
@@ -52,6 +53,7 @@ def _valid_qcom(t: float, **kwargs) -> GpsSample:
     unix_timestamp_millis=kwargs.get("unix_timestamp_millis", 1.7e12),
     altitude=kwargs.get("altitude", 12.0),
     speed_accuracy=kwargs.get("speed_accuracy", 0.5),
+    bearing_deg=kwargs.get("bearing_deg", 45.0),
     bearing_accuracy_deg=kwargs.get("bearing_accuracy_deg", 5.0),
     v_ned=kwargs.get("v_ned", (0.0, 0.0, 0.0)),
     measurement_mono_ns=meas_ns,
@@ -778,6 +780,16 @@ class TestLocationdUsabilityContract:
   def test_invalid_bearing_accuracy_not_qualified(self):
     assert not qcom_sample_is_valid_fix(_valid_qcom(1.0, bearing_accuracy_deg=0.0))
     assert not ublox_sample_is_valid_fix(_valid_ublox(1.0, bearing_accuracy_deg=float("nan")))
+
+  def test_finite_bearing_deg_remains_usable(self):
+    assert ublox_sample_is_valid_fix(_valid_ublox(1.0, bearing_deg=0.0))
+    assert ublox_sample_is_valid_fix(_valid_ublox(1.0, bearing_deg=359.9))
+    assert qcom_sample_is_valid_fix(_valid_qcom(1.0, bearing_deg=-45.0))
+
+  def test_nonfinite_bearing_deg_not_qualified(self):
+    assert not ublox_sample_is_valid_fix(_valid_ublox(1.0, bearing_deg=float("nan")))
+    assert not qcom_sample_is_valid_fix(_valid_qcom(1.0, bearing_deg=float("inf")))
+    assert not ublox_sample_is_valid_fix(_valid_ublox(1.0, bearing_deg=float("-inf")))
 
   def test_invalid_vned_not_qualified(self):
     assert not qcom_sample_is_valid_fix(_valid_qcom(1.0, v_ned=(300.0, 0.0, 0.0)))

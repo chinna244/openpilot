@@ -67,6 +67,7 @@ class GpsSample:
   unix_timestamp_millis: float | None = None
   altitude: float = 0.0
   speed_accuracy: float = 1.0
+  bearing_deg: float = 0.0
   bearing_accuracy_deg: float = 1.0
   v_ned: tuple[float, float, float] = (0.0, 0.0, 0.0)
   measurement_mono_ns: int | None = None
@@ -126,6 +127,7 @@ def sample_is_locationd_usable(sample: GpsSample) -> bool:
     horizontal_accuracy=sample.horizontal_accuracy,
     vertical_accuracy=vert,
     speed_accuracy=sample.speed_accuracy,
+    bearing_deg=sample.bearing_deg,
     bearing_accuracy_deg=sample.bearing_accuracy_deg,
     v_ned=sample.v_ned,
     measurement_mono_ns=sample.measurement_mono_ns,

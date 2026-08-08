@@ -104,6 +104,7 @@ def locationd_position_fields_usable(
   horizontal_accuracy: float,
   vertical_accuracy: float,
   speed_accuracy: float,
+  bearing_deg: float,
   bearing_accuracy_deg: float,
   v_ned: Sequence[float] | None,
   measurement_mono_ns: int | None,
@@ -124,6 +125,7 @@ def locationd_position_fields_usable(
     and _finite_number(horizontal_accuracy)
     and _finite_number(vertical_accuracy)
     and _finite_number(speed_accuracy)
+    and _finite_number(bearing_deg)
     and _finite_number(bearing_accuracy_deg)
   ):
     return False
