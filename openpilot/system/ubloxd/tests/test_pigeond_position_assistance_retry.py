@@ -67,7 +67,7 @@ def execution(
 
 def runtime(tmp_path: Path) -> PositionAssistanceRetryRuntime:
   return PositionAssistanceRetryRuntime(
-    "receiver",
+    "v1|receiver|sw=ext core 3.01|hw=00080000|prot=20.30|fw=hpg 1.40rov",
     state_path=tmp_path / "position_retry.json",
     boot_id_reader=lambda: BOOT_ID,
   )
@@ -161,7 +161,7 @@ def test_retry_claim_is_persisted_before_receiver_write(
 ) -> None:
   state_path = tmp_path / "position_retry.json"
   retry = PositionAssistanceRetryRuntime(
-    "receiver",
+    "v1|receiver|sw=ext core 3.01|hw=00080000|prot=20.30|fw=hpg 1.40rov",
     state_path=state_path,
     boot_id_reader=lambda: BOOT_ID,
   )
@@ -229,7 +229,7 @@ def test_same_boot_process_restart_cancels_pending_retry(
 ) -> None:
   state_path = tmp_path / "position_retry.json"
   first = PositionAssistanceRetryRuntime(
-    "receiver",
+    "v1|receiver|sw=ext core 3.01|hw=00080000|prot=20.30|fw=hpg 1.40rov",
     state_path=state_path,
     boot_id_reader=lambda: BOOT_ID,
   )
@@ -243,7 +243,7 @@ def test_same_boot_process_restart_cancels_pending_retry(
   )
 
   second = PositionAssistanceRetryRuntime(
-    "receiver",
+    "v1|receiver|sw=ext core 3.01|hw=00080000|prot=20.30|fw=hpg 1.40rov",
     state_path=state_path,
     boot_id_reader=lambda: BOOT_ID,
   )
@@ -607,7 +607,7 @@ def test_restart_after_persisted_claim_is_interrupted_without_write(
 ) -> None:
   state_path = tmp_path / "position_retry.json"
   first = PositionAssistanceRetryRuntime(
-    "receiver",
+    "v1|receiver|sw=ext core 3.01|hw=00080000|prot=20.30|fw=hpg 1.40rov",
     state_path=state_path,
     boot_id_reader=lambda: BOOT_ID,
   )
@@ -630,7 +630,7 @@ def test_restart_after_persisted_claim_is_interrupted_without_write(
   )
 
   second = PositionAssistanceRetryRuntime(
-    "receiver",
+    "v1|receiver|sw=ext core 3.01|hw=00080000|prot=20.30|fw=hpg 1.40rov",
     state_path=state_path,
     boot_id_reader=lambda: BOOT_ID,
   )
@@ -649,7 +649,7 @@ def test_arm_persistence_failure_is_structured_and_logged_by_integration(
     raise OSError("storage unavailable")
 
   retry = PositionAssistanceRetryRuntime(
-    "receiver",
+    "v1|receiver|sw=ext core 3.01|hw=00080000|prot=20.30|fw=hpg 1.40rov",
     state_path=tmp_path / "position_retry.json",
     boot_id_reader=lambda: BOOT_ID,
     state_storer=fail_store,
@@ -776,7 +776,7 @@ def test_invalid_existing_retry_state_fails_closed_without_overwrite(
     match="state load failed",
   ):
     PositionAssistanceRetryRuntime(
-      "receiver",
+      "v1|receiver|sw=ext core 3.01|hw=00080000|prot=20.30|fw=hpg 1.40rov",
       state_path=state_path,
       boot_id_reader=lambda: BOOT_ID,
     )
@@ -802,7 +802,7 @@ def test_invalid_retry_state_value_fails_closed_without_overwrite(
     match="state load failed",
   ):
     PositionAssistanceRetryRuntime(
-      "receiver",
+      "v1|receiver|sw=ext core 3.01|hw=00080000|prot=20.30|fw=hpg 1.40rov",
       state_path=state_path,
       boot_id_reader=lambda: BOOT_ID,
     )
@@ -829,7 +829,7 @@ def test_retry_state_read_error_disables_runtime_without_store_or_write(
     match="OSError:read unavailable",
   ):
     PositionAssistanceRetryRuntime(
-      "receiver",
+      "v1|receiver|sw=ext core 3.01|hw=00080000|prot=20.30|fw=hpg 1.40rov",
       state_path=tmp_path / "position_retry.json",
       boot_id_reader=lambda: BOOT_ID,
       state_loader=fail_load,

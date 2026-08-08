@@ -19,18 +19,40 @@ from openpilot.system.ubloxd.navigation_database_restore_runtime import (
   NavigationDatabaseRestoreRuntime,
   NavigationDatabaseRestoreSnapshot,
   PositionAssistanceAckStatus,
+  PositionAssistanceFailureKind,
   PositionAssistanceWriteStatus,
 )
 from openpilot.system.ubloxd.position_assistance_retry import (
   PositionAssistanceRetryResult,
   PositionAssistanceRetryRuntime,
 )
+from openpilot.system.ubloxd.trusted_time_anchor import (
+  TimeProvenance,
+  TrustedTimeSource,
+)
+from openpilot.system.ubloxd.trusted_time_authority import (
+  AuthorizedTime,
+  TimeAuthorizationEvidence,
+)
 from openpilot.system.ubloxd.yuma_almanac_transmit import MgaReceiverNackError
 
 
 BOOT_ID = "12345678-1234-5678-9234-567812345678"
+TEST_RECEIVER_FINGERPRINT = "v1|receiver|sw=ext core 3.01|hw=00080000|prot=20.30|fw=hpg 1.40rov"
 NOW = datetime(2026, 7, 29, 13, 0, tzinfo=UTC)
 TEST_BOOTTIME_SECONDS = 100.0
+
+
+def same_boot_time() -> AuthorizedTime:
+  return AuthorizedTime(
+    utc=NOW,
+    uncertainty_seconds=2.0,
+    source=TrustedTimeSource.SYSTEM_SYNCHRONIZED,
+    provenance=TimeProvenance.NETWORK_INDEPENDENT,
+    independent=False,
+    evidence=TimeAuthorizationEvidence.SAME_BOOT_BOOTTIME,
+    observed_boottime_seconds=TEST_BOOTTIME_SECONDS,
+  )
 
 
 def startup_ready_quality() -> NavigationQuality:
@@ -54,7 +76,7 @@ def startup_ready_quality() -> NavigationQuality:
 
 def position_snapshot(
   *,
-  age: timedelta = timedelta(minutes=30),
+  age: timedelta = timedelta(minutes=5),
   with_database: bool = True,
 ) -> NavigationDatabaseRestoreSnapshot:
   return NavigationDatabaseRestoreSnapshot(
@@ -77,7 +99,7 @@ def make_runtime(
   state_name: str = "dbd_state.json",
 ) -> NavigationDatabaseRestoreRuntime:
   return NavigationDatabaseRestoreRuntime(
-    "receiver",
+    TEST_RECEIVER_FINGERPRINT,
     snapshot_loader=lambda _fingerprint: loaded,
     retry_delay_seconds=0.0,
     state_path=tmp_path / state_name,
@@ -103,7 +125,7 @@ def install_send_recorder(monkeypatch: pytest.MonkeyPatch) -> list[bytes]:
   return writes
 
 
-def test_field_case_skipped_no_trusted_time_after_acquisition_sends_position(
+def test_field_case_skipped_no_trusted_time_after_acquisition_skips_unverified_position(
   tmp_path: Path,
   monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -118,16 +140,16 @@ def test_field_case_skipped_no_trusted_time_after_acquisition_sends_position(
   writes = install_send_recorder(monkeypatch)
   result = pigeond.restore_navigation_assistance(
     object(),  # type: ignore[arg-type, ty:invalid-argument-type]
-    "receiver",
+    TEST_RECEIVER_FINGERPRINT,
     navigation_database_runtime=runtime,
     authorized_time=None,
   )
 
-  assert len(writes) == 1
+  assert len(writes) == 0
   assert runtime.execution.position_assistance_attempted
-  assert runtime.execution.position_assistance_succeeded
+  assert not runtime.execution.position_assistance_succeeded
   assert result.position_assistance_attempted
-  assert result.position_assistance_succeeded
+  assert not result.position_assistance_succeeded
 
 
 @pytest.mark.parametrize(
@@ -147,13 +169,13 @@ def test_field_case_skipped_no_trusted_time_after_acquisition_sends_position(
     ),
   ),
 )
-def test_non_success_dbd_outcomes_still_send_independent_position(
+def test_non_success_dbd_outcomes_still_send_fresh_same_boot_position(
   tmp_path: Path,
   monkeypatch: pytest.MonkeyPatch,
   close_method: str,
   expected_disposition: NavigationDatabaseRestoreDisposition,
 ) -> None:
-  runtime = make_runtime(tmp_path, loaded=position_snapshot())
+  runtime = make_runtime(tmp_path, loaded=position_snapshot(age=timedelta(minutes=5)))
   runtime.prepare()
   getattr(runtime, close_method)()
   runtime.note_acquisition_started()
@@ -162,12 +184,36 @@ def test_non_success_dbd_outcomes_still_send_independent_position(
   writes = install_send_recorder(monkeypatch)
   pigeond.restore_navigation_assistance(
     object(),  # type: ignore[arg-type, ty:invalid-argument-type]
-    "receiver",
+    TEST_RECEIVER_FINGERPRINT,
     navigation_database_runtime=runtime,
+    authorized_time=same_boot_time(),
   )
 
   assert len(writes) == 1
   assert runtime.execution.position_assistance_attempted
+  assert runtime.execution.position_assistance_succeeded
+
+
+def test_non_success_dbd_without_age_evidence_skips_position(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  runtime = make_runtime(tmp_path, loaded=position_snapshot())
+  runtime.prepare()
+  runtime.close_restore_window_no_trusted_time()
+  runtime.note_acquisition_started()
+
+  writes = install_send_recorder(monkeypatch)
+  pigeond.restore_navigation_assistance(
+    object(),  # type: ignore[arg-type, ty:invalid-argument-type]
+    TEST_RECEIVER_FINGERPRINT,
+    navigation_database_runtime=runtime,
+    authorized_time=None,
+  )
+
+  assert len(writes) == 0
+  assert runtime.execution.position_assistance_attempted
+  assert not runtime.execution.position_assistance_succeeded
 
 
 def test_no_position_snapshot_does_not_send_or_arm_retry(
@@ -186,7 +232,7 @@ def test_no_position_snapshot_does_not_send_or_arm_retry(
 
   writes = install_send_recorder(monkeypatch)
   retry = PositionAssistanceRetryRuntime(
-    "receiver",
+    TEST_RECEIVER_FINGERPRINT,
     state_path=tmp_path / "retry_state.json",
     boot_id_reader=lambda: BOOT_ID,
     boottime_reader=lambda: TEST_BOOTTIME_SECONDS,
@@ -196,7 +242,7 @@ def test_no_position_snapshot_does_not_send_or_arm_retry(
 
   pigeond.restore_navigation_assistance(
     object(),  # type: ignore[arg-type, ty:invalid-argument-type]
-    "receiver",
+    TEST_RECEIVER_FINGERPRINT,
     navigation_database_runtime=runtime,
   )
   controller.runtime = retry
@@ -219,7 +265,7 @@ def test_invalid_snapshot_load_does_not_send_position(
     raise OSError("cache read failed")
 
   runtime = NavigationDatabaseRestoreRuntime(
-    "receiver",
+    TEST_RECEIVER_FINGERPRINT,
     snapshot_loader=fail_loader,
     retry_delay_seconds=0.0,
     state_path=tmp_path / "dbd_state.json",
@@ -233,7 +279,7 @@ def test_invalid_snapshot_load_does_not_send_position(
   writes = install_send_recorder(monkeypatch)
   pigeond.restore_navigation_assistance(
     object(),  # type: ignore[arg-type, ty:invalid-argument-type]
-    "receiver",
+    TEST_RECEIVER_FINGERPRINT,
     navigation_database_runtime=runtime,
   )
 
@@ -253,13 +299,15 @@ def test_one_shot_claim_prevents_duplicate_position_send(
 
   pigeond.restore_navigation_assistance(
     object(),  # type: ignore[arg-type, ty:invalid-argument-type]
-    "receiver",
+    TEST_RECEIVER_FINGERPRINT,
     navigation_database_runtime=runtime,
+    authorized_time=same_boot_time(),
   )
   pigeond.restore_navigation_assistance(
     object(),  # type: ignore[arg-type, ty:invalid-argument-type]
-    "receiver",
+    TEST_RECEIVER_FINGERPRINT,
     navigation_database_runtime=runtime,
+    authorized_time=same_boot_time(),
   )
 
   assert len(writes) == 1
@@ -295,12 +343,13 @@ def test_info_code_5_rejection_arms_bounded_retry_once(
 
   pigeond.restore_navigation_assistance(
     object(),  # type: ignore[arg-type, ty:invalid-argument-type]
-    "receiver",
+    TEST_RECEIVER_FINGERPRINT,
     navigation_database_runtime=runtime,
+    authorized_time=same_boot_time(),
   )
 
   retry = PositionAssistanceRetryRuntime(
-    "receiver",
+    TEST_RECEIVER_FINGERPRINT,
     state_path=tmp_path / "retry_state.json",
     boot_id_reader=lambda: BOOT_ID,
     boottime_reader=lambda: TEST_BOOTTIME_SECONDS,
@@ -341,12 +390,13 @@ def test_successful_initial_send_does_not_arm_retry(
 
   pigeond.restore_navigation_assistance(
     object(),  # type: ignore[arg-type, ty:invalid-argument-type]
-    "receiver",
+    TEST_RECEIVER_FINGERPRINT,
     navigation_database_runtime=runtime,
+    authorized_time=same_boot_time(),
   )
 
   retry = PositionAssistanceRetryRuntime(
-    "receiver",
+    TEST_RECEIVER_FINGERPRINT,
     state_path=tmp_path / "retry_state.json",
     boot_id_reader=lambda: BOOT_ID,
     boottime_reader=lambda: TEST_BOOTTIME_SECONDS,
@@ -372,13 +422,14 @@ def test_receiver_cycle_isolation_clears_claimed_and_retry_state(
   writes = install_send_recorder(monkeypatch)
   pigeond.restore_navigation_assistance(
     object(),  # type: ignore[arg-type, ty:invalid-argument-type]
-    "receiver",
+    TEST_RECEIVER_FINGERPRINT,
     navigation_database_runtime=first,
+    authorized_time=same_boot_time(),
   )
   assert len(writes) == 1
 
   retry = PositionAssistanceRetryRuntime(
-    "receiver",
+    TEST_RECEIVER_FINGERPRINT,
     state_path=tmp_path / "retry_state.json",
     boot_id_reader=lambda: BOOT_ID,
     boottime_reader=lambda: TEST_BOOTTIME_SECONDS,
@@ -387,7 +438,7 @@ def test_receiver_cycle_isolation_clears_claimed_and_retry_state(
   retry.arm_from_initial(first.execution, first.position_assistance_message)
 
   next_cycle = NavigationDatabaseRestoreRuntime(
-    "receiver",
+    TEST_RECEIVER_FINGERPRINT,
     snapshot_loader=lambda _fingerprint: position_snapshot(),
     retry_delay_seconds=0.0,
     state_path=tmp_path / "cycle2.json",
@@ -396,7 +447,7 @@ def test_receiver_cycle_isolation_clears_claimed_and_retry_state(
     new_receiver_cycle=True,
   )
   next_retry = PositionAssistanceRetryRuntime(
-    "receiver",
+    TEST_RECEIVER_FINGERPRINT,
     state_path=tmp_path / "retry_state.json",
     boot_id_reader=lambda: BOOT_ID,
     boottime_reader=lambda: TEST_BOOTTIME_SECONDS,
@@ -412,8 +463,9 @@ def test_receiver_cycle_isolation_clears_claimed_and_retry_state(
 
   pigeond.restore_navigation_assistance(
     object(),  # type: ignore[arg-type, ty:invalid-argument-type]
-    "receiver",
+    TEST_RECEIVER_FINGERPRINT,
     navigation_database_runtime=next_cycle,
+    authorized_time=same_boot_time(),
   )
   assert len(writes) == 2
   assert next_cycle.execution.position_assistance_attempted
@@ -438,7 +490,7 @@ def test_restore_position_path_does_not_reintroduce_trusted_time_wait(
 
   result = pigeond.restore_navigation_assistance(
     object(),  # type: ignore[arg-type, ty:invalid-argument-type]
-    "receiver",
+    TEST_RECEIVER_FINGERPRINT,
     navigation_database_runtime=runtime,
     authorized_time=None,
   )
@@ -447,6 +499,8 @@ def test_restore_position_path_does_not_reintroduce_trusted_time_wait(
   assert result.database_trusted_time_wait_started_at is None
   assert result.database_trusted_time_wait_elapsed_seconds is None
   assert runtime.execution.position_assistance_attempted
+  assert not runtime.execution.position_assistance_succeeded
+  assert runtime.execution.position_assistance_failure_kind is PositionAssistanceFailureKind.AGE_UNVERIFIED
 
 
 def test_restore_source_no_longer_gates_position_on_acquisition_or_early_skip() -> None:

@@ -14,6 +14,7 @@ from math import ceil, isfinite
 from pathlib import Path
 from typing import cast
 
+from openpilot.common.gps_time import ublox_nav_pvt_has_fix
 from openpilot.common.time_helpers import MAX_DATE, MIN_DATE
 
 
@@ -80,9 +81,23 @@ MAX_RTC_ASSISTANCE_ELAPSED_SECONDS = (
 RTC_BASE_TIME_UNCERTAINTY_SECONDS = 60
 RTC_DRIFT_PARTS_PER_MILLION = 100
 
-# A deliberately broad radius prevents an old position from misleading the
-# receiver if the device has moved since the cache was saved.
+# A deliberately broad radius prevents a recent cached point from being treated
+# as exact. This is a restore floor (larger = safer), not an age model.
 MIN_RESTORE_POSITION_ACCURACY_CM = 5_000_000  # 50 km
+# Policy/usefulness ceiling for assistance we are willing to encode. Not a
+# u-blox protocol maximum (posAcc is U4 cm). Required uncertainty above this
+# must SKIP assistance rather than clamp downward.
+MAX_RESTORE_POSITION_ACCURACY_CM = 50_000_000  # 500 km policy limit
+# Without an authoritative mobility model, only genuinely fresh verified-age
+# positions may be sent. At highway speeds (~40 m/s), 50 km exceeds ~21 minutes
+# of travel; use a shorter window so the 50 km floor remains conservative.
+FRESH_POSITION_ASSISTANCE_MAX_AGE_SECONDS = 15 * 60
+
+# Durable assistance fingerprint schema. Legacy persisted caches used
+# "{serial}|ublox-m8-prot20.30" without consulting live MON-VER and must fail
+# closed for receiver-specific restore.
+RECEIVER_FINGERPRINT_SCHEMA_VERSION = 1
+LEGACY_RECEIVER_FINGERPRINT_SUFFIX = "ublox-m8-prot20.30"
 
 
 class CacheValidationError(ValueError):
@@ -392,6 +407,171 @@ def normalized_receiver_identity(info: MonVerInfo) -> str:
     f"hw={normalize(info.hardware_version)}",
     f"ext={';'.join(extensions)}",
   ))
+
+
+def _normalize_fingerprint_token(value: str) -> str:
+  return " ".join(value.split()).casefold()
+
+
+def mon_ver_protocol_version(info: MonVerInfo) -> str | None:
+  for extension in info.protocol_versions:
+    if "=" not in extension:
+      continue
+    _, _, value = extension.partition("=")
+    token = _normalize_fingerprint_token(value)
+    if token:
+      return token
+  return None
+
+
+def mon_ver_firmware_versions(info: MonVerInfo) -> tuple[str, ...]:
+  tokens: list[str] = []
+  for extension in info.firmware_versions:
+    if "=" not in extension:
+      continue
+    _, _, value = extension.partition("=")
+    token = _normalize_fingerprint_token(value)
+    if token and token not in tokens:
+      tokens.append(token)
+  return tuple(sorted(tokens))
+
+
+def build_durable_receiver_fingerprint(
+  hardware_serial: str,
+  info: MonVerInfo | None,
+) -> str:
+  """Build a versioned receiver fingerprint from serial + MON-VER.
+
+  Incomplete/missing MON-VER yields a sentinel string that is never treated as
+  a compatible receiver identity by receiver_fingerprints_compatible().
+  """
+  serial = _normalize_fingerprint_token(hardware_serial)
+  if not serial:
+    return f"v{RECEIVER_FINGERPRINT_SCHEMA_VERSION}|unknown_serial|mon_ver_unavailable"
+  if info is None:
+    return f"v{RECEIVER_FINGERPRINT_SCHEMA_VERSION}|{serial}|mon_ver_unavailable"
+
+  software = _normalize_fingerprint_token(info.software_version)
+  hardware = _normalize_fingerprint_token(info.hardware_version)
+  protocol = mon_ver_protocol_version(info)
+  firmwares = mon_ver_firmware_versions(info)
+  if not software or not hardware or protocol is None or not firmwares:
+    return f"v{RECEIVER_FINGERPRINT_SCHEMA_VERSION}|{serial}|mon_ver_incomplete"
+  firmware = ";".join(firmwares)
+  return (
+    f"v{RECEIVER_FINGERPRINT_SCHEMA_VERSION}|{serial}|sw={software}|hw={hardware}|prot={protocol}|fw={firmware}"
+  )
+
+
+def parse_legacy_receiver_fingerprint(value: str) -> tuple[str, str] | None:
+  parts = value.strip().split("|", 1)
+  if len(parts) != 2:
+    return None
+  serial, suffix = parts
+  serial = serial.strip()
+  if not serial or suffix.strip() != LEGACY_RECEIVER_FINGERPRINT_SUFFIX:
+    return None
+  return serial, suffix.strip()
+
+
+def parse_durable_receiver_fingerprint(
+  value: str,
+) -> dict[str, str] | None:
+  """Parse a complete durable identity. Sentinels/legacy/malformed -> None."""
+  if type(value) is not str:
+    return None
+  raw = value.strip()
+  prefix = f"v{RECEIVER_FINGERPRINT_SCHEMA_VERSION}|"
+  if not raw.startswith(prefix):
+    return None
+  parts = raw.split("|")
+  if len(parts) != 6:
+    return None
+  _, serial, sw_part, hw_part, prot_part, fw_part = parts
+  if (
+    not serial
+    or serial in ("unknown_serial",)
+    or not sw_part.startswith("sw=")
+    or not hw_part.startswith("hw=")
+    or not prot_part.startswith("prot=")
+    or not fw_part.startswith("fw=")
+  ):
+    return None
+  software = sw_part[3:]
+  hardware = hw_part[3:]
+  protocol = prot_part[5:]
+  firmware = fw_part[3:]
+  if not software or not hardware or not protocol or not firmware:
+    return None
+  if "mon_ver_" in software or "mon_ver_" in hardware:
+    return None
+  return {
+    "serial": serial,
+    "software": software,
+    "hardware": hardware,
+    "protocol": protocol,
+    "firmware": firmware,
+  }
+
+
+def receiver_fingerprints_compatible(stored: str, expected: str) -> bool:
+  """True only for identical complete durable MON-VER identities.
+
+  Fail-closed for sentinels (including identical unavailable/incomplete
+  strings), legacy opaque fingerprints, and malformed v1 strings.
+  """
+  stored_parsed = parse_durable_receiver_fingerprint(stored)
+  expected_parsed = parse_durable_receiver_fingerprint(expected)
+  if stored_parsed is None or expected_parsed is None:
+    return False
+  return stored_parsed == expected_parsed
+
+
+def evaluate_position_assistance_accuracy_cm(
+  stored_position_accuracy_cm: int,
+  *,
+  age_seconds: float | None,
+  age_verified: bool,
+) -> tuple[int | None, str]:
+  """Decide whether cached position assistance may be sent.
+
+  Returns (accuracy_cm, reason). accuracy_cm is None when assistance must SKIP.
+  Unverified/unknown age never invents a radius. Verified age beyond the fresh
+  window is skipped rather than grown with an unsupported mobility model.
+  Uncertainty is never clamped downward.
+  """
+  if type(stored_position_accuracy_cm) is not int:
+    raise CacheValidationError("Position accuracy must be an exact integer")
+  if stored_position_accuracy_cm < 1:
+    raise CacheValidationError("Position accuracy is outside the valid range")
+
+  if not age_verified or age_seconds is None or not isfinite(age_seconds):
+    return None, "position_age_unverified"
+  if age_seconds < 0:
+    return None, "position_age_unverified"
+  if age_seconds > FRESH_POSITION_ASSISTANCE_MAX_AGE_SECONDS:
+    return None, "position_uncertainty_unrepresentable"
+
+  accuracy = max(stored_position_accuracy_cm, MIN_RESTORE_POSITION_ACCURACY_CM)
+  if accuracy > MAX_RESTORE_POSITION_ACCURACY_CM:
+    return None, "position_uncertainty_unrepresentable"
+  if accuracy == MIN_RESTORE_POSITION_ACCURACY_CM:
+    return accuracy, "verified_fresh_floor"
+  return accuracy, "verified_fresh_stored"
+
+
+# Backward-compatible name used by older call sites/tests during PR77.
+def age_safe_restore_position_accuracy_cm(
+  stored_position_accuracy_cm: int,
+  *,
+  age_seconds: float | None,
+  age_verified: bool,
+) -> tuple[int | None, str]:
+  return evaluate_position_assistance_accuracy_cm(
+    stored_position_accuracy_cm,
+    age_seconds=age_seconds,
+    age_verified=age_verified,
+  )
 
 
 def parse_upd_sos_response(frame: bytes) -> UpdSosResponse | None:
@@ -1542,7 +1722,7 @@ def parse_nav_pvt(frame: bytes) -> NavPvtFix | None:
   flags = payload[21]
 
   return NavPvtFix(
-    fix_ok=bool(flags & 0x01) and fix_type >= 3,
+    fix_ok=ublox_nav_pvt_has_fix(flags, fix_type),
     satellites=payload[23],
     longitude_e7=struct.unpack_from("<i", payload, 24)[0],
     latitude_e7=struct.unpack_from("<i", payload, 28)[0],
@@ -1731,10 +1911,15 @@ def build_position_assistance_message(
     position_accuracy_cm,
   )
 
+  # Floor upward only (larger uncertainty is safer). Never clamp downward.
   restore_accuracy_cm = max(
     position_accuracy_cm,
     MIN_RESTORE_POSITION_ACCURACY_CM,
   )
+  if restore_accuracy_cm > MAX_RESTORE_POSITION_ACCURACY_CM:
+    raise CacheValidationError(
+      "Position accuracy exceeds the restore policy usefulness limit"
+    )
 
   payload = struct.pack(
     "<BBxxiiiI",
@@ -2237,7 +2422,10 @@ def load_cache(
     if expected_receiver_fingerprint is not None:
       if type(expected_receiver_fingerprint) is not str:
         raise CacheValidationError("Expected receiver fingerprint is invalid")
-      if receiver_fingerprint != expected_receiver_fingerprint.strip():
+      if not receiver_fingerprints_compatible(
+        receiver_fingerprint,
+        expected_receiver_fingerprint,
+      ):
         raise CacheValidationError("GPS assistance cache belongs to a different receiver")
 
     if now_utc is not None:
@@ -2340,7 +2528,7 @@ def _validate_position(
   if not -10_000_000 <= altitude_cm <= 10_000_000:
     raise CacheValidationError("Altitude is outside the valid range")
 
-  if not 1 <= position_accuracy_cm <= 50_000_000:
+  if not 1 <= position_accuracy_cm <= MAX_RESTORE_POSITION_ACCURACY_CM:
     raise CacheValidationError(
       "Position accuracy is outside the valid range"
     )

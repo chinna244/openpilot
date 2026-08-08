@@ -84,6 +84,8 @@ from openpilot.system.ubloxd.gps_assistance import (
   build_cfg_rate_poll_message,
   build_cfg_rxm_poll_message,
   build_database_poll_message,
+  build_durable_receiver_fingerprint,
+  age_safe_restore_position_accuracy_cm,
   build_nav_aopstatus_poll_message,
   build_navx5_ack_aiding_enable_message,
   build_navx5_aop_enable_message,
@@ -3966,13 +3968,16 @@ def cached_rtc_time_assistance(
 
 def gps_assistance_receiver_fingerprint(
   params: Params,
+  mon_ver_info: MonVerInfo | None = None,
 ) -> str:
   hardware_serial = (
     params.get("HardwareSerial")
     or HARDWARE.get_serial()
   )
-
-  return f"{hardware_serial}|ublox-m8-prot20.30"
+  return build_durable_receiver_fingerprint(
+    str(hardware_serial or ""),
+    mon_ver_info,
+  )
 
 
 def wait_for_matching_mga_ack(
@@ -4804,6 +4809,18 @@ def log_navigation_assistance_restore_result(
     cloudlog.info(message)
 
 
+def _position_assistance_policy_skipped(
+  execution: NavigationDatabaseRestoreExecution,
+) -> bool:
+  return (
+    execution.position_assistance_attempted
+    and execution.position_assistance_failure_kind in (
+      PositionAssistanceFailureKind.AGE_UNVERIFIED,
+      PositionAssistanceFailureKind.UNCERTAINTY_UNREPRESENTABLE,
+    )
+  )
+
+
 def _position_assistance_failure_phase(
   execution: NavigationDatabaseRestoreExecution,
 ) -> NavigationAssistanceRestoreFailurePhase:
@@ -4823,6 +4840,12 @@ def _position_assistance_failure_phase(
     PositionAssistanceFailureKind.ACK_OBSERVATION_FAILED: (
       NavigationAssistanceRestoreFailurePhase.POSITION_ASSISTANCE_ACK_OBSERVATION_FAILED
     ),
+    PositionAssistanceFailureKind.AGE_UNVERIFIED: (
+      NavigationAssistanceRestoreFailurePhase.POSITION_ASSISTANCE_BUILD
+    ),
+    PositionAssistanceFailureKind.UNCERTAINTY_UNREPRESENTABLE: (
+      NavigationAssistanceRestoreFailurePhase.POSITION_ASSISTANCE_BUILD
+    ),
   }
   return mapping.get(
     execution.position_assistance_failure_kind,
@@ -4834,15 +4857,19 @@ def navigation_assistance_result_from_database_execution(
   execution: NavigationDatabaseRestoreExecution,
 ) -> NavigationAssistanceRestoreResult:
   disposition = execution.disposition
+  position_policy_skipped = _position_assistance_policy_skipped(execution)
+  position_satisfied = (
+    execution.position_assistance_succeeded or position_policy_skipped
+  )
   if disposition.database_available:
     status = (
       NavigationAssistanceRestoreStatus.COMPLETE
-      if execution.position_assistance_succeeded
+      if position_satisfied
       else NavigationAssistanceRestoreStatus.PARTIAL
     )
     failure_phase = (
       None
-      if execution.position_assistance_succeeded
+      if position_satisfied
       else _position_assistance_failure_phase(execution)
     )
   elif execution.position_assistance_succeeded:
@@ -4856,7 +4883,7 @@ def navigation_assistance_result_from_database_execution(
     status = NavigationAssistanceRestoreStatus.FAILED
     failure_phase = (
       _position_assistance_failure_phase(execution)
-      if execution.position_assistance_attempted
+      if execution.position_assistance_attempted and not position_policy_skipped
       else NavigationAssistanceRestoreFailurePhase.CACHE_LOAD
     )
 
@@ -5274,18 +5301,45 @@ def restore_navigation_assistance(
   failure_phase = None
 
   try:
-    position_message = build_position_assistance_message(
-      latitude_e7=cache.latitude_e7,
-      longitude_e7=cache.longitude_e7,
-      altitude_cm=cache.altitude_cm,
-      position_accuracy_cm=cache.position_accuracy_cm,
+    # Position age is independent of DBD age evidence. Only TRUSTED_UTC may
+    # authorize a verified age; RTC estimates and unverified clocks skip.
+    age_seconds: float | None = None
+    age_verified = False
+    if (
+      trusted_now is not None
+      and cache_age_evidence is CacheAgeEvidence.TRUSTED_UTC
+    ):
+      age_seconds = (trusted_now - cache.saved_at_utc).total_seconds()
+      age_verified = True
+    accuracy_cm, accuracy_reason = age_safe_restore_position_accuracy_cm(
+      cache.position_accuracy_cm,
+      age_seconds=age_seconds,
+      age_verified=age_verified,
     )
+    if accuracy_cm is None:
+      try:
+        cloudlog.info(
+          ", ".join((
+            "GPS legacy position assistance skipped",
+            f"reason={accuracy_reason}",
+          ))
+        )
+      except Exception:
+        # Observability must never block DBD restore after a policy skip.
+        pass
+    else:
+      position_message = build_position_assistance_message(
+        latitude_e7=cache.latitude_e7,
+        longitude_e7=cache.longitude_e7,
+        altitude_cm=cache.altitude_cm,
+        position_accuracy_cm=accuracy_cm,
+      )
 
-    active_phase = NavigationAssistanceRestoreFailurePhase.POSITION_ASSISTANCE_WRITE
-    send_mga_with_strict_ack(
-      pigeon,
-      position_message,
-    )
+      active_phase = NavigationAssistanceRestoreFailurePhase.POSITION_ASSISTANCE_WRITE
+      send_mga_with_strict_ack(
+        pigeon,
+        position_message,
+      )
 
     active_phase = NavigationAssistanceRestoreFailurePhase.DATABASE_FRAME_RESTORE
     for database_frame_index, database_message in enumerate(
@@ -6860,6 +6914,8 @@ def initialize_receiver_cycle(
       initialization.transport_mon_ver_info,
       collect_mon_ver_diagnostics,
     )
+    if mon_ver_info is not None:
+      initialization.transport_mon_ver_info = mon_ver_info
     log_navx5_ack_aiding_support(mon_ver_info)
     try:
       ack_aiding_configuration_result = configure_navx5_ack_aiding(
@@ -9003,9 +9059,10 @@ def run_receiving(duration: int = 0):
   sm = messaging.SubMaster(['deviceState'])
 
   params = Params()
-  receiver_fingerprint = (
-    gps_assistance_receiver_fingerprint(params)
-  )
+  fingerprint_holder = {
+    "value": gps_assistance_receiver_fingerprint(params, None),
+  }
+  receiver_fingerprint = fingerprint_holder["value"]
 
   receiver_cycle_persistence = ReceiverCyclePersistenceOwnership()
 
@@ -9016,8 +9073,19 @@ def run_receiving(duration: int = 0):
     PositionAssistancePostStartRetryController,
     ReceiverAcquisitionStateGuard,
   ]:
+    active_init = _ACTIVE_PRE_ACQUISITION_INITIALIZATION
+    mon_ver = (
+      active_init.transport_mon_ver_info
+      if active_init is not None
+      else None
+    )
+    if mon_ver is not None:
+      active_fingerprint = gps_assistance_receiver_fingerprint(params, mon_ver)
+      fingerprint_holder["value"] = active_fingerprint
+    else:
+      active_fingerprint = fingerprint_holder["value"]
     navigation_database_runtime = create_receiver_cycle_navigation_state(
-      receiver_fingerprint,
+      active_fingerprint,
       state_storer=receiver_cycle_persistence.guarded_state_storer(
         persistence_generation,
         store_navigation_database_restore_boot_state,
@@ -9030,7 +9098,7 @@ def run_receiving(duration: int = 0):
     if navigation_database_runtime.state_available:
       try:
         position_assistance_retry_runtime = PositionAssistanceRetryRuntime(
-          receiver_fingerprint,
+          active_fingerprint,
           state_storer=receiver_cycle_persistence.guarded_state_storer(
             persistence_generation,
             store_position_assistance_retry_state,
@@ -9101,6 +9169,11 @@ def run_receiving(duration: int = 0):
     if process_start_transport_bootstrap_supported
     else None
   )
+  fingerprint_holder["value"] = gps_assistance_receiver_fingerprint(
+    params,
+    process_start_mon_ver_info,
+  )
+  receiver_fingerprint = fingerprint_holder["value"]
   navigation_database_runtime: (
     NavigationDatabaseRestoreRuntime | None
   ) = None
@@ -9200,6 +9273,12 @@ def run_receiving(duration: int = 0):
       activate_receiver_cycle_assistance_state
     ),
   )
+  if cycle_initialization.mon_ver_info is not None:
+    fingerprint_holder["value"] = gps_assistance_receiver_fingerprint(
+      params,
+      cycle_initialization.mon_ver_info,
+    )
+    receiver_fingerprint = fingerprint_holder["value"]
   deferred_assistance_poll = (
     cycle_initialization.poll_deferred_assistance_state
   )
@@ -9273,6 +9352,7 @@ def run_receiving(duration: int = 0):
     nonlocal host_time_state
     nonlocal latest_authority_evaluation
     nonlocal deferred_assistance_poll
+    nonlocal receiver_fingerprint
 
     reason_value = reason.value
     attempt = data_watchdog.recoveries
@@ -9334,6 +9414,12 @@ def run_receiving(duration: int = 0):
       cycle_initialization.next_time_assistance_attempt
     )
     mon_ver_info = cycle_initialization.mon_ver_info
+    if mon_ver_info is not None:
+      fingerprint_holder["value"] = gps_assistance_receiver_fingerprint(
+        params,
+        mon_ver_info,
+      )
+      receiver_fingerprint = fingerprint_holder["value"]
     assistnow_autonomous_configuration_attempted = (
       cycle_initialization.assistnow_autonomous_configuration_attempted
     )

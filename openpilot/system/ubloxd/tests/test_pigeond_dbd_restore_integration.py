@@ -44,6 +44,7 @@ from openpilot.system.ubloxd.trusted_time_authority import (
 
 
 BOOT_ID = "12345678-1234-5678-9234-567812345678"
+TEST_RECEIVER_FINGERPRINT = "v1|receiver|sw=ext core 3.01|hw=00080000|prot=20.30|fw=hpg 1.40rov"
 NOW = datetime(2026, 7, 29, 13, 0, tzinfo=UTC)
 TEST_BOOTTIME_SECONDS = 100.0
 
@@ -122,7 +123,7 @@ def startup_ready_quality() -> NavigationQuality:
 
 def snapshot(
   *,
-  age: timedelta = timedelta(minutes=30),
+  age: timedelta = timedelta(minutes=10),
 ) -> NavigationDatabaseRestoreSnapshot:
   return NavigationDatabaseRestoreSnapshot(
     saved_at_utc=NOW - age,
@@ -563,7 +564,7 @@ def test_configuration_traffic_closes_database_window_before_write(
   events: list[str] = []
   pigeon = FakePigeon(events)
   runtime = NavigationDatabaseRestoreRuntime(
-    "receiver",
+    TEST_RECEIVER_FINGERPRINT,
     snapshot_loader=lambda _fingerprint: snapshot(),
     retry_delay_seconds=0.0,
     monotonic=lambda: 0.0,
@@ -620,7 +621,7 @@ def test_configuration_traffic_closes_database_window_before_write(
 
   result = pigeond.initialize_receiver_cycle(
     pigeon,  # type: ignore[arg-type, ty:invalid-argument-type]
-    "receiver",
+    TEST_RECEIVER_FINGERPRINT,
     FakeDiagnostics(),  # type: ignore[arg-type, ty:invalid-argument-type]
     "test",
     time_authority=object(),  # type: ignore[arg-type, ty:invalid-argument-type]
@@ -939,7 +940,7 @@ def test_delayed_network_time_is_not_awaited_before_start(
     raising=False,
   )
   runtime = NavigationDatabaseRestoreRuntime(
-    "receiver",
+    TEST_RECEIVER_FINGERPRINT,
     snapshot_loader=lambda _fingerprint: snapshot(),
     retry_delay_seconds=0.0,
     monotonic=lambda: 0.0,
@@ -1007,7 +1008,7 @@ def test_delayed_network_time_is_not_awaited_before_start(
 
   result = pigeond.initialize_receiver_cycle(
     pigeon,  # type: ignore[arg-type, ty:invalid-argument-type]
-    "receiver",
+    TEST_RECEIVER_FINGERPRINT,
     FakeDiagnostics(),  # type: ignore[arg-type, ty:invalid-argument-type]
     "test",
     time_authority=object(),  # type: ignore[arg-type, ty:invalid-argument-type]
@@ -1026,13 +1027,13 @@ def test_delayed_network_time_is_not_awaited_before_start(
   assert not restore.database_network_available
   assert database_indexes == []
   assert runtime.execution.position_assistance_attempted
-  assert runtime.execution.position_assistance_succeeded
+  assert not runtime.execution.position_assistance_succeeded
   assert "trusted_time_arrived" not in events
   assert "dbd_write" not in events
   assert "time_write" not in events
+  assert "position_write" not in events
   assert events.index("gnss_stop") < events.index("normal_configuration")
-  assert events.index("normal_configuration") < events.index("position_write")
-  assert events.index("position_write") < events.index("acquisition_start_claim")
+  assert events.index("normal_configuration") < events.index("acquisition_start_claim")
   assert events.index("acquisition_start_claim") < events.index("gnss_start")
   assert not result.trusted_time_assistance_sent
   assert result.navigation_assistance_restore_attempted
@@ -1045,7 +1046,7 @@ def test_initial_offline_state_is_not_rechecked_before_start(
   events: list[str] = []
   pigeon = FakePigeon(events)
   runtime = NavigationDatabaseRestoreRuntime(
-    "receiver",
+    TEST_RECEIVER_FINGERPRINT,
     snapshot_loader=lambda _fingerprint: snapshot(),
     retry_delay_seconds=0.0,
     state_path=tmp_path / "dbd_state.json",
@@ -1099,7 +1100,7 @@ def test_initial_offline_state_is_not_rechecked_before_start(
 
   result = pigeond.initialize_receiver_cycle(
     pigeon,  # type: ignore[arg-type, ty:invalid-argument-type]
-    "receiver",
+    TEST_RECEIVER_FINGERPRINT,
     FakeDiagnostics(),  # type: ignore[arg-type, ty:invalid-argument-type]
     "test",
     time_authority=object(),  # type: ignore[arg-type, ty:invalid-argument-type]
@@ -1125,7 +1126,7 @@ def test_obsolete_trusted_time_wait_callback_is_not_invoked(
 ) -> None:
   pigeon = FakePigeon()
   runtime = NavigationDatabaseRestoreRuntime(
-    "receiver",
+    TEST_RECEIVER_FINGERPRINT,
     snapshot_loader=lambda _fingerprint: snapshot(),
     retry_delay_seconds=0.0,
     state_path=tmp_path / "dbd_state.json",
@@ -1166,7 +1167,7 @@ def test_obsolete_trusted_time_wait_callback_is_not_invoked(
 
   result = pigeond.initialize_receiver_cycle(
     pigeon,  # type: ignore[arg-type, ty:invalid-argument-type]
-    "receiver",
+    TEST_RECEIVER_FINGERPRINT,
     FakeDiagnostics(),  # type: ignore[arg-type, ty:invalid-argument-type]
     "test",
     time_authority=object(),  # type: ignore[arg-type, ty:invalid-argument-type]
@@ -1191,7 +1192,7 @@ def test_bootstrap_acquisition_frames_use_exact_early_outcome(
 ) -> None:
   events: list[str] = []
   runtime = NavigationDatabaseRestoreRuntime(
-    "receiver",
+    TEST_RECEIVER_FINGERPRINT,
     snapshot_loader=lambda _fingerprint: snapshot(),
     retry_delay_seconds=0.0,
     state_path=tmp_path / "dbd_state.json",
@@ -1237,7 +1238,7 @@ def test_bootstrap_acquisition_frames_use_exact_early_outcome(
 
   result = pigeond.initialize_receiver_cycle(
     pigeon,  # type: ignore[arg-type, ty:invalid-argument-type]
-    "receiver",
+    TEST_RECEIVER_FINGERPRINT,
     FakeDiagnostics(),  # type: ignore[arg-type, ty:invalid-argument-type]
     "test",
     time_authority=object(),  # type: ignore[arg-type, ty:invalid-argument-type]
@@ -1329,7 +1330,7 @@ def initialize_deferred_assistance_cycle(
 ):
   return pigeond.initialize_receiver_cycle(
     pigeon,  # type: ignore[arg-type, ty:invalid-argument-type]
-    "receiver",
+    TEST_RECEIVER_FINGERPRINT,
     FakeDiagnostics(),  # type: ignore[arg-type, ty:invalid-argument-type]
     "test",
     time_authority=object(),  # type: ignore[arg-type, ty:invalid-argument-type]
@@ -1350,7 +1351,7 @@ def test_deferred_assistance_worker_never_completes_does_not_block_start(
   pigeon = FakePigeon(events)
   configure_deferred_assistance_startup(monkeypatch, events, clock)
   runtime = NavigationDatabaseRestoreRuntime(
-    "receiver",
+    TEST_RECEIVER_FINGERPRINT,
     snapshot_loader=lambda _fingerprint: snapshot(),
     retry_delay_seconds=0.0,
     monotonic=lambda: clock[0],
@@ -1433,7 +1434,7 @@ def test_slow_deferred_assistance_is_adopted_once_after_receiver_start(
   pigeon = FakePigeon(events)
   configure_deferred_assistance_startup(monkeypatch, events, clock)
   runtime = NavigationDatabaseRestoreRuntime(
-    "receiver",
+    TEST_RECEIVER_FINGERPRINT,
     snapshot_loader=lambda _fingerprint: snapshot(),
     retry_delay_seconds=0.0,
     monotonic=lambda: clock[0],
@@ -1464,7 +1465,7 @@ def test_slow_deferred_assistance_is_adopted_once_after_receiver_start(
 
   result = pigeond.initialize_receiver_cycle(
     pigeon,  # type: ignore[arg-type, ty:invalid-argument-type]
-    "receiver",
+    TEST_RECEIVER_FINGERPRINT,
     FakeDiagnostics(),  # type: ignore[arg-type, ty:invalid-argument-type]
     "test",
     time_authority=object(),  # type: ignore[arg-type, ty:invalid-argument-type]
@@ -1509,7 +1510,7 @@ def test_deferred_assistance_worker_exception_is_fail_open_and_observable(
 
   result = pigeond.initialize_receiver_cycle(
     pigeon,  # type: ignore[arg-type, ty:invalid-argument-type]
-    "receiver",
+    TEST_RECEIVER_FINGERPRINT,
     FakeDiagnostics(),  # type: ignore[arg-type, ty:invalid-argument-type]
     "test",
     time_authority=object(),  # type: ignore[arg-type, ty:invalid-argument-type]
@@ -1551,7 +1552,7 @@ def test_drive2_expired_cache_no_time_cannot_starve_configuration(
     raising=False,
   )
   runtime = NavigationDatabaseRestoreRuntime(
-    "receiver",
+    TEST_RECEIVER_FINGERPRINT,
     snapshot_loader=lambda _fingerprint: snapshot(
       age=timedelta(hours=1, minutes=53),
     ),
@@ -1692,7 +1693,7 @@ def test_drive2_expired_cache_no_time_cannot_starve_configuration(
 
   result = pigeond.initialize_receiver_cycle(
     pigeon,  # type: ignore[arg-type, ty:invalid-argument-type]
-    "receiver",
+    TEST_RECEIVER_FINGERPRINT,
     FakeDiagnostics(),  # type: ignore[arg-type, ty:invalid-argument-type]
     "test",
     time_authority=object(),  # type: ignore[arg-type, ty:invalid-argument-type]
@@ -1721,9 +1722,9 @@ def test_drive2_expired_cache_no_time_cannot_starve_configuration(
   assert restore.database_trusted_time_wait_elapsed_seconds is None
   assert restore.database_trusted_time_wait_error_type is None
   assert database_indexes == []
-  assert "position_write" in events
+  assert "position_write" not in events
   assert runtime.execution.position_assistance_attempted
-  assert events.index("gnss_start") < events.index("position_write")
+  assert not runtime.execution.position_assistance_succeeded
   mandatory_items = tuple(
     item_name
     for item_name, mandatory in configuration_items
@@ -1777,7 +1778,7 @@ def test_deadline_boundary_skips_assistance_after_mandatory_configuration(
   clock = [0.0]
   pigeon = FakePigeon(events)
   runtime = NavigationDatabaseRestoreRuntime(
-    "receiver",
+    TEST_RECEIVER_FINGERPRINT,
     snapshot_loader=lambda _fingerprint: snapshot(),
     retry_delay_seconds=0.0,
     monotonic=lambda: clock[0],
@@ -1845,7 +1846,7 @@ def test_deadline_boundary_skips_assistance_after_mandatory_configuration(
 
   result = pigeond.initialize_receiver_cycle(
     pigeon,  # type: ignore[arg-type, ty:invalid-argument-type]
-    "receiver",
+    TEST_RECEIVER_FINGERPRINT,
     FakeDiagnostics(),  # type: ignore[arg-type, ty:invalid-argument-type]
     "test",
     time_authority=object(),  # type: ignore[arg-type, ty:invalid-argument-type]
@@ -1862,8 +1863,9 @@ def test_deadline_boundary_skips_assistance_after_mandatory_configuration(
   assert restore is not None
   assert runtime.controller.disposition is NavigationDatabaseRestoreDisposition.SKIPPED_NO_TRUSTED_TIME
   assert runtime.acquisition_started
-  assert len(position_writes) == 1
+  assert len(position_writes) == 0
   assert runtime.execution.position_assistance_attempted
+  assert not runtime.execution.position_assistance_succeeded
   assert events.index("mandatory_configuration") < events.index("gnss_start")
   assert events.index("gnss_start") < events.index("assistance_state_factory")
   assert events.index("assistance_state_factory") < events.index("assistance_state_prepare")
@@ -1877,7 +1879,7 @@ def test_tiny_factory_budget_defers_real_factory_until_after_start(
   clock = [0.0]
   pigeon = FakePigeon(events)
   runtime = NavigationDatabaseRestoreRuntime(
-    "receiver",
+    TEST_RECEIVER_FINGERPRINT,
     snapshot_loader=lambda _fingerprint: snapshot(),
     retry_delay_seconds=0.0,
     monotonic=lambda: clock[0],
@@ -1946,7 +1948,7 @@ def test_tiny_factory_budget_defers_real_factory_until_after_start(
 
   result = pigeond.initialize_receiver_cycle(
     pigeon,  # type: ignore[arg-type, ty:invalid-argument-type]
-    "receiver",
+    TEST_RECEIVER_FINGERPRINT,
     FakeDiagnostics(),  # type: ignore[arg-type, ty:invalid-argument-type]
     "test",
     time_authority=object(),  # type: ignore[arg-type, ty:invalid-argument-type]
@@ -1981,7 +1983,7 @@ def test_factory_or_prepare_exception_is_fail_open_before_deadline(
   clock = [5.0]
   pigeon = FakePigeon(events)
   runtime = NavigationDatabaseRestoreRuntime(
-    "receiver",
+    TEST_RECEIVER_FINGERPRINT,
     snapshot_loader=lambda _fingerprint: snapshot(),
     retry_delay_seconds=0.0,
     monotonic=lambda: clock[0],
@@ -2050,7 +2052,7 @@ def test_factory_or_prepare_exception_is_fail_open_before_deadline(
 
   result = pigeond.initialize_receiver_cycle(
     pigeon,  # type: ignore[arg-type, ty:invalid-argument-type]
-    "receiver",
+    TEST_RECEIVER_FINGERPRINT,
     FakeDiagnostics(),  # type: ignore[arg-type, ty:invalid-argument-type]
     "test",
     time_authority=object(),  # type: ignore[arg-type, ty:invalid-argument-type]
@@ -2074,7 +2076,7 @@ def test_factory_or_prepare_exception_is_fail_open_before_deadline(
   ("cache_age", "expected_disposition", "expected_database_writes"),
   (
     (
-      timedelta(minutes=30),
+      timedelta(minutes=10),
       NavigationDatabaseRestoreDisposition.RESTORED,
       1,
     ),
@@ -2096,7 +2098,7 @@ def test_trusted_time_available_evaluates_dbd_after_mandatory_configuration(
   clock = [4.0]
   pigeon = FakePigeon(events)
   runtime = NavigationDatabaseRestoreRuntime(
-    "receiver",
+    TEST_RECEIVER_FINGERPRINT,
     snapshot_loader=lambda _fingerprint: snapshot(age=cache_age),
     retry_delay_seconds=0.0,
     monotonic=lambda: clock[0],
@@ -2173,7 +2175,7 @@ def test_trusted_time_available_evaluates_dbd_after_mandatory_configuration(
 
   result = pigeond.initialize_receiver_cycle(
     pigeon,  # type: ignore[arg-type, ty:invalid-argument-type]
-    "receiver",
+    TEST_RECEIVER_FINGERPRINT,
     FakeDiagnostics(),  # type: ignore[arg-type, ty:invalid-argument-type]
     "test",
     time_authority=object(),  # type: ignore[arg-type, ty:invalid-argument-type]
@@ -2197,15 +2199,19 @@ def test_trusted_time_available_evaluates_dbd_after_mandatory_configuration(
   assert events.index("navx5") < events.index("trusted_time_check")
   assert events.index("trusted_time_check") < events.index("assistance_state_factory")
   assert events.index("assistance_state_factory") < events.index("assistance_state_ready")
-  assert events.index("trusted_time_check") < events.index("position_write")
   assert events.count("dbd_write") == expected_database_writes
   if expected_database_writes:
+    assert "position_write" in events
+    assert events.index("trusted_time_check") < events.index("position_write")
     assert events.index("trusted_time_check") < events.index("navigation_database_post_time_wait")
     assert events.index("navigation_database_post_time_wait") < events.index("dbd_write")
     assert events.index("dbd_write") < events.index("position_write")
-  assert events.index("position_write") < events.index("time_write")
+    assert events.index("position_write") < events.index("time_write")
+  else:
+    assert "position_write" not in events
+    assert runtime.execution.position_assistance_attempted
+    assert not runtime.execution.position_assistance_succeeded
   assert events.index("time_write") < events.index("gnss_start")
-
 
 def test_pre_restore_drain_failure_is_terminal_and_gnss_starts(
   tmp_path: Path,
@@ -2214,7 +2220,7 @@ def test_pre_restore_drain_failure_is_terminal_and_gnss_starts(
   events: list[str] = []
   pigeon = FakePigeon(events)
   runtime = NavigationDatabaseRestoreRuntime(
-    "receiver",
+    TEST_RECEIVER_FINGERPRINT,
     snapshot_loader=lambda _fingerprint: snapshot(),
     retry_delay_seconds=0.0,
     state_path=tmp_path / "dbd_state.json",
@@ -2255,7 +2261,7 @@ def test_pre_restore_drain_failure_is_terminal_and_gnss_starts(
 
   result = pigeond.initialize_receiver_cycle(
     pigeon,  # type: ignore[arg-type, ty:invalid-argument-type]
-    "receiver",
+    TEST_RECEIVER_FINGERPRINT,
     FakeDiagnostics(),  # type: ignore[arg-type, ty:invalid-argument-type]
     "test",
     time_authority=object(),  # type: ignore[arg-type, ty:invalid-argument-type]
@@ -2282,7 +2288,7 @@ def test_pending_dbd_blocks_yuma_until_terminal_then_survives_restart(
   tmp_path: Path,
 ) -> None:
   first = NavigationDatabaseRestoreRuntime(
-    "receiver",
+    TEST_RECEIVER_FINGERPRINT,
     snapshot_loader=lambda _fingerprint: snapshot(),
     retry_delay_seconds=0.0,
     state_path=tmp_path / "dbd_state.json",
@@ -2308,7 +2314,7 @@ def test_pending_dbd_blocks_yuma_until_terminal_then_survives_restart(
   assert yuma_writes == [b"provisional-yuma"]
 
   second = NavigationDatabaseRestoreRuntime(
-    "receiver",
+    TEST_RECEIVER_FINGERPRINT,
     snapshot_loader=lambda _fingerprint: snapshot(),
     retry_delay_seconds=0.0,
     state_path=tmp_path / "dbd_state.json",
@@ -2336,7 +2342,7 @@ def test_trusted_time_wait_error_is_durable_and_not_a_timeout(
 ) -> None:
   state_path = tmp_path / "dbd_state.json"
   first = NavigationDatabaseRestoreRuntime(
-    "receiver",
+    TEST_RECEIVER_FINGERPRINT,
     snapshot_loader=lambda _fingerprint: snapshot(),
     retry_delay_seconds=0.0,
     state_path=state_path,
@@ -2347,7 +2353,7 @@ def test_trusted_time_wait_error_is_durable_and_not_a_timeout(
   assert first.close_restore_window_wait_error()
 
   second = NavigationDatabaseRestoreRuntime(
-    "receiver",
+    TEST_RECEIVER_FINGERPRINT,
     snapshot_loader=lambda _fingerprint: snapshot(),
     retry_delay_seconds=0.0,
     state_path=state_path,
@@ -2373,7 +2379,7 @@ def test_new_receiver_cycle_reopens_navigation_assistance_state(
 ) -> None:
   state_path = tmp_path / "dbd_state.json"
   first = NavigationDatabaseRestoreRuntime(
-    "receiver",
+    TEST_RECEIVER_FINGERPRINT,
     snapshot_loader=lambda _fingerprint: snapshot(),
     retry_delay_seconds=0.0,
     state_path=state_path,
@@ -2386,7 +2392,7 @@ def test_new_receiver_cycle_reopens_navigation_assistance_state(
   assert first.claim_acquisition_start()
 
   same_cycle = NavigationDatabaseRestoreRuntime(
-    "receiver",
+    TEST_RECEIVER_FINGERPRINT,
     snapshot_loader=lambda _fingerprint: snapshot(),
     retry_delay_seconds=0.0,
     state_path=state_path,
@@ -2397,7 +2403,7 @@ def test_new_receiver_cycle_reopens_navigation_assistance_state(
   assert same_cycle.acquisition_started
 
   next_cycle = NavigationDatabaseRestoreRuntime(
-    "receiver",
+    TEST_RECEIVER_FINGERPRINT,
     snapshot_loader=lambda _fingerprint: snapshot(),
     retry_delay_seconds=0.0,
     state_path=state_path,
@@ -2430,7 +2436,7 @@ def test_new_receiver_cycle_navigation_read_error_does_not_overwrite(
     match="state_load_failed:OSError:read unavailable",
   ):
     NavigationDatabaseRestoreRuntime(
-      "receiver",
+      TEST_RECEIVER_FINGERPRINT,
       snapshot_loader=lambda _fingerprint: snapshot(),
       retry_delay_seconds=0.0,
       state_path=tmp_path / "dbd_state.json",
@@ -2459,7 +2465,7 @@ def test_new_receiver_cycle_reopens_position_retry_state(
     position_assistance_ack_info_code=5,
   )
   first = pigeond.PositionAssistanceRetryRuntime(
-    "receiver",
+    TEST_RECEIVER_FINGERPRINT,
     state_path=state_path,
     boot_id_reader=lambda: BOOT_ID,
     boottime_reader=lambda: TEST_BOOTTIME_SECONDS,
@@ -2472,7 +2478,7 @@ def test_new_receiver_cycle_reopens_position_retry_state(
   assert first.state.retry_completed
 
   same_cycle = pigeond.PositionAssistanceRetryRuntime(
-    "receiver",
+    TEST_RECEIVER_FINGERPRINT,
     state_path=state_path,
     boot_id_reader=lambda: BOOT_ID,
     boottime_reader=lambda: TEST_BOOTTIME_SECONDS,
@@ -2480,7 +2486,7 @@ def test_new_receiver_cycle_reopens_position_retry_state(
   assert same_cycle.state.retry_completed
 
   next_cycle = pigeond.PositionAssistanceRetryRuntime(
-    "receiver",
+    TEST_RECEIVER_FINGERPRINT,
     state_path=state_path,
     boot_id_reader=lambda: BOOT_ID,
     boottime_reader=lambda: TEST_BOOTTIME_SECONDS,
@@ -2517,7 +2523,7 @@ def test_new_receiver_cycle_retry_read_error_does_not_overwrite(
     match="OSError:read unavailable",
   ):
     pigeond.PositionAssistanceRetryRuntime(
-      "receiver",
+      TEST_RECEIVER_FINGERPRINT,
       state_path=tmp_path / "position_retry_state.json",
       boot_id_reader=lambda: BOOT_ID,
       boottime_reader=lambda: TEST_BOOTTIME_SECONDS,
@@ -2616,7 +2622,7 @@ def test_pr68_bootstrap_acquisition_skips_wait_drain_and_dbd(
 ) -> None:
   events: list[str] = []
   runtime = NavigationDatabaseRestoreRuntime(
-    "receiver",
+    TEST_RECEIVER_FINGERPRINT,
     snapshot_loader=lambda _fingerprint: snapshot(),
     retry_delay_seconds=0.0,
     state_path=tmp_path / "dbd_state.json",
@@ -2713,7 +2719,7 @@ def test_pr68_bootstrap_acquisition_skips_wait_drain_and_dbd(
 
   result = pigeond.initialize_receiver_cycle(
     pigeon,  # ty: ignore[invalid-argument-type]
-    "receiver",
+    TEST_RECEIVER_FINGERPRINT,
     FakeDiagnostics(),  # ty: ignore[invalid-argument-type]
     "test",
     time_authority=object(),  # ty: ignore[invalid-argument-type]
@@ -2739,7 +2745,7 @@ def test_database_ack_timeout_is_clamped_to_remaining_transfer_budget(
   monkeypatch: pytest.MonkeyPatch,
 ) -> None:
   runtime = NavigationDatabaseRestoreRuntime(
-    "receiver",
+    TEST_RECEIVER_FINGERPRINT,
     snapshot_loader=lambda _fingerprint: snapshot(),
     retry_delay_seconds=0.0,
     transfer_budget_seconds=0.5,
@@ -2765,7 +2771,7 @@ def test_database_ack_timeout_is_clamped_to_remaining_transfer_budget(
   monkeypatch.setattr(pigeond, "send_mga_with_strict_ack", send_with_ack)
   result = pigeond.restore_navigation_assistance(
     object(),  # type: ignore[arg-type, ty:invalid-argument-type]
-    "receiver",
+    TEST_RECEIVER_FINGERPRINT,
     navigation_database_runtime=runtime,
     authorized_time=network_time(),
   )
@@ -2777,7 +2783,7 @@ def test_database_ack_timeout_is_clamped_to_remaining_transfer_budget(
 
 def test_frame_zero_transaction_drain_guard_blocks_receiver_write(tmp_path: Path) -> None:
   runtime = NavigationDatabaseRestoreRuntime(
-    "receiver",
+    TEST_RECEIVER_FINGERPRINT,
     snapshot_loader=lambda _fingerprint: snapshot(),
     retry_delay_seconds=0.0,
     state_path=tmp_path / "dbd_state.json",
@@ -2914,7 +2920,7 @@ def test_assistance_state_initialization_failure_still_starts_gnss(
 
   result = pigeond.initialize_receiver_cycle(
     pigeon,  # type: ignore[arg-type, ty:invalid-argument-type]
-    "receiver",
+    TEST_RECEIVER_FINGERPRINT,
     FakeDiagnostics(),  # type: ignore[arg-type, ty:invalid-argument-type]
     "test",
     time_authority=object(),  # type: ignore[arg-type, ty:invalid-argument-type]
@@ -2956,7 +2962,7 @@ def test_restore_state_persistence_failure_does_not_block_gnss_start(
     )
 
   runtime = NavigationDatabaseRestoreRuntime(
-    "receiver",
+    TEST_RECEIVER_FINGERPRINT,
     snapshot_loader=lambda _fingerprint: snapshot(),
     retry_delay_seconds=0.0,
     state_path=tmp_path / "dbd_state.json",
@@ -3029,7 +3035,7 @@ def test_restore_state_persistence_failure_does_not_block_gnss_start(
 
   result = pigeond.initialize_receiver_cycle(
     pigeon,  # type: ignore[arg-type, ty:invalid-argument-type]
-    "receiver",
+    TEST_RECEIVER_FINGERPRINT,
     FakeDiagnostics(),  # type: ignore[arg-type, ty:invalid-argument-type]
     "test",
     time_authority=object(),  # type: ignore[arg-type, ty:invalid-argument-type]
@@ -3160,7 +3166,7 @@ def test_superseded_constructor_worker_cannot_overwrite_new_cycle_dbd_state(
   def construct_cycle_a() -> None:
     try:
       NavigationDatabaseRestoreRuntime(
-        "receiver",
+        TEST_RECEIVER_FINGERPRINT,
         state_path=state_path,
         boot_id_reader=lambda: BOOT_ID,
         boottime_reader=lambda: TEST_BOOTTIME_SECONDS,
@@ -3181,7 +3187,7 @@ def test_superseded_constructor_worker_cannot_overwrite_new_cycle_dbd_state(
   # staging I/O. This fails if the slow write is performed under the owner lock.
   generation_b = _begin_next_generation_without_blocking(ownership)
   runtime_b = NavigationDatabaseRestoreRuntime(
-    "receiver",
+    TEST_RECEIVER_FINGERPRINT,
     state_path=state_path,
     boot_id_reader=lambda: BOOT_ID,
     boottime_reader=lambda: TEST_BOOTTIME_SECONDS,
@@ -3225,7 +3231,7 @@ def test_superseded_prepare_worker_cannot_overwrite_new_cycle_dbd_state(
     restore_runtime.store_navigation_database_restore_boot_state(state, path)
 
   runtime_a = NavigationDatabaseRestoreRuntime(
-    "receiver",
+    TEST_RECEIVER_FINGERPRINT,
     snapshot_loader=lambda _fingerprint: snapshot(),
     state_path=state_path,
     boot_id_reader=lambda: BOOT_ID,
@@ -3243,7 +3249,7 @@ def test_superseded_prepare_worker_cannot_overwrite_new_cycle_dbd_state(
 
   generation_b = _begin_next_generation_without_blocking(ownership)
   runtime_b = NavigationDatabaseRestoreRuntime(
-    "receiver",
+    TEST_RECEIVER_FINGERPRINT,
     state_path=state_path,
     boot_id_reader=lambda: BOOT_ID,
     boottime_reader=lambda: TEST_BOOTTIME_SECONDS,

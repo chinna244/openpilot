@@ -57,6 +57,7 @@ from openpilot.system.ubloxd.yuma_almanac_transmit import (
 
 NOW = datetime(2026, 7, 28, 20, 0, tzinfo=UTC)
 BOOT_ID = "12345678-1234-5678-9234-567812345678"
+TEST_RECEIVER_FINGERPRINT = "v1|receiver|sw=ext core 3.01|hw=00080000|prot=20.30|fw=hpg 1.40rov"
 OTHER_BOOT_ID = "87654321-4321-6789-9234-567812345678"
 TEST_BOOTTIME_SECONDS = 100.0
 FRAMES = (b"frame-0", b"frame-1")
@@ -138,6 +139,18 @@ def same_boot_time() -> AuthorizedTime:
   )
 
 
+def fresh_position_snapshot(**kwargs) -> NavigationDatabaseRestoreSnapshot:
+  return snapshot(age_seconds=300.0, **kwargs)
+
+
+def authorize_position(
+  value: NavigationDatabaseRestoreRuntime,
+  authorized: AuthorizedTime | None = None,
+) -> None:
+  value.prepare()
+  value._last_authorized_time = same_boot_time() if authorized is None else authorized
+
+
 def runtime(
   tmp_path: Path,
   *,
@@ -152,7 +165,7 @@ def runtime(
 ) -> NavigationDatabaseRestoreRuntime:
   selected = snapshot() if selected is None else selected
   return NavigationDatabaseRestoreRuntime(
-    "receiver",
+    TEST_RECEIVER_FINGERPRINT,
     snapshot_loader=lambda _fingerprint: selected,
     retry_delay_seconds=0.0,
     transfer_budget_seconds=transfer_budget_seconds,
@@ -167,7 +180,7 @@ def runtime(
 
 def no_cache_runtime(tmp_path: Path) -> NavigationDatabaseRestoreRuntime:
   return NavigationDatabaseRestoreRuntime(
-    "receiver",
+    TEST_RECEIVER_FINGERPRINT,
     snapshot_loader=lambda _fingerprint: None,
     retry_delay_seconds=0.0,
     state_path=tmp_path / "dbd_state.json",
@@ -207,7 +220,7 @@ def test_state_round_trip(tmp_path: Path) -> None:
   state = NavigationDatabaseRestoreBootState(
     version=NAVIGATION_DATABASE_RESTORE_STATE_VERSION,
     boot_id=BOOT_ID,
-    receiver_fingerprint="receiver",
+    receiver_fingerprint=TEST_RECEIVER_FINGERPRINT,
     disposition=NavigationDatabaseRestoreDisposition.SKIPPED_EXPIRED,
     restore_attempted=False,
     position_assistance_claimed=True,
@@ -258,7 +271,7 @@ def test_terminal_restore_result_round_trip(tmp_path: Path) -> None:
   state = NavigationDatabaseRestoreBootState(
     version=NAVIGATION_DATABASE_RESTORE_STATE_VERSION,
     boot_id=BOOT_ID,
-    receiver_fingerprint="receiver",
+    receiver_fingerprint=TEST_RECEIVER_FINGERPRINT,
     disposition=NavigationDatabaseRestoreDisposition.RESTORE_PARTIAL,
     restore_attempted=True,
     position_assistance_claimed=False,
@@ -345,7 +358,7 @@ def test_pr69_policy_state_schema_migrates_without_inventing_result(
   policy_state = {
     "version": POLICY_NAVIGATION_DATABASE_RESTORE_STATE_VERSION,
     "boot_id": BOOT_ID,
-    "receiver_fingerprint": "receiver",
+    "receiver_fingerprint": TEST_RECEIVER_FINGERPRINT,
     "disposition": NavigationDatabaseRestoreDisposition.RESTORE_PARTIAL.value,
     "restore_attempted": True,
     "position_assistance_claimed": False,
@@ -378,7 +391,7 @@ def test_pr68_state_schema_migrates_without_quarantine(
   legacy = {
     "version": LEGACY_NAVIGATION_DATABASE_RESTORE_STATE_VERSION,
     "boot_id": BOOT_ID,
-    "receiver_fingerprint": "receiver",
+    "receiver_fingerprint": TEST_RECEIVER_FINGERPRINT,
     "disposition": NavigationDatabaseRestoreDisposition.SKIPPED_UNVERIFIED.value,
     "restore_attempted": False,
     "position_assistance_claimed": True,
@@ -407,7 +420,7 @@ def test_corrupt_state_is_quarantined_and_fails_closed(
   path.write_text("not-json", encoding="utf-8")
 
   value = NavigationDatabaseRestoreRuntime(
-    "receiver",
+    TEST_RECEIVER_FINGERPRINT,
     snapshot_loader=lambda _fingerprint: snapshot(),
     state_path=path,
     boot_id_reader=lambda: BOOT_ID,
@@ -436,7 +449,7 @@ def test_new_linux_boot_discards_old_state(tmp_path: Path) -> None:
   old = NavigationDatabaseRestoreBootState(
     version=NAVIGATION_DATABASE_RESTORE_STATE_VERSION,
     boot_id=OTHER_BOOT_ID,
-    receiver_fingerprint="receiver",
+    receiver_fingerprint=TEST_RECEIVER_FINGERPRINT,
     disposition=NavigationDatabaseRestoreDisposition.SKIPPED_EXPIRED,
     restore_attempted=False,
     position_assistance_claimed=True,
@@ -445,7 +458,7 @@ def test_new_linux_boot_discards_old_state(tmp_path: Path) -> None:
   )
   store_navigation_database_restore_boot_state(old, path)
   value = NavigationDatabaseRestoreRuntime(
-    "receiver",
+    TEST_RECEIVER_FINGERPRINT,
     snapshot_loader=lambda _fingerprint: snapshot(),
     retry_delay_seconds=0.0,
     state_path=path,
@@ -466,7 +479,7 @@ def test_snapshot_is_loaded_only_once(tmp_path: Path) -> None:
     return snapshot()
 
   value = NavigationDatabaseRestoreRuntime(
-    "receiver",
+    TEST_RECEIVER_FINGERPRINT,
     snapshot_loader=loader,
     retry_delay_seconds=0.0,
     state_path=tmp_path / "state.json",
@@ -498,7 +511,7 @@ def test_snapshot_loader_failure_is_cache_unqualified(
     raise OSError("cache read failed")
 
   value = NavigationDatabaseRestoreRuntime(
-    "receiver",
+    TEST_RECEIVER_FINGERPRINT,
     snapshot_loader=fail_loader,
     retry_delay_seconds=0.0,
     state_path=tmp_path / "dbd_state.json",
@@ -537,7 +550,7 @@ def test_present_invalid_cache_is_not_reported_as_missing(
     ),
   )
   value = NavigationDatabaseRestoreRuntime(
-    "receiver",
+    TEST_RECEIVER_FINGERPRINT,
     snapshot_loader=lambda _fingerprint: frozen,
     retry_delay_seconds=0.0,
     state_path=tmp_path / "dbd_state.json",
@@ -571,7 +584,7 @@ def test_unqualified_cache_is_terminal_without_writes(tmp_path: Path) -> None:
     orbit_source_counts={"ephemeris": 2, "almanac": 14},
   ))
   value = NavigationDatabaseRestoreRuntime(
-    "receiver",
+    TEST_RECEIVER_FINGERPRINT,
     snapshot_loader=lambda _fingerprint: weak,
     retry_delay_seconds=0.0,
     state_path=tmp_path / "dbd_state.json",
@@ -593,7 +606,7 @@ def test_only_quality_qualified_cache_can_delay_startup(tmp_path: Path) -> None:
   )
 
   qualified = NavigationDatabaseRestoreRuntime(
-    "receiver",
+    TEST_RECEIVER_FINGERPRINT,
     snapshot_loader=lambda _fingerprint: snapshot(
       quality=startup_ready_quality()
     ),
@@ -606,16 +619,20 @@ def test_only_quality_qualified_cache_can_delay_startup(tmp_path: Path) -> None:
 
 
 def test_position_assistance_claim_survives_process_restart(tmp_path: Path) -> None:
-  first = runtime(tmp_path)
+  first = runtime(tmp_path, selected=fresh_position_snapshot())
+  authorize_position(first)
   messages = []
   first.send_position_once(messages.append)
-  second = runtime(tmp_path)
+  second = runtime(tmp_path, selected=fresh_position_snapshot())
+  authorize_position(second)
   second.send_position_once(messages.append)
   assert len(messages) == 1
 
 
 def test_position_assistance_success_is_structured(tmp_path: Path) -> None:
-  result = runtime(tmp_path).send_position_once(lambda _message: None)
+  value = runtime(tmp_path, selected=fresh_position_snapshot())
+  authorize_position(value)
+  result = value.send_position_once(lambda _message: None)
 
   assert result.position_assistance_attempted
   assert result.position_assistance_succeeded
@@ -634,6 +651,41 @@ def test_position_assistance_success_is_structured(tmp_path: Path) -> None:
   assert result.position_assistance_error_type is None
   assert result.position_assistance_error is None
 
+
+def test_position_assistance_skips_without_verified_age(tmp_path: Path) -> None:
+  value = runtime(tmp_path, selected=fresh_position_snapshot())
+  value.prepare()
+  result = value.send_position_once(lambda _message: None)
+  assert result.position_assistance_attempted
+  assert not result.position_assistance_succeeded
+  assert (
+    result.position_assistance_failure_kind
+    is PositionAssistanceFailureKind.AGE_UNVERIFIED
+  )
+
+
+def test_position_assistance_skips_receiver_derived_time(tmp_path: Path) -> None:
+  value = runtime(tmp_path, selected=fresh_position_snapshot())
+  authorize_position(value, receiver_time())
+  result = value.send_position_once(lambda _message: None)
+  assert result.position_assistance_attempted
+  assert not result.position_assistance_succeeded
+  assert (
+    result.position_assistance_failure_kind
+    is PositionAssistanceFailureKind.AGE_UNVERIFIED
+  )
+
+
+def test_position_assistance_skips_stale_verified_age(tmp_path: Path) -> None:
+  value = runtime(tmp_path, selected=snapshot(age_seconds=1800.0))
+  authorize_position(value, network_time())
+  result = value.send_position_once(lambda _message: None)
+  assert result.position_assistance_attempted
+  assert not result.position_assistance_succeeded
+  assert (
+    result.position_assistance_failure_kind
+    is PositionAssistanceFailureKind.UNCERTAINTY_UNREPRESENTABLE
+  )
 
 @pytest.mark.parametrize(
   (
@@ -726,7 +778,9 @@ def test_position_assistance_failures_remain_structured(
   def fail(_message: bytes) -> None:
     raise exception
 
-  result = runtime(tmp_path).send_position_once(fail)
+  value = runtime(tmp_path, selected=fresh_position_snapshot())
+  authorize_position(value)
+  result = value.send_position_once(fail)
 
   assert result.position_assistance_attempted
   assert not result.position_assistance_succeeded
@@ -752,7 +806,9 @@ def test_position_assistance_build_failure_is_structured(
     ),
   )
 
-  result = runtime(tmp_path).send_position_once(
+  value = runtime(tmp_path, selected=fresh_position_snapshot())
+  authorize_position(value)
+  result = value.send_position_once(
     lambda _message: pytest.fail("position message must not be written")
   )
 
@@ -899,7 +955,7 @@ def test_interrupted_attempt_recovers_as_write_failed(tmp_path: Path) -> None:
   interrupted = NavigationDatabaseRestoreBootState(
     version=NAVIGATION_DATABASE_RESTORE_STATE_VERSION,
     boot_id=BOOT_ID,
-    receiver_fingerprint="receiver",
+    receiver_fingerprint=TEST_RECEIVER_FINGERPRINT,
     disposition=NavigationDatabaseRestoreDisposition.PENDING,
     restore_attempted=True,
     position_assistance_claimed=True,
@@ -916,7 +972,7 @@ def test_interrupted_attempt_recovers_as_write_failed(tmp_path: Path) -> None:
   )
   store_navigation_database_restore_boot_state(interrupted, path)
   value = NavigationDatabaseRestoreRuntime(
-    "receiver",
+    TEST_RECEIVER_FINGERPRINT,
     snapshot_loader=lambda _fingerprint: snapshot(),
     retry_delay_seconds=0.0,
     state_path=path,
@@ -1119,7 +1175,7 @@ def test_retry_delay_cannot_exceed_total_transfer_deadline(
   now = [0.0]
   sleeps: list[float] = []
   value = NavigationDatabaseRestoreRuntime(
-    "receiver",
+    TEST_RECEIVER_FINGERPRINT,
     snapshot_loader=lambda _fingerprint: snapshot(),
     retry_delay_seconds=0.25,
     transfer_budget_seconds=0.2,
@@ -1189,7 +1245,7 @@ def test_boot_id_unavailable_aborts_initialization(
     match="boot_id_unavailable",
   ):
     NavigationDatabaseRestoreRuntime(
-      "receiver",
+      TEST_RECEIVER_FINGERPRINT,
       snapshot_loader=lambda _fingerprint: snapshot(),
       state_path=tmp_path / "state.json",
       boot_id_reader=lambda: None,
@@ -1207,7 +1263,7 @@ def test_runtime_rejects_invalid_retry_delay(
 ) -> None:
   with pytest.raises(ValueError):
     NavigationDatabaseRestoreRuntime(
-      "receiver",
+      TEST_RECEIVER_FINGERPRINT,
       snapshot_loader=lambda _fingerprint: snapshot(),
       retry_delay_seconds=retry_delay_seconds,  # type: ignore[arg-type, ty:invalid-argument-type]
       state_path=tmp_path / "state.json",
@@ -1237,7 +1293,7 @@ def multi_runtime(
 ) -> NavigationDatabaseRestoreRuntime:
   value = frozen_caches(primary=primary, previous=previous)
   return NavigationDatabaseRestoreRuntime(
-    "receiver",
+    TEST_RECEIVER_FINGERPRINT,
     snapshot_loader=lambda _fingerprint: value,
     retry_delay_seconds=0.0,
     state_path=tmp_path / "dbd_state.json",
@@ -1477,7 +1533,7 @@ def test_typed_frame_failure_and_retry_policy(
 
 def test_retry_sleeper_failure_records_phase_and_error(tmp_path: Path) -> None:
   value = NavigationDatabaseRestoreRuntime(
-    "receiver",
+    TEST_RECEIVER_FINGERPRINT,
     snapshot_loader=lambda _fingerprint: snapshot(),
     retry_delay_seconds=0.25,
     sleeper=lambda _delay: (_ for _ in ()).throw(RuntimeError("sleep failed")),
@@ -1501,7 +1557,7 @@ def test_retry_sleeper_failure_after_accepted_frame_is_partial(
   tmp_path: Path,
 ) -> None:
   value = NavigationDatabaseRestoreRuntime(
-    "receiver",
+    TEST_RECEIVER_FINGERPRINT,
     snapshot_loader=lambda _fingerprint: snapshot(),
     retry_delay_seconds=0.25,
     sleeper=lambda _delay: (_ for _ in ()).throw(
@@ -1534,7 +1590,7 @@ def test_transfer_start_clock_exception_is_terminal_and_durable(
 ) -> None:
   state_path = tmp_path / "dbd_state.json"
   value = NavigationDatabaseRestoreRuntime(
-    "receiver",
+    TEST_RECEIVER_FINGERPRINT,
     snapshot_loader=lambda _fingerprint: snapshot(),
     retry_delay_seconds=0.0,
     monotonic=lambda: (_ for _ in ()).throw(
@@ -1554,7 +1610,7 @@ def test_transfer_start_clock_exception_is_terminal_and_durable(
   assert result.execution_error == "RuntimeError:transfer clock unavailable"
 
   restored = NavigationDatabaseRestoreRuntime(
-    "receiver",
+    TEST_RECEIVER_FINGERPRINT,
     snapshot_loader=lambda _fingerprint: snapshot(),
     retry_delay_seconds=0.0,
     state_path=state_path,
@@ -1624,7 +1680,7 @@ def test_conservative_age_includes_uncertainty_and_elapsed_time(
   tmp_path: Path,
 ) -> None:
   value = NavigationDatabaseRestoreRuntime(
-    "receiver",
+    TEST_RECEIVER_FINGERPRINT,
     snapshot_loader=lambda _fingerprint: snapshot(
       NAVIGATION_DATABASE_RESTORE_MAX_AGE_SECONDS - 15.0
     ),
@@ -1652,7 +1708,7 @@ def test_conservative_age_one_second_over_boundary_skips(
 ) -> None:
   writes: list[tuple[bytes, int]] = []
   value = NavigationDatabaseRestoreRuntime(
-    "receiver",
+    TEST_RECEIVER_FINGERPRINT,
     snapshot_loader=lambda _fingerprint: snapshot(
       NAVIGATION_DATABASE_RESTORE_MAX_AGE_SECONDS - 15.0
     ),
@@ -1692,7 +1748,7 @@ def test_acquisition_claim_failure_is_reported_before_receiver_start(
     store_navigation_database_restore_boot_state(state, path)
 
   value = NavigationDatabaseRestoreRuntime(
-    "receiver",
+    TEST_RECEIVER_FINGERPRINT,
     snapshot_loader=lambda _fingerprint: None,
     state_path=tmp_path / "dbd_state.json",
     boot_id_reader=lambda: BOOT_ID,
@@ -1749,7 +1805,7 @@ def test_cache_age_is_rechecked_after_restore_claim_before_frame_zero(tmp_path: 
   def read_boottime() -> float:
     return boottimes.pop(0) if boottimes else TEST_BOOTTIME_SECONDS + 2.0
   value = NavigationDatabaseRestoreRuntime(
-    "receiver",
+    TEST_RECEIVER_FINGERPRINT,
     snapshot_loader=lambda _fingerprint: snapshot(NAVIGATION_DATABASE_RESTORE_MAX_AGE_SECONDS - 1.0),
     retry_delay_seconds=0.0,
     state_path=tmp_path / "dbd_state.json",
@@ -1798,7 +1854,7 @@ def test_failed_acquisition_persistence_cannot_reopen_after_restart(
     store_navigation_database_restore_boot_state(state, state_path)
 
   first = NavigationDatabaseRestoreRuntime(
-    "receiver",
+    TEST_RECEIVER_FINGERPRINT,
     snapshot_loader=lambda _fingerprint: snapshot(),
     retry_delay_seconds=0.0,
     state_path=path,
@@ -1816,7 +1872,7 @@ def test_failed_acquisition_persistence_cannot_reopen_after_restart(
 
   writes: list[tuple[bytes, int]] = []
   second = NavigationDatabaseRestoreRuntime(
-    "receiver",
+    TEST_RECEIVER_FINGERPRINT,
     snapshot_loader=lambda _fingerprint: snapshot(),
     retry_delay_seconds=0.0,
     state_path=path,
@@ -1856,7 +1912,7 @@ def test_boot_id_reader_exception_aborts_initialization(
     match="boot_id_read_failed",
   ):
     NavigationDatabaseRestoreRuntime(
-      "receiver",
+      TEST_RECEIVER_FINGERPRINT,
       snapshot_loader=lambda _fingerprint: snapshot(),
       state_path=tmp_path / "state.json",
       boot_id_reader=fail_boot_id,
@@ -1878,7 +1934,7 @@ def test_state_loader_exception_aborts_without_overwriting_state(
     match="state_load_failed",
   ):
     NavigationDatabaseRestoreRuntime(
-      "receiver",
+      TEST_RECEIVER_FINGERPRINT,
       snapshot_loader=lambda _fingerprint: snapshot(),
       state_path=path,
       boot_id_reader=lambda: BOOT_ID,
@@ -1897,7 +1953,7 @@ def test_invalid_state_loader_result_aborts_initialization(
     match="state_load_returned_invalid_type",
   ):
     NavigationDatabaseRestoreRuntime(
-      "receiver",
+      TEST_RECEIVER_FINGERPRINT,
       snapshot_loader=lambda _fingerprint: snapshot(),
       state_path=tmp_path / "state.json",
       boot_id_reader=lambda: BOOT_ID,
@@ -1922,7 +1978,7 @@ def test_missing_state_baseline_write_failure_aborts_initialization(
     match="current_boot_baseline_persist_failed",
   ):
     NavigationDatabaseRestoreRuntime(
-      "receiver",
+      TEST_RECEIVER_FINGERPRINT,
       snapshot_loader=lambda _fingerprint: snapshot(),
       state_path=path,
       boot_id_reader=lambda: BOOT_ID,
@@ -1940,7 +1996,7 @@ def test_previous_boot_replacement_failure_aborts_initialization(
   previous = NavigationDatabaseRestoreBootState(
     version=NAVIGATION_DATABASE_RESTORE_STATE_VERSION,
     boot_id=OTHER_BOOT_ID,
-    receiver_fingerprint="receiver",
+    receiver_fingerprint=TEST_RECEIVER_FINGERPRINT,
     disposition=NavigationDatabaseRestoreDisposition.SKIPPED_EXPIRED,
     restore_attempted=False,
     position_assistance_claimed=True,
@@ -1960,7 +2016,7 @@ def test_previous_boot_replacement_failure_aborts_initialization(
     match="current_boot_baseline_persist_failed",
   ):
     NavigationDatabaseRestoreRuntime(
-      "receiver",
+      TEST_RECEIVER_FINGERPRINT,
       snapshot_loader=lambda _fingerprint: snapshot(),
       state_path=path,
       boot_id_reader=lambda: BOOT_ID,
@@ -1987,7 +2043,7 @@ def test_storage_recovery_later_process_establishes_fresh_baseline(
 
   with pytest.raises(NavigationDatabaseRestoreInitializationError):
     NavigationDatabaseRestoreRuntime(
-      "receiver",
+      TEST_RECEIVER_FINGERPRINT,
       snapshot_loader=lambda _fingerprint: snapshot(),
       state_path=path,
       boot_id_reader=lambda: BOOT_ID,
@@ -1998,7 +2054,7 @@ def test_storage_recovery_later_process_establishes_fresh_baseline(
 
   storage_available = True
   recovered = NavigationDatabaseRestoreRuntime(
-    "receiver",
+    TEST_RECEIVER_FINGERPRINT,
     snapshot_loader=lambda _fingerprint: snapshot(),
     state_path=path,
     boot_id_reader=lambda: BOOT_ID,
@@ -2010,7 +2066,7 @@ def test_storage_recovery_later_process_establishes_fresh_baseline(
   persisted = load_navigation_database_restore_boot_state(path)
   assert persisted is not None
   assert persisted.boot_id == BOOT_ID
-  assert persisted.receiver_fingerprint == "receiver"
+  assert persisted.receiver_fingerprint == TEST_RECEIVER_FINGERPRINT
   assert persisted.disposition is NavigationDatabaseRestoreDisposition.PENDING
 
 
@@ -2021,7 +2077,7 @@ def test_previous_boot_replacement_succeeds_after_storage_recovers(
   previous = NavigationDatabaseRestoreBootState(
     version=NAVIGATION_DATABASE_RESTORE_STATE_VERSION,
     boot_id=OTHER_BOOT_ID,
-    receiver_fingerprint="receiver",
+    receiver_fingerprint=TEST_RECEIVER_FINGERPRINT,
     disposition=NavigationDatabaseRestoreDisposition.SKIPPED_EXPIRED,
     restore_attempted=False,
     position_assistance_claimed=True,
@@ -2041,7 +2097,7 @@ def test_previous_boot_replacement_succeeds_after_storage_recovers(
 
   with pytest.raises(NavigationDatabaseRestoreInitializationError):
     NavigationDatabaseRestoreRuntime(
-      "receiver",
+      TEST_RECEIVER_FINGERPRINT,
       snapshot_loader=lambda _fingerprint: snapshot(),
       state_path=path,
       boot_id_reader=lambda: BOOT_ID,
@@ -2052,7 +2108,7 @@ def test_previous_boot_replacement_succeeds_after_storage_recovers(
 
   storage_available = True
   recovered = NavigationDatabaseRestoreRuntime(
-    "receiver",
+    TEST_RECEIVER_FINGERPRINT,
     snapshot_loader=lambda _fingerprint: snapshot(),
     state_path=path,
     boot_id_reader=lambda: BOOT_ID,
@@ -2088,7 +2144,7 @@ def test_trusted_time_terminal_outcomes_persist_across_restart(
 ) -> None:
   state_path = tmp_path / "dbd_state.json"
   first = NavigationDatabaseRestoreRuntime(
-    "receiver",
+    TEST_RECEIVER_FINGERPRINT,
     snapshot_loader=lambda _fingerprint: snapshot(),
     retry_delay_seconds=0.0,
     state_path=state_path,
@@ -2102,7 +2158,7 @@ def test_trusted_time_terminal_outcomes_persist_across_restart(
   assert not first.controller.restore_attempted
 
   second = NavigationDatabaseRestoreRuntime(
-    "receiver",
+    TEST_RECEIVER_FINGERPRINT,
     snapshot_loader=lambda _fingerprint: snapshot(),
     retry_delay_seconds=0.0,
     state_path=state_path,
@@ -2123,8 +2179,8 @@ def test_bootstrap_acquisition_is_durable_and_preserves_one_position_write(
 ) -> None:
   state_path = tmp_path / "dbd_state.json"
   first = NavigationDatabaseRestoreRuntime(
-    "receiver",
-    snapshot_loader=lambda _fingerprint: snapshot(),
+    TEST_RECEIVER_FINGERPRINT,
+    snapshot_loader=lambda _fingerprint: fresh_position_snapshot(),
     retry_delay_seconds=0.0,
     state_path=state_path,
     boot_id_reader=lambda: BOOT_ID,
@@ -2140,13 +2196,14 @@ def test_bootstrap_acquisition_is_durable_and_preserves_one_position_write(
   )
 
   position_writes: list[bytes] = []
+  authorize_position(first)
   first_result = first.send_position_once(position_writes.append)
   assert len(position_writes) == 1
   assert first_result.position_assistance_succeeded
 
   second = NavigationDatabaseRestoreRuntime(
-    "receiver",
-    snapshot_loader=lambda _fingerprint: snapshot(),
+    TEST_RECEIVER_FINGERPRINT,
+    snapshot_loader=lambda _fingerprint: fresh_position_snapshot(),
     retry_delay_seconds=0.0,
     state_path=state_path,
     boot_id_reader=lambda: BOOT_ID,
@@ -2167,6 +2224,7 @@ def test_bootstrap_acquisition_is_durable_and_preserves_one_position_write(
     send_database_message=lambda frame, index, _mark: database_writes.append((frame, index)),
   )
   second_position_writes: list[bytes] = []
+  authorize_position(second)
   second.send_position_once(second_position_writes.append)
 
   assert result.database_write_attempt_count == 0
@@ -2179,7 +2237,7 @@ def test_pre_restore_drain_failure_is_durable_transport_error(
 ) -> None:
   state_path = tmp_path / "dbd_state.json"
   first = NavigationDatabaseRestoreRuntime(
-    "receiver",
+    TEST_RECEIVER_FINGERPRINT,
     snapshot_loader=lambda _fingerprint: snapshot(),
     retry_delay_seconds=0.0,
     state_path=state_path,
@@ -2204,7 +2262,7 @@ def test_pre_restore_drain_failure_is_durable_transport_error(
   assert result.failure_phase == "pre_restore_drain"
 
   second = NavigationDatabaseRestoreRuntime(
-    "receiver",
+    TEST_RECEIVER_FINGERPRINT,
     snapshot_loader=lambda _fingerprint: snapshot(),
     retry_delay_seconds=0.0,
     state_path=state_path,
@@ -2225,8 +2283,8 @@ def test_early_acquisition_closes_only_database_restore_window(
 ) -> None:
   state_path = tmp_path / "dbd_state.json"
   first = NavigationDatabaseRestoreRuntime(
-    "receiver",
-    snapshot_loader=lambda _fingerprint: snapshot(),
+    TEST_RECEIVER_FINGERPRINT,
+    snapshot_loader=lambda _fingerprint: fresh_position_snapshot(),
     retry_delay_seconds=0.0,
     state_path=state_path,
     boot_id_reader=lambda: BOOT_ID,
@@ -2242,6 +2300,7 @@ def test_early_acquisition_closes_only_database_restore_window(
   assert not first.acquisition_started
 
   first_position_writes: list[bytes] = []
+  authorize_position(first)
   first_result = first.send_position_once(
     first_position_writes.append
   )
@@ -2252,8 +2311,8 @@ def test_early_acquisition_closes_only_database_restore_window(
   assert not first.acquisition_started
 
   second = NavigationDatabaseRestoreRuntime(
-    "receiver",
-    snapshot_loader=lambda _fingerprint: snapshot(),
+    TEST_RECEIVER_FINGERPRINT,
+    snapshot_loader=lambda _fingerprint: fresh_position_snapshot(),
     retry_delay_seconds=0.0,
     state_path=state_path,
     boot_id_reader=lambda: BOOT_ID,
@@ -2285,6 +2344,7 @@ def test_early_acquisition_closes_only_database_restore_window(
   assert second_result.database_write_attempt_count == 0
 
   second_position_writes: list[bytes] = []
+  authorize_position(second)
   second_result = second.send_position_once(
     second_position_writes.append
   )
@@ -2293,10 +2353,9 @@ def test_early_acquisition_closes_only_database_restore_window(
   assert not second_result.position_assistance_attempted
   assert not second.acquisition_started
 
-
 def test_unavailable_runtime_blocks_assistance_but_allows_acquisition() -> None:
   value = NavigationDatabaseRestoreUnavailableRuntime(
-    "receiver",
+    TEST_RECEIVER_FINGERPRINT,
     "boot_state:storage_unavailable",
   )
   database_writes: list[tuple[bytes, int]] = []
@@ -2343,7 +2402,7 @@ def test_state_failure_remains_latched_after_storage_recovers(
     store_navigation_database_restore_boot_state(state, path)
 
   value = NavigationDatabaseRestoreRuntime(
-    "receiver",
+    TEST_RECEIVER_FINGERPRINT,
     snapshot_loader=lambda _fingerprint: snapshot(),
     retry_delay_seconds=0.0,
     state_path=tmp_path / "dbd_state.json",
@@ -2386,7 +2445,7 @@ def test_runtime_rejects_invalid_transfer_budget(
 ) -> None:
   with pytest.raises(ValueError):
     NavigationDatabaseRestoreRuntime(
-      "receiver",
+      TEST_RECEIVER_FINGERPRINT,
       snapshot_loader=lambda _fingerprint: snapshot(),
       transfer_budget_seconds=transfer_budget_seconds,  # type: ignore[arg-type, ty:invalid-argument-type]
       state_path=tmp_path / "state.json",

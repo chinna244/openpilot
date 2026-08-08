@@ -37,7 +37,7 @@ from openpilot.system.ubloxd.tests.test_gps_assistance import (
 
 
 NOW = datetime(2026, 7, 16, 12, tzinfo=UTC)
-RECEIVER = "receiver"
+RECEIVER = "v1|receiver|sw=ext core 3.01|hw=00080000|prot=20.30|fw=hpg 1.40rov"
 CYCLE = 7
 
 

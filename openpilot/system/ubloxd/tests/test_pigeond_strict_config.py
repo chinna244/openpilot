@@ -762,7 +762,13 @@ def test_pending_frames_dispatch_between_mga_dbd_restore_frames(monkeypatch):
   monkeypatch.setattr(pigeond, "read_host_time_observation", lambda: None)
   monkeypatch.setattr(pigeond, "load_cache", lambda *args, **kwargs: cache)
 
-  result = pigeond.restore_navigation_assistance(pigeon, "receiver", allow_legacy_direct_restore=True)
+  result = pigeond.restore_navigation_assistance(
+    pigeon,
+    "v1|receiver|sw=ext core 3.01|hw=00080000|prot=20.30|fw=hpg 1.40rov",
+    trusted_now=datetime(2026, 7, 10, 0, 5, tzinfo=UTC),
+    time_assistance_source="system_synchronized",
+    allow_legacy_direct_restore=True,
+  )
   assert result.status is pigeond.NavigationAssistanceRestoreStatus.COMPLETE
   assert result.accepted_frame_count == 2
   assert dispatched == [nav, rawx]
@@ -948,7 +954,7 @@ def test_pre_start_configuration_runs_only_mandatory_inventory(monkeypatch):
   )
   pigeon = SimpleNamespace(
     _receiver_cycle=4,
-    receiver_fingerprint="receiver",
+    receiver_fingerprint="v1|receiver|sw=ext core 3.01|hw=00080000|prot=20.30|fw=hpg 1.40rov",
     _transport_verified_for_receiver_cycle=True,
   )
 
@@ -971,7 +977,7 @@ def test_pre_start_configuration_runs_only_mandatory_inventory(monkeypatch):
 def test_optional_inventory_replaces_deferred_results_after_start(monkeypatch):
   summary = complete_configuration_summary(
     receiver_cycle=4,
-    receiver_fingerprint="receiver",
+    receiver_fingerprint="v1|receiver|sw=ext core 3.01|hw=00080000|prot=20.30|fw=hpg 1.40rov",
     items=tuple(
       item
       if item.mandatory
@@ -1091,7 +1097,13 @@ def test_queue_overflow_during_mga_restore_returns_failed_result(monkeypatch):
   monkeypatch.setattr(pigeond, "read_host_time_observation", lambda: None)
   monkeypatch.setattr(pigeond, "load_cache", lambda *args, **kwargs: cache)
 
-  result = pigeond.restore_navigation_assistance(pigeon, "receiver", allow_legacy_direct_restore=True)
+  result = pigeond.restore_navigation_assistance(
+    pigeon,
+    "v1|receiver|sw=ext core 3.01|hw=00080000|prot=20.30|fw=hpg 1.40rov",
+    trusted_now=datetime(2026, 7, 10, 0, 5, tzinfo=UTC),
+    time_assistance_source="system_synchronized",
+    allow_legacy_direct_restore=True,
+  )
   assert result.status is pigeond.NavigationAssistanceRestoreStatus.FAILED
   assert result.accepted_frame_count == 0
   assert result.failure_phase is pigeond.NavigationAssistanceRestoreFailurePhase.POSITION_ASSISTANCE_WRITE
@@ -1758,11 +1770,11 @@ def test_receiver_configuration_loader_rejects_stale_cycle_and_missing_context(
 ):
   monkeypatch.setattr(pigeond, "GPS_ASSISTANCE_CACHE_PATH", str(tmp_path / "assistance-cache.json"))
   summary = complete_configuration_summary(
-    receiver_fingerprint="receiver",
+    receiver_fingerprint="v1|receiver|sw=ext core 3.01|hw=00080000|prot=20.30|fw=hpg 1.40rov",
   )
   assert persist_current_configuration_summary(summary)
 
-  assert pigeond.load_receiver_configuration_summary_record("receiver", 4) is None
+  assert pigeond.load_receiver_configuration_summary_record("v1|receiver|sw=ext core 3.01|hw=00080000|prot=20.30|fw=hpg 1.40rov", 4) is None
   monkeypatch.setattr(
     pigeond,
     "_current_receiver_configuration_fingerprint",
@@ -1954,12 +1966,12 @@ def test_loader_rejects_wrong_inventory_classification_and_order(
 def test_navx5_failure_is_visible_in_durable_summary(monkeypatch, tmp_path):
   monkeypatch.setattr(pigeond, "GPS_ASSISTANCE_CACHE_PATH", str(tmp_path / "assistance-cache.json"))
   summary = complete_configuration_summary(
-    receiver_fingerprint="receiver",
+    receiver_fingerprint="v1|receiver|sw=ext core 3.01|hw=00080000|prot=20.30|fw=hpg 1.40rov",
     navx5_ack_aiding_result=(pigeond.Navx5AckAidingConfigurationResult.WRITE_TIMED_OUT),
   )
 
   assert persist_current_configuration_summary(summary)
-  record = pigeond.load_receiver_configuration_summary_record("receiver", 3)
+  record = pigeond.load_receiver_configuration_summary_record("v1|receiver|sw=ext core 3.01|hw=00080000|prot=20.30|fw=hpg 1.40rov", 3)
 
   assert record is not None
   assert record["navx5_ack_aiding_result"] == "write_timed_out"
@@ -2247,7 +2259,7 @@ def test_cache_restore_is_independent_of_time_assistance_ack(
 
   result = pigeond.initialize_receiver_cycle(
     ScriptedPigeon(),
-    "receiver",
+    "v1|receiver|sw=ext core 3.01|hw=00080000|prot=20.30|fw=hpg 1.40rov",
     Diagnostics(),
     "process_start",
   )

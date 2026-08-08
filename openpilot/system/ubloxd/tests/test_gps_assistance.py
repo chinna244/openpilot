@@ -104,7 +104,7 @@ def test_cache_round_trip_and_atomic_overwrite(tmp_path):
   )
 
   first_cache = create_cache(
-    receiver_fingerprint="NEO-M8P|HPG1.40|20.30",
+    receiver_fingerprint="v1|neo-m8p|sw=hpg1.40|hw=00080000|prot=20.30|fw=hpg 1.40rov",
     fix=reliable_fix(),
     database_frames=frames,
     saved_at_utc=datetime(2026, 7, 1, tzinfo=UTC),
@@ -112,7 +112,7 @@ def test_cache_round_trip_and_atomic_overwrite(tmp_path):
   save_cache(path, first_cache)
 
   second_cache = create_cache(
-    receiver_fingerprint="NEO-M8P|HPG1.40|20.30",
+    receiver_fingerprint="v1|neo-m8p|sw=hpg1.40|hw=00080000|prot=20.30|fw=hpg 1.40rov",
     fix=reliable_fix(latitude_e7=281_000_000),
     database_frames=frames,
     saved_at_utc=datetime(2026, 7, 2, tzinfo=UTC),
@@ -121,7 +121,7 @@ def test_cache_round_trip_and_atomic_overwrite(tmp_path):
 
   loaded = load_cache(
     path,
-    expected_receiver_fingerprint="NEO-M8P|HPG1.40|20.30",
+    expected_receiver_fingerprint="v1|neo-m8p|sw=hpg1.40|hw=00080000|prot=20.30|fw=hpg 1.40rov",
     now_utc=datetime(2026, 7, 3, tzinfo=UTC),
   )
 
@@ -132,7 +132,7 @@ def test_cache_round_trip_and_atomic_overwrite(tmp_path):
 def test_cache_rejects_database_checksum_mismatch(tmp_path):
   path = tmp_path / "gps_assistance.json"
   cache = create_cache(
-    receiver_fingerprint="receiver",
+    receiver_fingerprint="v1|receiver|sw=ext core 3.01|hw=00080000|prot=20.30|fw=hpg 1.40rov",
     fix=reliable_fix(),
     database_frames=(build_dbd_frame(1),),
     saved_at_utc=datetime(2026, 7, 1, tzinfo=UTC),
@@ -182,7 +182,7 @@ def test_cache_age_is_checked_only_when_current_time_is_supplied(
   saved_at = datetime(2026, 1, 1, tzinfo=UTC)
 
   cache = create_cache(
-    receiver_fingerprint="receiver",
+    receiver_fingerprint="v1|receiver|sw=ext core 3.01|hw=00080000|prot=20.30|fw=hpg 1.40rov",
     fix=reliable_fix(),
     database_frames=(build_dbd_frame(1),),
     saved_at_utc=saved_at,
@@ -243,7 +243,7 @@ def test_create_cache_requires_reliable_fix():
     match="reliable GPS fix",
   ):
     create_cache(
-      receiver_fingerprint="receiver",
+      receiver_fingerprint="v1|receiver|sw=ext core 3.01|hw=00080000|prot=20.30|fw=hpg 1.40rov",
       fix=bad_fix,
       database_frames=(build_dbd_frame(1),),
     )
@@ -259,7 +259,7 @@ def test_save_cache_rejects_non_dbd_message(tmp_path):
 
   cache = GpsAssistanceCache(
     saved_at_utc=datetime.now(UTC),
-    receiver_fingerprint="receiver",
+    receiver_fingerprint="v1|receiver|sw=ext core 3.01|hw=00080000|prot=20.30|fw=hpg 1.40rov",
     latitude_e7=0,
     longitude_e7=0,
     altitude_cm=0,
@@ -700,7 +700,7 @@ def test_cache_round_trip_preserves_rtc_anchor(tmp_path):
   saved_at = datetime(2026, 7, 6, 17, 45, 16, tzinfo=UTC)
 
   cache = create_cache(
-    receiver_fingerprint="receiver",
+    receiver_fingerprint="v1|receiver|sw=ext core 3.01|hw=00080000|prot=20.30|fw=hpg 1.40rov",
     fix=reliable_fix(),
     database_frames=(build_dbd_frame(1),),
     saved_at_utc=saved_at,
@@ -720,7 +720,7 @@ def test_load_cache_accepts_legacy_file_without_rtc_anchor(
   path = tmp_path / "gps_assistance.json"
 
   cache = create_cache(
-    receiver_fingerprint="receiver",
+    receiver_fingerprint="v1|receiver|sw=ext core 3.01|hw=00080000|prot=20.30|fw=hpg 1.40rov",
     fix=reliable_fix(),
     database_frames=(build_dbd_frame(1),),
     saved_at_utc=datetime(2026, 7, 6, tzinfo=UTC),
@@ -745,7 +745,7 @@ def test_rtc_anchor_estimates_current_utc():
     tzinfo=UTC,
   )
   cache = create_cache(
-    receiver_fingerprint="receiver",
+    receiver_fingerprint="v1|receiver|sw=ext core 3.01|hw=00080000|prot=20.30|fw=hpg 1.40rov",
     fix=reliable_fix(),
     database_frames=(build_dbd_frame(1),),
     saved_at_utc=saved_at,
@@ -781,7 +781,7 @@ def test_rtc_evaluator_rejection_reasons(
   elapsed,
 ):
   cache = create_cache(
-    receiver_fingerprint="receiver",
+    receiver_fingerprint="v1|receiver|sw=ext core 3.01|hw=00080000|prot=20.30|fw=hpg 1.40rov",
     fix=reliable_fix(),
     database_frames=(build_dbd_frame(1),),
     saved_at_utc=datetime(2026, 7, 6, tzinfo=UTC),
@@ -817,7 +817,7 @@ def test_rtc_evaluator_read_semantics(
     read_rtc,
   )
   cache = create_cache(
-    receiver_fingerprint="receiver",
+    receiver_fingerprint="v1|receiver|sw=ext core 3.01|hw=00080000|prot=20.30|fw=hpg 1.40rov",
     fix=reliable_fix(),
     database_frames=(build_dbd_frame(1),),
     saved_at_utc=datetime(2026, 7, 6, tzinfo=UTC),
@@ -849,7 +849,7 @@ def test_rtc_evaluator_read_semantics(
 def test_rtc_evaluator_accepts_elapsed_boundaries(elapsed_seconds):
   saved_at = datetime(2026, 7, 6, tzinfo=UTC)
   cache = create_cache(
-    receiver_fingerprint="receiver",
+    receiver_fingerprint="v1|receiver|sw=ext core 3.01|hw=00080000|prot=20.30|fw=hpg 1.40rov",
     fix=reliable_fix(),
     database_frames=(build_dbd_frame(1),),
     saved_at_utc=saved_at,
@@ -878,7 +878,7 @@ def test_rtc_evaluator_accepts_elapsed_boundaries(elapsed_seconds):
 
 def test_rtc_evaluator_rejects_estimate_after_supported_maximum():
   cache = create_cache(
-    receiver_fingerprint="receiver",
+    receiver_fingerprint="v1|receiver|sw=ext core 3.01|hw=00080000|prot=20.30|fw=hpg 1.40rov",
     fix=reliable_fix(),
     database_frames=(build_dbd_frame(1),),
     saved_at_utc=datetime(2026, 7, 6, tzinfo=UTC),
@@ -919,7 +919,7 @@ def test_rtc_estimate_compatibility_read_semantics(
   )
   saved_at = datetime(2026, 7, 6, tzinfo=UTC)
   cache = create_cache(
-    receiver_fingerprint="receiver",
+    receiver_fingerprint="v1|receiver|sw=ext core 3.01|hw=00080000|prot=20.30|fw=hpg 1.40rov",
     fix=reliable_fix(),
     database_frames=(build_dbd_frame(1),),
     saved_at_utc=saved_at,
@@ -941,7 +941,7 @@ def test_rtc_estimate_compatibility_read_semantics(
 
 def test_rtc_evaluator_rejects_malformed_input_without_raising():
   cache = create_cache(
-    receiver_fingerprint="receiver",
+    receiver_fingerprint="v1|receiver|sw=ext core 3.01|hw=00080000|prot=20.30|fw=hpg 1.40rov",
     fix=reliable_fix(),
     database_frames=(build_dbd_frame(1),),
     saved_at_utc=datetime(2026, 7, 6, tzinfo=UTC),
@@ -966,7 +966,7 @@ def test_rtc_estimate_compatibility_rejections(
   current_rtc,
 ):
   cache = create_cache(
-    receiver_fingerprint="receiver",
+    receiver_fingerprint="v1|receiver|sw=ext core 3.01|hw=00080000|prot=20.30|fw=hpg 1.40rov",
     fix=reliable_fix(),
     database_frames=(build_dbd_frame(1),),
     saved_at_utc=datetime(2026, 7, 6, tzinfo=UTC),
@@ -985,7 +985,7 @@ def test_rtc_estimate_compatibility_rejections(
 
 def test_rtc_anchor_rejects_counter_rollback():
   cache = create_cache(
-    receiver_fingerprint="receiver",
+    receiver_fingerprint="v1|receiver|sw=ext core 3.01|hw=00080000|prot=20.30|fw=hpg 1.40rov",
     fix=reliable_fix(),
     database_frames=(build_dbd_frame(1),),
     saved_at_utc=datetime(2026, 7, 6, tzinfo=UTC),
@@ -1000,7 +1000,7 @@ def test_rtc_anchor_rejects_counter_rollback():
 
 def test_rtc_anchor_rejects_excessive_elapsed_time():
   cache = create_cache(
-    receiver_fingerprint="receiver",
+    receiver_fingerprint="v1|receiver|sw=ext core 3.01|hw=00080000|prot=20.30|fw=hpg 1.40rov",
     fix=reliable_fix(),
     database_frames=(build_dbd_frame(1),),
     saved_at_utc=datetime(2026, 7, 6, tzinfo=UTC),

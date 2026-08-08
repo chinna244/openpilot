@@ -195,8 +195,10 @@ def run_navigation_restore_with_outcomes(
 
   result = pigeond.restore_navigation_assistance(
     object(),
-    "receiver",
+    "v1|receiver|sw=ext core 3.01|hw=00080000|prot=20.30|fw=hpg 1.40rov",
     diagnostic_context=diagnostic_context,
+    trusted_now=datetime(2026, 7, 10, 0, 5, tzinfo=UTC),
+    time_assistance_source="system_synchronized",
     allow_legacy_direct_restore=True,
   )
   return result, calls, sleeps, logs
@@ -445,7 +447,7 @@ def run_receiving_with_fakes(
   monkeypatch.setattr(
     pigeond,
     "gps_assistance_receiver_fingerprint",
-    lambda params: "receiver",
+    lambda params, mon_ver_info=None: "receiver",
   )
   monkeypatch.setattr(pigeond, "TTYPigeon", FakePigeon)
   if inline_assistance_worker:

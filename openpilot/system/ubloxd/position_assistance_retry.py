@@ -12,6 +12,7 @@ from pathlib import Path
 import tempfile
 from typing import Any, cast
 
+from openpilot.system.ubloxd.gps_assistance import receiver_fingerprints_compatible
 from openpilot.system.ubloxd.navigation_database_restore_runtime import (
   NavigationDatabaseRestoreExecution,
   PositionAssistanceAckStatus,
@@ -315,12 +316,16 @@ class PositionAssistanceRetryRuntime:
     if new_receiver_cycle:
       self._state = baseline
       if not self._persist():
-        raise PositionAssistanceRetryStateError(
-          "receiver cycle baseline persist failed: "
-          + (self._persistence_error or "unknown")
-        )
+        raise PositionAssistanceRetryStateError("receiver cycle baseline persist failed: " + (self._persistence_error or "unknown"))
       return
-    if persisted is None or persisted.boot_id != boot_id or persisted.receiver_fingerprint != receiver_fingerprint:
+    if (
+      persisted is None
+      or persisted.boot_id != boot_id
+      or not receiver_fingerprints_compatible(
+        persisted.receiver_fingerprint,
+        receiver_fingerprint,
+      )
+    ):
       self._state = baseline
       self._persist()
       return
