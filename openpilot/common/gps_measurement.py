@@ -110,7 +110,7 @@ def locationd_position_fields_usable(
   event_mono_s: float,
   require_measurement_mono: bool = True,
 ) -> bool:
-  """True iff fields would pass Localizer::handle_gps acceptance (sans KF state).
+  """True if and only if fields would pass Localizer::handle_gps acceptance (sans KF state).
 
   Aligns gpsard HEALTHY qualification with locationd usability. Does not compare
   accuracy magnitudes across sources — only "usable by the position consumer?".
