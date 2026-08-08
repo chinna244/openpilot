@@ -168,6 +168,9 @@ def feed_rawx(
 ) -> None:
   """Latch RAWX era evidence through the real _gen_rxm_rawx wiring path."""
   from types import SimpleNamespace
+  from typing import cast
+
+  from openpilot.system.ubloxd.ubx import Ubx
 
   parser.framer.last_log_time = mono_t
   meas = [_rawx_measurement(sv_id=i + 1) for i in range(max(0, num_meas))]
@@ -179,7 +182,7 @@ def feed_rawx(
     rec_stat=0x01,
     meas=meas,
   )
-  parser._gen_rxm_rawx(msg)
+  parser._gen_rxm_rawx(cast(Ubx.RxmRawx, msg))
 
 
 def feed_gps(parser: UbloxMsgParser, sv_id: int, subframe_id: int, iod: int, mono_t: float):
