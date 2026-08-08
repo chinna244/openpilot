@@ -18,7 +18,7 @@ if platform.system() == 'Darwin':
 
 
 class TestLocationdProc:
-  LLD_MSGS = ['gpsLocationExternal', 'cameraOdometry', 'carState', 'liveCalibration',
+  LLD_MSGS = ['gpsLocationExternal', 'gpsSourceState', 'cameraOdometry', 'carState', 'liveCalibration',
               'accelerometer', 'gyroscope']
 
   def setup_method(self):
@@ -49,14 +49,21 @@ class TestLocationdProc:
       msg.gpsLocationExternal.longitude = float(self.lon)
       msg.gpsLocationExternal.unixTimestampMillis = t * 1e6
       msg.gpsLocationExternal.altitude = float(self.alt)
-    #if name == "gnssMeasurements":
-    #  msg.gnssMeasurements.measTime = t
-    #  msg.gnssMeasurements.positionECEF.value = [self.x , self.y, self.z]
-    #  msg.gnssMeasurements.positionECEF.std = [0,0,0]
-    #  msg.gnssMeasurements.positionECEF.valid = True
-    #  msg.gnssMeasurements.velocityECEF.value = []
-    #  msg.gnssMeasurements.velocityECEF.std = [0,0,0]
-    #  msg.gnssMeasurements.velocityECEF.valid = True
+    elif name == "gpsSourceState":
+      # Authoritative ublox-primary selection for the integration harness.
+      msg.gpsSourceState.selected = "ubloxPrimary"
+      msg.gpsSourceState.generation = 0
+      msg.gpsSourceState.transitionMonoNs = 0
+      msg.gpsSourceState.transitionReason = "test"
+      msg.gpsSourceState.ubloxHealth = "healthy"
+      msg.gpsSourceState.qcomHealth = "unknown"
+      msg.gpsSourceState.ubloxAgeS = 0.0
+      msg.gpsSourceState.qcomAgeS = -1.0
+      msg.gpsSourceState.ubloxHealthyAgeS = 0.0
+      msg.gpsSourceState.qcomHealthyAgeS = -1.0
+      msg.gpsSourceState.failoverCount = 0
+      msg.gpsSourceState.recoveryCount = 0
+      msg.gpsSourceState.ubloxHardwareAvailable = True
     elif name == 'cameraOdometry':
       msg.cameraOdometry.rot = [0.0, 0.0, 0.0]
       msg.cameraOdometry.rotStd = [0.0, 0.0, 0.0]

@@ -37,7 +37,8 @@ def logging(started: bool, params: Params, CP: car.CarParams) -> bool:
   return started and run
 
 def ublox_available() -> bool:
-  return os.path.exists('/dev/ttyHS0') and not os.path.exists('/persist/comma/use-quectel-gps')
+  from openpilot.common.gps import ublox_hardware_available
+  return ublox_hardware_available()
 
 def ublox(started: bool, params: Params, CP: car.CarParams) -> bool:
   global _ublox_last_started, _ublox_offroad_prewarm_deadline
@@ -82,7 +83,15 @@ def not_long_maneuver(started: bool, params: Params, CP: car.CarParams) -> bool:
   return started and not params.get_bool("LongitudinalManeuverMode")
 
 def qcomgps(started: bool, params: Params, CP: car.CarParams) -> bool:
-  return started and not ublox_available()
+  # PR80: when u-blox hardware is present, still run qcomgpsd onroad so the
+  # arbiter can observe a healthy QCOM fallback. GPIO power for u-blox is owned
+  # by pigeond; qcomgpsd must not toggle GNSS_PWR_EN in that configuration.
+  return started
+
+
+def gpsard(started: bool, params: Params, CP: car.CarParams) -> bool:
+  # Always-on arbiter so timed/locationd share one authoritative source policy.
+  return True
 
 def always_run(started: bool, params: Params, CP: car.CarParams) -> bool:
   return True
@@ -155,6 +164,7 @@ procs = [
   PythonProcess("journald", "openpilot.system.journald", only_onroad, platform.system() != "Darwin"),
   PythonProcess("micd", "openpilot.system.micd", iscar),
   PythonProcess("timed", "openpilot.system.timed", always_run, enabled=not PC, restart_if_crash=True),
+  PythonProcess("gpsard", "openpilot.system.gpsard", gpsard, enabled=TICI, restart_if_crash=True),
 
   PythonProcess("modeld", "openpilot.selfdrive.modeld.modeld", and_(only_onroad, is_stock_model)),
   PythonProcess("dmonitoringmodeld", "openpilot.selfdrive.modeld.dmonitoringmodeld", driverview, enabled=(WEBCAM or not PC)),
@@ -172,7 +182,7 @@ procs = [
   PythonProcess("card", "openpilot.selfdrive.car.card", only_onroad),
   PythonProcess("deleter", "openpilot.system.loggerd.deleter", always_run),
   PythonProcess("dmonitoringd", "openpilot.selfdrive.monitoring.dmonitoringd", driverview, enabled=(WEBCAM or not PC)),
-  PythonProcess("qcomgpsd", "openpilot.system.qcomgpsd.qcomgpsd", qcomgps, enabled=TICI),
+  PythonProcess("qcomgpsd", "openpilot.system.qcomgpsd.qcomgpsd", qcomgps, enabled=TICI, restart_if_crash=True),
   PythonProcess("pandad", "openpilot.selfdrive.pandad.pandad", always_run),
   PythonProcess("paramsd", "openpilot.selfdrive.locationd.paramsd", only_onroad),
   PythonProcess("lagd", "openpilot.selfdrive.locationd.lagd", only_onroad),

@@ -484,7 +484,38 @@ struct ModelDataV2SP @0xa1680744031fdb2d {
   }
 }
 
-struct CustomReserved10 @0xcb9fd56c7057593a {
+# PR80: authoritative GPS source arbitration (ublox primary / QCOM fallback).
+# Runtime-only; not persisted across boot.
+struct GpsSourceState @0xcb9fd56c7057593a {
+  enum SelectedSource {
+    ubloxPrimary @0;
+    qcomFallback @1;
+    noHealthySource @2;
+  }
+
+  enum SourceHealth {
+    unknown @0;
+    acquiring @1;
+    healthy @2;
+    unhealthy @3;
+  }
+
+  selected @0 :SelectedSource;
+  generation @1 :UInt32;
+  transitionMonoNs @2 :UInt64;
+  transitionReason @3 :Text;
+
+  ubloxHealth @4 :SourceHealth;
+  qcomHealth @5 :SourceHealth;
+
+  ubloxAgeS @6 :Float32;   # seconds since last ublox sample; -1 if none
+  qcomAgeS @7 :Float32;    # seconds since last qcom sample; -1 if none
+  ubloxHealthyAgeS @8 :Float32;
+  qcomHealthyAgeS @9 :Float32;
+
+  failoverCount @10 :UInt32;
+  recoveryCount @11 :UInt32;
+  ubloxHardwareAvailable @12 :Bool;
 }
 
 struct CustomReserved11 @0xc2243c65e0340384 {

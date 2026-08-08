@@ -46,6 +46,8 @@ const double GPS_COURSE_MIN_SPEED_FOR_YAW_RESET = 5.0; // m/s
 // initial heading is hard to unwind, so reject coarse bearing reports for reset-only use.
 const double GPS_COURSE_MAX_BEARING_ACC_DEG = 45.0;
 const double GPS_INPUT_DIAG_LOG_INTERVAL_S = 10.0;
+// Must match openpilot.common.gps.GPS_SOURCE_STATE_FRESH_SECONDS (gpsSourceState @ 1 Hz).
+const double GPS_SOURCE_STATE_FRESH_SECONDS = 3.0;
 
 const bool   DEBUG = getenv("DEBUG") != nullptr && std::string(getenv("DEBUG")) != "0";
 
@@ -748,22 +750,46 @@ void Localizer::handle_msg_bytes(const char *data, const size_t size) {
 void Localizer::handle_msg(const cereal::Event::Reader& log) {
   double t = log.getLogMonoTime() * 1e-9;
   this->time_check(t);
-  if (log.isAccelerometer()) {
-    this->handle_sensor(t, log.getAccelerometer());
-  } else if (log.isGyroscope()) {
-    this->handle_sensor(t, log.getGyroscope());
-  } else if (log.isGpsLocation()) {
-    this->handle_gps(t, log.getGpsLocation(), GPS_QUECTEL_SENSOR_TIME_OFFSET);
-  } else if (log.isGpsLocationExternal()) {
-    this->handle_gps(t, log.getGpsLocationExternal(), GPS_UBLOX_SENSOR_TIME_OFFSET);
-  //} else if (log.isGnssMeasurements()) {
-  //  this->handle_gnss(t, log.getGnssMeasurements());
-  } else if (log.isCarState()) {
-    this->handle_car_state(t, log.getCarState());
-  } else if (log.isCameraOdometry()) {
-    this->handle_cam_odo(t, log.getCameraOdometry());
-  } else if (log.isLiveCalibration()) {
-    this->handle_live_calib(t, log.getLiveCalibration());
+  if (log.isGpsSourceState()) {
+    this->handle_gps_source_state(t, log.getGpsSourceState());
+  } else {
+    // Expire arbiter authority. Use max(event, last state recv) so buffered
+    // pre-epoch GPS timestamps cannot poison freshness while still allowing
+    // transitionMonoNs gating against the message's own mono time.
+    double authority_now = t;
+    if (this->gps_source_state_seen && std::isfinite(this->gps_source_state_recv_mono)) {
+      authority_now = std::max(t, this->gps_source_state_recv_mono);
+    }
+    this->refresh_gps_source_authority(authority_now);
+
+    if (log.isAccelerometer()) {
+      this->handle_sensor(t, log.getAccelerometer());
+    } else if (log.isGyroscope()) {
+      this->handle_sensor(t, log.getGyroscope());
+    } else if (log.isGpsLocation()) {
+      if (this->gps_message_authoritative(AuthGpsSource::QCOM_FALLBACK, t)) {
+        if (this->gnss_source != LocalizerGnssSource::QCOM) {
+          // Reconfigure measurement factors only; do not hard-reset the KF.
+          this->configure_gnss_source(LocalizerGnssSource::QCOM);
+        }
+        this->handle_gps(t, log.getGpsLocation(), GPS_QUECTEL_SENSOR_TIME_OFFSET);
+      }
+    } else if (log.isGpsLocationExternal()) {
+      if (this->gps_message_authoritative(AuthGpsSource::UBLOX_PRIMARY, t)) {
+        if (this->gnss_source != LocalizerGnssSource::UBLOX) {
+          this->configure_gnss_source(LocalizerGnssSource::UBLOX);
+        }
+        this->handle_gps(t, log.getGpsLocationExternal(), GPS_UBLOX_SENSOR_TIME_OFFSET);
+      }
+    //} else if (log.isGnssMeasurements()) {
+    //  this->handle_gnss(t, log.getGnssMeasurements());
+    } else if (log.isCarState()) {
+      this->handle_car_state(t, log.getCarState());
+    } else if (log.isCameraOdometry()) {
+      this->handle_cam_odo(t, log.getCameraOdometry());
+    } else if (log.isLiveCalibration()) {
+      this->handle_live_calib(t, log.getLiveCalibration());
+    }
   }
   this->finite_check();
   this->update_reset_tracker();
@@ -833,23 +859,118 @@ void Localizer::configure_gnss_source(const LocalizerGnssSource &source) {
   }
 }
 
-int Localizer::locationd_thread() {
-  Params params;
-  LocalizerGnssSource source;
-  const char* gps_location_socket;
-  if (params.getBool("UbloxAvailable")) {
-    source = LocalizerGnssSource::UBLOX;
-    gps_location_socket = "gpsLocationExternal";
-  } else {
-    source = LocalizerGnssSource::QCOM;
-    gps_location_socket = "gpsLocation";
+bool Localizer::gps_message_authoritative(AuthGpsSource expected_source, double msg_mono) const {
+  if (this->auth_gps_source != expected_source) {
+    return false;
+  }
+  if (this->auth_gps_source == AuthGpsSource::NO_HEALTHY_SOURCE) {
+    return false;
+  }
+  if (!std::isfinite(msg_mono)) {
+    return false;
+  }
+  // Reject buffered pre-transition samples (source epoch).
+  return msg_mono > this->gps_source_transition_mono;
+}
+
+void Localizer::refresh_gps_source_authority(double now_mono) {
+  if (!this->gps_source_state_seen || !std::isfinite(now_mono) || !std::isfinite(this->gps_source_state_recv_mono)) {
+    this->auth_gps_source = AuthGpsSource::NO_HEALTHY_SOURCE;
+    return;
+  }
+  const double age = now_mono - this->gps_source_state_recv_mono;
+  if (age < 0.0 || age > GPS_SOURCE_STATE_FRESH_SECONDS) {
+    this->auth_gps_source = AuthGpsSource::NO_HEALTHY_SOURCE;
+    return;
+  }
+  this->auth_gps_source = this->auth_gps_source_selected;
+}
+
+void Localizer::handle_gps_source_state(double current_time, const cereal::GpsSourceState::Reader &state) {
+  AuthGpsSource next = AuthGpsSource::NO_HEALTHY_SOURCE;
+  switch (state.getSelected()) {
+    case cereal::GpsSourceState::SelectedSource::UBLOX_PRIMARY:
+      next = AuthGpsSource::UBLOX_PRIMARY;
+      break;
+    case cereal::GpsSourceState::SelectedSource::QCOM_FALLBACK:
+      next = AuthGpsSource::QCOM_FALLBACK;
+      break;
+    case cereal::GpsSourceState::SelectedSource::NO_HEALTHY_SOURCE:
+    default:
+      next = AuthGpsSource::NO_HEALTHY_SOURCE;
+      break;
   }
 
-  this->configure_gnss_source(source);
-  const std::initializer_list<const char *> service_list = {gps_location_socket, "cameraOdometry", "liveCalibration",
-                                                          "carState", "accelerometer", "gyroscope"};
+  const uint64_t transition_ns = state.getTransitionMonoNs();
+  const uint32_t generation = state.getGeneration();
+  const double transition_mono = transition_ns * 1e-9;
+  const uint64_t recv_ns = std::isfinite(current_time) && current_time >= 0.0
+                             ? static_cast<uint64_t>(current_time * 1e9)
+                             : 0ULL;
 
-  SubMaster sm(service_list, {}, nullptr, {gps_location_socket});
+  // Reject impossible future authority epochs vs receive mono time.
+  if (!std::isfinite(current_time) || transition_ns > recv_ns) {
+    return;
+  }
+
+  // Reject regressing epochs; equal epoch must keep selected+generation consistent.
+  if (this->gps_source_state_seen) {
+    if (transition_ns < this->gps_source_transition_mono_ns) {
+      return;
+    }
+    if (transition_ns == this->gps_source_transition_mono_ns) {
+      if (generation != this->gps_source_generation || next != this->auth_gps_source_selected) {
+        return;
+      }
+      // Consistent equal-epoch refresh: update freshness only.
+      this->gps_source_state_recv_mono = current_time;
+      this->refresh_gps_source_authority(current_time);
+      return;
+    }
+  }
+
+  const AuthGpsSource prev_selected = this->auth_gps_source_selected;
+  const uint32_t prev_generation = this->gps_source_generation;
+
+  this->gps_source_state_seen = true;
+  this->gps_source_state_recv_mono = current_time;
+  this->auth_gps_source_selected = next;
+  this->gps_source_generation = generation;
+  this->gps_source_transition_mono_ns = transition_ns;
+  this->gps_source_transition_mono = transition_mono;
+
+  this->refresh_gps_source_authority(current_time);
+
+  // Source identity change alone must not hard-reset the filter.
+  if (next != prev_selected || generation != prev_generation) {
+    if (next == AuthGpsSource::UBLOX_PRIMARY && this->gnss_source != LocalizerGnssSource::UBLOX) {
+      this->configure_gnss_source(LocalizerGnssSource::UBLOX);
+    } else if (next == AuthGpsSource::QCOM_FALLBACK && this->gnss_source != LocalizerGnssSource::QCOM) {
+      this->configure_gnss_source(LocalizerGnssSource::QCOM);
+    }
+  }
+}
+
+int Localizer::locationd_thread() {
+  Params params;
+  // Measurement factors default from hardware presence; authoritative source selection
+  // requires fresh gpsSourceState (fail closed until then).
+  LocalizerGnssSource source = params.getBool("UbloxAvailable") ? LocalizerGnssSource::UBLOX
+                                                                : LocalizerGnssSource::QCOM;
+  this->auth_gps_source = AuthGpsSource::NO_HEALTHY_SOURCE;
+  this->auth_gps_source_selected = AuthGpsSource::NO_HEALTHY_SOURCE;
+
+  this->configure_gnss_source(source);
+  const std::initializer_list<const char *> service_list = {
+    "gpsSourceState", "gpsLocationExternal", "gpsLocation",
+    "cameraOdometry", "liveCalibration", "carState", "accelerometer", "gyroscope",
+  };
+
+  // GPS sockets and arbiter state are optional for filter initialization alive checks.
+  const std::vector<const char *> ignore_alive = {
+    "gpsSourceState", "gpsLocationExternal", "gpsLocation",
+  };
+  SubMaster sm(service_list, {}, nullptr, ignore_alive);
   PubMaster pm({"liveLocationKalman"});
 
   uint64_t cnt = 0;
@@ -861,6 +982,7 @@ int Localizer::locationd_thread() {
 
   while (!do_exit) {
     sm.update();
+    this->refresh_gps_source_authority(nanos_since_boot() * 1e-9);
     if (filterInitialized){
       this->observation_timings_invalid_reset();
       for (const char* service : service_list) {
@@ -870,12 +992,15 @@ int Localizer::locationd_thread() {
         }
       }
     } else {
-      filterInitialized = sm.allAliveAndValid();
+      // Optional GPS sockets / arbiter must not block filter start.
+      filterInitialized = sm.allAliveAndValid({"cameraOdometry", "liveCalibration", "carState",
+                                              "accelerometer", "gyroscope"});
     }
 
     const char* trigger_msg = "cameraOdometry";
     if (sm.updated(trigger_msg)) {
-      bool inputsOK = sm.allValid() && this->are_inputs_ok();
+      bool inputsOK = sm.allValid({"cameraOdometry", "liveCalibration", "carState",
+                                   "accelerometer", "gyroscope"}) && this->are_inputs_ok();
       bool gpsOK = this->is_gps_ok();
       bool sensorsOK = sm.allAliveAndValid({"accelerometer", "gyroscope"});
 

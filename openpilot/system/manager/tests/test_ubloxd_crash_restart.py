@@ -4,8 +4,9 @@ from openpilot.system.manager.process_config import managed_processes
 def test_ubloxd_restarts_on_crash() -> None:
   assert managed_processes["ubloxd"].restart_if_crash is True
   assert managed_processes["pigeond"].restart_if_crash is True
-  # qcomgpsd remains without crash-restart (unchanged lifecycle).
-  assert managed_processes["qcomgpsd"].restart_if_crash is False
+  # PR80: qcomgpsd is a live fallback source and must also restart on crash.
+  assert managed_processes["qcomgpsd"].restart_if_crash is True
+  assert managed_processes["gpsard"].restart_if_crash is True
 
 
 def test_ubloxd_run_condition_unchanged() -> None:
