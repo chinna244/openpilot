@@ -101,7 +101,7 @@ def min_date():
 
 
 def utc_within_exclusive_supported_range(value: datetime.datetime) -> bool:
-  """True iff exclusive host/GPS representable bounds: min_date() < utc < MAX_DATE."""
+  """True when exclusive host/GPS representable bounds hold: min_date() < utc < MAX_DATE."""
   if value.tzinfo is None or value.utcoffset() is None:
     normalized = value.replace(tzinfo=datetime.UTC)
   else:
