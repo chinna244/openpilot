@@ -93,8 +93,13 @@ def test_process_start_never_installs_a_pre_start_network_wait() -> None:
   segment = ast.get_source_segment(source, node)
   assert segment is not None
   assert "network_available=device_network_available(sm)" in segment
-  assert "allow_database_trusted_time_wait=False" in segment
-  assert "network_available_reader=" not in segment
+  assert "allow_database_trusted_time_wait" not in segment
+  assert "network_available_reader" not in segment
+  assert "wait_for_current_independent_network_time" not in source
+  assert "get_assistnow_messages" not in source
+  assert "AssistNowToken" not in source
+  assert "online-live2.services.u-blox.com" not in source
+  assert "GetOnlineData.ashx" not in source
 
 
 def test_deferred_assistance_worker_is_polled_without_unbounded_wait() -> None:
@@ -102,10 +107,7 @@ def test_deferred_assistance_worker_is_polled_without_unbounded_wait() -> None:
   initialize = named_node(tree, "initialize_receiver_cycle")
   wait_calls = calls(initialize, "wait")
   assert len(wait_calls) == 1
-  assert any(
-    keyword.arg == "timeout"
-    for keyword in wait_calls[0].keywords
-  )
+  assert any(keyword.arg == "timeout" for keyword in wait_calls[0].keywords)
   initialize_segment = ast.get_source_segment(source, initialize)
   assert initialize_segment is not None
   assert "assistance_state_task_complete.is_set()" in initialize_segment
@@ -122,9 +124,7 @@ def test_deferred_assistance_worker_is_polled_without_unbounded_wait() -> None:
   )
   receive = receiving_segment.index("pigeon.receive()", loop)
   assert loop < poll < receive
-  assert receiving_segment.count(
-    "if navigation_database_runtime is not None"
-  ) >= 3
+  assert receiving_segment.count("if navigation_database_runtime is not None") >= 3
 
 
 def test_late_network_time_remains_a_post_start_assistance_path() -> None:
@@ -164,9 +164,7 @@ def test_database_decision_runs_before_yuma_transmission() -> None:
   assert "navigation_database_runtime.database_restore_pending" in segment
   assert "yuma_outcome = (" in segment
   assert "yuma_feature.evaluate(" in segment
-  assert segment.count(
-    "if navigation_database_runtime is not None"
-  ) >= 3
+  assert segment.count("if navigation_database_runtime is not None") >= 3
   assert "navigation_database_runtime.note_yuma_sent()" not in segment
 
   helper = named_node(tree, "send_yuma_with_durable_claim")
@@ -256,11 +254,7 @@ def test_process_start_transport_precedes_pr66_state_creation() -> None:
 def test_bootstrap_frames_dispatch_only_after_mandatory_configuration() -> None:
   source, tree = source_tree(PIGEOND)
   node = named_node(tree, "initialize_receiver_cycle")
-  callback = next(
-    item for item in node.body
-    if isinstance(item, ast.FunctionDef)
-    and item.name == "pre_acquisition_initialization"
-  )
+  callback = next(item for item in node.body if isinstance(item, ast.FunctionDef) and item.name == "pre_acquisition_initialization")
   segment = ast.get_source_segment(source, callback)
   assert segment is not None
   navx5 = segment.index("configure_navx5_ack_aiding(")
@@ -418,20 +412,13 @@ def test_dbd_runtime_initialization_is_deferred_until_after_configuration() -> N
   initialize = named_node(tree, "initialize_receiver_cycle")
   initialize_segment = ast.get_source_segment(source, initialize)
   assert initialize_segment is not None
-  callbacks = [
-    item
-    for item in initialize.body
-    if isinstance(item, ast.FunctionDef)
-    and item.name == "pre_acquisition_initialization"
-  ]
+  callbacks = [item for item in initialize.body if isinstance(item, ast.FunctionDef) and item.name == "pre_acquisition_initialization"]
   assert len(callbacks) == 1
   callback_segment = ast.get_source_segment(source, callbacks[0])
   assert callback_segment is not None
   navx5 = callback_segment.index("configure_navx5_ack_aiding(")
   trusted_time = callback_segment.index("read_host_time_observation()")
-  assistance_state = callback_segment.index(
-    "prepare_assistance_state_before_start("
-  )
+  assistance_state = callback_segment.index("prepare_assistance_state_before_start(")
   assert navx5 < trusted_time < assistance_state
 
 

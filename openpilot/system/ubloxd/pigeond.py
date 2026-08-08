@@ -6,8 +6,6 @@ import sys
 import time
 import signal
 from openpilot.common.serial import Serial
-import requests
-import urllib.parse
 from collections import deque
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -238,17 +236,14 @@ PRE_TRANSACTION_DRAIN_MAX_BYTES = 64 * 1024
 CONTROLLED_GNSS_STOP_MESSAGE = b"\xB5\x62\x06\x04\x04\x00\x00\x00\x08\x00\x16\x74"
 CONTROLLED_GNSS_START_MESSAGE = b"\xB5\x62\x06\x04\x04\x00\x00\x00\x09\x00\x17\x76"
 CONTROLLED_GNSS_TRANSITION_DELAY = 0.05
-# General post-START callers may still use a bounded wait for independent
-# network time. Receiver initialization samples trusted time once and never
-# waits for it before GNSS START.
-NAVIGATION_DATABASE_TRUSTED_TIME_WAIT_SECONDS = 40.0
 # The absolute pre-START deadline is measured from receiver cycle start.
+# Receiver initialization samples trusted time once and never waits for
+# independent network time before GNSS START.
 NAVIGATION_DATABASE_PROCESS_START_TIME_DEADLINE_SECONDS = 45.0
 # Leave enough time to return from a bounded assistance-setup wait and reach
 # the GNSS START UART boundary. Unbounded factory/cache work never runs on the
 # startup thread.
 PRE_START_ASSISTANCE_SETUP_RESERVE_SECONDS = 0.5
-NAVIGATION_DATABASE_TRUSTED_TIME_POLL_SECONDS = 0.25
 # A validated MGA-DBD cache is capped at 64 KiB. Frequent dispatch between
 # transactions is the primary bound; these limits retain four cache volumes or
 # 512 small navigation frames if a dispatcher is temporarily unavailable.
@@ -344,27 +339,6 @@ def add_ubx_checksum(msg: bytes) -> bytes:
     A = (A + b) % 256
     B = (B + A) % 256
   return msg + bytes([A, B])
-
-def get_assistnow_messages(token: str) -> list[bytes]:
-  # make request
-  # TODO: implement adding the last known location
-  r = requests.get("https://online-live2.services.u-blox.com/GetOnlineData.ashx", params=urllib.parse.urlencode({
-    'token': token,
-    'gnss': 'gps,glo',
-    'datatype': 'eph,alm,aux',
-  }, safe=':,'), timeout=5)
-  assert r.status_code == 200, "Got invalid status code"
-  dat = r.content
-
-  # split up messages
-  msgs = []
-  while len(dat) > 0:
-    assert dat[:2] == b"\xB5\x62"
-    msg_len = 6 + (dat[5] << 8 | dat[4]) + 2
-    msgs.append(dat[:msg_len])
-    dat = dat[msg_len:]
-  return msgs
-
 
 class TTYPigeon:
   def __init__(
@@ -2989,7 +2963,11 @@ def finish_post_start_receiver_configuration(
 
 
 def run_post_start_legacy_assistance(pigeon: TTYPigeon) -> None:
-  """Run legacy backup diagnostics and online AssistNow after GNSS START."""
+  """Run legacy backup diagnostics after GNSS START.
+
+  AssistNow Online download/injection is retired. Current YUMA/DBD/position
+  assistance and AssistNow Autonomous (NAVX5 AOP) supersede that path.
+  """
   try:
     restore_status = pigeon.poll_backup_restore_status()
     if restore_status == 2:
@@ -3000,16 +2978,6 @@ def run_post_start_legacy_assistance(pigeon: TTYPigeon) -> None:
       cloudlog.error(f"failed to restore almanac backup, status: {restore_status}")
   except Exception:
     cloudlog.exception("GPS almanac backup status poll failed")
-  # Keep AssistNow policy unchanged: it is best-effort and must never turn a
-  # receiver-configuration result into a GNSS acquisition failure.
-  token = Params().get("AssistNowToken")
-  if token is not None:
-    try:
-      for msg in get_assistnow_messages(token):
-        pigeon.send_with_ack(msg, ack=UBLOX_ASSIST_ACK)
-      cloudlog.warning("AssistNow messages sent")
-    except Exception:
-      cloudlog.warning("failed to get AssistNow messages")
   cloudlog.warning("Pigeon GPS on!")
 
 
@@ -6487,41 +6455,6 @@ def drain_receiver_before_database_restore(pigeon: TTYPigeon) -> None:
     drain("navigation_database_post_time_wait")
 
 
-def should_wait_for_navigation_database_trusted_time(
-  *,
-  restore_pending: bool,
-  state_available: bool,
-  candidate_available: bool,
-  allow_wait: bool,
-  network_available: bool | None,
-  network_recheck_available: bool,
-  acquisition_started: bool,
-  current_network_time: bool,
-) -> bool:
-  return (
-    restore_pending
-    and state_available
-    and candidate_available
-    and allow_wait
-    and (network_available is not False or network_recheck_available)
-    and not acquisition_started
-    and not current_network_time
-  )
-
-
-def navigation_database_trusted_time_wait_expired(
-  *,
-  wait_attempted: bool,
-  network_available: bool | None,
-) -> bool:
-  # Every attempted wait is bounded by the process-start deadline.  An
-  # explicit offline observation no longer creates a separate, arbitrary
-  # early cutoff because networkType.none cannot distinguish "offline" from
-  # Wi-Fi that is still establishing its default route.
-  del network_available
-  return wait_attempted
-
-
 def navigation_database_process_start_wait_seconds(
   cycle_started_at: float,
   now: float,
@@ -6542,47 +6475,6 @@ def pre_start_remaining_seconds(pre_start_deadline: float) -> float:
   ):
     raise ValueError("pre_start_deadline must be finite")
   return max(0.0, float(pre_start_deadline) - time.monotonic())
-
-
-def wait_for_current_independent_network_time(
-  authority: TimeAuthority,
-  host_time_observation: HostTimeObservation | None,
-  authority_evaluation: TimeAuthorityEvaluation,
-  *,
-  timeout_seconds: float = NAVIGATION_DATABASE_TRUSTED_TIME_WAIT_SECONDS,
-  poll_seconds: float = NAVIGATION_DATABASE_TRUSTED_TIME_POLL_SECONDS,
-  observation_reader: Callable[[], HostTimeObservation | None] = read_host_time_observation,
-  evaluator: Callable[[TimeAuthority, HostTimeObservation | None], TimeAuthorityEvaluation] = evaluate_time_authority,
-  monotonic: Callable[[], float] = time.monotonic,
-  sleeper: Callable[[float], None] = time.sleep,
-  initial_network_available: bool | None = None,
-  network_available_reader: Callable[[], bool | None] | None = None,
-) -> tuple[HostTimeObservation | None, TimeAuthorityEvaluation]:
-  # networkType.none cannot distinguish a definitely offline device from one
-  # whose Wi-Fi route is still coming up.  Keep the observation for callers'
-  # telemetry, but let the single bounded time deadline govern the wait.
-  del initial_network_available
-  authorized = authority_evaluation.authorized_time
-  if authorized is not None and is_current_independent_network_time(authorized):
-    return host_time_observation, authority_evaluation
-  started_at = monotonic()
-  deadline = started_at + timeout_seconds
-  latest_observation = host_time_observation
-  latest_evaluation = authority_evaluation
-  while True:
-    now = monotonic()
-    remaining = deadline - now
-    if remaining <= 0.0:
-      return latest_observation, latest_evaluation
-    sleeper(min(poll_seconds, remaining))
-    latest_observation = observation_reader()
-    latest_evaluation = evaluator(authority, latest_observation)
-    authorized = latest_evaluation.authorized_time
-    if authorized is not None and is_current_independent_network_time(authorized):
-      return latest_observation, latest_evaluation
-
-    if network_available_reader is not None:
-      network_available_reader()
 
 
 def send_yuma_with_durable_claim(
@@ -6612,9 +6504,7 @@ def initialize_receiver_cycle(
   position_assistance_retry: PositionAssistancePostStartRetryController | None = None,
   transport_mon_ver_info: MonVerInfo | None = None,
   cycle_started_at: float | None = None,
-  allow_database_trusted_time_wait: bool = False,
   network_available: bool | None = False,
-  network_available_reader: Callable[[], bool | None] | None = None,
   assistance_state_factory: Callable[[], tuple[
     NavigationDatabaseRestoreRuntime,
     PositionAssistancePostStartRetryController,
@@ -6628,15 +6518,8 @@ def initialize_receiver_cycle(
 ) -> ReceiverCycleInitialization:
   if cycle_started_at is None:
     cycle_started_at = time.monotonic()
-  if not isinstance(allow_database_trusted_time_wait, bool):
-    raise ValueError("allow_database_trusted_time_wait must be a bool")
   if network_available is not None and not isinstance(network_available, bool):
     raise ValueError("network_available must be a bool or None")
-  if (
-    network_available_reader is not None
-    and not callable(network_available_reader)
-  ):
-    raise ValueError("network_available_reader must be callable")
   if assistance_state_factory is not None and not callable(
     assistance_state_factory
   ):
@@ -9266,7 +9149,6 @@ def run_receiving(duration: int = 0):
     position_assistance_retry=position_assistance_retry,
     transport_mon_ver_info=process_start_mon_ver_info,
     cycle_started_at=process_start_cycle_started_at,
-    allow_database_trusted_time_wait=False,
     network_available=device_network_available(sm),
     assistance_state_factory=new_receiver_cycle_assistance_state_factory(),
     assistance_state_ready_callback=(

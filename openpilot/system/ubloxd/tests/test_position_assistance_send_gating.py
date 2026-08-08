@@ -481,12 +481,7 @@ def test_restore_position_path_does_not_reintroduce_trusted_time_wait(
   runtime.note_acquisition_started()
   install_send_recorder(monkeypatch)
 
-  wait_calls: list[object] = []
-  monkeypatch.setattr(
-    pigeond,
-    "wait_for_current_independent_network_time",
-    lambda *_args, **_kwargs: wait_calls.append("wait"),
-  )
+  assert not hasattr(pigeond, "wait_for_current_independent_network_time")
 
   result = pigeond.restore_navigation_assistance(
     object(),  # type: ignore[arg-type, ty:invalid-argument-type]
@@ -494,8 +489,6 @@ def test_restore_position_path_does_not_reintroduce_trusted_time_wait(
     navigation_database_runtime=runtime,
     authorized_time=None,
   )
-
-  assert wait_calls == []
   assert result.database_trusted_time_wait_started_at is None
   assert result.database_trusted_time_wait_elapsed_seconds is None
   assert runtime.execution.position_assistance_attempted
