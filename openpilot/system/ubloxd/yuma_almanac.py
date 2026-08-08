@@ -4,11 +4,11 @@
 
 import struct
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from math import isfinite, pi
 
 from openpilot.common.gps_time import (
-  GPS_EPOCH_UTC,
+  gps_week_tow_to_unix_millis,
   resolve_gps_week_mod_1024,
 )
 from openpilot.system.ubloxd.gps_assistance import add_ubx_checksum, validate_ubx_frame
@@ -436,10 +436,13 @@ def resolve_yuma_reference_time(
     )
   except ValueError as exc:
     raise YumaAlmanacError(str(exc)) from exc
-  return GPS_EPOCH_UTC + timedelta(
-    weeks=absolute_week,
-    seconds=almanac.time_of_applicability_seconds,
-  )
+  # GPS week + ToA is GPS time; convert to UTC via maintained leap authority.
+  tow_ms = float(almanac.time_of_applicability_seconds) * 1000.0
+  try:
+    unix_ms = gps_week_tow_to_unix_millis(absolute_week, tow_ms)
+  except ValueError as exc:
+    raise YumaAlmanacError(str(exc)) from exc
+  return datetime.fromtimestamp(unix_ms / 1000.0, tz=UTC)
 
 
 def validate_yuma_reference_time(

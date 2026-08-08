@@ -8,11 +8,10 @@ from openpilot.cereal import log
 import openpilot.cereal.messaging as messaging
 from openpilot.common.time_helpers import (
   HostTimeSource,
-  MAX_DATE,
   mark_time_synced,
-  min_date,
   set_system_time,
   system_time_valid,
+  utc_within_exclusive_supported_range,
 )
 from openpilot.common.gps_time import ublox_gps_time_valid
 from openpilot.common.swaglog import cloudlog
@@ -129,9 +128,7 @@ def main() -> NoReturn:
       tz=datetime.UTC,
     )
 
-    minimum_time = min_date().replace(tzinfo=datetime.UTC)
-    maximum_time = MAX_DATE.replace(tzinfo=datetime.UTC)
-    if gps_time < minimum_time or gps_time > maximum_time:
+    if not utc_within_exclusive_supported_range(gps_time):
       continue
 
     if set_time(gps_time):

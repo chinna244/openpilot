@@ -135,10 +135,30 @@ def resolve_gps_week_mod_1024(
   elif trusted_utc is not None:
     if trusted_utc.tzinfo is None or trusted_utc.utcoffset() is None:
       raise ValueError("trusted_utc must be timezone-aware")
-    elapsed = (trusted_utc.astimezone(UTC) - GPS_EPOCH_UTC).total_seconds()
-    if elapsed < 0:
+    utc = trusted_utc.astimezone(UTC)
+    # GPS = UTC + leap. Resolve leap via maintained table using a provisional week,
+    # then convert with utc_to_gps_week_tow (not raw UTC-as-GPS elapsed).
+    provisional_elapsed = (utc - GPS_EPOCH_UTC).total_seconds()
+    if provisional_elapsed < 0:
       raise ValueError("trusted_utc predates the GPS epoch")
-    reference_week = int(elapsed // GPS_WEEK_SECONDS)
+    provisional_week = int(provisional_elapsed // GPS_WEEK_SECONDS)
+    leap: int | None = None
+    for candidate_week in (provisional_week, provisional_week + 1):
+      if not gps_week_is_full(candidate_week):
+        continue
+      try:
+        leap = default_leap_seconds_for_week(candidate_week)
+        break
+      except ValueError:
+        continue
+    if leap is None:
+      raise ValueError(
+        "trusted_utc is outside the maintained GPS_UTC_LEAP_SECONDS era; pass trusted_full_week or an explicit conversion path for historical UTC"
+      )
+    reference_week, _ = utc_to_gps_week_tow(utc, leap_seconds=leap)
+    applied_leap = default_leap_seconds_for_week(reference_week)
+    if applied_leap != leap:
+      reference_week, _ = utc_to_gps_week_tow(utc, leap_seconds=applied_leap)
   else:
     raise ValueError("modulo GPS week requires trusted era evidence")
 

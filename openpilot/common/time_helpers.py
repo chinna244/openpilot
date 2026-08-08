@@ -100,8 +100,19 @@ def min_date():
   return MIN_DATE
 
 
+def utc_within_exclusive_supported_range(value: datetime.datetime) -> bool:
+  """True when exclusive host/GPS representable bounds hold: min_date() < utc < MAX_DATE."""
+  if value.tzinfo is None or value.utcoffset() is None:
+    normalized = value.replace(tzinfo=datetime.UTC)
+  else:
+    normalized = value.astimezone(datetime.UTC)
+  minimum = min_date().replace(tzinfo=datetime.UTC)
+  maximum = MAX_DATE.replace(tzinfo=datetime.UTC)
+  return minimum < normalized < maximum
+
+
 def system_time_valid():
-  return min_date() < datetime.datetime.now() < MAX_DATE
+  return utc_within_exclusive_supported_range(datetime.datetime.now())
 
 
 def set_system_time(new_time: datetime.datetime) -> bool:

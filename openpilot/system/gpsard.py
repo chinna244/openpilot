@@ -64,6 +64,7 @@ def _gps_msg_to_sample(msg, recv_mono: float) -> GpsSample:
     unix_timestamp_millis=float(msg.unixTimestampMillis),
     altitude=float(msg.altitude),
     speed_accuracy=float(msg.speedAccuracy),
+    bearing_deg=float(msg.bearingDeg),
     bearing_accuracy_deg=float(msg.bearingAccuracyDeg),
     v_ned=(vned[0], vned[1], vned[2]),
     measurement_mono_ns=meas_ns if meas_ns > 0 else None,

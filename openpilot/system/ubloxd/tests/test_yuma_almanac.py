@@ -3,9 +3,14 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
+from openpilot.common.gps_time import (
+  GPS_EPOCH_UTC,
+  GPS_UTC_LEAP_SECONDS,
+  gps_week_tow_to_unix_millis,
+  resolve_gps_week_mod_1024,
+)
 from openpilot.system.ubloxd.gps_assistance import validate_ubx_frame
 from openpilot.system.ubloxd.yuma_almanac import (
-  GPS_EPOCH_UTC,
   MINIMUM_YUMA_GPS_SATELLITES,
   YUMA_ALMANAC_MAX_REFERENCE_AGE_SECONDS,
   YUMA_ALMANAC_MAX_REFERENCE_FUTURE_SECONDS,
@@ -15,6 +20,11 @@ from openpilot.system.ubloxd.yuma_almanac import (
   split_yuma_ubx_frames,
   validate_yuma_reference_time,
 )
+
+
+def _utc_from_gps_week_tow(gps_week: int, tow_seconds: float = 0.0) -> datetime:
+  unix_ms = gps_week_tow_to_unix_millis(gps_week, tow_seconds * 1000.0)
+  return datetime.fromtimestamp(unix_ms / 1000.0, tz=UTC)
 
 
 def yuma_block(
@@ -151,16 +161,21 @@ def test_resolve_yuma_reference_time_uses_nearest_rollover():
   almanac = convert_yuma_almanac(yuma_text())
   trusted_now = datetime(2026, 7, 21, tzinfo=UTC)
 
-  assert resolve_yuma_reference_time(
-    almanac,
-    trusted_now,
-  ) == (
-    GPS_EPOCH_UTC
-    + timedelta(
-      weeks=2428,
-      seconds=almanac.time_of_applicability_seconds,
-    )
+  absolute_week = resolve_gps_week_mod_1024(
+    almanac.gps_week_mod_1024,
+    trusted_utc=trusted_now,
   )
+  expected = _utc_from_gps_week_tow(
+    absolute_week,
+    almanac.time_of_applicability_seconds,
+  )
+  assert resolve_yuma_reference_time(almanac, trusted_now) == expected
+  # Leap-aware: not raw GPS_EPOCH + weeks/ToA.
+  naive_gps = GPS_EPOCH_UTC + timedelta(
+    weeks=absolute_week,
+    seconds=almanac.time_of_applicability_seconds,
+  )
+  assert expected == naive_gps - timedelta(seconds=GPS_UTC_LEAP_SECONDS)
 
 
 def test_resolve_yuma_reference_time_handles_rollover_boundary():
@@ -170,15 +185,13 @@ def test_resolve_yuma_reference_time_handles_rollover_boundary():
     gps_week_mod_1024=1023,
     time_of_applicability_seconds=0,
   )
-  trusted_now = GPS_EPOCH_UTC + timedelta(
-    weeks=2048,
-    days=1,
-  )
+  # UTC corresponding to GPS week 2048 + 1 day (leap-aware).
+  trusted_now = _utc_from_gps_week_tow(2048, 24 * 60 * 60)
 
   assert resolve_yuma_reference_time(
     almanac,
     trusted_now,
-  ) == GPS_EPOCH_UTC + timedelta(weeks=2047)
+  ) == _utc_from_gps_week_tow(2047, 0.0)
 
 
 def test_resolve_yuma_reference_time_ambiguous_midpoint_fail_closed():
@@ -188,7 +201,8 @@ def test_resolve_yuma_reference_time_ambiguous_midpoint_fail_closed():
     gps_week_mod_1024=0,
     time_of_applicability_seconds=0,
   )
-  trusted_now = GPS_EPOCH_UTC + timedelta(weeks=512)
+  # Modern-era midpoint between week 2048 and 3072 (GPS week 2560).
+  trusted_now = _utc_from_gps_week_tow(2560, 0.0)
   with pytest.raises(YumaAlmanacError, match="ambiguous"):
     resolve_yuma_reference_time(almanac, trusted_now)
 

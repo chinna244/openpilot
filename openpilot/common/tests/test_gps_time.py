@@ -156,7 +156,47 @@ def test_resolve_modulo_week_with_trusted_utc():
   trusted = datetime(2026, 8, 8, tzinfo=UTC)
   resolved = resolve_gps_week_mod_1024(100, trusted_utc=trusted)
   assert resolved % GPS_WEEK_ROLLOVER_MODULO == 100
-  assert abs(resolved - 2200) < GPS_WEEK_ROLLOVER_MODULO
+  # Leap-aware reference week from UTC.
+  leap_week, _ = utc_to_gps_week_tow(trusted, leap_seconds=GPS_UTC_LEAP_SECONDS)
+  assert abs(resolved - leap_week) < GPS_WEEK_ROLLOVER_MODULO
+
+
+def test_trusted_utc_week_resolution_is_leap_aware_near_rollover():
+  # Construct UTC such that GPS time is near a week boundary (±30s).
+  gps_week = 2400
+  boundary_gps = GPS_EPOCH_UTC + timedelta(weeks=gps_week)
+  # UTC = GPS - leap at the GPS week boundary.
+  utc_at_boundary = boundary_gps - timedelta(seconds=GPS_UTC_LEAP_SECONDS)
+
+  before = utc_at_boundary - timedelta(seconds=30)
+  after = utc_at_boundary + timedelta(seconds=30)
+
+  week_before, tow_before = utc_to_gps_week_tow(before, leap_seconds=GPS_UTC_LEAP_SECONDS)
+  week_at, _ = utc_to_gps_week_tow(utc_at_boundary, leap_seconds=GPS_UTC_LEAP_SECONDS)
+  week_after, tow_after = utc_to_gps_week_tow(after, leap_seconds=GPS_UTC_LEAP_SECONDS)
+  assert week_before == gps_week - 1
+  assert week_at == gps_week
+  assert week_after == gps_week
+  assert tow_before > GPS_WEEK_MILLISECONDS - 31_000
+  assert tow_after < 31_000
+
+  # Modulo resolution must follow leap-aware GPS week for each UTC sample.
+  assert resolve_gps_week_mod_1024(week_before % GPS_WEEK_ROLLOVER_MODULO, trusted_utc=before) == week_before
+  assert resolve_gps_week_mod_1024(week_at % GPS_WEEK_ROLLOVER_MODULO, trusted_utc=utc_at_boundary) == week_at
+  assert resolve_gps_week_mod_1024(week_after % GPS_WEEK_ROLLOVER_MODULO, trusted_utc=after) == week_after
+
+  # In the leap-offset window, naive UTC-as-GPS disagrees with leap-aware GPS week.
+  naive_at_boundary = int((utc_at_boundary - GPS_EPOCH_UTC).total_seconds() // (7 * 24 * 3600))
+  assert naive_at_boundary == gps_week - 1
+  assert week_at == gps_week
+  assert resolve_gps_week_mod_1024(week_at % GPS_WEEK_ROLLOVER_MODULO, trusted_utc=utc_at_boundary) != naive_at_boundary
+
+
+def test_utc_gps_roundtrip_current_leap_era():
+  utc = datetime(2026, 8, 8, 12, 0, 0, tzinfo=UTC)
+  week, tow_ms = utc_to_gps_week_tow(utc, leap_seconds=GPS_UTC_LEAP_SECONDS)
+  back_ms = gps_week_tow_to_unix_millis(week, tow_ms, leap_seconds=GPS_UTC_LEAP_SECONDS)
+  assert back_ms == pytest.approx(utc.timestamp() * 1000.0)
 
 
 def test_rawx_trusted_era_requires_nonempty_measurements():
