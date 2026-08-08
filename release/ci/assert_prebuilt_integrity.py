@@ -77,6 +77,10 @@ def check_release_files(root: pathlib.Path, workspace: pathlib.Path | None) -> N
     rel = line.strip()
     if not rel:
       continue
+    # Cache / CI scratch paths may exist in the Actions workspace but are not
+    # part of the staged product tree under BUILD_DIR.
+    if rel.startswith("release/ci/scons_cache/") or rel.startswith("release/ci/scons_cache"):
+      continue
     src = workspace / rel
     if not src.exists():
       continue
