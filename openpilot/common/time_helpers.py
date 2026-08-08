@@ -10,8 +10,13 @@ from enum import StrEnum
 from math import isfinite
 from pathlib import Path
 
+from openpilot.common.gps_time import representable_gps_utc_maximum
+
 MIN_DATE = datetime.datetime(year=2025, month=2, day=21)
-MAX_DATE = datetime.datetime(year=2035, month=1, day=1)
+# Exclusive UTC ceiling for host/trusted-time authority.
+# Representation-derived from GPS week UInt16 capacity, NOT a product sunset year.
+# Replaces the former hard-coded 2035-01-01 bomb.
+MAX_DATE = representable_gps_utc_maximum().astimezone(datetime.UTC).replace(tzinfo=None)
 
 TIME_SYNC_MARKER = Path("/dev/shm/openpilot/time_synced")
 NTP_SYNC_MARKER = Path("/run/systemd/timesync/synchronized")

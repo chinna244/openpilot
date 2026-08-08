@@ -885,15 +885,17 @@ def test_rtc_evaluator_rejects_estimate_after_supported_maximum():
     rtc_counter_seconds=0,
   )
 
+  # Exceed representable GPS UTC ceiling (PR82); former 700e6s from 2026 no longer past MAX_DATE.
+  elapsed = 40_000_000_000
   result = evaluate_utc_from_rtc(
     cache,
-    current_rtc_seconds=700_000_000,
-    max_elapsed_seconds=700_000_000,
+    current_rtc_seconds=elapsed,
+    max_elapsed_seconds=elapsed,
   )
 
   assert result == RtcEstimateRejection(
     RtcEstimateRejectionReason.UTC_AFTER_SUPPORTED_MAXIMUM,
-    700_000_000,
+    elapsed,
   )
 
 

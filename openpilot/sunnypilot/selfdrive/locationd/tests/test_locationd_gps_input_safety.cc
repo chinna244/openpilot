@@ -789,6 +789,27 @@ TEST_CASE("PR81 measurement timing and covariance", "[pr81][timing][covariance]"
     REQUIRE(loc.get_gps_input_stats().last_reason == GpsInputRejectReason::Accepted);
   }
 
+  SECTION("legacy measurementMonoNs unset uses offset but still KF-rewind safe") {
+    MessageBuilder msg;
+    auto gps = msg.initEvent().initGpsLocationExternal();
+    fill_gps(gps, base);
+    gps.setMeasurementMonoNs(0);  // legacy unset
+    // Event 10.0, offset 0.095 → sensor_time 9.905; within rewind of filter seeded at 1.0 after warm.
+    loc.handle_gps(10.0, gps.asReader(), 0.095);
+    REQUIRE(loc.get_gps_input_stats().last_reason == GpsInputRejectReason::Accepted);
+
+    // Filter far ahead of legacy observation → reject stale via KF rewind gate.
+    loc.reset_kalman(12.0);
+    seed_filter_near_gps(loc, 12.0, base);
+    MessageBuilder stale;
+    auto gps2 = stale.initEvent().initGpsLocationExternal();
+    fill_gps(gps2, base);
+    gps2.setMeasurementMonoNs(0);
+    // current_time 10.0, offset 0.095 → 9.905; filter at 12.0 → >0.8s behind filter
+    loc.handle_gps(10.0, gps2.asReader(), 0.095);
+    REQUIRE(loc.get_gps_input_stats().last_reason == GpsInputRejectReason::StaleMeasurement);
+  }
+
   SECTION("future measurement rejected") {
     MessageBuilder msg;
     auto gps = msg.initEvent().initGpsLocationExternal();

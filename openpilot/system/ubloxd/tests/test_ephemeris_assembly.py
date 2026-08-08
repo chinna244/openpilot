@@ -138,8 +138,58 @@ def make_sfrbx_frame(gnss_id: int, sv_id: int, freq_id: int, words: list[int]) -
   return add_ubx_checksum(b"\xb5\x62\x02\x13" + len(payload).to_bytes(2, "little") + payload)
 
 
+def _rawx_measurement(*, sv_id: int = 1, gnss_id: int = 0):
+  from types import SimpleNamespace
+
+  from openpilot.system.ubloxd.ubx import GnssType
+
+  return SimpleNamespace(
+    pr_mes=0.0,
+    cp_mes=0.0,
+    do_mes=0.0,
+    gnss_id=GnssType(gnss_id),
+    sv_id=sv_id,
+    freq_id=0,
+    lock_time=0,
+    cno=30,
+    pr_stdev=0,
+    cp_stdev=0,
+    do_stdev=0,
+    trk_stat=0x01,
+  )
+
+
+def feed_rawx(
+  parser: UbloxMsgParser,
+  *,
+  week: int,
+  num_meas: int,
+  mono_t: float,
+) -> None:
+  """Latch RAWX era evidence through the real _gen_rxm_rawx wiring path."""
+  from types import SimpleNamespace
+  from typing import cast
+
+  from openpilot.system.ubloxd.ubx import Ubx
+
+  parser.framer.last_log_time = mono_t
+  meas = [_rawx_measurement(sv_id=i + 1) for i in range(max(0, num_meas))]
+  msg = SimpleNamespace(
+    rcv_tow=1000.0,
+    week=week,
+    leap_s=18,
+    num_meas=num_meas,
+    rec_stat=0x01,
+    meas=meas,
+  )
+  parser._gen_rxm_rawx(cast(Ubx.RxmRawx, msg))
+
+
 def feed_gps(parser: UbloxMsgParser, sv_id: int, subframe_id: int, iod: int, mono_t: float):
   parser.framer.last_log_time = mono_t
+  # Real RAWX wiring supplies trusted era evidence (do not poke private state).
+  if parser._latest_rawx_gps_week is None:
+    feed_rawx(parser, week=2048 + 100, num_meas=1, mono_t=mono_t)
   frame = make_sfrbx_frame(0, sv_id, 0, subframe_to_words(gps_subframe_bytes(subframe_id, iod=iod)))
   return parser.parse_frame(frame)
 
@@ -410,3 +460,102 @@ def test_glonass_decode_failure_classified() -> None:
   frame = make_sfrbx_frame(6, 3, 1, [0, 0])  # wrong word count
   assert parser.parse_frame(frame) is None
   assert parser.assembly_stats.glonass_decode_failure == 1
+
+
+def test_rawx_nonempty_latches_trusted_week_for_ephemeris_era() -> None:
+  parser = UbloxMsgParser()
+  assert parser._latest_rawx_gps_week is None
+  feed_rawx(parser, week=2411, num_meas=2, mono_t=1.0)
+  assert parser._latest_rawx_gps_week == 2411
+  week_mod = 2411 % 1024
+  parser.framer.last_log_time = 2.0
+  result = None
+  for subframe_id in (1, 2, 3):
+    frame = make_sfrbx_frame(
+      0,
+      5,
+      0,
+      subframe_to_words(gps_subframe_bytes(subframe_id, iod=7, week=week_mod)),
+    )
+    result = parser.parse_frame(frame)
+  assert result is not None
+  assert result[1].ubloxGnss.ephemeris.toeWeek == 2411
+
+
+def test_live_ephemeris_far_era_from_rawx_rejected() -> None:
+  parser = UbloxMsgParser()
+  feed_rawx(parser, week=2411, num_meas=2, mono_t=1.0)
+  assert parser._latest_rawx_gps_week == 2411
+  # week_mod=100 nearest-resolves to 2148 (~5 years away) and must fail closed for LIVE ephemeris.
+  parser.framer.last_log_time = 2.0
+  result = None
+  for subframe_id in (1, 2, 3):
+    frame = make_sfrbx_frame(
+      0,
+      5,
+      0,
+      subframe_to_words(gps_subframe_bytes(subframe_id, iod=7, week=100)),
+    )
+    result = parser.parse_frame(frame)
+  assert result is None
+  assert parser.assembly_stats.gps_week_era_unresolved >= 1
+  assert parser.assembly_stats.gps_week_current_mismatch >= 1
+
+
+def test_live_ephemeris_week_boundary_plus_minus_one_accepted() -> None:
+  parser = UbloxMsgParser()
+  feed_rawx(parser, week=2411, num_meas=2, mono_t=1.0)
+  for offset, sv_id in ((-1, 6), (1, 7)):
+    target_week = 2411 + offset
+    week_mod = target_week % 1024
+    parser.framer.last_log_time = float(10 + sv_id)
+    result = None
+    for subframe_id in (1, 2, 3):
+      frame = make_sfrbx_frame(
+        0,
+        sv_id,
+        0,
+        subframe_to_words(gps_subframe_bytes(subframe_id, iod=sv_id, week=week_mod)),
+      )
+      result = parser.parse_frame(frame)
+    assert result is not None
+    assert result[1].ubloxGnss.ephemeris.toeWeek == target_week
+
+
+def test_rawx_empty_nonzero_week_does_not_establish_era() -> None:
+  parser = UbloxMsgParser()
+  feed_rawx(parser, week=2411, num_meas=0, mono_t=1.0)
+  assert parser._latest_rawx_gps_week is None
+  # Attempt assembly without feed_gps auto-RAWX latch.
+  parser.framer.last_log_time = 2.0
+  result = None
+  for subframe_id in (1, 2, 3):
+    frame = make_sfrbx_frame(0, 9, 0, subframe_to_words(gps_subframe_bytes(subframe_id, iod=7)))
+    result = parser.parse_frame(frame)
+  assert result is None
+  assert parser.assembly_stats.gps_week_era_unresolved >= 1
+  assert parser._latest_rawx_gps_week is None
+
+
+def test_rawx_zero_week_does_not_establish_era() -> None:
+  parser = UbloxMsgParser()
+  feed_rawx(parser, week=0, num_meas=3, mono_t=1.0)
+  assert parser._latest_rawx_gps_week is None
+
+
+def test_ephemeris_next_era_rollover_resolves_from_rawx() -> None:
+  parser = UbloxMsgParser()
+  # Trusted week in 2900 era; subframe week_mod=853 → absolute 2901.
+  feed_rawx(parser, week=2900, num_meas=1, mono_t=1.0)
+  parser.framer.last_log_time = 2.0
+  result = None
+  for subframe_id in (1, 2, 3):
+    frame = make_sfrbx_frame(
+      0,
+      11,
+      0,
+      subframe_to_words(gps_subframe_bytes(subframe_id, iod=4, week=853)),
+    )
+    result = parser.parse_frame(frame)
+  assert result is not None
+  assert result[1].ubloxGnss.ephemeris.toeWeek == 2901

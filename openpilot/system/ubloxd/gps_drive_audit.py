@@ -19,6 +19,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from openpilot.system.ubloxd import gps_acquisition_report
+
 DEFAULT_REALDATA_ROOT = Path("/data/media/0/realdata")
 DEFAULT_OUTPUT_ROOT = Path("/data")
 DEFAULT_REPOSITORY_ROOT = Path("/data/openpilot")
@@ -41,6 +43,8 @@ EVENT_KEYWORDS = (
   "gps acquisition status",
   "gps receiver cycle",
   "gps receiver utc provenance",
+  "gps rf observability",
+  "gps startup timeline",
   "time assistance",
   "trusted time",
   "navigation assistance restore",
@@ -52,6 +56,11 @@ EVENT_KEYWORDS = (
   "receiver reset",
   "pigeond",
   "ubloxd",
+  "gpsard",
+  "position assistance",
+  "dbd",
+  "yuma",
+  "measurement",
   "mga",
 )
 
@@ -64,17 +73,45 @@ def safe_get(obj: object, name: str, default: Any = None) -> Any:
 
 
 def as_float(value: object, default: float | None = None) -> float | None:
-  try:
-    return float(value)
-  except (TypeError, ValueError):
+  if value is None:
     return default
+  if isinstance(value, bool):
+    return float(value)
+  if isinstance(value, (int, float)):
+    return float(value)
+  if isinstance(value, str):
+    try:
+      return float(value)
+    except ValueError:
+      return default
+  if isinstance(value, (bytes, bytearray)):
+    try:
+      return float(value.decode())
+    except (ValueError, UnicodeDecodeError):
+      return default
+  return default
 
 
 def as_int(value: object, default: int | None = None) -> int | None:
-  try:
-    return int(value)
-  except (TypeError, ValueError):
+  if value is None:
     return default
+  if isinstance(value, bool):
+    return int(value)
+  if isinstance(value, int):
+    return value
+  if isinstance(value, float):
+    return int(value)
+  if isinstance(value, str):
+    try:
+      return int(value)
+    except ValueError:
+      return default
+  if isinstance(value, (bytes, bytearray)):
+    try:
+      return int(value.decode())
+    except (ValueError, UnicodeDecodeError):
+      return default
+  return default
 
 
 def decode_text(value: object) -> str:
@@ -95,11 +132,7 @@ def extract_event_message(text: str) -> str:
 
 def is_independent_receiver_utc_event(text: str) -> bool:
   message = extract_event_message(text).lower()
-  return (
-    "gps receiver utc provenance" in message
-    and "classification=receiver_utc_unassisted_gnss" in message
-    and "independent=true" in message
-  )
+  return "gps receiver utc provenance" in message and "classification=receiver_utc_unassisted_gnss" in message and "independent=true" in message
 
 
 def haversine_m(latitude_1: float, longitude_1: float, latitude_2: float, longitude_2: float) -> float:
@@ -108,10 +141,7 @@ def haversine_m(latitude_1: float, longitude_1: float, latitude_2: float, longit
   phi_2 = math.radians(latitude_2)
   delta_phi = math.radians(latitude_2 - latitude_1)
   delta_lambda = math.radians(longitude_2 - longitude_1)
-  value = (
-    math.sin(delta_phi / 2.0) ** 2
-    + math.cos(phi_1) * math.cos(phi_2) * math.sin(delta_lambda / 2.0) ** 2
-  )
+  value = math.sin(delta_phi / 2.0) ** 2 + math.cos(phi_1) * math.cos(phi_2) * math.sin(delta_lambda / 2.0) ** 2
   return 2.0 * radius * math.asin(min(1.0, math.sqrt(value)))
 
 
@@ -154,6 +184,72 @@ class RouteMetrics:
   vehicle_distance_m: float = 0.0
   previous_gps: tuple[float, float, float] | None = None
   previous_car: tuple[float, float] | None = None
+  has_gps_source_state: bool = False
+  has_measurement_mono_ns: bool = False
+  has_sat_report: bool = False
+  has_rf_observability_logs: bool = False
+  has_qcom_gps: bool = False
+  first_nav_pvt: float | None = None
+  first_fix_ok: float | None = None
+  first_reliable_fix: float | None = None
+  first_tracked_sv: float | None = None
+  first_code_lock: float | None = None
+  first_ephemeris: float | None = None
+  first_3_used: float | None = None
+  first_4_used: float | None = None
+  first_fix_ublox: float | None = None
+  first_fix_qcom: float | None = None
+  first_authoritative: float | None = None
+  measurement_mono_samples_with_stamp: int = 0
+  measurement_mono_first_positive: float | None = None
+  measurement_mono_max_age_s: float | None = None
+  gps_source_first_selected: str | None = None
+  gps_source_first_authoritative: str | None = None
+  gps_source_transitions: list[dict[str, Any]] = field(default_factory=list)
+  max_failover_count: int = 0
+  max_recovery_count: int = 0
+  no_healthy_interval_count: int = 0
+  no_healthy_intervals: list[dict[str, Any]] = field(default_factory=list)
+  startup_no_healthy_interval_count: int = 0
+  runtime_no_healthy_interval_count: int = 0
+  startup_no_healthy_intervals: list[dict[str, Any]] = field(default_factory=list)
+  runtime_no_healthy_intervals: list[dict[str, Any]] = field(default_factory=list)
+  source_authority_intervals: list[dict[str, Any]] = field(default_factory=list)
+  source_epoch_warnings: list[str] = field(default_factory=list)
+  _no_healthy_active: bool = False
+  _no_healthy_start: float | None = None
+  _no_healthy_phase: str | None = None
+  gnss_start_mono: float | None = None
+  cycle_start_mono: float | None = None
+  reference_policy: str = "route_start"
+  classification: str = "INSUFFICIENT_TELEMETRY"
+  start_type: str = "UNKNOWN_START_TYPE"
+  missing_telemetry: list[str] = field(default_factory=list)
+  max_sat_signal_count: int = 0
+  max_sat_code_locked: int = 0
+  max_sat_used: int = 0
+  max_sat_ephemeris: int = 0
+  max_rf_jam_indicator: int | None = None
+  sat_report_count: int = 0
+  sat_reports_with_zero_signals: int = 0
+  sat_reports_with_code_lock_and_zero_eph: int = 0
+  rf_observability_zero_signal_count: int = 0
+  dbd_assisted_evidence: bool = False
+  dbd_restore_disposition: str = "none"
+  assistance_late_evidence: bool = False
+  configuration_failure_evidence: bool = False
+  warm_start_evidence: bool = False
+  short_stop_dbd_evidence: bool = False
+  overnight_offline_evidence: bool = False
+  overnight_online_evidence: bool = False
+  trusted_time_available: bool | None = None
+  yuma_attempted: float | None = None
+  yuma_completed: float | None = None
+  yuma_failed: float | None = None
+  yuma_disposition: str | None = None
+  _previous_gps_source: str | None = None
+  _previous_gps_source_generation: int | None = None
+  _previous_transition_mono_ns: int | None = None
 
   def note_time(self, monotonic_time: float) -> None:
     if self.route_start is None or monotonic_time < self.route_start:
@@ -161,11 +257,149 @@ class RouteMetrics:
     if self.route_end is None or monotonic_time > self.route_end:
       self.route_end = monotonic_time
 
+  def _note_milestone(self, milestone: str, monotonic_time: float) -> None:
+    field_map = {
+      "first_nav_pvt": "first_nav_pvt",
+      "first_fix_ok": "first_fix_ok",
+      "first_reliable_fix": "first_reliable_fix",
+      "first_receiver_utc": "first_receiver_utc",
+      "first_nonempty_rawx": "first_nonempty_rawx",
+      "first_valid_gps_week": "first_valid_gps_week",
+      "first_valid_leap_second": "first_valid_leap_second",
+      "first_gps_measurement": "first_gps_measurement",
+      "first_glonass_measurement": "first_glonass_measurement",
+      "first_rawx_after_initialization": "first_rawx",
+    }
+    attribute = field_map.get(milestone)
+    if attribute is not None and getattr(self, attribute) is None:
+      setattr(self, attribute, monotonic_time)
+
+  def _apply_dbd_restore_disposition(self, disposition: str) -> None:
+    normalized = gps_acquisition_report.normalize_dbd_restore_disposition(disposition)
+    if normalized == "none":
+      return
+    self.dbd_restore_disposition = normalized
+    if normalized == "success":
+      self.dbd_assisted_evidence = True
+
+  def _apply_short_stop_evidence(self, fields: dict[str, str]) -> None:
+    if not self.dbd_assisted_evidence:
+      return
+    start_scenario = fields.get("start_scenario", "").lower()
+    if start_scenario in ("short_stop_dbd", "short_stop"):
+      self.short_stop_dbd_evidence = True
+      return
+    if fields.get("short_stop", "").lower() == "true":
+      self.short_stop_dbd_evidence = True
+      return
+    cache_age = as_float(fields.get("cache_age_seconds") or fields.get("dbd_age_seconds"), None)
+    short_stop_max = as_float(fields.get("short_stop_max_age_seconds"), None)
+    if cache_age is not None and short_stop_max is not None and cache_age <= short_stop_max:
+      self.short_stop_dbd_evidence = True
+      return
+    age_evidence = fields.get("restored_cache_age_evidence", "").lower()
+    if age_evidence in ("short_stop", "short_stop_dbd"):
+      self.short_stop_dbd_evidence = True
+
+  def _apply_start_scenario_fields(self, fields: dict[str, str]) -> None:
+    start_scenario = fields.get("start_scenario", "").lower()
+    if start_scenario in ("overnight_offline_cold_start", "overnight_offline"):
+      self.overnight_offline_evidence = True
+    elif start_scenario in ("overnight_online_start", "overnight_online"):
+      self.overnight_online_evidence = True
+    elif start_scenario in ("warm_start",):
+      self.warm_start_evidence = True
+    elif start_scenario in ("short_stop_dbd", "short_stop"):
+      self._apply_short_stop_evidence(fields)
+
+  def _parse_startup_timeline(self, monotonic_time: float, text: str) -> None:
+    fields = gps_acquisition_report.parse_log_fields(text)
+    gnss_start_cycle = as_float(fields.get("gnss_start_sent_cycle_seconds"), None)
+    if gnss_start_cycle is not None and self.cycle_start_mono is not None:
+      candidate = self.cycle_start_mono + gnss_start_cycle
+      if self.gnss_start_mono is None or candidate < self.gnss_start_mono:
+        self.gnss_start_mono = candidate
+
+    self._apply_dbd_restore_disposition(fields.get("database_restore_disposition", ""))
+    self._apply_start_scenario_fields(fields)
+    self._apply_short_stop_evidence(fields)
+
+    trusted_time = fields.get("trusted_time_available", "").lower()
+    if trusted_time == "true":
+      self.trusted_time_available = True
+    elif trusted_time == "false":
+      self.trusted_time_available = False
+
+    accepted_before = fields.get("time_assistance_accepted_before_gnss_start", "").lower()
+    if accepted_before == "false":
+      self.assistance_late_evidence = True
+
+  def _parse_yuma_log(self, monotonic_time: float, text: str) -> None:
+    fields = gps_acquisition_report.parse_log_fields(text)
+    if self.yuma_attempted is None:
+      if fields.get("transmission_attempt") or fields.get("action"):
+        self.yuma_attempted = monotonic_time
+    transmit_status = fields.get("transmit_status", "").lower()
+    terminal = fields.get("terminal", "").lower() == "true"
+    cancellation = fields.get("cancellation_reason", "").lower()
+    action = fields.get("action", "").lower()
+    success_statuses = ("complete", "success", "accepted")
+    failure_tokens = ("fail", "reject", "error", "timeout", "cancel")
+
+    # Historical and current terminal-success statuses are unambiguous without terminal=true.
+    if transmit_status in success_statuses or (terminal and (transmit_status in success_statuses or action in ("transmit", "send_all"))):
+      if self.yuma_completed is None:
+        self.yuma_completed = monotonic_time
+      self.yuma_disposition = transmit_status or action or "complete"
+      return
+
+    failed = any(token in transmit_status for token in failure_tokens) or (cancellation not in ("", "none"))
+    if failed or (terminal and failed):
+      if self.yuma_failed is None:
+        self.yuma_failed = monotonic_time
+      self.yuma_disposition = transmit_status or cancellation or action
+      return
+
+    if terminal and any(token in transmit_status for token in failure_tokens):
+      if self.yuma_failed is None:
+        self.yuma_failed = monotonic_time
+      self.yuma_disposition = transmit_status or cancellation or action
+
   def process_log_message(self, monotonic_time: float, value: object) -> None:
     text = decode_text(value)
     lowered = text.lower()
     if any(keyword in lowered for keyword in EVENT_KEYWORDS):
       self.events.append((monotonic_time, text))
+
+    if "gps rf observability" in lowered:
+      self.has_rf_observability_logs = True
+      if "signal_satellites=0" in lowered:
+        self.rf_observability_zero_signal_count += 1
+
+    if "gps receiver cycle started" in lowered:
+      self.cycle_start_mono = monotonic_time
+      fields = gps_acquisition_report.parse_log_fields(text)
+      self._apply_start_scenario_fields(fields)
+
+    if "gps startup timeline" in lowered:
+      self._parse_startup_timeline(monotonic_time, text)
+
+    if "navigation assistance restore" in lowered:
+      fields = gps_acquisition_report.parse_log_fields(text)
+      self._apply_dbd_restore_disposition(fields.get("database_restore_disposition", ""))
+      self._apply_start_scenario_fields(fields)
+      self._apply_short_stop_evidence(fields)
+
+    if "gps public yuma" in lowered:
+      self._parse_yuma_log(monotonic_time, text)
+
+    if "configuration failure" in lowered or "strict configuration failure" in lowered:
+      self.configuration_failure_evidence = True
+
+    milestone, _fields = gps_acquisition_report.parse_milestone_log(text)
+    if milestone is not None:
+      self._note_milestone(milestone, monotonic_time)
+
     if self.first_receiver_utc is None and is_independent_receiver_utc_event(text):
       self.first_receiver_utc = monotonic_time
 
@@ -178,8 +412,23 @@ class RouteMetrics:
         self.vehicle_distance_m += ((previous_speed + speed) / 2.0) * delta
     self.previous_car = (monotonic_time, speed)
 
-  def process_gps(self, monotonic_time: float, gps: object) -> None:
+  def process_gps(self, monotonic_time: float, gps: object, source: str = "ublox") -> None:
     self.gps_samples += 1
+    if source == "qcom":
+      self.has_qcom_gps = True
+
+    measurement_mono_ns = as_int(safe_get(gps, "measurementMonoNs", 0), 0) or 0
+    if measurement_mono_ns > 0:
+      self.has_measurement_mono_ns = True
+      self.measurement_mono_samples_with_stamp += 1
+      measurement_mono_s = measurement_mono_ns * 1e-9
+      if self.measurement_mono_first_positive is None:
+        self.measurement_mono_first_positive = measurement_mono_s
+      age_s = monotonic_time - measurement_mono_s
+      if age_s >= 0.0:
+        if self.measurement_mono_max_age_s is None or age_s > self.measurement_mono_max_age_s:
+          self.measurement_mono_max_age_s = age_s
+
     flags = as_int(safe_get(gps, "flags", 0), 0) or 0
     has_fix = bool(flags & 1) or bool(safe_get(gps, "hasFix", False))
     timestamp_ms = as_int(safe_get(gps, "unixTimestampMillis", 0), 0) or 0
@@ -200,6 +449,10 @@ class RouteMetrics:
     self.last_fix = monotonic_time
     if self.first_fix is None:
       self.first_fix = monotonic_time
+    if source == "qcom" and self.first_fix_qcom is None:
+      self.first_fix_qcom = monotonic_time
+    if source == "ublox" and self.first_fix_ublox is None:
+      self.first_fix_ublox = monotonic_time
 
     if accuracy is not None and math.isfinite(accuracy) and accuracy >= 0.0:
       if self.best_accuracy is None or accuracy < self.best_accuracy:
@@ -234,6 +487,157 @@ class RouteMetrics:
           self.gps_distance_m += distance
     self.previous_gps = (monotonic_time, latitude, longitude)
 
+  def _close_no_healthy_interval(self, end_t: float | None) -> None:
+    if not self._no_healthy_active or self._no_healthy_start is None:
+      self._no_healthy_active = False
+      self._no_healthy_start = None
+      self._no_healthy_phase = None
+      return
+    duration_s = None if end_t is None else end_t - self._no_healthy_start
+    interval = {
+      "phase": self._no_healthy_phase or "startup",
+      "start_t": self._no_healthy_start,
+      "end_t": end_t,
+      "duration_s": duration_s,
+    }
+    self.no_healthy_intervals.append(interval)
+    if interval["phase"] == "runtime":
+      self.runtime_no_healthy_intervals.append(interval)
+      self.runtime_no_healthy_interval_count = len(self.runtime_no_healthy_intervals)
+    else:
+      self.startup_no_healthy_intervals.append(interval)
+      self.startup_no_healthy_interval_count = len(self.startup_no_healthy_intervals)
+    self.no_healthy_interval_count = len(self.no_healthy_intervals)
+    self._no_healthy_active = False
+    self._no_healthy_start = None
+    self._no_healthy_phase = None
+
+  def process_gps_source_state(self, monotonic_time: float, state: object) -> None:
+    self.has_gps_source_state = True
+    selected = gps_acquisition_report.normalize_source_name(safe_get(state, "selected", None))
+    generation = as_int(safe_get(state, "generation", None), None)
+    transition_mono_ns = as_int(safe_get(state, "transitionMonoNs", None), None)
+    reason = decode_text(safe_get(state, "transitionReason", ""))
+
+    decision = gps_acquisition_report.evaluate_gps_source_epoch(
+      selected=selected,
+      generation=generation,
+      transition_mono_ns=transition_mono_ns,
+      previous_selected=self._previous_gps_source,
+      previous_generation=self._previous_gps_source_generation,
+      previous_transition_mono_ns=self._previous_transition_mono_ns,
+      event_mono_s=monotonic_time,
+    )
+    if decision in ("reject_regressing", "reject_inconsistent", "reject_future"):
+      warning = (
+        f"gpsSourceState epoch {decision}: selected={selected} generation={generation} " + f"transitionMonoNs={transition_mono_ns} event_t={monotonic_time}"
+      )
+      self.source_epoch_warnings.append(warning)
+      self.errors.append(warning)
+      return
+
+    transition_t = gps_acquisition_report.authority_transition_time_s(
+      transition_mono_ns=transition_mono_ns,
+      event_mono_s=monotonic_time,
+    )
+
+    if self.gps_source_first_selected is None and selected is not None:
+      self.gps_source_first_selected = selected
+    if self.gps_source_first_authoritative is None and selected in (
+      gps_acquisition_report.SOURCE_UBLOX,
+      gps_acquisition_report.SOURCE_QCOM,
+    ):
+      self.gps_source_first_authoritative = selected
+      if self.first_authoritative is None:
+        self.first_authoritative = transition_t
+
+    failover_count = as_int(safe_get(state, "failoverCount", 0), 0) or 0
+    recovery_count = as_int(safe_get(state, "recoveryCount", 0), 0) or 0
+    self.max_failover_count = max(self.max_failover_count, failover_count)
+    self.max_recovery_count = max(self.max_recovery_count, recovery_count)
+
+    if selected == gps_acquisition_report.SOURCE_NO_HEALTHY:
+      if not self._no_healthy_active:
+        self._no_healthy_active = True
+        self._no_healthy_start = transition_t
+        self._no_healthy_phase = "runtime" if self.gps_source_first_authoritative is not None else "startup"
+    elif self._no_healthy_active:
+      self._close_no_healthy_interval(transition_t)
+
+    if decision == "transition" and selected is not None:
+      self.gps_source_transitions.append(
+        {
+          "t": transition_t,
+          "selected": selected,
+          "generation": generation,
+          "transitionMonoNs": transition_mono_ns,
+          "reason": reason,
+        }
+      )
+      self._previous_gps_source = selected
+      self._previous_gps_source_generation = generation
+      if transition_mono_ns is not None:
+        self._previous_transition_mono_ns = transition_mono_ns
+    elif decision == "refresh":
+      # Same epoch identity: keep authority pointers unchanged.
+      if self._previous_gps_source is None and selected is not None:
+        self._previous_gps_source = selected
+        self._previous_gps_source_generation = generation
+        if transition_mono_ns is not None:
+          self._previous_transition_mono_ns = transition_mono_ns
+
+  def process_sat_report(self, monotonic_time: float, report: object) -> None:
+    self.has_sat_report = True
+    svs = tuple(safe_get(report, "svs", ()) or ())
+    if not svs:
+      return
+
+    signal_count = 0
+    code_locked_count = 0
+    used_count = 0
+    ephemeris_count = 0
+    for sv in svs:
+      cno = as_int(safe_get(sv, "cno", 0), 0) or 0
+      flags = as_int(safe_get(sv, "flagsBitfield", 0), 0) or 0
+      analysis = gps_acquisition_report.analyze_sat_flags(flags)
+      if cno > 0:
+        signal_count += 1
+      if analysis["code_locked"]:
+        code_locked_count += 1
+      if analysis["used"]:
+        used_count += 1
+      if analysis["ephemeris"]:
+        ephemeris_count += 1
+
+    self.sat_report_count += 1
+    if signal_count == 0:
+      self.sat_reports_with_zero_signals += 1
+    if code_locked_count > 0 and ephemeris_count == 0:
+      self.sat_reports_with_code_lock_and_zero_eph += 1
+
+    self.max_sat_signal_count = max(self.max_sat_signal_count, signal_count)
+    self.max_sat_code_locked = max(self.max_sat_code_locked, code_locked_count)
+    self.max_sat_used = max(self.max_sat_used, used_count)
+    self.max_sat_ephemeris = max(self.max_sat_ephemeris, ephemeris_count)
+
+    if self.first_ephemeris is None and ephemeris_count > 0:
+      self.first_ephemeris = monotonic_time
+
+    if self.first_tracked_sv is None and len(svs) > 0:
+      self.first_tracked_sv = monotonic_time
+    if self.first_code_lock is None and code_locked_count > 0:
+      self.first_code_lock = monotonic_time
+    if self.first_3_used is None and used_count >= 3:
+      self.first_3_used = monotonic_time
+    if self.first_4_used is None and used_count >= 4:
+      self.first_4_used = monotonic_time
+
+  def process_hw_status(self, status: object) -> None:
+    jam_ind = as_int(safe_get(status, "jamInd", None), None)
+    if jam_ind is not None:
+      if self.max_rf_jam_indicator is None or jam_ind > self.max_rf_jam_indicator:
+        self.max_rf_jam_indicator = jam_ind
+
   def process_rawx(self, monotonic_time: float, report: object) -> None:
     self.rawx_reports += 1
     if self.first_rawx is None:
@@ -260,10 +664,24 @@ class RouteMetrics:
     if leap_seconds is not None and leap_seconds != 0 and self.first_valid_leap_second is None:
       self.first_valid_leap_second = monotonic_time
 
+  def finalize(self) -> None:
+    if self._no_healthy_active:
+      self._close_no_healthy_interval(self.route_end)
+
+    self.source_authority_intervals = gps_acquisition_report.build_source_authority_intervals(self)
+    self.reference_policy = gps_acquisition_report.resolve_reference_policy(self)
+    self.missing_telemetry = gps_acquisition_report.compute_missing_telemetry(self)
+    self.classification = gps_acquisition_report.classify_acquisition(self)
+    self.start_type = gps_acquisition_report.infer_start_type(self)
+
   def relative(self, value: float | None) -> float | None:
-    if value is None or self.route_start is None:
-      return None
-    return value - self.route_start
+    return gps_acquisition_report.relative_seconds(self, value)
+
+  def to_machine_report(self) -> dict[str, Any]:
+    return gps_acquisition_report.to_machine_report(self)
+
+  def ttff_report_lines(self) -> list[str]:
+    return gps_acquisition_report.ttff_report_lines(self)
 
   def summary_lines(self, segment_count: int) -> list[str]:
     duration = None if self.route_start is None or self.route_end is None else self.route_end - self.route_start
@@ -297,6 +715,8 @@ class RouteMetrics:
       f"first_5m_seconds={self.relative(self.first_5m)}",
       f"best_accuracy_m={self.best_accuracy}",
       f"max_satellites={self.max_satellites}",
+      "",
+      *self.ttff_report_lines(),
       "",
       "===== LOG FILES =====",
       *self.used_logs,
@@ -392,18 +812,34 @@ def analyze_route(selection: RouteSelection, output_root: Path) -> list[str]:
           elif service == "carState":
             metrics.process_car_state(monotonic_time, message.carState)
           elif service == "gpsLocationExternal":
-            metrics.process_gps(monotonic_time, message.gpsLocationExternal)
+            metrics.process_gps(monotonic_time, message.gpsLocationExternal, source="ublox")
+          elif service == "gpsLocation":
+            metrics.process_gps(monotonic_time, message.gpsLocation, source="qcom")
+          elif service == "gpsSourceState":
+            metrics.process_gps_source_state(monotonic_time, message.gpsSourceState)
           elif service == "ubloxGnss":
             ublox = message.ubloxGnss
-            if ublox.which() == "measurementReport":
+            ublox_kind = ublox.which()
+            if ublox_kind == "measurementReport":
               metrics.process_rawx(monotonic_time, ublox.measurementReport)
+            elif ublox_kind == "satReport":
+              metrics.process_sat_report(monotonic_time, ublox.satReport)
+            elif ublox_kind == "hwStatus":
+              metrics.process_hw_status(ublox.hwStatus)
+            elif ublox_kind == "hwStatus2":
+              metrics.process_hw_status(ublox.hwStatus2)
         except Exception as exc:
           metrics.errors.append(f"{service} parse: {type(exc).__name__}: {exc}")
     except Exception as exc:
       metrics.errors.append(f"{log_path}: {type(exc).__name__}: {exc}\n{traceback.format_exc(limit=3)}")
 
+  metrics.finalize()
   route_dir = output_root / "routes" / selection.route
   route_dir.mkdir(parents=True, exist_ok=True)
+  (route_dir / "acquisition_report.json").write_text(
+    json.dumps(metrics.to_machine_report(), indent=2) + "\n",
+    encoding="utf-8",
+  )
   summary = metrics.summary_lines(len(selection.segments))
   (route_dir / "summary.txt").write_text("\n".join(summary) + "\n", encoding="utf-8")
 
@@ -588,11 +1024,13 @@ def build_bundle(
     current_boot_id = read_boot_id()
     (bundle_root / "current_boot_id.txt").write_text(current_boot_id + "\n", encoding="utf-8")
     (bundle_root / "state_capture_utc.txt").write_text(datetime.now(UTC).isoformat() + "\n", encoding="utf-8")
-    evidence_scope = "\n".join((
-      "Route summaries and assistance_events are derived from selected route logs.",
-      "Files under state/current_boot are snapshots from the boot active when collection ran.",
-      "A current state file must not be attributed to a route unless its boot identity is independently matched.",
-    ))
+    evidence_scope = "\n".join(
+      (
+        "Route summaries and assistance_events are derived from selected route logs.",
+        "Files under state/current_boot are snapshots from the boot active when collection ran.",
+        "A current state file must not be attributed to a route unless its boot identity is independently matched.",
+      )
+    )
     (bundle_root / "EVIDENCE_SCOPE.txt").write_text(evidence_scope + "\n", encoding="utf-8")
     collect_params(bundle_root / "selected_params.txt")
     collect_git_state(repository_root, bundle_root / "git_state.txt")
