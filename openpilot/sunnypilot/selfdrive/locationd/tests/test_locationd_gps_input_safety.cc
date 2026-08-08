@@ -504,3 +504,269 @@ TEST_CASE("large-position reset heading safety", "[pr75][gps][heading]") {
     REQUIRE(orient_after.isApprox(orient_before, 1e-6));
   }
 }
+
+TEST_CASE("PR80 source gating coordinates GPS authority", "[pr80][source]") {
+  Localizer loc(LocalizerGnssSource::UBLOX);
+
+  auto publish_state = [](Localizer &localizer, double t_s, cereal::GpsSourceState::SelectedSource selected,
+                          uint32_t generation, double transition_s) {
+    MessageBuilder st_msg;
+    auto evt = st_msg.initEvent();
+    evt.setLogMonoTime(static_cast<uint64_t>(t_s * 1e9));
+    auto st = evt.initGpsSourceState();
+    st.setSelected(selected);
+    st.setGeneration(generation);
+    st.setTransitionMonoNs(static_cast<uint64_t>(transition_s * 1e9));
+    st.setTransitionReason("test");
+    st.setUbloxHealth(cereal::GpsSourceState::SourceHealth::HEALTHY);
+    st.setQcomHealth(cereal::GpsSourceState::SourceHealth::UNKNOWN);
+    st.setUbloxHardwareAvailable(true);
+    localizer.handle_msg(evt.asReader());
+  };
+
+  SECTION("no gpsSourceState rejects both sockets") {
+    const uint64_t before = loc.get_gps_input_stats().received;
+    {
+      MessageBuilder msg;
+      auto evt = msg.initEvent();
+      evt.setLogMonoTime(2'000'000'000ULL);
+      fill_gps(evt.initGpsLocationExternal(), {});
+      loc.handle_msg(evt.asReader());
+    }
+    {
+      MessageBuilder msg;
+      auto evt = msg.initEvent();
+      evt.setLogMonoTime(2'100'000'000ULL);
+      fill_gps(evt.initGpsLocation(), {});
+      loc.handle_msg(evt.asReader());
+    }
+    REQUIRE(loc.get_gps_input_stats().received == before);
+  }
+
+  SECTION("fresh ubloxPrimary accepts ublox and rejects qcom") {
+    publish_state(loc, 2.0, cereal::GpsSourceState::SelectedSource::UBLOX_PRIMARY, 0, 0.0);
+    const uint64_t before = loc.get_gps_input_stats().received;
+    {
+      MessageBuilder msg;
+      auto evt = msg.initEvent();
+      evt.setLogMonoTime(2'100'000'000ULL);
+      fill_gps(evt.initGpsLocation(), {});
+      loc.handle_msg(evt.asReader());
+    }
+    REQUIRE(loc.get_gps_input_stats().received == before);
+    {
+      MessageBuilder msg;
+      auto evt = msg.initEvent();
+      evt.setLogMonoTime(2'200'000'000ULL);
+      fill_gps(evt.initGpsLocationExternal(), {});
+      loc.handle_msg(evt.asReader());
+    }
+    REQUIRE(loc.get_gps_input_stats().received == before + 1);
+  }
+
+  SECTION("stale gpsSourceState expires authority") {
+    publish_state(loc, 2.0, cereal::GpsSourceState::SelectedSource::UBLOX_PRIMARY, 0, 0.0);
+    const uint64_t before = loc.get_gps_input_stats().received;
+    {
+      MessageBuilder msg;
+      auto evt = msg.initEvent();
+      // > 3s after last state recv
+      evt.setLogMonoTime(6'000'000'000ULL);
+      fill_gps(evt.initGpsLocationExternal(), {});
+      loc.handle_msg(evt.asReader());
+    }
+    REQUIRE(loc.get_gps_input_stats().received == before);
+  }
+
+  SECTION("source transition rejects pre-transition samples") {
+    publish_state(loc, 5.0, cereal::GpsSourceState::SelectedSource::QCOM_FALLBACK, 1, 5.0);
+
+    const uint64_t before = loc.get_gps_input_stats().received;
+    {
+      MessageBuilder old_ublox;
+      auto evt = old_ublox.initEvent();
+      evt.setLogMonoTime(4'000'000'000ULL);  // before transition
+      fill_gps(evt.initGpsLocationExternal(), {});
+      loc.handle_msg(evt.asReader());
+    }
+    REQUIRE(loc.get_gps_input_stats().received == before);
+
+    {
+      MessageBuilder stale_qcom;
+      auto evt = stale_qcom.initEvent();
+      evt.setLogMonoTime(5'000'000'000ULL);  // equal to transition -> reject
+      fill_gps(evt.initGpsLocation(), {});
+      loc.handle_msg(evt.asReader());
+    }
+    REQUIRE(loc.get_gps_input_stats().received == before);
+
+    {
+      MessageBuilder fresh_qcom;
+      auto evt = fresh_qcom.initEvent();
+      evt.setLogMonoTime(5'100'000'000ULL);
+      fill_gps(evt.initGpsLocation(), {});
+      loc.handle_msg(evt.asReader());
+    }
+    REQUIRE(loc.get_gps_input_stats().received == before + 1);
+  }
+
+  SECTION("arbiter restart same source/gen newer epoch invalidates old GPS") {
+    publish_state(loc, 1.0, cereal::GpsSourceState::SelectedSource::UBLOX_PRIMARY, 0, 0.100);
+    {
+      MessageBuilder msg;
+      auto evt = msg.initEvent();
+      evt.setLogMonoTime(1'500'000'000ULL);
+      fill_gps(evt.initGpsLocationExternal(), {});
+      loc.handle_msg(evt.asReader());
+    }
+    const uint64_t mid = loc.get_gps_input_stats().received;
+    REQUIRE(mid >= 1);
+
+    // Restart: same selected+generation, newer transition epoch.
+    publish_state(loc, 2.0, cereal::GpsSourceState::SelectedSource::UBLOX_PRIMARY, 0, 0.200);
+    {
+      MessageBuilder old_msg;
+      auto evt = old_msg.initEvent();
+      evt.setLogMonoTime(150'000'000ULL);  // 0.15s < new epoch 0.2s
+      fill_gps(evt.initGpsLocationExternal(), {});
+      loc.handle_msg(evt.asReader());
+    }
+    REQUIRE(loc.get_gps_input_stats().received == mid);
+    {
+      MessageBuilder fresh_msg;
+      auto evt = fresh_msg.initEvent();
+      evt.setLogMonoTime(2'100'000'000ULL);
+      fill_gps(evt.initGpsLocationExternal(), {});
+      loc.handle_msg(evt.asReader());
+    }
+    REQUIRE(loc.get_gps_input_stats().received == mid + 1);
+  }
+
+  SECTION("noHealthySource rejects both sockets") {
+    publish_state(loc, 3.0, cereal::GpsSourceState::SelectedSource::NO_HEALTHY_SOURCE, 2, 3.0);
+    const uint64_t before = loc.get_gps_input_stats().received;
+    for (bool ublox : {true, false}) {
+      MessageBuilder msg;
+      auto evt = msg.initEvent();
+      evt.setLogMonoTime(4'000'000'000ULL);
+      if (ublox) {
+        fill_gps(evt.initGpsLocationExternal(), {});
+      } else {
+        fill_gps(evt.initGpsLocation(), {});
+      }
+      loc.handle_msg(evt.asReader());
+    }
+    REQUIRE(loc.get_gps_input_stats().received == before);
+  }
+
+  SECTION("fresh state resumes after expiry") {
+    publish_state(loc, 1.0, cereal::GpsSourceState::SelectedSource::UBLOX_PRIMARY, 0, 0.0);
+    {
+      MessageBuilder msg;
+      auto evt = msg.initEvent();
+      evt.setLogMonoTime(5'000'000'000ULL);  // stale
+      fill_gps(evt.initGpsLocationExternal(), {});
+      loc.handle_msg(evt.asReader());
+    }
+    const uint64_t before = loc.get_gps_input_stats().received;
+    publish_state(loc, 5.1, cereal::GpsSourceState::SelectedSource::UBLOX_PRIMARY, 0, 0.0);
+    {
+      MessageBuilder msg;
+      auto evt = msg.initEvent();
+      evt.setLogMonoTime(5'200'000'000ULL);
+      fill_gps(evt.initGpsLocationExternal(), {});
+      loc.handle_msg(evt.asReader());
+    }
+    REQUIRE(loc.get_gps_input_stats().received == before + 1);
+  }
+
+  SECTION("D: regressing epoch does not roll authority backward") {
+    publish_state(loc, 2.0, cereal::GpsSourceState::SelectedSource::QCOM_FALLBACK, 1, 0.100);
+    const uint64_t before = loc.get_gps_input_stats().received;
+    {
+      MessageBuilder qcom;
+      auto evt = qcom.initEvent();
+      evt.setLogMonoTime(2'100'000'000ULL);
+      fill_gps(evt.initGpsLocation(), {});
+      loc.handle_msg(evt.asReader());
+    }
+    REQUIRE(loc.get_gps_input_stats().received == before + 1);
+    // Stale older epoch claiming ublox — reject; keep QCOM authority.
+    publish_state(loc, 2.2, cereal::GpsSourceState::SelectedSource::UBLOX_PRIMARY, 2, 0.050);
+    {
+      MessageBuilder ublox;
+      auto evt = ublox.initEvent();
+      evt.setLogMonoTime(2'300'000'000ULL);
+      fill_gps(evt.initGpsLocationExternal(), {});
+      loc.handle_msg(evt.asReader());
+    }
+    REQUIRE(loc.get_gps_input_stats().received == before + 1);
+    {
+      MessageBuilder qcom2;
+      auto evt = qcom2.initEvent();
+      evt.setLogMonoTime(2'400'000'000ULL);
+      fill_gps(evt.initGpsLocation(), {});
+      loc.handle_msg(evt.asReader());
+    }
+    REQUIRE(loc.get_gps_input_stats().received == before + 2);
+  }
+
+  SECTION("D: equal epoch inconsistent source/generation rejected") {
+    publish_state(loc, 2.0, cereal::GpsSourceState::SelectedSource::QCOM_FALLBACK, 1, 0.100);
+    const uint64_t before = loc.get_gps_input_stats().received;
+    {
+      MessageBuilder qcom;
+      auto evt = qcom.initEvent();
+      evt.setLogMonoTime(2'100'000'000ULL);
+      fill_gps(evt.initGpsLocation(), {});
+      loc.handle_msg(evt.asReader());
+    }
+    REQUIRE(loc.get_gps_input_stats().received == before + 1);
+    publish_state(loc, 2.2, cereal::GpsSourceState::SelectedSource::UBLOX_PRIMARY, 2, 0.100);
+    {
+      MessageBuilder ublox;
+      auto evt = ublox.initEvent();
+      evt.setLogMonoTime(2'300'000'000ULL);
+      fill_gps(evt.initGpsLocationExternal(), {});
+      loc.handle_msg(evt.asReader());
+    }
+    REQUIRE(loc.get_gps_input_stats().received == before + 1);
+  }
+
+  SECTION("D: newer epoch with gen0 accepted as arbiter restart") {
+    publish_state(loc, 1.0, cereal::GpsSourceState::SelectedSource::QCOM_FALLBACK, 1, 0.100);
+    publish_state(loc, 2.0, cereal::GpsSourceState::SelectedSource::UBLOX_PRIMARY, 0, 0.200);
+    const uint64_t before = loc.get_gps_input_stats().received;
+    {
+      MessageBuilder ublox;
+      auto evt = ublox.initEvent();
+      evt.setLogMonoTime(2'100'000'000ULL);
+      fill_gps(evt.initGpsLocationExternal(), {});
+      loc.handle_msg(evt.asReader());
+    }
+    REQUIRE(loc.get_gps_input_stats().received == before + 1);
+  }
+
+  SECTION("D: future epoch relative to receive time rejected") {
+    publish_state(loc, 1.0, cereal::GpsSourceState::SelectedSource::UBLOX_PRIMARY, 1, 0.100);
+    const uint64_t before = loc.get_gps_input_stats().received;
+    // transition 5.0s > receive 1.5s
+    publish_state(loc, 1.5, cereal::GpsSourceState::SelectedSource::QCOM_FALLBACK, 2, 5.0);
+    {
+      MessageBuilder qcom;
+      auto evt = qcom.initEvent();
+      evt.setLogMonoTime(1'600'000'000ULL);
+      fill_gps(evt.initGpsLocation(), {});
+      loc.handle_msg(evt.asReader());
+    }
+    REQUIRE(loc.get_gps_input_stats().received == before);
+    {
+      MessageBuilder ublox;
+      auto evt = ublox.initEvent();
+      evt.setLogMonoTime(1'700'000'000ULL);
+      fill_gps(evt.initGpsLocationExternal(), {});
+      loc.handle_msg(evt.asReader());
+    }
+    REQUIRE(loc.get_gps_input_stats().received == before + 1);
+  }
+}

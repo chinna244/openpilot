@@ -122,6 +122,22 @@ private:
   double ttff = NAN;
   double last_gps_msg = 0;
   LocalizerGnssSource gnss_source;
+  // PR80: single authoritative source from gpsSourceState (no independent choice).
+  enum class AuthGpsSource {
+    UBLOX_PRIMARY,
+    QCOM_FALLBACK,
+    NO_HEALTHY_SOURCE,
+  };
+  // Effective authority after freshness gate (fail closed without fresh gpsSourceState).
+  AuthGpsSource auth_gps_source = AuthGpsSource::NO_HEALTHY_SOURCE;
+  // Last selected value from a received gpsSourceState (may be masked when stale).
+  AuthGpsSource auth_gps_source_selected = AuthGpsSource::NO_HEALTHY_SOURCE;
+  // Authority epoch from gpsSourceState.transitionMonoNs (integer ns for exact compare).
+  uint64_t gps_source_transition_mono_ns = 0;
+  double gps_source_transition_mono = 0.0;
+  uint32_t gps_source_generation = 0;
+  double gps_source_state_recv_mono = NAN;
+  bool gps_source_state_seen = false;
   bool observation_timings_invalid = false;
   std::map<std::string, double> observation_values_invalid;
   bool standstill = true;
@@ -137,6 +153,9 @@ private:
   bool last_reset_used_gps_course = false;
 
   void configure_gnss_source(const LocalizerGnssSource &source);
+  void handle_gps_source_state(double current_time, const cereal::GpsSourceState::Reader &state);
+  void refresh_gps_source_authority(double now_mono);
+  bool gps_message_authoritative(AuthGpsSource expected_source, double msg_mono) const;
   void reject_gps_input(double current_time, GpsInputRejectReason reason);
   void maybe_log_gps_input_stats(double current_time);
   bool gps_course_usable_for_yaw_reset(double ecef_speed_mps, double bearing_accuracy_deg) const;

@@ -50,6 +50,7 @@ _services: dict[str, tuple] = {
   "procLog": (True, 0.5, 15, QueueSize.BIG),
   "gpsLocationExternal": (True, 10., 10),
   "gpsLocation": (True, 1., 1),
+  "gpsSourceState": (True, 1., 1),
   "ubloxGnss": (True, 10.),
   "qcomGnss": (True, 2.),
   "clocks": (True, 0.1, 1),

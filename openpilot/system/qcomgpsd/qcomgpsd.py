@@ -17,6 +17,7 @@ from typing import NoReturn
 from openpilot.cereal import log
 import openpilot.cereal.messaging as messaging
 from openpilot.common.gpio import gpio_init, gpio_set
+from openpilot.common.gps import ublox_hardware_available
 from openpilot.common.hardware.tici.pins import GPIO
 from openpilot.common.serial import Serial
 from openpilot.common.swaglog import cloudlog
@@ -876,10 +877,16 @@ def main() -> NoReturn:
 
   wait_for_modem()
 
+  # GNSS_PWR_EN is the u-blox power rail (GPIO_UBLOX_PWR_EN). When u-blox is
+  # present, pigeond owns that rail; qcomgpsd must not toggle it or cleanup
+  # would power-kill the primary receiver during concurrent failover mode.
+  manage_ublox_rail = not ublox_hardware_available()
+
   def cleanup(sig, frame):
     cloudlog.warning("caught sig disabling quectel gps")
 
-    gpio_set(GPIO.GNSS_PWR_EN, False)
+    if manage_ublox_rail:
+      gpio_set(GPIO.GNSS_PWR_EN, False)
     try:
       teardown_quectel(diag)
       cloudlog.warning("quectel cleanup done")
@@ -894,8 +901,11 @@ def main() -> NoReturn:
   diag = ModemDiag()
   setup_quectel(diag)
   cloudlog.warning("quectel setup done")
-  gpio_init(GPIO.GNSS_PWR_EN, True)
-  gpio_set(GPIO.GNSS_PWR_EN, True)
+  if manage_ublox_rail:
+    gpio_init(GPIO.GNSS_PWR_EN, True)
+    gpio_set(GPIO.GNSS_PWR_EN, True)
+  else:
+    cloudlog.warning("qcomgpsd skipping GNSS_PWR_EN; ublox hardware owns rail")
 
   pm = messaging.PubMaster(["qcomGnss", "gpsLocation"])
 
