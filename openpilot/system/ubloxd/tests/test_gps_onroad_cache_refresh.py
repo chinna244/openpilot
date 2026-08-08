@@ -189,7 +189,7 @@ def test_completion_quality_is_persisted_conservatively_end_to_end(
   assert completed == database_frames
   assert state.capture_fix is not None
   result = pigeond.write_navigation_assistance_cache(
-    "receiver",
+    "v1|receiver|sw=ext core 3.01|hw=00080000|prot=20.30|fw=hpg 1.40rov",
     state.capture_fix,
     completed,
     finalized_quality,
@@ -202,13 +202,13 @@ def test_completion_quality_is_persisted_conservatively_end_to_end(
   )
   assert result is pigeond.NavigationAssistanceCacheResult.SAVED
   durable_quality = pigeond.durable_quality_after_cache_result(
-    result, "receiver", receiver_utc,
+    result, "v1|receiver|sw=ext core 3.01|hw=00080000|prot=20.30|fw=hpg 1.40rov", receiver_utc,
   )
   state.complete(result, 61, durable_quality, finalized_quality)
 
   saved = load_cache(
     path,
-    expected_receiver_fingerprint="receiver",
+    expected_receiver_fingerprint="v1|receiver|sw=ext core 3.01|hw=00080000|prot=20.30|fw=hpg 1.40rov",
     require_complete=True,
     expected_receiver_cycle=RECEIVER_CYCLE,
   )
@@ -247,7 +247,7 @@ def test_conservative_qualified_improvement_still_saves(monkeypatch, tmp_path):
   fix = NavPvtFix(True, 10, 1, 1, 1, 100, 100, receiver_utc)
   baseline = quality()
   gps_assistance.save_cache(path, create_cache(
-    "receiver",
+    "v1|receiver|sw=ext core 3.01|hw=00080000|prot=20.30|fw=hpg 1.40rov",
     fix,
     (build_dbd_frame(1),),
     receiver_utc - timedelta(seconds=1),
@@ -269,7 +269,7 @@ def test_conservative_qualified_improvement_still_saves(monkeypatch, tmp_path):
   assert navigation_quality_strictly_better(finalized_quality, baseline)
 
   result = pigeond.write_navigation_assistance_cache(
-    "receiver",
+    "v1|receiver|sw=ext core 3.01|hw=00080000|prot=20.30|fw=hpg 1.40rov",
     state.capture_fix,
     (build_dbd_frame(2),),
     finalized_quality,
@@ -513,7 +513,7 @@ def test_route_6c_late_reliable_fix_saves_complete_usable_cache(monkeypatch, tmp
   latest_fix = quality_tracker.latest_fix
   assert latest_fix is not None and latest_fix.utc_time is not None
   result = pigeond.write_navigation_assistance_cache(
-    "receiver",
+    "v1|receiver|sw=ext core 3.01|hw=00080000|prot=20.30|fw=hpg 1.40rov",
     state.capture_fix,
     completed,
     candidate_quality,
@@ -527,7 +527,7 @@ def test_route_6c_late_reliable_fix_saves_complete_usable_cache(monkeypatch, tmp
   assert result is pigeond.NavigationAssistanceCacheResult.SAVED
   saved = load_cache(
     path,
-    expected_receiver_fingerprint="receiver",
+    expected_receiver_fingerprint="v1|receiver|sw=ext core 3.01|hw=00080000|prot=20.30|fw=hpg 1.40rov",
     require_complete=True,
     expected_receiver_cycle=RECEIVER_CYCLE,
   )
@@ -630,7 +630,7 @@ def test_cache_comparison_accepts_fresh_usable_but_keeps_old_recoverable():
 
   def cache(candidate_quality, when):
     return create_cache(
-      "receiver", fix, (build_dbd_frame(1),), when, quality=candidate_quality,
+      "v1|receiver|sw=ext core 3.01|hw=00080000|prot=20.30|fw=hpg 1.40rov", fix, (build_dbd_frame(1),), when, quality=candidate_quality,
     )
 
   replace_cache, reason = compare_cache_quality(

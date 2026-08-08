@@ -176,7 +176,7 @@ procs = [
   PythonProcess("pandad", "openpilot.selfdrive.pandad.pandad", always_run),
   PythonProcess("paramsd", "openpilot.selfdrive.locationd.paramsd", only_onroad),
   PythonProcess("lagd", "openpilot.selfdrive.locationd.lagd", only_onroad),
-  PythonProcess("ubloxd", "openpilot.system.ubloxd.ubloxd", ublox, enabled=TICI),
+  PythonProcess("ubloxd", "openpilot.system.ubloxd.ubloxd", ublox, enabled=TICI, restart_if_crash=True),
   PythonProcess("pigeond", "openpilot.system.ubloxd.pigeond", ublox, enabled=TICI, restart_if_crash=True),
   PythonProcess("yumaalmanacd", "openpilot.system.ubloxd.yuma_almanacd", yuma_almanac_refresh, enabled=TICI, restart_if_crash=True),
   PythonProcess("plannerd", "openpilot.selfdrive.controls.plannerd", not_long_maneuver),

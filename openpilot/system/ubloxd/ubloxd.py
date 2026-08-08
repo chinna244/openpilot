@@ -10,7 +10,7 @@ from openpilot.cereal import log
 from openpilot.cereal import messaging
 from openpilot.common.swaglog import cloudlog
 from openpilot.system.ubloxd.rf_observability import UbloxRfObservability
-from openpilot.common.gps_time import encode_ublox_gps_flags
+from openpilot.common.gps_time import encode_ublox_gps_flags, ublox_nav_pvt_has_fix
 from openpilot.system.ubloxd.ubx import Ubx
 from openpilot.system.ubloxd.gps import Gps
 from openpilot.system.ubloxd.glonass import Glonass
@@ -263,7 +263,8 @@ class UbloxMsgParser:
     # Preserve the existing fix flags in the lower byte and expose the
     # NAV-PVT validDate/validTime bits in the upper byte.
     gps.flags = encode_ublox_gps_flags(msg.flags, msg.valid)
-    gps.hasFix = (msg.flags % 2) == 1
+    # hasFix: gnssFixOk and fixType in {3D, GNSS+DR}. See ublox_nav_pvt_has_fix.
+    gps.hasFix = ublox_nav_pvt_has_fix(msg.flags, msg.fix_type)
     gps.latitude = msg.lat * 1e-07
     gps.longitude = msg.lon * 1e-07
     gps.altitude = msg.height * 1e-03

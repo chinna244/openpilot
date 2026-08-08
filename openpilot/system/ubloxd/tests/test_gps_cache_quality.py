@@ -49,7 +49,7 @@ def mature_tracker() -> CaptureQualityTracker:
   return tracker
 
 
-def cache(tmp_quality, saved_at=datetime(2026, 7, 13, tzinfo=UTC), receiver="receiver"):
+def cache(tmp_quality, saved_at=datetime(2026, 7, 13, tzinfo=UTC), receiver="v1|receiver|sw=ext core 3.01|hw=00080000|prot=20.30|fw=hpg 1.40rov"):
   return create_cache(receiver, fix(), (build_dbd_frame(1),), saved_at, quality=tmp_quality)
 
 
@@ -436,7 +436,7 @@ def _write_candidate(monkeypatch, path, candidate_quality):
   monkeypatch.setattr(pigeond, "read_host_time_observation", lambda: None)
   candidate_fix = replace(fix(), utc_time=datetime(2026, 7, 13, 1, tzinfo=UTC))
   return pigeond.write_navigation_assistance_cache(
-    "receiver", candidate_fix, (build_dbd_frame(2),), candidate_quality,
+    "v1|receiver|sw=ext core 3.01|hw=00080000|prot=20.30|fw=hpg 1.40rov", candidate_fix, (build_dbd_frame(2),), candidate_quality,
     receiver_utc_independent=True,
   )
 

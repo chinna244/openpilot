@@ -15,6 +15,7 @@ import tempfile
 import time
 from typing import Any, cast
 
+from openpilot.common.swaglog import cloudlog
 from openpilot.system.ubloxd.gps_assistance import (
   CacheAgeEvidence,
   CacheFileInspection,
@@ -26,9 +27,11 @@ from openpilot.system.ubloxd.gps_assistance import (
   NavigationCacheStore,
   NavigationQuality,
   RestoredNavigationQuality,
+  age_safe_restore_position_accuracy_cm,
   build_position_assistance_message,
   effective_restored_navigation_quality,
   load_cache,
+  receiver_fingerprints_compatible,
 )
 from openpilot.system.ubloxd.navigation_database_restore import (
   DEFAULT_NAVIGATION_DATABASE_RESTORE_AGE_POLICY,
@@ -42,7 +45,10 @@ from openpilot.system.ubloxd.trusted_time_anchor import (
   read_boot_id,
   read_boottime_seconds,
 )
-from openpilot.system.ubloxd.trusted_time_authority import AuthorizedTime
+from openpilot.system.ubloxd.trusted_time_authority import (
+  AuthorizedTime,
+  TimeAuthorizationEvidence,
+)
 from openpilot.system.ubloxd.yuma_almanac_transmit import (
   MgaReceiverNackError,
   MgaTransactionError,
@@ -91,6 +97,8 @@ class PositionAssistanceFailureKind(StrEnum):
   ACK_REJECTED = "ack_rejected"
   ACK_TIMEOUT = "ack_timeout"
   ACK_OBSERVATION_FAILED = "ack_observation_failed"
+  AGE_UNVERIFIED = "position_age_unverified"
+  UNCERTAINTY_UNREPRESENTABLE = "position_uncertainty_unrepresentable"
 
 
 @dataclass(frozen=True)
@@ -1297,13 +1305,19 @@ class NavigationDatabaseRestoreRuntime:
     valid_same_boot_state = (
       persisted is not None
       and persisted.boot_id == self._boot_id
-      and persisted.receiver_fingerprint == self._receiver_fingerprint
+      and receiver_fingerprints_compatible(
+        persisted.receiver_fingerprint,
+        self._receiver_fingerprint,
+      )
     )
 
     receiver_fingerprint_mismatch = (
       persisted is not None
       and persisted.boot_id == self._boot_id
-      and persisted.receiver_fingerprint != self._receiver_fingerprint
+      and not receiver_fingerprints_compatible(
+        persisted.receiver_fingerprint,
+        self._receiver_fingerprint,
+      )
     )
 
     if quarantine_closed:
@@ -1487,7 +1501,10 @@ class NavigationDatabaseRestoreRuntime:
     assert self._boot_id is not None
     if state.boot_id != self._boot_id:
       return
-    if state.receiver_fingerprint != self._receiver_fingerprint:
+    if not receiver_fingerprints_compatible(
+      state.receiver_fingerprint,
+      self._receiver_fingerprint,
+    ):
       self._fail_closed("boot_state:receiver_fingerprint_mismatch")
       self._persist_state()
       return
@@ -1685,11 +1702,60 @@ class NavigationDatabaseRestoreRuntime:
 
     self._position_attempted = True
     try:
+      age_seconds: float | None = None
+      age_verified = False
+      authorized = self._last_authorized_time
+      if authorized is not None and (
+        is_current_independent_network_time(authorized)
+        or authorized.evidence is TimeAuthorizationEvidence.SAME_BOOT_BOOTTIME
+      ):
+        age_seconds = (
+          authorized.utc - snapshot.saved_at_utc
+        ).total_seconds()
+        age_verified = True
+      position_accuracy_cm, accuracy_reason = age_safe_restore_position_accuracy_cm(
+        snapshot.position_accuracy_cm,
+        age_seconds=age_seconds,
+        age_verified=age_verified,
+      )
+      try:
+        cloudlog.info(
+          ", ".join((
+            "GPS position assistance uncertainty",
+            f"reason={accuracy_reason}",
+            (
+              f"accuracy_cm={position_accuracy_cm}"
+              if position_accuracy_cm is not None
+              else "accuracy_cm=skipped"
+            ),
+            f"age_verified={str(age_verified).lower()}",
+            (
+              f"age_seconds={age_seconds:.1f}"
+              if age_seconds is not None
+              else "age_seconds=unknown"
+            ),
+          ))
+        )
+      except Exception:
+        # Observability must never interfere with position assistance send.
+        pass
+      if position_accuracy_cm is None:
+        if accuracy_reason == "position_uncertainty_unrepresentable":
+          self._position_failure_kind = (
+            PositionAssistanceFailureKind.UNCERTAINTY_UNREPRESENTABLE
+          )
+        else:
+          self._position_failure_kind = PositionAssistanceFailureKind.AGE_UNVERIFIED
+        self._position_error_type = "PositionAssistanceAgePolicy"
+        self._position_error = accuracy_reason
+        self._position_succeeded = False
+        self._execution = self._build_execution(self._last_authorized_time)
+        return self._execution
       message = build_position_assistance_message(
         latitude_e7=snapshot.latitude_e7,
         longitude_e7=snapshot.longitude_e7,
         altitude_cm=snapshot.altitude_cm,
-        position_accuracy_cm=snapshot.position_accuracy_cm,
+        position_accuracy_cm=position_accuracy_cm,
       )
     except Exception as exc:
       self._position_failure_kind = PositionAssistanceFailureKind.BUILD
