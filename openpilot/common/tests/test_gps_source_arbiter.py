@@ -732,7 +732,7 @@ class TestGpsardTelemetryFailOpen:
         raise RuntimeError("exception boom")
 
     original = gpsard_mod.cloudlog
-    gpsard_mod.cloudlog = Boom()
+    gpsard_mod.cloudlog = Boom()  # ty: ignore[invalid-assignment]  # test double
     try:
       gpsard.safe_cloudlog("info", "startup")
       gpsard.safe_cloudlog("warning", "transition")
@@ -758,9 +758,9 @@ class TestGpsardTelemetryFailOpen:
         raise RuntimeError("log boom")
 
     original = gpsard_mod.cloudlog
-    gpsard_mod.cloudlog = Boom()
+    gpsard_mod.cloudlog = Boom()  # ty: ignore[invalid-assignment]  # test double
     try:
-      ok = gpsard._publish_state(FakePM(), a, 2.0)
+      ok = gpsard._publish_state(FakePM(), a, 2.0)  # ty: ignore[invalid-argument-type]
     finally:
       gpsard_mod.cloudlog = original
     assert ok is False
