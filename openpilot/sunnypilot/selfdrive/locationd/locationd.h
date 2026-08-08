@@ -40,6 +40,10 @@ enum class GpsInputRejectReason : int32_t {
   InvalidBearingAccuracy = 8,
   UnreasonableUncertainty = 9,
   UnreasonableVelocity = 10,
+  InvalidMeasurementTime = 11,
+  FutureMeasurement = 12,
+  StaleMeasurement = 13,
+  PreTransitionMeasurement = 14,
 };
 
 struct GpsInputStats {
@@ -54,6 +58,10 @@ struct GpsInputStats {
   uint64_t rejected_bearing_accuracy = 0;
   uint64_t rejected_unreasonable_uncertainty = 0;
   uint64_t rejected_unreasonable_velocity = 0;
+  uint64_t rejected_invalid_measurement_time = 0;
+  uint64_t rejected_future_measurement = 0;
+  uint64_t rejected_stale_measurement = 0;
+  uint64_t rejected_pre_transition_measurement = 0;
   GpsInputRejectReason last_reason = GpsInputRejectReason::None;
 };
 

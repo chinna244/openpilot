@@ -208,13 +208,19 @@ class UbloxMsgParser:
     self.assembly_stats = EphemerisAssemblyStats()
 
   # Message generation entry point
-  def parse_frame(self, frame: bytes) -> tuple[str, capnp.lib.capnp._DynamicStructBuilder] | None:
+  def parse_frame(
+    self,
+    frame: bytes,
+    *,
+    measurement_mono_ns: int | None = None,
+  ) -> tuple[str, capnp.lib.capnp._DynamicStructBuilder] | None:
     # Quick header parse
     msg_type = int.from_bytes(frame[2:4], 'big')
     payload = frame[6:-2]
     if msg_type == 0x0107:
       body = Ubx.NavPvt.from_bytes(payload)
-      return self._gen_nav_pvt(body)
+      mono_ns = int(measurement_mono_ns) if measurement_mono_ns is not None else 0
+      return self._gen_nav_pvt(body, measurement_mono_ns=mono_ns)
     if msg_type == 0x0213:
       # Manually parse RXM-SFRBX to avoid EOF on some frames
       if len(payload) < 8:
@@ -256,7 +262,12 @@ class UbloxMsgParser:
     return None
 
   # NAV-PVT -> gpsLocationExternal
-  def _gen_nav_pvt(self, msg: Ubx.NavPvt) -> tuple[str, capnp.lib.capnp._DynamicStructBuilder]:
+  def _gen_nav_pvt(
+    self,
+    msg: Ubx.NavPvt,
+    *,
+    measurement_mono_ns: int,
+  ) -> tuple[str, capnp.lib.capnp._DynamicStructBuilder]:
     dat = messaging.new_message('gpsLocationExternal', valid=True)
     gps = dat.gpsLocationExternal
     gps.source = log.GpsLocationData.SensorSource.ublox
@@ -280,6 +291,9 @@ class UbloxMsgParser:
     except Exception:
       utc_tt = 0
     gps.unixTimestampMillis = int(utc_tt * 1e3 + (msg.nano * 1e-6))
+
+    # Host mono at ubloxRaw framing completion — not publication time.
+    gps.measurementMonoNs = int(measurement_mono_ns)
 
     # match C++ float32 rounding semantics exactly
     gps.vNED = [
@@ -715,7 +729,8 @@ def main():
         # RF diagnostics are read-only and must never interfere with parsing.
         pass
       try:
-        res = parser.parse_frame(frame)
+        # Stamp measurement epoch at ubloxRaw receive/framing completion time.
+        res = parser.parse_frame(frame, measurement_mono_ns=int(msg.logMonoTime))
       except Exception as exc:
         try:
           parser_error = observability.observe_parser_error(frame, exc, log_time)

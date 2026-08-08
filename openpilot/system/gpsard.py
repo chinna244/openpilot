@@ -52,6 +52,8 @@ def _age_or_neg1(now_mono: float, then: float | None) -> float:
 
 
 def _gps_msg_to_sample(msg, recv_mono: float) -> GpsSample:
+  vned = tuple(float(v) for v in msg.vNED[:3]) if len(msg.vNED) >= 3 else (float("nan"), float("nan"), float("nan"))
+  meas_ns = int(msg.measurementMonoNs) if hasattr(msg, "measurementMonoNs") else 0
   return GpsSample(
     recv_mono=recv_mono,
     has_fix=bool(msg.hasFix),
@@ -60,6 +62,11 @@ def _gps_msg_to_sample(msg, recv_mono: float) -> GpsSample:
     horizontal_accuracy=float(msg.horizontalAccuracy),
     vertical_accuracy=float(msg.verticalAccuracy),
     unix_timestamp_millis=float(msg.unixTimestampMillis),
+    altitude=float(msg.altitude),
+    speed_accuracy=float(msg.speedAccuracy),
+    bearing_accuracy_deg=float(msg.bearingAccuracyDeg),
+    v_ned=(vned[0], vned[1], vned[2]),
+    measurement_mono_ns=meas_ns if meas_ns > 0 else None,
   )
 
 
