@@ -7,6 +7,7 @@ from typing import NoReturn
 
 DEBUG = int(os.environ.get("DEBUG", "0"))
 
+
 @dataclass
 class GnssClockNmeaPort:
   # flags bit mask:
@@ -20,18 +21,19 @@ class GnssClockNmeaPort:
   flags: int | None
   leap_seconds: int | None
   time_ns: int | None
-  time_uncertainty_ns: int | None # 1-sigma
+  time_uncertainty_ns: int | None  # 1-sigma
   full_bias_ns: int | None
   bias_ns: float | None
-  bias_uncertainty_ns: float | None # 1-sigma
+  bias_uncertainty_ns: float | None  # 1-sigma
   drift_nsps: float | None
-  drift_uncertainty_nsps: float | None # 1-sigma
+  drift_uncertainty_nsps: float | None  # 1-sigma
 
   @classmethod
   def from_fields(cls, values: list[str]) -> 'GnssClockNmeaPort':
     ints = [int(value) if value else None for value in values[:5]]
     floats = [float(value) if value else None for value in values[5:9]]
     return cls(*ints, *floats)
+
 
 @dataclass
 class GnssMeasNmeaPort:
@@ -47,7 +49,7 @@ class GnssMeasNmeaPort:
   # 6 = GALILEO
   constellation: int | None
   svId: int | None
-  flags: int | None # always zero
+  flags: int | None  # always zero
   time_offset_ns: int | None
   # state bit mask:
   # 0x0001 = CODE LOCK
@@ -66,10 +68,10 @@ class GnssMeasNmeaPort:
   # 0x2000 = GALILEO E1B PAGE SYNC
   state: int | None
   time_of_week_ns: int | None
-  time_of_week_uncertainty_ns: int | None # 1-sigma
+  time_of_week_uncertainty_ns: int | None  # 1-sigma
   carrier_to_noise_ratio: float | None
   pseudorange_rate: float | None
-  pseudorange_rate_uncertainty: float | None # 1-sigma
+  pseudorange_rate_uncertainty: float | None  # 1-sigma
 
   @classmethod
   def from_fields(cls, values: list[str]) -> 'GnssMeasNmeaPort':
@@ -77,11 +79,12 @@ class GnssMeasNmeaPort:
     floats = [float(value) if value else None for value in values[10:13]]
     return cls(*ints, *floats)
 
+
 def nmea_checksum_ok(s):
   checksum = 0
   for i, c in enumerate(s[1:]):
     if c == "*":
-      if i != len(s) - 4: # should be 3rd to last character
+      if i != len(s) - 4:  # should be 3rd to last character
         print("ERROR: NMEA string does not have checksum delimiter in correct location:", s)
         return False
       break
@@ -92,7 +95,8 @@ def nmea_checksum_ok(s):
 
   return True
 
-def process_nmea_port_messages(device:str="/dev/ttyUSB1") -> NoReturn:
+
+def process_nmea_port_messages(device: str = "/dev/ttyUSB1") -> NoReturn:
   while True:
     try:
       with open(device) as nmeaport:
@@ -100,7 +104,7 @@ def process_nmea_port_messages(device:str="/dev/ttyUSB1") -> NoReturn:
           line = line.strip()
           if DEBUG:
             print(line)
-          if not line.startswith("$"): # all NMEA messages start with $
+          if not line.startswith("$"):  # all NMEA messages start with $
             continue
           if not nmea_checksum_ok(line):
             continue
@@ -119,6 +123,7 @@ def process_nmea_port_messages(device:str="/dev/ttyUSB1") -> NoReturn:
       print(e)
       sleep(1)
 
+
 def main() -> NoReturn:
   from openpilot.common.gpio import gpio_init, gpio_set
   from openpilot.common.hardware.tici.pins import GPIO
@@ -129,22 +134,22 @@ def main() -> NoReturn:
     print("qcomgpsd is running, please kill openpilot before running this script! (aborted)")
     sys.exit(1)
   except CalledProcessError as e:
-    if e.returncode != 1: # 1 == no process found (pandad not running)
+    if e.returncode != 1:  # 1 == no process found (pandad not running)
       raise e
 
   print("power up antenna ...")
   gpio_init(GPIO.GNSS_PWR_EN, True)
   gpio_set(GPIO.GNSS_PWR_EN, True)
 
-  if b"+QGPS: 0" not in (at_cmd("AT+QGPS?") or b""):
+  if "+QGPS: 0" not in (at_cmd("AT+QGPS?") or ""):
     print("stop location tracking ...")
     at_cmd("AT+QGPSEND")
 
-  if b'+QGPSCFG: "outport",usbnmea' not in (at_cmd('AT+QGPSCFG="outport"') or b""):
+  if '+QGPSCFG: "outport",usbnmea' not in (at_cmd('AT+QGPSCFG="outport"') or ""):
     print("configure outport ...")
-    at_cmd('AT+QGPSCFG="outport","usbnmea"') # usbnmea = /dev/ttyUSB1
+    at_cmd('AT+QGPSCFG="outport","usbnmea"')  # usbnmea = /dev/ttyUSB1
 
-  if b'+QGPSCFG: "gnssrawdata",3,0' not in (at_cmd('AT+QGPSCFG="gnssrawdata"') or b""):
+  if '+QGPSCFG: "gnssrawdata",3,0' not in (at_cmd('AT+QGPSCFG="gnssrawdata"') or ""):
     print("configure gnssrawdata ...")
     # AT+QGPSCFG="gnssrawdata",<constellation-mask>,<port>'
     # <constellation-mask> values:
@@ -156,7 +161,7 @@ def main() -> NoReturn:
     # <port> values:
     # 0 = NMEA port
     # 1 = AT port
-    at_cmd('AT+QGPSCFG="gnssrawdata",3,0') # enable all constellations, output data to NMEA port
+    at_cmd('AT+QGPSCFG="gnssrawdata",3,0')  # enable all constellations, output data to NMEA port
     print("rebooting ...")
     at_cmd('AT+CFUN=1,1')
     print("re-run this script when it is back up")
@@ -166,6 +171,7 @@ def main() -> NoReturn:
   at_cmd("AT+QGPS=1")
 
   process_nmea_port_messages()
+
 
 if __name__ == "__main__":
   main()
