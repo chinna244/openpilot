@@ -7,6 +7,7 @@ import uuid
 
 from openpilot.common.params import Params, ParamKeyFlag, UnknownKeyName
 
+
 class TestParams:
   def setup_method(self):
     self.params = Params()
@@ -45,6 +46,7 @@ class TestParams:
     def _delayed_writer():
       time.sleep(0.1)
       self.params.put("CarParams", b"test", block=True)
+
     threading.Thread(target=_delayed_writer).start()
     assert self.params.get("CarParams") is None
     assert self.params.get("CarParams", block=True) == b"test"
@@ -85,18 +87,22 @@ class TestParams:
 
   def test_put_non_blocking_with_get_block(self):
     q = Params()
+
     def _delayed_writer():
       time.sleep(0.1)
       Params().put("CarParams", b"test")
+
     threading.Thread(target=_delayed_writer).start()
     assert q.get("CarParams") is None
     assert q.get("CarParams", True) == b"test"
 
   def test_put_bool_non_blocking_with_get_block(self):
     q = Params()
+
     def _delayed_writer():
       time.sleep(0.1)
       Params().put_bool("CarParams", True)
+
     threading.Thread(target=_delayed_writer).start()
     assert q.get("CarParams") is None
     assert q.get("CarParams", True) == b"1"
@@ -108,6 +114,16 @@ class TestParams:
     assert len(keys) > 20
     assert len(keys) == len(set(keys))
     assert b"CarParams" in keys
+    assert b"AssistNowToken" not in keys
+
+  def test_assistnow_token_param_is_retired(self):
+    params = Params()
+    with pytest.raises(UnknownKeyName):
+      params.check_key("AssistNowToken")
+    with pytest.raises(UnknownKeyName):
+      params.get("AssistNowToken")
+    with pytest.raises(UnknownKeyName):
+      params.put("AssistNowToken", "should-not-register", block=True)
 
   def test_params_default_value(self):
     self.params.remove("LanguageSetting")

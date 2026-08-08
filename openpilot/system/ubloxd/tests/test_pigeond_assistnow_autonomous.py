@@ -1,3 +1,4 @@
+from pathlib import Path
 import struct
 from datetime import UTC, datetime
 from typing import cast
@@ -766,25 +767,15 @@ def test_autonomous_configuration_never_requires_online_token(monkeypatch, auton
   assert result is pigeond.AssistNowAutonomousConfigurationResult.ALREADY_ENABLED
 
 
-@pytest.mark.parametrize(
-  ("token", "online_error"),
-  [
-    (None, False),
-    ("online-token", False),
-    ("online-token", True),
-  ],
-)
-def test_legacy_assistnow_online_path_runs_after_strict_configuration(monkeypatch, token, online_error):
-  online_calls = []
-
+def test_legacy_assistnow_online_path_is_retired_after_strict_configuration(monkeypatch):
   class Params:
     def get(self, key):
-      assert key == "AssistNowToken"
-      return token
+      raise AssertionError(f"AssistNow Online retired; unexpected Params.get({key!r})")
 
   class Pigeon:
     def __init__(self):
       self.ack_writes = []
+      self.backup_polls = 0
 
     def send(self, message):
       pass
@@ -793,16 +784,11 @@ def test_legacy_assistnow_online_path_runs_after_strict_configuration(monkeypatc
       self.ack_writes.append((message, ack, nack))
 
     def poll_backup_restore_status(self):
+      self.backup_polls += 1
       return 3
 
-  def online_messages(actual_token):
-    online_calls.append(actual_token)
-    if online_error:
-      raise TimeoutError("online request failed")
-    return [b"online-one", b"online-two"]
-
   monkeypatch.setattr(pigeond, "Params", Params)
-  monkeypatch.setattr(pigeond, "get_assistnow_messages", online_messages)
+  assert not hasattr(pigeond, "get_assistnow_messages")
   monkeypatch.setattr(pigeond, "poll_cfg_prt", lambda _pigeon, port_id: expected_port_config(port_id))
   monkeypatch.setattr(pigeond, "poll_cfg_rate", lambda *args: pigeond.RateConfig(100, 1, 0))
   monkeypatch.setattr(pigeond, "poll_cfg_nav5", lambda *args: pigeond.Nav5Config(4, 3))
@@ -819,45 +805,15 @@ def test_legacy_assistnow_online_path_runs_after_strict_configuration(monkeypatc
   )
   pigeon = Pigeon()
   assert pigeond.init_pigeon(pigeon)
-  assert online_calls == []
   assert pigeon.ack_writes == []
 
   pigeond.run_post_start_legacy_assistance(cast(pigeond.TTYPigeon, pigeon))
 
-  online_writes = [entry for entry in pigeon.ack_writes if entry[1] == pigeond.UBLOX_ASSIST_ACK]
-  if token is None:
-    assert online_calls == []
-    assert online_writes == []
-  elif not online_error:
-    assert online_calls == [token]
-    assert online_writes == [
-      (b"online-one", pigeond.UBLOX_ASSIST_ACK, pigeond.UBLOX_NACK),
-      (b"online-two", pigeond.UBLOX_ASSIST_ACK, pigeond.UBLOX_NACK),
-    ]
-  else:
-    assert online_calls == [token]
-    assert online_writes == []
-
-
-def test_legacy_assistnow_online_request_and_timeout_are_unchanged(monkeypatch):
-  request = {}
-
-  class Response:
-    status_code = 200
-    content = b""
-
-  def get(url, **kwargs):
-    request["url"] = url
-    request.update(kwargs)
-    return Response()
-
-  monkeypatch.setattr(pigeond.requests, "get", get)
-  assert pigeond.get_assistnow_messages("online-token") == []
-  assert request == {
-    "url": "https://online-live2.services.u-blox.com/GetOnlineData.ashx",
-    "params": "token=online-token&gnss=gps,glo&datatype=eph,alm,aux",
-    "timeout": 5,
-  }
+  assert pigeon.backup_polls == 1
+  assert pigeon.ack_writes == []
+  source = Path(pigeond.__file__).read_text()
+  assert "AssistNowToken" not in source
+  assert "online-live2.services.u-blox.com" not in source
 
 
 def test_receiver_recovery_cycle_does_not_retry_aop_transaction(monkeypatch):

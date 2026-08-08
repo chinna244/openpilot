@@ -5,12 +5,13 @@ import pytest
 from openpilot.system.ubloxd import pigeond
 
 
-def test_process_start_wait_has_separate_absolute_deadline() -> None:
-  assert pigeond.NAVIGATION_DATABASE_TRUSTED_TIME_WAIT_SECONDS == 40.0
-  assert (
-    pigeond.NAVIGATION_DATABASE_PROCESS_START_TIME_DEADLINE_SECONDS
-    == 45.0
-  )
+def test_process_start_deadline_remains_45_seconds_without_legacy_wait() -> None:
+  assert not hasattr(pigeond, "NAVIGATION_DATABASE_TRUSTED_TIME_WAIT_SECONDS")
+  assert not hasattr(pigeond, "NAVIGATION_DATABASE_TRUSTED_TIME_POLL_SECONDS")
+  assert not hasattr(pigeond, "should_wait_for_navigation_database_trusted_time")
+  assert not hasattr(pigeond, "navigation_database_trusted_time_wait_expired")
+  assert not hasattr(pigeond, "wait_for_current_independent_network_time")
+  assert pigeond.NAVIGATION_DATABASE_PROCESS_START_TIME_DEADLINE_SECONDS == 45.0
   assert (
     pigeond.navigation_database_process_start_wait_seconds(
       cycle_started_at=10.0,
@@ -27,63 +28,12 @@ def test_process_start_wait_has_separate_absolute_deadline() -> None:
   )
 
 
-@pytest.mark.parametrize(
-  ("overrides", "expected"),
-  (
-    ({}, True),
-    ({"restore_pending": False}, False),
-    ({"state_available": False}, False),
-    ({"candidate_available": False}, False),
-    ({"allow_wait": False}, False),
-    ({"network_available": False}, False),
-    ({"network_available": False, "network_recheck_available": True}, True),
-    ({"network_available": None}, True),
-    ({"acquisition_started": True}, False),
-    ({"current_network_time": True}, False),
-  ),
-)
-def test_database_wait_requires_every_process_start_gate(
-  overrides: dict[str, bool],
-  expected: bool,
-) -> None:
-  values = {
-    "restore_pending": True,
-    "state_available": True,
-    "candidate_available": True,
-    "allow_wait": True,
-    "network_available": True,
-    "network_recheck_available": False,
-    "acquisition_started": False,
-    "current_network_time": False,
-  }
-  values.update(overrides)
-  assert (
-    pigeond.should_wait_for_navigation_database_trusted_time(**values)
-    is expected
-  )
+def test_initialize_receiver_cycle_rejects_legacy_trusted_time_wait_switch() -> None:
+  import inspect
 
-
-@pytest.mark.parametrize(
-  ("wait_attempted", "network_available", "expected"),
-  (
-    (False, None, False),
-    (True, False, True),
-    (True, None, True),
-    (True, True, True),
-  ),
-)
-def test_database_wait_timeout_requires_network_opportunity(
-  wait_attempted: bool,
-  network_available: bool | None,
-  expected: bool,
-) -> None:
-  assert (
-    pigeond.navigation_database_trusted_time_wait_expired(
-      wait_attempted=wait_attempted,
-      network_available=network_available,
-    )
-    is expected
-  )
+  signature = inspect.signature(pigeond.initialize_receiver_cycle)
+  assert "allow_database_trusted_time_wait" not in signature.parameters
+  assert "network_available_reader" not in signature.parameters
 
 
 def test_device_network_availability_distinguishes_unready_from_offline() -> None:

@@ -178,7 +178,8 @@ def test_position_failure_kind_survives_runtime_result_mapping(
     position_assistance_message_type=0x01,
     position_assistance_write_status=(
       PositionAssistanceWriteStatus.SUCCEEDED
-      if failure_kind in (
+      if failure_kind
+      in (
         PositionAssistanceFailureKind.ACK_REJECTED,
         PositionAssistanceFailureKind.ACK_TIMEOUT,
         PositionAssistanceFailureKind.ACK_OBSERVATION_FAILED,
@@ -198,21 +199,13 @@ def test_position_failure_kind_survives_runtime_result_mapping(
         )
       )
     ),
-    position_assistance_ack_info_code=(
-      5
-      if failure_kind is PositionAssistanceFailureKind.ACK_REJECTED
-      else None
-    ),
+    position_assistance_ack_info_code=(5 if failure_kind is PositionAssistanceFailureKind.ACK_REJECTED else None),
     position_assistance_failure_kind=failure_kind,
     position_assistance_error_type="InjectedPositionError",
     position_assistance_error="InjectedPositionError:receiver detail",
   )
 
-  result = (
-    pigeond.navigation_assistance_result_from_database_execution(
-      execution
-    )
-  )
+  result = pigeond.navigation_assistance_result_from_database_execution(execution)
   summary = pigeond.format_navigation_assistance_restore_summary(
     result,
     attempted=True,
@@ -224,27 +217,15 @@ def test_position_failure_kind_survives_runtime_result_mapping(
   assert not result.position_assistance_succeeded
   assert result.position_assistance_message_id == 0x40
   assert result.position_assistance_message_type == 0x01
-  assert (
-    result.position_assistance_error_type
-    == "InjectedPositionError"
-  )
-  assert (
-    result.position_assistance_error
-    == "InjectedPositionError:receiver detail"
-  )
+  assert result.position_assistance_error_type == "InjectedPositionError"
+  assert result.position_assistance_error == "InjectedPositionError:receiver detail"
   assert f"failure_phase={expected_phase.value}" in summary
   assert "position_assistance_attempted=true" in summary
   assert "position_assistance_succeeded=false" in summary
   assert "position_assistance_message_id=0x40" in summary
   assert "position_assistance_message_type=0x01" in summary
-  assert (
-    "position_assistance_error_type=InjectedPositionError"
-    in summary
-  )
-  assert (
-    "position_assistance_error=InjectedPositionError:receiver detail"
-    in summary
-  )
+  assert "position_assistance_error_type=InjectedPositionError" in summary
+  assert "position_assistance_error=InjectedPositionError:receiver detail" in summary
 
 
 def test_database_transfer_and_candidate_telemetry_survive_mapping() -> None:
@@ -257,9 +238,7 @@ def test_database_transfer_and_candidate_telemetry_survive_mapping() -> None:
     error="NavigationDatabaseRestoreTransferDeadlineError:budget expired",
   )
   execution = NavigationDatabaseRestoreExecution(
-    disposition=(
-      NavigationDatabaseRestoreDisposition.RESTORE_TRANSFER_DEADLINE
-    ),
+    disposition=(NavigationDatabaseRestoreDisposition.RESTORE_TRANSFER_DEADLINE),
     total_frame_count=69,
     accepted_frame_count=2,
     database_write_attempt_count=3,
@@ -277,11 +256,7 @@ def test_database_transfer_and_candidate_telemetry_survive_mapping() -> None:
     transfer_deadline=25.0,
   )
 
-  result = (
-    pigeond.navigation_assistance_result_from_database_execution(
-      execution
-    )
-  )
+  result = pigeond.navigation_assistance_result_from_database_execution(execution)
   summary = pigeond.format_navigation_assistance_restore_summary(
     result,
     attempted=True,
@@ -294,10 +269,7 @@ def test_database_transfer_and_candidate_telemetry_survive_mapping() -> None:
   assert result.database_restore_transfer_elapsed_seconds == 15.0
   assert result.database_restore_first_failed_frame_index == 2
   assert result.database_restore_first_failed_attempt == 2
-  assert (
-    result.database_restore_first_failure_kind
-    == NavigationDatabaseRestoreFrameFailureKind.TRANSFER_DEADLINE.value
-  )
+  assert result.database_restore_first_failure_kind == NavigationDatabaseRestoreFrameFailureKind.TRANSFER_DEADLINE.value
   assert "restored_cache_database_digest=" + "a" * 64 in summary
   assert "restored_cache_maximum_age_seconds=3600.0" in summary
   assert "database_restore_transfer_elapsed_seconds=15.0" in summary
@@ -315,41 +287,23 @@ def test_position_nack_ack_detail_survives_restore_log() -> None:
     position_assistance_succeeded=False,
     position_assistance_message_id=0x40,
     position_assistance_message_type=0x01,
-    position_assistance_write_status=(
-      PositionAssistanceWriteStatus.SUCCEEDED
-    ),
-    position_assistance_ack_status=(
-      PositionAssistanceAckStatus.REJECTED
-    ),
+    position_assistance_write_status=(PositionAssistanceWriteStatus.SUCCEEDED),
+    position_assistance_ack_status=(PositionAssistanceAckStatus.REJECTED),
     position_assistance_ack_info_code=5,
-    position_assistance_failure_kind=(
-      PositionAssistanceFailureKind.ACK_REJECTED
-    ),
+    position_assistance_failure_kind=(PositionAssistanceFailureKind.ACK_REJECTED),
     position_assistance_error_type="MgaReceiverNackError",
-    position_assistance_error=(
-      "MgaReceiverNackError:u-blox rejected MGA message: ack_infoCode=5"
-    ),
+    position_assistance_error=("MgaReceiverNackError:u-blox rejected MGA message: ack_infoCode=5"),
   )
 
-  result = (
-    pigeond.navigation_assistance_result_from_database_execution(
-      execution
-    )
-  )
+  result = pigeond.navigation_assistance_result_from_database_execution(execution)
   summary = pigeond.format_navigation_assistance_restore_summary(
     result,
     attempted=True,
     time_assistance_source="system_synchronized",
   )
 
-  assert (
-    result.failure_phase
-    is pigeond.NavigationAssistanceRestoreFailurePhase.POSITION_ASSISTANCE_ACK_REJECTED
-  )
-  assert (
-    result.position_assistance_ack_status
-    is PositionAssistanceAckStatus.REJECTED
-  )
+  assert result.failure_phase is pigeond.NavigationAssistanceRestoreFailurePhase.POSITION_ASSISTANCE_ACK_REJECTED
+  assert result.position_assistance_ack_status is PositionAssistanceAckStatus.REJECTED
   assert result.position_assistance_ack_info_code == 5
   assert "position_assistance_ack_status=rejected" in summary
   assert "position_assistance_ack_info_code=5" in summary
@@ -365,13 +319,9 @@ def test_startup_timeline_formats_correlated_fields() -> None:
     permanently_rejected_indexes=(1,),
     permanently_timed_out_indexes=(2,),
     restored_cache_generation="primary",
-    restored_cache_selection_reason=(
-      "trusted_age_only_eligible:primary"
-    ),
+    restored_cache_selection_reason=("trusted_age_only_eligible:primary"),
     restored_cache_age_seconds=1800.0,
-    database_restore_disposition=(
-      NavigationDatabaseRestoreDisposition.RESTORED
-    ),
+    database_restore_disposition=(NavigationDatabaseRestoreDisposition.RESTORED),
     database_frames_attempted_count=3,
   )
 
@@ -407,26 +357,14 @@ def test_startup_timeline_formats_correlated_fields() -> None:
   assert "GPS startup timeline" in message
   assert "cycle=2" in message
   assert "reason=process_start" in message
-  assert (
-    "trusted_time_wait_started_cycle_seconds=2.000"
-    in message
-  )
-  assert (
-    "trusted_time_wait_completed_cycle_seconds=34.500"
-    in message
-  )
+  assert "trusted_time_wait_started_cycle_seconds=2.000" in message
+  assert "trusted_time_wait_completed_cycle_seconds=34.500" in message
   assert "trusted_time_wait_duration_seconds=32.500" in message
-  assert (
-    "independent_network_time_first_seen_cycle_seconds=34.500"
-    in message
-  )
+  assert "independent_network_time_first_seen_cycle_seconds=34.500" in message
   assert "trusted_time_available=true" in message
   assert "database_restore_disposition=restored" in message
   assert "restored_cache_generation=primary" in message
-  assert (
-    "restored_cache_selection_reason=trusted_age_only_eligible:primary"
-    in message
-  )
+  assert "restored_cache_selection_reason=trusted_age_only_eligible:primary" in message
   assert "restored_cache_age_seconds=1800.0" in message
   assert "database_frames_attempted=3" in message
   assert "database_frames_accepted=2" in message
@@ -434,27 +372,15 @@ def test_startup_timeline_formats_correlated_fields() -> None:
   assert "database_timeout_events=2" in message
   assert "time_assistance_attempted_cycle_seconds=34.600" in message
   assert "time_assistance_written_cycle_seconds=34.700" in message
-  assert (
-    "time_assistance_ack_observed_cycle_seconds=34.800"
-    in message
-  )
+  assert "time_assistance_ack_observed_cycle_seconds=34.800" in message
   assert "time_assistance_write_status=succeeded" in message
   assert "time_assistance_ack_status=rejected" in message
   assert "time_assistance_ack_info_code=5" in message
   assert "time_assistance_accepted_cycle_seconds=none" in message
-  assert (
-    "time_assistance_accepted_before_gnss_start=false"
-    in message
-  )
-  assert (
-    "acquisition_start_claimed_cycle_seconds=35.000"
-    in message
-  )
+  assert "time_assistance_accepted_before_gnss_start=false" in message
+  assert "acquisition_start_claimed_cycle_seconds=35.000" in message
   assert "gnss_start_sent_cycle_seconds=35.100" in message
-  assert (
-    "related_acquisition_milestones=first_nonempty_rawx|first_fix_ok|first_reliable_fix"
-    in message
-  )
+  assert "related_acquisition_milestones=first_nonempty_rawx|first_fix_ok|first_reliable_fix" in message
 
 
 def test_startup_timeline_rejects_incomplete_time_stub() -> None:
@@ -467,12 +393,8 @@ def test_startup_timeline_rejects_incomplete_time_stub() -> None:
     observed_boottime_seconds=100.0,
   )
 
-  assert not pigeond._startup_timeline_has_current_network_time(
-    incomplete
-  )
-  assert pigeond._startup_timeline_has_current_network_time(
-    network_time()
-  )
+  assert not pigeond._startup_timeline_has_current_network_time(incomplete)
+  assert pigeond._startup_timeline_has_current_network_time(network_time())
 
 
 def test_paused_acquisition_records_start_timestamp(
@@ -482,19 +404,14 @@ def test_paused_acquisition_records_start_timestamp(
   monkeypatch.setattr(pigeond.time, "sleep", lambda _delay: None)
   monkeypatch.setattr(pigeond.time, "monotonic", lambda: 12.5)
 
-  with pigeond.install_pre_acquisition_initialization(
-    lambda: None
-  ) as initialization:
+  with pigeond.install_pre_acquisition_initialization(lambda: None) as initialization:
     with pigeond.paused_gnss_acquisition(
       pigeon  # type: ignore[arg-type, ty:invalid-argument-type]
     ):
       initialization.run()
 
   assert initialization.gnss_start_sent_at == 12.5
-  assert (
-    pigeon.sent[-1]
-    == pigeond.CONTROLLED_GNSS_START_MESSAGE
-  )
+  assert pigeon.sent[-1] == pigeond.CONTROLLED_GNSS_START_MESSAGE
 
 
 def test_paused_gnss_acquisition_starts_after_body_failure(
@@ -639,246 +556,17 @@ def test_configuration_traffic_closes_database_window_before_write(
 
 # COMMIT6_PIGEOND_SAFETY_TESTS
 
-def test_bounded_wait_accepts_delayed_network_time() -> None:
-  clock = [0.0]
-  sleeps: list[float] = []
-  evaluations = [SimpleNamespace(authorized_time=None), SimpleNamespace(authorized_time=network_time())]
-  def monotonic() -> float:
-    return clock[0]
-  def sleeper(delay: float) -> None:
-    sleeps.append(delay)
-    clock[0] += delay
-  def evaluator(_authority, _observation):
-    return evaluations.pop(0)
 
-  observation, evaluation = pigeond.wait_for_current_independent_network_time(
-    object(),  # type: ignore[arg-type, ty:invalid-argument-type]
-    None,
-    SimpleNamespace(authorized_time=None),  # type: ignore[arg-type, ty:invalid-argument-type]
-    timeout_seconds=1.0,
-    poll_seconds=0.25,
-    observation_reader=lambda: None,
-    evaluator=evaluator,  # type: ignore[arg-type]
-    monotonic=lambda: 0.0,
-    sleeper=sleeper,
-  )
-  assert observation is None
-  assert evaluation.authorized_time == network_time()
-  assert sleeps == [0.25, 0.25]
-
-
-
-def test_offline_wait_is_bounded_by_shorter_overall_timeout() -> None:
-  clock = [0.0]
-
-  observation, evaluation = (
-    pigeond.wait_for_current_independent_network_time(
-      object(),  # type: ignore[arg-type, ty:invalid-argument-type]
-      None,
-      SimpleNamespace(authorized_time=None),  # type: ignore[arg-type, ty:invalid-argument-type]
-      timeout_seconds=1.0,
-      poll_seconds=0.25,
-      observation_reader=lambda: None,
-      evaluator=lambda _authority, _observation: SimpleNamespace(
-        authorized_time=None
-      ),  # type: ignore[arg-type, ty:invalid-argument-type]
-      monotonic=lambda: clock[0],
-      sleeper=lambda delay: clock.__setitem__(0, clock[0] + delay),
-      initial_network_available=False,
-      network_available_reader=lambda: False,
-    )
-  )
-
-  assert observation is None
-  assert evaluation.authorized_time is None
-  assert clock[0] == pytest.approx(1.0)
-
-
-def test_persistent_offline_wait_uses_bounded_overall_deadline() -> None:
-  clock = [0.0]
-
-  pigeond.wait_for_current_independent_network_time(
-    object(),  # type: ignore[arg-type, ty:invalid-argument-type]
-    None,
-    SimpleNamespace(authorized_time=None),  # type: ignore[arg-type, ty:invalid-argument-type]
-    timeout_seconds=10.0,
-    poll_seconds=0.25,
-    observation_reader=lambda: None,
-    evaluator=lambda _authority, _observation: SimpleNamespace(
-      authorized_time=None
-    ),  # type: ignore[arg-type, ty:invalid-argument-type]
-    monotonic=lambda: clock[0],
-    sleeper=lambda delay: clock.__setitem__(0, clock[0] + delay),
-    initial_network_available=False,
-    network_available_reader=lambda: False,
-  )
-
-  assert clock[0] == pytest.approx(10.0)
-
-
-def test_unready_device_state_wait_uses_bounded_overall_deadline() -> None:
-  clock = [0.0]
-
-  _observation, evaluation = (
-    pigeond.wait_for_current_independent_network_time(
-      object(),  # type: ignore[arg-type, ty:invalid-argument-type]
-      None,
-      SimpleNamespace(authorized_time=None),  # type: ignore[arg-type, ty:invalid-argument-type]
-      timeout_seconds=10.0,
-      poll_seconds=0.25,
-      observation_reader=lambda: None,
-      evaluator=lambda _authority, _observation: SimpleNamespace(
-        authorized_time=None
-      ),  # type: ignore[arg-type, ty:invalid-argument-type]
-      monotonic=lambda: clock[0],
-      sleeper=lambda delay: clock.__setitem__(0, clock[0] + delay),
-      initial_network_available=None,
-      network_available_reader=lambda: None,
-    )
-  )
-
-  assert evaluation.authorized_time is None
-  assert clock[0] == pytest.approx(10.0)
-
-
-def test_offline_to_online_transition_beyond_five_seconds_reaches_time() -> None:
-  clock = [0.0]
-
-  def evaluator(_authority, _observation):
-    return SimpleNamespace(
-      authorized_time=network_time() if clock[0] >= 12.0 else None
-    )
-
-  _observation, evaluation = (
-    pigeond.wait_for_current_independent_network_time(
-      object(),  # type: ignore[arg-type, ty:invalid-argument-type]
-      None,
-      SimpleNamespace(authorized_time=None),  # type: ignore[arg-type, ty:invalid-argument-type]
-      timeout_seconds=20.0,
-      poll_seconds=0.25,
-      observation_reader=lambda: None,
-      evaluator=evaluator,  # type: ignore[arg-type]
-      monotonic=lambda: clock[0],
-      sleeper=lambda delay: clock.__setitem__(0, clock[0] + delay),
-      initial_network_available=False,
-      network_available_reader=lambda: clock[0] >= 10.0,
-    )
-  )
-
-  assert evaluation.authorized_time == network_time()
-  assert clock[0] == pytest.approx(12.0)
-
-
-def test_network_drop_after_opportunity_does_not_abort_sync_wait() -> None:
-  clock = [0.0]
-
-  def evaluator(_authority, _observation):
-    return SimpleNamespace(
-      authorized_time=network_time() if clock[0] >= 2.0 else None
-    )
-
-  _observation, evaluation = (
-    pigeond.wait_for_current_independent_network_time(
-      object(),  # type: ignore[arg-type, ty:invalid-argument-type]
-      None,
-      SimpleNamespace(authorized_time=None),  # type: ignore[arg-type, ty:invalid-argument-type]
-      timeout_seconds=10.0,
-      poll_seconds=0.25,
-      observation_reader=lambda: None,
-      evaluator=evaluator,  # type: ignore[arg-type]
-      monotonic=lambda: clock[0],
-      sleeper=lambda delay: clock.__setitem__(0, clock[0] + delay),
-      initial_network_available=True,
-      network_available_reader=lambda: False,
-    )
-  )
-
-  assert evaluation.authorized_time == network_time()
-  assert clock[0] == pytest.approx(2.0)
-
-
-def test_default_wait_covers_observed_c4_network_sync_delay() -> None:
-  clock = [0.0]
-  sleeps: list[float] = []
-
-  def monotonic() -> float:
-    return clock[0]
-
-  def sleeper(delay: float) -> None:
-    sleeps.append(delay)
-    clock[0] += delay
-
-  def evaluator(_authority, _observation):
-    return SimpleNamespace(
-      authorized_time=network_time() if clock[0] >= 32.5 else None
-    )
-
-  observation, evaluation = (
-    pigeond.wait_for_current_independent_network_time(
-      object(),  # type: ignore[arg-type, ty:invalid-argument-type]
-      None,
-      SimpleNamespace(authorized_time=None),  # type: ignore[arg-type, ty:invalid-argument-type]
-      observation_reader=lambda: None,
-      evaluator=evaluator,  # type: ignore[arg-type]
-      monotonic=monotonic,
-      sleeper=sleeper,
-    )
-  )
-
-  assert (
-    pigeond.NAVIGATION_DATABASE_TRUSTED_TIME_WAIT_SECONDS
-    == 40.0
-  )
-  assert observation is None
-  assert evaluation.authorized_time == network_time()
-  assert clock[0] == pytest.approx(32.5)
-  assert sum(sleeps) == pytest.approx(32.5)
-
-
-def test_default_wait_remains_bounded_without_network_time() -> None:
-  clock = [0.0]
-  sleeps: list[float] = []
-
-  def monotonic() -> float:
-    return clock[0]
-
-  def sleeper(delay: float) -> None:
-    sleeps.append(delay)
-    clock[0] += delay
-
-  def evaluator(_authority, _observation):
-    return SimpleNamespace(authorized_time=None)
-
-  observation, evaluation = (
-    pigeond.wait_for_current_independent_network_time(
-      object(),  # type: ignore[arg-type, ty:invalid-argument-type]
-      None,
-      SimpleNamespace(authorized_time=None),  # type: ignore[arg-type, ty:invalid-argument-type]
-      observation_reader=lambda: None,
-      evaluator=evaluator,  # type: ignore[arg-type]
-      monotonic=monotonic,
-      sleeper=sleeper,
-    )
-  )
-
-  assert observation is None
-  assert evaluation.authorized_time is None
-  assert clock[0] == pytest.approx(40.0)
-  assert sum(sleeps) == pytest.approx(40.0)
-  assert sleeps
-  assert all(
-    0.0 < delay
-    <= pigeond.NAVIGATION_DATABASE_TRUSTED_TIME_POLL_SECONDS
-    for delay in sleeps
-  )
-
+def test_legacy_prestart_trusted_time_wait_helpers_are_removed() -> None:
+  assert not hasattr(pigeond, "wait_for_current_independent_network_time")
+  assert not hasattr(pigeond, "should_wait_for_navigation_database_trusted_time")
+  assert not hasattr(pigeond, "NAVIGATION_DATABASE_TRUSTED_TIME_WAIT_SECONDS")
+  assert not hasattr(pigeond, "NAVIGATION_DATABASE_TRUSTED_TIME_POLL_SECONDS")
 
 
 def test_yuma_claim_happens_before_receiver_write() -> None:
   events: list[str] = []
-  runtime = SimpleNamespace(
-    claim_yuma_transmission=lambda: events.append("claim") or True
-  )
+  runtime = SimpleNamespace(claim_yuma_transmission=lambda: events.append("claim") or True)
   pigeond.send_yuma_with_durable_claim(
     runtime,  # type: ignore[arg-type, ty:invalid-argument-type]
     lambda _message: events.append("write"),
@@ -965,14 +653,6 @@ def test_delayed_network_time_is_not_awaited_before_start(
     "evaluate_time_authority",
     lambda _authority, _observation: SimpleNamespace(authorized_time=None),
   )
-  monkeypatch.setattr(
-    pigeond,
-    "wait_for_current_independent_network_time",
-    lambda _authority, observation, _evaluation, **_kwargs: (
-      events.append("trusted_time_arrived") or observation,
-      SimpleNamespace(authorized_time=network_time()),
-    ),
-  )
   monkeypatch.setattr(pigeond, "poll_mon_ver", lambda _pigeon: None)
   monkeypatch.setattr(pigeond, "configure_navx5_ack_aiding", lambda *_args: None)
   monkeypatch.setattr(pigeond, "log_navx5_ack_aiding_support", lambda _info: None)
@@ -1015,9 +695,7 @@ def test_delayed_network_time_is_not_awaited_before_start(
     time_provenance=FakeProvenance(),  # type: ignore[arg-type, ty:invalid-argument-type]
     navigation_database_runtime=runtime,
     cycle_started_at=0.0,
-    allow_database_trusted_time_wait=True,
     network_available=None,
-    network_available_reader=lambda: True,
   )
 
   restore = result.navigation_assistance_restore_result
@@ -1053,24 +731,7 @@ def test_initial_offline_state_is_not_rechecked_before_start(
     boot_id_reader=lambda: BOOT_ID,
     boottime_reader=lambda: TEST_BOOTTIME_SECONDS,
   )
-  network_reads = iter((False, True))
   database_indexes: list[int] = []
-
-  def transition_wait(
-    _authority,
-    observation,
-    _evaluation,
-    *,
-    timeout_seconds: float,
-    initial_network_available: bool | None,
-    network_available_reader,
-  ):
-    assert timeout_seconds > 0.0
-    assert initial_network_available is False
-    assert network_available_reader() is False
-    assert network_available_reader() is True
-    events.append("trusted_time_arrived")
-    return observation, SimpleNamespace(authorized_time=network_time())
 
   def send_mga(_pigeon, _message, **kwargs):
     if before_send := kwargs.get("before_send"):
@@ -1087,7 +748,6 @@ def test_initial_offline_state_is_not_rechecked_before_start(
     "evaluate_time_authority",
     lambda _authority, _observation: SimpleNamespace(authorized_time=None),
   )
-  monkeypatch.setattr(pigeond, "wait_for_current_independent_network_time", transition_wait)
   monkeypatch.setattr(pigeond, "poll_mon_ver", lambda _pigeon: None)
   monkeypatch.setattr(pigeond, "configure_navx5_ack_aiding", lambda *_args: None)
   monkeypatch.setattr(pigeond, "log_navx5_ack_aiding_support", lambda _info: None)
@@ -1106,9 +766,7 @@ def test_initial_offline_state_is_not_rechecked_before_start(
     time_authority=object(),  # type: ignore[arg-type, ty:invalid-argument-type]
     time_provenance=FakeProvenance(),  # type: ignore[arg-type, ty:invalid-argument-type]
     navigation_database_runtime=runtime,
-    allow_database_trusted_time_wait=True,
     network_available=False,
-    network_available_reader=lambda: next(network_reads),
   )
 
   restore = result.navigation_assistance_restore_result
@@ -1120,7 +778,7 @@ def test_initial_offline_state_is_not_rechecked_before_start(
   assert events.index("normal_configuration") < events.index("gnss_start")
 
 
-def test_obsolete_trusted_time_wait_callback_is_not_invoked(
+def test_initialize_never_invokes_removed_trusted_time_wait(
   tmp_path: Path,
   monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1133,19 +791,6 @@ def test_obsolete_trusted_time_wait_callback_is_not_invoked(
     boot_id_reader=lambda: BOOT_ID,
     boottime_reader=lambda: TEST_BOOTTIME_SECONDS,
   )
-  def failed_wait(
-    _authority,
-    observation,
-    evaluation,
-    *,
-    timeout_seconds: float,
-    initial_network_available: bool | None,
-    network_available_reader,
-  ):
-    del observation, evaluation, timeout_seconds
-    del initial_network_available, network_available_reader
-    raise RuntimeError("trusted-time reader failed")
-
   monkeypatch.setattr(pigeond.time, "sleep", lambda _delay: None)
   monkeypatch.setattr(pigeond, "start_pigeon_transport", lambda _pigeon: None)
   monkeypatch.setattr(pigeond, "read_host_time_observation", lambda: None)
@@ -1154,7 +799,6 @@ def test_obsolete_trusted_time_wait_callback_is_not_invoked(
     "evaluate_time_authority",
     lambda _authority, _observation: SimpleNamespace(authorized_time=None),
   )
-  monkeypatch.setattr(pigeond, "wait_for_current_independent_network_time", failed_wait)
   monkeypatch.setattr(pigeond, "poll_mon_ver", lambda _pigeon: None)
   monkeypatch.setattr(pigeond, "configure_navx5_ack_aiding", lambda *_args: None)
   monkeypatch.setattr(pigeond, "log_navx5_ack_aiding_support", lambda _info: None)
@@ -1173,9 +817,7 @@ def test_obsolete_trusted_time_wait_callback_is_not_invoked(
     time_authority=object(),  # type: ignore[arg-type, ty:invalid-argument-type]
     time_provenance=FakeProvenance(),  # type: ignore[arg-type, ty:invalid-argument-type]
     navigation_database_runtime=runtime,
-    allow_database_trusted_time_wait=True,
     network_available=False,
-    network_available_reader=lambda: True,
   )
 
   restore = result.navigation_assistance_restore_result
@@ -1251,10 +893,7 @@ def test_bootstrap_acquisition_frames_use_exact_early_outcome(
   restore = result.navigation_assistance_restore_result
   assert restore is not None
   assert runtime.acquisition_started
-  assert (
-    runtime.controller.disposition
-    is NavigationDatabaseRestoreDisposition.SKIPPED_EARLY_ACQUISITION
-  )
+  assert runtime.controller.disposition is NavigationDatabaseRestoreDisposition.SKIPPED_EARLY_ACQUISITION
   assert database_indexes == []
   assert len(position_writes) == 1
   assert events.index("gnss_stop") < events.index("normal_configuration")
@@ -1288,17 +927,13 @@ def configure_deferred_assistance_startup(
   monkeypatch.setattr(
     pigeond,
     "configure_navx5_ack_aiding",
-    lambda *_args, **_kwargs: (
-      pigeond.Navx5AckAidingConfigurationResult.DEADLINE_EXHAUSTED
-    ),
+    lambda *_args, **_kwargs: pigeond.Navx5AckAidingConfigurationResult.DEADLINE_EXHAUSTED,
   )
   monkeypatch.setattr(pigeond, "read_host_time_observation", lambda: None)
   monkeypatch.setattr(
     pigeond,
     "evaluate_time_authority",
-    lambda _authority, _observation: SimpleNamespace(
-      authorized_time=network_time()
-    ),
+    lambda _authority, _observation: SimpleNamespace(authorized_time=network_time()),
   )
   monkeypatch.setattr(
     pigeond,
@@ -1587,29 +1222,11 @@ def test_drive2_expired_cache_no_time_cannot_starve_configuration(
 
   database_indexes: list[int] = []
   timeline_calls: list[dict[str, object]] = []
-  wait_timeouts: list[float] = []
   pre_start_ack_timeouts: list[float] = []
   configuration_items: list[tuple[str, bool]] = []
 
   def monotonic() -> float:
     return clock[0]
-
-  def delayed_wait(
-    _authority,
-    observation,
-    _evaluation,
-    *,
-    timeout_seconds: float,
-    initial_network_available: bool | None,
-    network_available_reader,
-  ):
-    wait_timeouts.append(timeout_seconds)
-    assert initial_network_available is True
-    assert network_available_reader() is True
-    events.append("network_state_arrived")
-    clock[0] = 42.0
-    events.append("trusted_time_arrived")
-    return observation, SimpleNamespace(authorized_time=network_time())
 
   def send_mga(_pigeon, _message, **kwargs):
     if before_send := kwargs.get("before_send"):
@@ -1631,10 +1248,12 @@ def test_drive2_expired_cache_no_time_cannot_starve_configuration(
     return True
 
   def run_configuration_item(**kwargs):
-    configuration_items.append((
-      kwargs["item_name"],
-      kwargs["mandatory"],
-    ))
+    configuration_items.append(
+      (
+        kwargs["item_name"],
+        kwargs["mandatory"],
+      )
+    )
     events.append(f"configuration:{kwargs['item_name']}")
     return pigeond.ReceiverConfigurationItemResult(
       item_name=kwargs["item_name"],
@@ -1667,7 +1286,6 @@ def test_drive2_expired_cache_no_time_cannot_starve_configuration(
     "evaluate_time_authority",
     lambda _authority, _observation: SimpleNamespace(authorized_time=None),
   )
-  monkeypatch.setattr(pigeond, "wait_for_current_independent_network_time", delayed_wait)
   monkeypatch.setattr(pigeond, "poll_mon_ver", lambda _pigeon: None)
   monkeypatch.setattr(pigeond, "configure_navx5_ack_aiding", lambda *_args: None)
   monkeypatch.setattr(pigeond, "log_navx5_ack_aiding_support", lambda _info: None)
@@ -1699,7 +1317,6 @@ def test_drive2_expired_cache_no_time_cannot_starve_configuration(
     time_authority=object(),  # type: ignore[arg-type, ty:invalid-argument-type]
     time_provenance=FakeProvenance(),  # type: ignore[arg-type, ty:invalid-argument-type]
     cycle_started_at=0.0,
-    allow_database_trusted_time_wait=True,
     network_available=False,
     assistance_state_factory=create_assistance_state,
     assistance_state_ready_callback=activate_assistance_state,
@@ -1710,7 +1327,6 @@ def test_drive2_expired_cache_no_time_cannot_starve_configuration(
   assert poll_deferred is not None
   restore = poll_deferred()
   assert restore is not None
-  assert wait_timeouts == []
   assert clock[0] == pytest.approx(3.0)
   assert runtime.controller.disposition is NavigationDatabaseRestoreDisposition.SKIPPED_NO_TRUSTED_TIME
   assert restore.database_frames_attempted_count == 0
@@ -1725,16 +1341,8 @@ def test_drive2_expired_cache_no_time_cannot_starve_configuration(
   assert "position_write" not in events
   assert runtime.execution.position_assistance_attempted
   assert not runtime.execution.position_assistance_succeeded
-  mandatory_items = tuple(
-    item_name
-    for item_name, mandatory in configuration_items
-    if mandatory
-  )
-  assert mandatory_items == tuple(
-    item_name
-    for item_name, mandatory in pigeond.RECEIVER_CONFIGURATION_ITEM_INVENTORY
-    if mandatory
-  )
+  mandatory_items = tuple(item_name for item_name, mandatory in configuration_items if mandatory)
+  assert mandatory_items == tuple(item_name for item_name, mandatory in pigeond.RECEIVER_CONFIGURATION_ITEM_INVENTORY if mandatory)
   assert {
     "CFG-MSG-NAV-PVT",
     "CFG-MSG-RXM-RAWX",
@@ -1750,12 +1358,10 @@ def test_drive2_expired_cache_no_time_cannot_starve_configuration(
   assert events.index("gnss_start") < events.index("assistance_state_factory")
   assert events.index("assistance_state_factory") < events.index("assistance_state_ready")
   optional_events = [
-    event for event in events if event.startswith("configuration:")
-    and event.split(":", 1)[1] in {
-      item_name
-      for item_name, mandatory in pigeond.RECEIVER_CONFIGURATION_ITEM_INVENTORY
-      if not mandatory
-    }
+    event
+    for event in events
+    if event.startswith("configuration:")
+    and event.split(":", 1)[1] in {item_name for item_name, mandatory in pigeond.RECEIVER_CONFIGURATION_ITEM_INVENTORY if not mandatory}
   ]
   assert optional_events
   assert all(events.index(event) > events.index("gnss_start") for event in optional_events)
@@ -1824,16 +1430,12 @@ def test_deadline_boundary_skips_assistance_after_mandatory_configuration(
   monkeypatch.setattr(
     pigeond,
     "configure_navx5_ack_aiding",
-    lambda *_args, **_kwargs: (
-      pigeond.Navx5AckAidingConfigurationResult.DEADLINE_EXHAUSTED
-    ),
+    lambda *_args, **_kwargs: pigeond.Navx5AckAidingConfigurationResult.DEADLINE_EXHAUSTED,
   )
   monkeypatch.setattr(
     pigeond,
     "read_host_time_observation",
-    lambda: (_ for _ in ()).throw(
-      AssertionError("trusted time checked after deadline")
-    ),
+    lambda: (_ for _ in ()).throw(AssertionError("trusted time checked after deadline")),
   )
   monkeypatch.setattr(pigeond, "send_mga_with_strict_ack", send_mga)
   monkeypatch.setattr(
@@ -1919,17 +1521,13 @@ def test_tiny_factory_budget_defers_real_factory_until_after_start(
   monkeypatch.setattr(
     pigeond,
     "configure_navx5_ack_aiding",
-    lambda *_args, **_kwargs: (
-      pigeond.Navx5AckAidingConfigurationResult.DEADLINE_EXHAUSTED
-    ),
+    lambda *_args, **_kwargs: pigeond.Navx5AckAidingConfigurationResult.DEADLINE_EXHAUSTED,
   )
   monkeypatch.setattr(pigeond, "read_host_time_observation", lambda: None)
   monkeypatch.setattr(
     pigeond,
     "evaluate_time_authority",
-    lambda _authority, _observation: SimpleNamespace(
-      authorized_time=network_time()
-    ),
+    lambda _authority, _observation: SimpleNamespace(authorized_time=network_time()),
   )
   monkeypatch.setattr(
     pigeond,
@@ -1996,6 +1594,7 @@ def test_factory_or_prepare_exception_is_fail_open_before_deadline(
   worker_complete = Event()
 
   if failure_phase == "prepare":
+
     def fail_prepare():
       try:
         events.append("assistance_state_prepare")
@@ -2025,17 +1624,13 @@ def test_factory_or_prepare_exception_is_fail_open_before_deadline(
   monkeypatch.setattr(
     pigeond,
     "configure_navx5_ack_aiding",
-    lambda *_args, **_kwargs: (
-      pigeond.Navx5AckAidingConfigurationResult.ALREADY_ENABLED
-    ),
+    lambda *_args, **_kwargs: pigeond.Navx5AckAidingConfigurationResult.ALREADY_ENABLED,
   )
   monkeypatch.setattr(pigeond, "read_host_time_observation", lambda: None)
   monkeypatch.setattr(
     pigeond,
     "evaluate_time_authority",
-    lambda _authority, _observation: SimpleNamespace(
-      authorized_time=network_time()
-    ),
+    lambda _authority, _observation: SimpleNamespace(authorized_time=network_time()),
   )
   monkeypatch.setattr(
     pigeond,
@@ -2144,8 +1739,7 @@ def test_trusted_time_available_evaluates_dbd_after_mandatory_configuration(
   monkeypatch.setattr(
     pigeond,
     "configure_navx5_ack_aiding",
-    lambda *_args, **_kwargs: events.append("navx5")
-    or pigeond.Navx5AckAidingConfigurationResult.ALREADY_ENABLED,
+    lambda *_args, **_kwargs: events.append("navx5") or pigeond.Navx5AckAidingConfigurationResult.ALREADY_ENABLED,
   )
   monkeypatch.setattr(
     pigeond,
@@ -2155,9 +1749,7 @@ def test_trusted_time_available_evaluates_dbd_after_mandatory_configuration(
   monkeypatch.setattr(
     pigeond,
     "evaluate_time_authority",
-    lambda _authority, _observation: SimpleNamespace(
-      authorized_time=network_time()
-    ),
+    lambda _authority, _observation: SimpleNamespace(authorized_time=network_time()),
   )
   monkeypatch.setattr(pigeond, "send_mga_with_strict_ack", send_mga)
   monkeypatch.setattr(
@@ -2213,6 +1805,7 @@ def test_trusted_time_available_evaluates_dbd_after_mandatory_configuration(
     assert not runtime.execution.position_assistance_succeeded
   assert events.index("time_write") < events.index("gnss_start")
 
+
 def test_pre_restore_drain_failure_is_terminal_and_gnss_starts(
   tmp_path: Path,
   monkeypatch: pytest.MonkeyPatch,
@@ -2267,16 +1860,12 @@ def test_pre_restore_drain_failure_is_terminal_and_gnss_starts(
     time_authority=object(),  # type: ignore[arg-type, ty:invalid-argument-type]
     time_provenance=FakeProvenance(),  # type: ignore[arg-type, ty:invalid-argument-type]
     navigation_database_runtime=runtime,
-    allow_database_trusted_time_wait=True,
     network_available=True,
   )
 
   restore = result.navigation_assistance_restore_result
   assert restore is not None
-  assert (
-    runtime.controller.disposition
-    is NavigationDatabaseRestoreDisposition.RESTORE_TRANSPORT_ERROR
-  )
+  assert runtime.controller.disposition is NavigationDatabaseRestoreDisposition.RESTORE_TRANSPORT_ERROR
   assert restore.database_restore_runtime_phase == "pre_restore_drain"
   assert restore.database_restore_execution_error == "OSError:drain failed"
   assert database_writes == []
@@ -2326,14 +1915,9 @@ def test_pending_dbd_blocks_yuma_until_terminal_then_survives_restart(
     authorized_time=network_time(),
     reliable_fix_available=False,
     yuma_already_sent=False,
-    send_database_message=(
-      lambda frame, index, _mark: database_writes.append((frame, index))
-    ),
+    send_database_message=(lambda frame, index, _mark: database_writes.append((frame, index))),
   )
-  assert (
-    result.disposition
-    is NavigationDatabaseRestoreDisposition.SKIPPED_WAIT_TIMEOUT
-  )
+  assert result.disposition is NavigationDatabaseRestoreDisposition.SKIPPED_WAIT_TIMEOUT
   assert database_writes == []
 
 
@@ -2367,11 +1951,7 @@ def test_trusted_time_wait_error_is_durable_and_not_a_timeout(
     send_database_message=lambda _frame, _index, _mark: None,
   )
 
-  assert (
-    result.disposition
-    is NavigationDatabaseRestoreDisposition.SKIPPED_WAIT_ERROR
-  )
-
+  assert result.disposition is NavigationDatabaseRestoreDisposition.SKIPPED_WAIT_ERROR
 
 
 def test_new_receiver_cycle_reopens_navigation_assistance_state(
@@ -2614,7 +2194,9 @@ def test_prepared_receiver_response_state_is_not_reset_twice(
   assert resets == 1
   assert not pigeon._receiver_cycle_response_state_prepared
 
+
 # COMMIT7_DBD_LIVE_BOUNDARY_TESTS
+
 
 def test_pr68_bootstrap_acquisition_skips_wait_drain_and_dbd(
   tmp_path: Path,
@@ -2634,9 +2216,7 @@ def test_pr68_bootstrap_acquisition_skips_wait_drain_and_dbd(
     def drain_before_transaction(self, operation: str) -> None:
       events.append(operation)
       if operation == "navigation_database_post_time_wait":
-        raise AssertionError(
-          "early acquisition must not execute the obsolete DBD drain"
-        )
+        raise AssertionError("early acquisition must not execute the obsolete DBD drain")
 
   pigeon = DrainPigeon(events)
   database_indexes: list[int] = []
@@ -2656,16 +2236,7 @@ def test_pr68_bootstrap_acquisition_skips_wait_drain_and_dbd(
   monkeypatch.setattr(
     pigeond,
     "evaluate_time_authority",
-    lambda _authority, _observation: SimpleNamespace(
-      authorized_time=None
-    ),
-  )
-  monkeypatch.setattr(
-    pigeond,
-    "wait_for_current_independent_network_time",
-    lambda *_args, **_kwargs: (_ for _ in ()).throw(
-      AssertionError("bootstrap acquisition must bypass trusted-time wait")
-    ),
+    lambda _authority, _observation: SimpleNamespace(authorized_time=None),
   )
   monkeypatch.setattr(
     pigeond,
@@ -2685,11 +2256,7 @@ def test_pr68_bootstrap_acquisition_skips_wait_drain_and_dbd(
   monkeypatch.setattr(
     pigeond,
     "send_mga_with_strict_ack",
-    lambda _pigeon, _message, **kwargs: (
-      database_indexes.append(kwargs["database_frame_index"])
-      if kwargs.get("database_frame_index") is not None
-      else None
-    ),
+    lambda _pigeon, _message, **kwargs: database_indexes.append(kwargs["database_frame_index"]) if kwargs.get("database_frame_index") is not None else None,
   )
   monkeypatch.setattr(
     pigeond,
@@ -2725,19 +2292,14 @@ def test_pr68_bootstrap_acquisition_skips_wait_drain_and_dbd(
     time_authority=object(),  # ty: ignore[invalid-argument-type]
     time_provenance=FakeProvenance(),  # ty: ignore[invalid-argument-type]
     navigation_database_runtime=runtime,
-    allow_database_trusted_time_wait=True,
     network_available=True,
   )
 
   assert "navigation_database_post_time_wait" not in events
   assert database_indexes == []
-  assert (
-    runtime.controller.disposition
-    is NavigationDatabaseRestoreDisposition.SKIPPED_ACQUISITION_ALREADY_STARTED
-  )
+  assert runtime.controller.disposition is NavigationDatabaseRestoreDisposition.SKIPPED_ACQUISITION_ALREADY_STARTED
   assert events.index("gnss_stop") < events.index("gnss_start")
   assert result.navigation_assistance_restore_attempted
-
 
 
 def test_database_ack_timeout_is_clamped_to_remaining_transfer_budget(
@@ -2791,12 +2353,14 @@ def test_frame_zero_transaction_drain_guard_blocks_receiver_write(tmp_path: Path
     boottime_reader=lambda: TEST_BOOTTIME_SECONDS,
   )
   receiver_writes: list[bytes] = []
+
   class DrainPigeon:
     def begin_response_transaction(self, message: bytes, _operation: str, before_send):
       assert runtime.note_acquisition_started()
       before_send()
       receiver_writes.append(message)
       raise AssertionError("DBD write guard returned after acquisition")
+
   pigeon = DrainPigeon()
 
   def send_database_frame(
@@ -2825,24 +2389,19 @@ def test_frame_zero_transaction_drain_guard_blocks_receiver_write(tmp_path: Path
   assert receiver_writes == []
   assert result.permanent_failures
 
+
 def test_assistance_state_initialization_failure_still_starts_gnss(
   monkeypatch: pytest.MonkeyPatch,
 ) -> None:
   events: list[str] = []
   pigeon = FakePigeon(events)
   assistance_writes: list[bytes] = []
-  retry_controller = (
-    pigeond.PositionAssistancePostStartRetryController(
-      cast(pigeond.PositionAssistanceRetryRuntime, SimpleNamespace())
-    )
-  )
+  retry_controller = pigeond.PositionAssistancePostStartRetryController(cast(pigeond.PositionAssistanceRetryRuntime, SimpleNamespace()))
 
   def unavailable_runtime(
     _receiver_fingerprint: str,
   ) -> NavigationDatabaseRestoreRuntime:
-    raise NavigationDatabaseRestoreInitializationError(
-      "boot_state:storage_unavailable"
-    )
+    raise NavigationDatabaseRestoreInitializationError("boot_state:storage_unavailable")
 
   monkeypatch.setattr(
     pigeond,
@@ -2863,16 +2422,7 @@ def test_assistance_state_initialization_failure_still_starts_gnss(
   monkeypatch.setattr(
     pigeond,
     "evaluate_time_authority",
-    lambda _authority, _observation: SimpleNamespace(
-      authorized_time=network_time()
-    ),
-  )
-  monkeypatch.setattr(
-    pigeond,
-    "wait_for_current_independent_network_time",
-    lambda *_args, **_kwargs: (_ for _ in ()).throw(
-      AssertionError("disabled assistance must not wait")
-    ),
+    lambda _authority, _observation: SimpleNamespace(authorized_time=network_time()),
   )
   monkeypatch.setattr(pigeond, "poll_mon_ver", lambda _pigeon: None)
   monkeypatch.setattr(
@@ -2888,9 +2438,7 @@ def test_assistance_state_initialization_failure_still_starts_gnss(
   monkeypatch.setattr(
     pigeond,
     "send_mga_with_strict_ack",
-    lambda _pigeon, message, **_kwargs: assistance_writes.append(
-      message
-    ),
+    lambda _pigeon, message, **_kwargs: assistance_writes.append(message),
   )
   monkeypatch.setattr(
     pigeond,
@@ -2926,7 +2474,6 @@ def test_assistance_state_initialization_failure_still_starts_gnss(
     time_authority=object(),  # type: ignore[arg-type, ty:invalid-argument-type]
     time_provenance=FakeProvenance(),  # type: ignore[arg-type, ty:invalid-argument-type]
     position_assistance_retry=retry_controller,
-    allow_database_trusted_time_wait=True,
     network_available=True,
   )
 
@@ -2937,9 +2484,7 @@ def test_assistance_state_initialization_failure_still_starts_gnss(
   assert events.index("normal_configuration") < events.index("gnss_start")
   restore = result.navigation_assistance_restore_result
   assert restore is not None
-  assert restore.database_restore_state_error == (
-    "boot_state:storage_unavailable"
-  )
+  assert restore.database_restore_state_error == ("boot_state:storage_unavailable")
 
 
 def test_restore_state_persistence_failure_does_not_block_gnss_start(
@@ -2985,9 +2530,7 @@ def test_restore_state_persistence_failure_does_not_block_gnss_start(
   monkeypatch.setattr(
     pigeond,
     "evaluate_time_authority",
-    lambda _authority, _observation: SimpleNamespace(
-      authorized_time=None
-    ),
+    lambda _authority, _observation: SimpleNamespace(authorized_time=None),
   )
   monkeypatch.setattr(pigeond, "poll_mon_ver", lambda _pigeon: None)
   monkeypatch.setattr(
@@ -3003,9 +2546,7 @@ def test_restore_state_persistence_failure_does_not_block_gnss_start(
   monkeypatch.setattr(
     pigeond,
     "send_mga_with_strict_ack",
-    lambda _pigeon, message, **_kwargs: assistance_writes.append(
-      message
-    ),
+    lambda _pigeon, message, **_kwargs: assistance_writes.append(message),
   )
   monkeypatch.setattr(
     pigeond,
@@ -3119,12 +2660,9 @@ def test_yuma_assistance_state_suppression_uses_explicit_marker() -> None:
   )
 
   assert pigeond.yuma_assistance_state_unavailable_outcome(normal_outcome)
-  assert pigeond.yuma_assistance_state_unavailable_outcome(
-    provisional_outcome
-  )
-  assert not pigeond.yuma_assistance_state_unavailable_outcome(
-    structural_shape_without_marker
-  )
+  assert pigeond.yuma_assistance_state_unavailable_outcome(provisional_outcome)
+  assert not pigeond.yuma_assistance_state_unavailable_outcome(structural_shape_without_marker)
+
 
 # PR70_STALE_WORKER_PERSISTENCE_GUARD_TESTS
 
@@ -3205,9 +2743,7 @@ def test_superseded_constructor_worker_cannot_overwrite_new_cycle_dbd_state(
   assert constructor_errors
   assert "superseded" in str(constructor_errors[0])
 
-  persisted = restore_runtime.load_navigation_database_restore_boot_state(
-    state_path
-  )
+  persisted = restore_runtime.load_navigation_database_restore_boot_state(state_path)
   assert persisted is not None
   assert persisted.acquisition_started
 
@@ -3268,9 +2804,7 @@ def test_superseded_prepare_worker_cannot_overwrite_new_cycle_dbd_state(
   assert runtime_a.assistance_state_disabled_reason is not None
   assert "superseded" in runtime_a.assistance_state_disabled_reason
 
-  persisted = restore_runtime.load_navigation_database_restore_boot_state(
-    state_path
-  )
+  persisted = restore_runtime.load_navigation_database_restore_boot_state(state_path)
   assert persisted is not None
   assert persisted.acquisition_started
 
