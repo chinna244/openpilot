@@ -60,11 +60,7 @@ def test_convert_yuma_almanac_generates_valid_sorted_gps_frames():
 
   assert almanac.gps_week_mod_1024 == 380
   assert almanac.time_of_applicability_seconds == 319488
-  assert almanac.satellite_ids == tuple(
-    satellite_id
-    for satellite_id in range(1, 26)
-    if satellite_id != 13
-  )
+  assert almanac.satellite_ids == tuple(satellite_id for satellite_id in range(1, 26) if satellite_id != 13)
   assert len(almanac.frames) == MINIMUM_YUMA_GPS_SATELLITES
   assert len(almanac.ubx_data) == MINIMUM_YUMA_GPS_SATELLITES * 44
 
@@ -93,20 +89,24 @@ def test_convert_yuma_almanac_rejects_duplicate_satellite():
 
 
 def test_convert_yuma_almanac_rejects_mixed_week():
-  text = "\n".join((
-    *(yuma_block(satellite_id) for satellite_id in range(1, 24)),
-    yuma_block(24, week=381),
-  ))
+  text = "\n".join(
+    (
+      *(yuma_block(satellite_id) for satellite_id in range(1, 24)),
+      yuma_block(24, week=381),
+    )
+  )
 
   with pytest.raises(YumaAlmanacError, match="Mixed GPS weeks"):
     convert_yuma_almanac(text)
 
 
 def test_convert_yuma_almanac_rejects_mixed_time_of_applicability():
-  text = "\n".join((
-    *(yuma_block(satellite_id) for satellite_id in range(1, 24)),
-    yuma_block(24, time_of_applicability=323584.0),
-  ))
+  text = "\n".join(
+    (
+      *(yuma_block(satellite_id) for satellite_id in range(1, 24)),
+      yuma_block(24, time_of_applicability=323584.0),
+    )
+  )
 
   with pytest.raises(YumaAlmanacError, match="Mixed times of applicability"):
     convert_yuma_almanac(text)
@@ -146,6 +146,7 @@ def test_split_yuma_ubx_frames_rejects_duplicate_satellite():
   with pytest.raises(YumaAlmanacError, match="Duplicate YUMA satellite ID"):
     split_yuma_ubx_frames(duplicated)
 
+
 def test_resolve_yuma_reference_time_uses_nearest_rollover():
   almanac = convert_yuma_almanac(yuma_text())
   trusted_now = datetime(2026, 7, 21, tzinfo=UTC)
@@ -180,6 +181,18 @@ def test_resolve_yuma_reference_time_handles_rollover_boundary():
   ) == GPS_EPOCH_UTC + timedelta(weeks=2047)
 
 
+def test_resolve_yuma_reference_time_ambiguous_midpoint_fail_closed():
+  source = convert_yuma_almanac(yuma_text())
+  almanac = replace(
+    source,
+    gps_week_mod_1024=0,
+    time_of_applicability_seconds=0,
+  )
+  trusted_now = GPS_EPOCH_UTC + timedelta(weeks=512)
+  with pytest.raises(YumaAlmanacError, match="ambiguous"):
+    resolve_yuma_reference_time(almanac, trusted_now)
+
+
 @pytest.mark.parametrize(
   ("age_seconds", "accepted"),
   (
@@ -201,10 +214,13 @@ def test_validate_yuma_reference_time_age_boundary(
   )
 
   if accepted:
-    assert validate_yuma_reference_time(
-      almanac,
-      trusted_now,
-    ) == reference_time
+    assert (
+      validate_yuma_reference_time(
+        almanac,
+        trusted_now,
+      )
+      == reference_time
+    )
   else:
     with pytest.raises(YumaAlmanacError, match="too old"):
       validate_yuma_reference_time(
@@ -234,10 +250,13 @@ def test_validate_yuma_reference_time_future_boundary(
   )
 
   if accepted:
-    assert validate_yuma_reference_time(
-      almanac,
-      trusted_now,
-    ) == reference_time
+    assert (
+      validate_yuma_reference_time(
+        almanac,
+        trusted_now,
+      )
+      == reference_time
+    )
   else:
     with pytest.raises(
       YumaAlmanacError,

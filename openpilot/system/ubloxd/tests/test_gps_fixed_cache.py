@@ -1324,7 +1324,8 @@ def test_rtc_selection_chooses_freshest_estimate_with_primary_tiebreak(monkeypat
     RtcEstimateRejectionReason.UTC_BEFORE_SUPPORTED_MINIMUM,
   ),
   (
-    datetime(2035, 1, 1, tzinfo=UTC),
+    # Beyond representable GPS week UInt16 ceiling (PR82 replaces 2035 product sunset).
+    datetime(3236, 1, 6, tzinfo=UTC),
     0,
     RtcEstimateRejectionReason.UTC_AFTER_SUPPORTED_MAXIMUM,
   ),

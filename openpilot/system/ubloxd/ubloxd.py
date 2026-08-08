@@ -10,7 +10,13 @@ from openpilot.cereal import log
 from openpilot.cereal import messaging
 from openpilot.common.swaglog import cloudlog
 from openpilot.system.ubloxd.rf_observability import UbloxRfObservability
-from openpilot.common.gps_time import encode_ublox_gps_flags, ublox_nav_pvt_has_fix
+from openpilot.common.gps_time import (
+  encode_ublox_gps_flags,
+  live_ephemeris_week_matches_rawx_current,
+  rawx_full_week_is_trusted_era_evidence,
+  resolve_gps_week_mod_1024,
+  ublox_nav_pvt_has_fix,
+)
 from openpilot.system.ubloxd.ubx import Ubx
 from openpilot.system.ubloxd.gps import Gps
 from openpilot.system.ubloxd.glonass import Glonass
@@ -163,6 +169,8 @@ class EphemerisAssemblyStats:
   gps_partial_expired: int = 0
   gps_iod_mismatch: int = 0
   gps_decode_failure: int = 0
+  gps_week_era_unresolved: int = 0
+  gps_week_current_mismatch: int = 0
   glonass_strings_received: int = 0
   glonass_ephemeris_assembled: int = 0
   glonass_partial_expired: int = 0
@@ -206,6 +214,8 @@ class UbloxMsgParser:
       glonass_string_superframes=defaultdict(dict),
     )
     self.assembly_stats = EphemerisAssemblyStats()
+    # Latest full (UInt16) RAWX GPS week — era evidence for 10-bit ephemeris weeks.
+    self._latest_rawx_gps_week: int | None = None
 
   # Message generation entry point
   def parse_frame(
@@ -324,7 +334,8 @@ class UbloxMsgParser:
       cloudlog.info(
         "ubloxd ephemeris assembly: "
         + f"gps(recv={stats.gps_subframes_received} assembled={stats.gps_ephemeris_assembled} "
-        + f"expired={stats.gps_partial_expired} iod={stats.gps_iod_mismatch} decode={stats.gps_decode_failure}) "
+        + f"expired={stats.gps_partial_expired} iod={stats.gps_iod_mismatch} decode={stats.gps_decode_failure} "
+        + f"week_era={stats.gps_week_era_unresolved} week_mismatch={stats.gps_week_current_mismatch}) "
         + f"glo(recv={stats.glonass_strings_received} assembled={stats.glonass_ephemeris_assembled} "
         + f"expired={stats.glonass_partial_expired} decode={stats.glonass_decode_failure} "
         + f"slot={stats.glonass_slot_mismatch} superframe={stats.glonass_superframe_mismatch} "
@@ -405,9 +416,20 @@ class UbloxMsgParser:
       s1 = sf1.body
       assert isinstance(s1, Gps.Subframe1)
       week = s1.week_no
-      week += 1024
-      if week < 1877:
-        week += 1024
+      # 10-bit GPS week requires trustworthy era evidence (RAWX full week preferred).
+      # Do not hard-code +1024/+2048 current-era magic (fails ~2035-08).
+      # Live ephemeris must also match RAWX current week within ±1 (week-boundary race).
+      try:
+        week = resolve_gps_week_mod_1024(
+          int(week),
+          trusted_full_week=self._latest_rawx_gps_week,
+        )
+      except ValueError:
+        self.assembly_stats.gps_week_era_unresolved += 1
+        self.caches.gps_subframes[msg.sv_id].clear()
+        self.caches.gps_subframe_times[msg.sv_id].clear()
+        self._maybe_log_ephemeris_assembly_stats(now)
+        return None
       eph.tgd = s1.t_gd * math.pow(2, -31)
       eph.toc = s1.t_oc * math.pow(2, 4)
       eph.af2 = s1.af_2 * math.pow(2, -55)
@@ -423,6 +445,19 @@ class UbloxMsgParser:
       assert isinstance(s2, Gps.Subframe2)
       if s2.t_oe == 0 and sf2.how.tow_count * 6 >= (SECS_IN_WEEK - 2 * SECS_IN_HR):
         week += 1
+      if self._latest_rawx_gps_week is None or not live_ephemeris_week_matches_rawx_current(
+        week,
+        self._latest_rawx_gps_week,
+      ):
+        self.assembly_stats.gps_week_era_unresolved += 1
+        self.assembly_stats.gps_week_current_mismatch += 1
+        cloudlog.info(
+          "ubloxd ephemeris gps_week_era_unresolved/current-week-mismatch: " + f"sv={msg.sv_id} resolved_week={week} rawx_week={self._latest_rawx_gps_week}"
+        )
+        self.caches.gps_subframes[msg.sv_id].clear()
+        self.caches.gps_subframe_times[msg.sv_id].clear()
+        self._maybe_log_ephemeris_assembly_stats(now)
+        return None
       eph.crs = s2.c_rs * math.pow(2, -5)
       eph.deltaN = s2.delta_n * math.pow(2, -43) * self.gpsPi
       eph.m0 = s2.m_0 * math.pow(2, -31) * self.gpsPi
@@ -618,6 +653,8 @@ class UbloxMsgParser:
     mr.rcvTow = msg.rcv_tow
     mr.gpsWeek = msg.week
     mr.leapSeconds = msg.leap_s
+    if rawx_full_week_is_trusted_era_evidence(week=int(msg.week), num_meas=int(msg.num_meas)):
+      self._latest_rawx_gps_week = int(msg.week)
 
     mb = mr.init('measurements', msg.num_meas)
     for i, m in enumerate(msg.meas):

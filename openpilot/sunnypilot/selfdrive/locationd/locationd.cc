@@ -27,8 +27,9 @@ const double DECAY = 0.9993; // ~10 secs to resume after a bad input
 const double MAX_FILTER_REWIND_TIME = 0.8; // s
 const double YAWRATE_CROSS_ERR_CHECK_FACTOR = 30;
 
-// TODO: GPS sensor time offsets are empirically calculated
-// They should be replaced with synced time from a real clock
+// LEGACY FALLBACK ONLY (PR81/PR82): live producers stamp measurementMonoNs;
+// handle_gps prefers that epoch. Keep these offsets for historical logs with
+// measurementMonoNs==0. Values were empirically measured for pre-PR81 paths.
 const double GPS_QUECTEL_SENSOR_TIME_OFFSET = 0.630; // s
 const double GPS_UBLOX_SENSOR_TIME_OFFSET = 0.095; // s
 const float  GPS_POS_STD_THRESHOLD = 50.0;

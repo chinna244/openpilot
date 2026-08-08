@@ -9,10 +9,10 @@ from openpilot.system.manager.process_config import managed_processes
 from openpilot.common.hardware.tici.pins import GPIO
 
 
-# TODO: test TTFF when we have good A-GNSS
+# TODO(PR82): optional offline TTFF fixture once a representative route corpus is checked in.
+# AssistNow Online is retired; remaining assistance is YUMA/AOP/DBD (not a blocking correctness gap).
 @pytest.mark.tici
 class TestPigeond:
-
   def teardown_method(self):
     managed_processes['pigeond'].stop()
 

@@ -7,6 +7,10 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from math import isfinite, pi
 
+from openpilot.common.gps_time import (
+  GPS_EPOCH_UTC,
+  resolve_gps_week_mod_1024,
+)
 from openpilot.system.ubloxd.gps_assistance import add_ubx_checksum, validate_ubx_frame
 
 
@@ -15,9 +19,6 @@ YUMA_GPS_ALMANAC_MESSAGE_ID = 0x00
 YUMA_GPS_ALMANAC_PAYLOAD_LENGTH = 36
 MINIMUM_YUMA_GPS_SATELLITES = 24
 MAXIMUM_YUMA_GPS_SATELLITES = 32
-GPS_EPOCH_UTC = datetime(1980, 1, 6, tzinfo=UTC)
-GPS_WEEK_SECONDS = 7 * 24 * 60 * 60
-GPS_WEEK_ROLLOVER = 1024
 YUMA_ALMANAC_MAX_REFERENCE_AGE_SECONDS = 14 * 24 * 60 * 60
 YUMA_ALMANAC_MAX_REFERENCE_FUTURE_SECONDS = 4 * 24 * 60 * 60
 
@@ -426,47 +427,18 @@ def resolve_yuma_reference_time(
   almanac: YumaAlmanac,
   trusted_now: datetime,
 ) -> datetime:
-  """Resolve the 10-bit YUMA week to the rollover nearest trusted UTC."""
+  """Resolve the 10-bit YUMA week using shared modulo-week era resolution."""
   normalized_now = _trusted_utc(trusted_now, "trusted_now")
-  elapsed_seconds = (
-    normalized_now - GPS_EPOCH_UTC
-  ).total_seconds()
-  if elapsed_seconds < 0:
-    raise YumaAlmanacError(
-      "trusted_now predates the GPS epoch"
+  try:
+    absolute_week = resolve_gps_week_mod_1024(
+      almanac.gps_week_mod_1024,
+      trusted_utc=normalized_now,
     )
-
-  current_week = int(elapsed_seconds // GPS_WEEK_SECONDS)
-  base_cycle = (
-    current_week - almanac.gps_week_mod_1024
-  ) // GPS_WEEK_ROLLOVER
-  candidate_weeks = {
-    almanac.gps_week_mod_1024
-    + (base_cycle + cycle_offset) * GPS_WEEK_ROLLOVER
-    for cycle_offset in (-1, 0, 1, 2)
-    if (
-      almanac.gps_week_mod_1024
-      + (base_cycle + cycle_offset) * GPS_WEEK_ROLLOVER
-    ) >= 0
-  }
-  if not candidate_weeks:
-    raise YumaAlmanacError(
-      "Unable to resolve YUMA GPS week"
-    )
-
-  candidates = tuple(
-    GPS_EPOCH_UTC
-    + timedelta(
-      weeks=absolute_week,
-      seconds=almanac.time_of_applicability_seconds,
-    )
-    for absolute_week in candidate_weeks
-  )
-  return min(
-    candidates,
-    key=lambda candidate: abs(
-      (candidate - normalized_now).total_seconds()
-    ),
+  except ValueError as exc:
+    raise YumaAlmanacError(str(exc)) from exc
+  return GPS_EPOCH_UTC + timedelta(
+    weeks=absolute_week,
+    seconds=almanac.time_of_applicability_seconds,
   )
 
 
