@@ -11,7 +11,6 @@ import sys
 
 
 MANDATORY_PATHS = (
-  ".git",
   "build.json",
   "openpilot/sunnypilot/common/version.h",
   "launch_openpilot.sh",
@@ -140,7 +139,7 @@ def main() -> int:
                  help="source checkout used to validate release_files coverage")
   p.add_argument("--skip-release-files", action="store_true")
   p.add_argument("--skip-mandatory", action="store_true",
-                 help="skip .git/build.json requirements (use for BUILD_DIR)")
+                 help="skip build.json requirement (use for BUILD_DIR)")
   p.add_argument("--skip-metadata", action="store_true",
                  help="skip get_build_metadata() import check")
   args = p.parse_args()
