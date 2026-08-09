@@ -9,7 +9,6 @@ from openpilot.cereal import log, custom
 
 from opendbc.car import structs
 from opendbc.car.hyundai.values import HyundaiFlags
-from opendbc.car.vin import VIN_UNKNOWN, is_valid_vin
 from openpilot.common.params import Params
 from openpilot.sunnypilot.mads.helpers import MadsSteeringModeOnBrake, read_steering_mode_param, MADS_NO_ACC_MAIN_BUTTON
 from openpilot.sunnypilot.mads.state import StateMachine, GEARS_ALLOW_PAUSED_SILENT
@@ -37,8 +36,6 @@ class ModularAssistiveDrivingSystem:
     self.lateral_mismatch_counter = 0
     self.allow_always = False
     self.no_main_cruise = False
-    self.mazda_tja_button_detected = False
-    self.mazda_tja_button_vin: str | None = None
     self.selfdrive = selfdrive
     self.selfdrive.enabled_prev = False
     self.state_machine = StateMachine(self)
@@ -54,16 +51,6 @@ class ModularAssistiveDrivingSystem:
     if self.CP.brand in MADS_NO_ACC_MAIN_BUTTON:
       self.no_main_cruise = True
 
-    # A dedicated Mazda TJA button is learned only from a real ButtonType.lkas
-    # press. Persist positive proof by VIN so future boots do not temporarily
-    # couple MRCC availability to MADS again. Model year/trim and MRCC alone
-    # are intentionally not treated as TJA capability.
-    if self.CP.brand == "mazda":
-      vin = self.CP.carVin
-      if vin != VIN_UNKNOWN and is_valid_vin(vin):
-        self.mazda_tja_button_vin = vin
-        self.mazda_tja_button_detected = self.params.get("MazdaTjaButtonVin") == vin
-
     # read params on init
     self.enabled_toggle = self.params.get_bool("Mads")
     self.main_enabled_toggle = self.params.get_bool("MadsMainCruiseAllowed")
@@ -73,15 +60,6 @@ class ModularAssistiveDrivingSystem:
   def read_params(self):
     self.main_enabled_toggle = self.params.get_bool("MadsMainCruiseAllowed")
     self.unified_engagement_mode = self.params.get_bool("MadsUnifiedEngagementMode")
-
-  def _detect_mazda_tja_button(self) -> None:
-    if self.CP.brand != "mazda" or self.mazda_tja_button_detected:
-      return
-
-    self.mazda_tja_button_detected = True
-    if self.mazda_tja_button_vin is not None:
-      # Params.put() is non-blocking by default; this path runs once per VIN.
-      self.params.put("MazdaTjaButtonVin", self.mazda_tja_button_vin)
 
   def pedal_pressed_non_gas_pressed(self, CS: structs.CarState) -> bool:
     # ignore `pedalPressed` events caused by gas presses
@@ -139,14 +117,6 @@ class ModularAssistiveDrivingSystem:
       self.lateral_mismatch_counter += 1
 
   def update_events(self, CS: structs.CarState):
-    # PR1 maps the physical Mazda TJA bit to ButtonType.lkas. Seeing that
-    # pressed event is positive proof that this vehicle currently has the
-    # dedicated TJA control, including switch/FORScan retrofits.
-    mazda_tja_button_just_detected = False
-    if self.CP.brand == "mazda" and any(be.type == ButtonType.lkas and be.pressed for be in CS.buttonEvents):
-      mazda_tja_button_just_detected = not self.mazda_tja_button_detected
-      self._detect_mazda_tja_button()
-
     if not self.selfdrive.enabled and self.enabled:
       if CS.standstill:
         if self.events.has(EventName.doorOpen):
@@ -193,7 +163,7 @@ class ModularAssistiveDrivingSystem:
         self.events.remove(EventName.pcmEnable)
         self.events.remove(EventName.buttonEnable)
     else:
-      if self.main_enabled_toggle and not self.mazda_tja_button_detected:
+      if self.main_enabled_toggle:
         if CS.cruiseState.available and not self.selfdrive.CS_prev.cruiseState.available:
           self.events_sp.add(EventNameSP.lkasEnable)
 
@@ -201,22 +171,18 @@ class ModularAssistiveDrivingSystem:
       if be.type == ButtonType.cancel:
         if not self.selfdrive.enabled and self.selfdrive.enabled_prev:
           self.events_sp.add(EventNameSP.manualLongitudinalRequired)
-      if be.type == ButtonType.lkas and be.pressed and (CS.cruiseState.available or self.allow_always or self.mazda_tja_button_detected):
+      if be.type == ButtonType.lkas and be.pressed and (CS.cruiseState.available or self.allow_always):
         if self.enabled:
-          # On the first-ever dedicated TJA press, MADS may already be enabled
-          # only because legacy MRCC availability previously enabled it. Adopt
-          # that existing ON state instead of immediately toggling lateral OFF.
-          if not mazda_tja_button_just_detected:
-            if self.selfdrive.enabled:
-              self.events_sp.add(EventNameSP.manualSteeringRequired)
-            else:
-              self.events_sp.add(EventNameSP.lkasDisable)
+          if self.selfdrive.enabled:
+            self.events_sp.add(EventNameSP.manualSteeringRequired)
+          else:
+            self.events_sp.add(EventNameSP.lkasDisable)
         else:
           self.events_sp.add(EventNameSP.lkasEnable)
 
     if not CS.cruiseState.available and not self.no_main_cruise:
       self.events.remove(EventName.buttonEnable)
-      if self.selfdrive.CS_prev.cruiseState.available and not self.mazda_tja_button_detected:
+      if self.selfdrive.CS_prev.cruiseState.available:
         self.events_sp.add(EventNameSP.lkasDisable)
 
     if self.steering_mode_on_brake == MadsSteeringModeOnBrake.DISENGAGE:

@@ -933,7 +933,7 @@ def test_legacy_ttff_flags_fallback_only_when_has_fix_absent():
     115.0,
     SimpleNamespace(
       flags=1,
-      # no hasFix attribute → explicitly labeled legacy path
+      # no hasFix attribute → explicitly labelled legacy path
       unixTimestampMillis=1,
       satelliteCount=4,
       horizontalAccuracy=5.0,
