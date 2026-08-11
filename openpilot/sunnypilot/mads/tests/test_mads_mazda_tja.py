@@ -1,7 +1,10 @@
 # Mazda dedicated TJA-button MADS independence regression tests.
 
+import pytest
+
 from openpilot.cereal import log, custom
 from opendbc.car import structs
+from opendbc.car.mazda.values import MazdaSafetyFlags
 from opendbc.car.vin import VIN_UNKNOWN
 from openpilot.selfdrive.selfdrived.events import Events
 from openpilot.sunnypilot.selfdrive.selfdrived.events import EventsSP
@@ -26,11 +29,15 @@ def make_car_state(available: bool, button_type=None, pressed=False):
   return cs
 
 
-def make_mads(mocker, brand="mazda", vin=TJA_VIN, stored_tja_vin=None, prev_available=False):
+def make_mads(mocker, brand="mazda", vin=TJA_VIN, stored_tja_vin=None, prev_available=False,
+              dedicated_tja=True, unified=False):
   sd = mocker.MagicMock()
   sd.CP = structs.CarParams()
   sd.CP.brand = brand
   sd.CP.carVin = vin
+  safety_config = structs.CarParams.SafetyConfig()
+  safety_config.safetyParam = int(MazdaSafetyFlags.TJA) if dedicated_tja and brand == "mazda" else 0
+  sd.CP.safetyConfigs = [safety_config]
   sd.CP_SP = structs.CarParamsSP()
 
   params = mocker.MagicMock()
@@ -38,7 +45,7 @@ def make_mads(mocker, brand="mazda", vin=TJA_VIN, stored_tja_vin=None, prev_avai
     "Mads": True,
     "MadsMainCruiseAllowed": True,
     "DisengageOnAccelerator": True,
-    "MadsUnifiedEngagementMode": False,
+    "MadsUnifiedEngagementMode": unified,
   }.get(key, False))
   params.get = mocker.MagicMock(side_effect=lambda key, **_: {
     "MazdaTjaButtonVin": stored_tja_vin,
@@ -63,14 +70,14 @@ def make_mads(mocker, brand="mazda", vin=TJA_VIN, stored_tja_vin=None, prev_avai
 
 
 def test_unlearned_mazda_mrcc_on_keeps_existing_mads_behavior(mocker):
-  mads, sd, _ = make_mads(mocker, prev_available=False)
+  mads, sd, _ = make_mads(mocker, prev_available=False, dedicated_tja=False)
   mads.update_events(make_car_state(True))
   assert sd.events_sp.has(EventNameSP.lkasEnable)
   assert not mads.mazda_tja_button_detected
 
 
 def test_unlearned_mazda_mrcc_off_keeps_existing_mads_behavior(mocker):
-  mads, sd, _ = make_mads(mocker, prev_available=True)
+  mads, sd, _ = make_mads(mocker, prev_available=True, dedicated_tja=False)
   mads.update_events(make_car_state(False))
   assert sd.events_sp.has(EventNameSP.lkasDisable)
   assert not mads.mazda_tja_button_detected
@@ -151,3 +158,73 @@ def test_non_mazda_availability_behavior_is_unchanged(mocker):
   assert sd.events_sp.has(EventNameSP.lkasEnable)
   assert not mads.mazda_tja_button_detected
   assert all(call.args[0] != "MazdaTjaButtonVin" for call in params.get.call_args_list)
+
+
+def test_dedicated_tja_ignores_shared_longitudinal_enable(mocker):
+  mads, sd, _ = make_mads(mocker, prev_available=False, unified=True)
+
+  # MRCC/SET's standard event remains available to SelfdriveD longitudinal, but
+  # cannot create MADS lateral state on a physical-button-owned Mazda.
+  sd.events.add(EventName.pcmEnable)
+  assert mads.state_machine.update() == (False, False)
+  assert not mads.enabled
+  assert sd.events.has(EventName.pcmEnable)
+
+  sd.events.clear()
+  mads.update(make_car_state(False, ButtonType.lkas, True))
+  assert mads.enabled
+  assert mads.active
+
+
+def test_dedicated_tja_and_mrcc_state_transitions_are_independent(mocker):
+  mads, sd, _ = make_mads(mocker, prev_available=False, unified=True)
+
+  # TJA ON while longitudinal is already active.
+  sd.enabled = True
+  mads.update(make_car_state(True, ButtonType.lkas, True))
+  assert mads.enabled
+  assert sd.enabled
+
+  # MRCC cancel/off is consumed by SelfdriveD first, then removed before the
+  # independent MADS state machine sees it.
+  sd.events.clear()
+  sd.events_sp.clear()
+  sd.events.add(EventName.pcmDisable)
+  sd.enabled = False
+  mads.update_events(make_car_state(False))
+  mads.enabled, mads.active = mads.state_machine.update()
+  assert mads.enabled
+  assert not sd.enabled
+
+  # A physical TJA toggle disables only MADS; longitudinal remains active.
+  sd.events.clear()
+  sd.events_sp.clear()
+  sd.enabled = True
+  mads.update(make_car_state(True, ButtonType.lkas, True))
+  assert not mads.enabled
+  assert sd.enabled
+
+
+@pytest.mark.parametrize("unified", [False, True])
+def test_dedicated_tja_rapid_toggles_are_session_local(mocker, unified):
+  mads, sd, _ = make_mads(mocker, prev_available=False, unified=unified)
+
+  # MRCC/SET enable is longitudinal-owned and cannot establish initial MADS.
+  sd.events.add(EventName.pcmEnable)
+  mads.update(make_car_state(True, ButtonType.mainCruise, True))
+  assert not mads.enabled
+
+  for expected in (True, False, True, False, True):
+    sd.events.clear()
+    sd.events_sp.clear()
+    mads.update(make_car_state(True, ButtonType.lkas, True))
+    assert mads.enabled == expected
+
+    # Availability and standard longitudinal events remain inert between
+    # physical TJA toggles, regardless of Unified Engagement mode.
+    sd.events.clear()
+    sd.events_sp.clear()
+    sd.events.add(EventName.pcmEnable if expected else EventName.pcmDisable)
+    mads.update_events(make_car_state(not expected, ButtonType.mainCruise, True))
+    mads.enabled, mads.active = mads.state_machine.update()
+    assert mads.enabled == expected

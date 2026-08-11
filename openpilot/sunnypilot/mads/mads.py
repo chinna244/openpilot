@@ -9,6 +9,7 @@ from openpilot.cereal import log, custom
 
 from opendbc.car import structs
 from opendbc.car.hyundai.values import HyundaiFlags
+from opendbc.car.mazda.values import MazdaSafetyFlags
 from opendbc.car.vin import VIN_UNKNOWN, is_valid_vin
 from openpilot.common.params import Params
 from openpilot.sunnypilot.mads.helpers import MadsSteeringModeOnBrake, read_steering_mode_param, MADS_NO_ACC_MAIN_BUTTON
@@ -38,6 +39,9 @@ class ModularAssistiveDrivingSystem:
     self.allow_always = False
     self.no_main_cruise = False
     self.mazda_tja_button_detected = False
+    self.mazda_tja_physical_button_only = self.CP.brand == "mazda" and any(
+      config.safetyParam & MazdaSafetyFlags.TJA for config in self.CP.safetyConfigs
+    )
     self.mazda_tja_button_vin: str | None = None
     self.selfdrive = selfdrive
     self.selfdrive.enabled_prev = False
@@ -63,6 +67,7 @@ class ModularAssistiveDrivingSystem:
       if vin != VIN_UNKNOWN and is_valid_vin(vin):
         self.mazda_tja_button_vin = vin
         self.mazda_tja_button_detected = self.params.get("MazdaTjaButtonVin") == vin
+        self.mazda_tja_physical_button_only |= self.mazda_tja_button_detected
 
     # read params on init
     self.enabled_toggle = self.params.get_bool("Mads")
@@ -79,6 +84,7 @@ class ModularAssistiveDrivingSystem:
       return
 
     self.mazda_tja_button_detected = True
+    self.mazda_tja_physical_button_only = True
     if self.mazda_tja_button_vin is not None:
       # Params.put() is non-blocking by default; this path runs once per VIN.
       self.params.put("MazdaTjaButtonVin", self.mazda_tja_button_vin)
@@ -193,7 +199,7 @@ class ModularAssistiveDrivingSystem:
         self.events.remove(EventName.pcmEnable)
         self.events.remove(EventName.buttonEnable)
     else:
-      if self.main_enabled_toggle and not self.mazda_tja_button_detected:
+      if self.main_enabled_toggle and not self.mazda_tja_physical_button_only:
         if CS.cruiseState.available and not self.selfdrive.CS_prev.cruiseState.available:
           self.events_sp.add(EventNameSP.lkasEnable)
 
@@ -216,7 +222,7 @@ class ModularAssistiveDrivingSystem:
 
     if not CS.cruiseState.available and not self.no_main_cruise:
       self.events.remove(EventName.buttonEnable)
-      if self.selfdrive.CS_prev.cruiseState.available and not self.mazda_tja_button_detected:
+      if self.selfdrive.CS_prev.cruiseState.available and not self.mazda_tja_physical_button_only:
         self.events_sp.add(EventNameSP.lkasDisable)
 
     if self.steering_mode_on_brake == MadsSteeringModeOnBrake.DISENGAGE:
