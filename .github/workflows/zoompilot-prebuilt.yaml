@@ -10,6 +10,10 @@ name: zoompilot prebuilt
 # The runner only picks jobs up while the device is off the car: hardwared sets
 # GithubRunnerSufficientVoltage above 9V and process_config stops the runner service
 # when it is set. Bench-power the device to let a build run.
+#
+# Safety: BUILD_DIR (/data/openpilot) is only safe inside the runner's private mount
+# namespace, where /data/github/openpilot is bind-mounted over it. The setup step
+# aborts unless that bind is active, so a broken mount can never wipe the live install.
 
 env:
   BUILD_DIR: "/data/openpilot"
@@ -75,10 +79,14 @@ jobs:
 
       - name: Setup build environment
         run: |
-          # BUILD_DIR is the CI copy bind-mounted over /data/openpilot inside the
-          # runner service's private mount namespace, not the real install.
+          chmod +x ${{ env.CI_DIR }}/assert_ci_openpilot_mount.sh
+          # Abort before any delete if /data/openpilot is the real install.
+          ${{ env.CI_DIR }}/assert_ci_openpilot_mount.sh "${BUILD_DIR}"
           mkdir -p "${BUILD_DIR}/"
           sudo find $BUILD_DIR/ -mindepth 1 -delete
+          # recreate marker wiped by find -delete; still must be the CI inode
+          touch "${BUILD_DIR}/.ci_build_dir"
+          ${{ env.CI_DIR }}/assert_ci_openpilot_mount.sh "${BUILD_DIR}"
           source ${UV_PROJECT_ENVIRONMENT}/bin/activate
           PYTHONPATH=$PYTHONPATH:${{ github.workspace }}/ ${{ github.workspace }}/scripts/manage-powersave.py --disable
 
@@ -98,6 +106,11 @@ jobs:
           scons -j1 cache_dir=${{ env.SCONS_CACHE_DIR }} --minimal openpilot/selfdrive/locationd
           scons -j$(nproc) cache_dir=${{ env.SCONS_CACHE_DIR }} --minimal
           touch ${BUILD_DIR}/prebuilt
+          # Full staging coverage against BUILD_DIR (before output excludes).
+          python3 ${{ env.CI_DIR }}/assert_prebuilt_integrity.py ${BUILD_DIR} \
+            --workspace ${{ github.workspace }} \
+            --skip-mandatory \
+            --skip-metadata
 
       - name: Prepare output
         run: |
@@ -125,12 +138,65 @@ jobs:
             --exclude='openpilot/sunnypilot/modeld*/models/*.onnx*' \
             --exclude='openpilot/third_party/*x86*' \
             --exclude='openpilot/third_party/*Darwin*' \
+            --exclude='.ci_build_dir' \
             --delete-excluded \
             --chown=comma:comma \
             ${BUILD_DIR}/ ${OUTPUT_DIR}/
 
+          # Package must be installable without the publish-time git rewrite.
+          VERSION="${{ steps.set-env.outputs.version }}"
+          python3 ${{ env.CI_DIR }}/write_build_metadata.py \
+            ${OUTPUT_DIR} \
+            --channel ${{ env.TARGET_BRANCH }} \
+            --version "$VERSION" \
+            --git-commit ${{ github.sha }} \
+            --git-origin ${{ env.PUBLIC_REPO_URL }} \
+            --git-commit-date "$(date -u '+%Y-%m-%dT%H:%M:%S+00:00')" \
+            --build-style prebuilt
+
+          # Ensure tagged version.h matches release version string.
+          echo "#define SUNNYPILOT_VERSION \"$VERSION\"" > ${OUTPUT_DIR}/openpilot/sunnypilot/common/version.h
+
+      - name: Guard artifact contents
+        run: |
+          # The artifact uses build.json for release metadata. publish.sh creates
+          # the Git repository later, after the artifact is downloaded.
+          GIT_DIRS="$(find "${OUTPUT_DIR}" -type d -name .git -print)"
+          if [ -n "${GIT_DIRS}" ]; then
+            echo "::error::OUTPUT_DIR contains forbidden .git directories:"
+            printf '%s\n' "${GIT_DIRS}"
+            exit 1
+          fi
+          du -sh "${OUTPUT_DIR}"
+
+      - name: Integrity gate
+        run: |
+          source ${UV_PROJECT_ENVIRONMENT}/bin/activate
+          export PYTHONPATH="${OUTPUT_DIR}"
+          export OUTPUT_DIR="${OUTPUT_DIR}"
+          python3 ${{ env.CI_DIR }}/assert_prebuilt_integrity.py ${OUTPUT_DIR} --skip-release-files
+          python3 - <<'PY'
+          import os
+          os.chdir(os.environ["OUTPUT_DIR"])
+          from openpilot.common.version import get_build_metadata, get_version
+          print(get_version())
+          print(get_build_metadata())
+          PY
+
       - name: Tar.gz files
-        run: tar czf prebuilt.tar.gz -C ${{ env.OUTPUT_DIR }} .
+        run: |
+          tar czf prebuilt.tar.gz -C "${OUTPUT_DIR}" .
+          GIT_DIRS="$(find "${OUTPUT_DIR}" -type d -name .git -print)"
+          if [ -n "${GIT_DIRS}" ]; then
+            echo "::error::OUTPUT_DIR contains forbidden .git directories after tar creation:"
+            printf '%s\n' "${GIT_DIRS}"
+            exit 1
+          fi
+          if tar tzf prebuilt.tar.gz | grep -E '(^|/)\.git(/|$)'; then
+            echo "::error::prebuilt.tar.gz contains a forbidden .git directory"
+            exit 1
+          fi
+          ls -lh prebuilt.tar.gz
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -179,3 +245,35 @@ jobs:
             "${{ needs.build.outputs.version }}" \
             "https://x-access-token:${{ github.token }}@github.com/chinna244/zoompilot.git" \
             "prebuilt"
+
+      - name: Verify published tree
+        run: |
+          # File-level gate on the tree we just pushed (skip import: ubuntu runner may lack zmq).
+          python3 - <<'PY'
+          import json, pathlib, stat, sys
+          root = pathlib.Path("${{ env.OUTPUT_DIR }}")
+          required = [
+            ".git",
+            "build.json",
+            "openpilot/sunnypilot/common/version.h",
+            "launch_openpilot.sh",
+            "openpilot/system/manager/manager.py",
+            "prebuilt",
+          ]
+          missing = [r for r in required if not (root / r).exists()]
+          if missing:
+            print("missing:", missing)
+            sys.exit(1)
+          launch = root / "launch_openpilot.sh"
+          if not (launch.stat().st_mode & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)):
+            print("launch_openpilot.sh not executable")
+            sys.exit(1)
+          meta = json.loads((root / "build.json").read_text())
+          assert meta.get("channel") == "main", meta
+          assert meta.get("openpilot", {}).get("build_style") == "prebuilt", meta
+          ver = (root / "openpilot/sunnypilot/common/version.h").read_text()
+          assert meta["openpilot"]["version"] in ver, (meta["openpilot"]["version"], ver)
+          print("published tree mandatory files OK")
+          print("version", meta["openpilot"]["version"])
+          print("commit", meta["openpilot"]["git_commit"])
+          PY
