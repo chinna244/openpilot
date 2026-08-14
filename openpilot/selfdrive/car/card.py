@@ -21,6 +21,8 @@ from opendbc.car.interfaces import CarInterfaceBase, RadarInterfaceBase
 from openpilot.selfdrive.pandad import can_capnp_to_list, can_list_to_can_capnp
 from openpilot.selfdrive.car.cruise import VCruiseHelper
 from openpilot.selfdrive.car.helpers import convert_carControlSP, convert_to_capnp
+from openpilot.selfdrive.car.mazda_cam_lkas_keepalive import (
+  panda_safety_model_is_mazda, should_send_mazda_cam_lkas)
 
 from openpilot.sunnypilot.mads.helpers import set_alternative_experience, set_car_specific_params
 from openpilot.sunnypilot.selfdrive.car import interfaces as sunnypilot_interfaces
@@ -208,6 +210,16 @@ class Car:
 
     self.sm.update(0)
 
+    if hasattr(self.CI, "CS") and hasattr(self.CI.CS, "on_panda_alive"):
+      alive = True
+      try:
+        alive_map = getattr(self.sm, "alive", None)
+        if isinstance(alive_map, dict) and "pandaStates" in alive_map:
+          alive = bool(alive_map["pandaStates"])
+      except Exception:
+        alive = False
+      self.CI.CS.on_panda_alive(alive)
+
     can_rcv_valid = len(can_strs) > 0
 
     # Check for CAN timeout
@@ -276,6 +288,20 @@ class Car:
     cs_sp_send.carStateSP = CS_SP
     self.pm.send('carStateSP', cs_sp_send)
 
+  def _panda_safety_is_mazda(self) -> bool:
+    if not self.sm.seen['pandaStates']:
+      return False
+    states = self.sm['pandaStates']
+    if len(states) == 0:
+      return False
+    return panda_safety_model_is_mazda(states[0].safetyModel)
+
+  def _mazda_early_cam_lkas_keepalive(self, CS: car.CarState):
+    # Do not call CI.apply / controls_update: that path can emit HUD, CRZ_BTNS,
+    # MRCC restore, ICBM, and longitudinal frames. Only inactive CAM_LKAS is required.
+    can_sends = self.CI.CC.early_init_cam_lkas_keepalive(self.CI.CS)
+    self.pm.send('sendcan', can_list_to_can_capnp(can_sends, msgtype='sendcan', valid=CS.canValid))
+
   def controls_update(self, CS: car.CarState, CC: car.CarControl, CC_SP: custom.CarControlSP):
     """control update loop, driven by carControl"""
 
@@ -304,8 +330,21 @@ class Car:
 
     initialized = (not any(e.name == EventName.selfdriveInitializing for e in self.sm['onroadEvents']) and
                    self.sm.seen['onroadEvents'])
-    if not self.CP.passive and initialized:
-      self.controls_update(CS, self.sm['carControl'], self.sm['carControlSP'])
+    panda_mazda = self._panda_safety_is_mazda()
+    send_controls = should_send_mazda_cam_lkas(
+      passive=bool(self.CP.passive),
+      brand=str(getattr(self.CP, "brand", "")),
+      initialized=initialized,
+      panda_safety_mazda=panda_mazda,
+    )
+    if send_controls:
+      # Leftover mazda safety (relay up) must not wait for selfdriveInitializing.
+      # Route 00000014: ~9 s CAM_LKAS gap → FSC ERR_BIT latch until power cycle.
+      keepalive = (not initialized) and panda_mazda
+      if keepalive:
+        self._mazda_early_cam_lkas_keepalive(CS)
+      else:
+        self.controls_update(CS, self.sm['carControl'], self.sm['carControlSP'])
 
     self.initialized_prev = initialized
     self.CS_prev = CS
