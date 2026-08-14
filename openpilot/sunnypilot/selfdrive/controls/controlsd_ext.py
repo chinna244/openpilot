@@ -10,6 +10,8 @@ import openpilot.cereal.messaging as messaging
 from openpilot.cereal import log, custom
 
 from opendbc.car import structs
+from opendbc.car.mazda.values import MazdaSafetyFlags
+from opendbc.car.structs import CarParams
 from openpilot.common.params import Params
 from openpilot.common.swaglog import cloudlog
 from openpilot.sunnypilot import PARAMS_UPDATE_PERIOD
@@ -17,6 +19,8 @@ from openpilot.sunnypilot.livedelay.helpers import get_lat_delay
 from openpilot.sunnypilot.modeld_v2.modeld_base import ModelStateBase
 from openpilot.sunnypilot.selfdrive.controls.lib.blinker_pause_lateral import BlinkerPauseLateral
 from openpilot.sunnypilot.selfdrive.controls.lib.latcontrol_torque_v0 import LatControlTorque as LatControlTorqueV0
+
+IGNORED_SAFETY_MODES = (CarParams.SafetyModel.silent, CarParams.SafetyModel.noOutput)
 
 
 class ControlsExt(ModelStateBase):
@@ -31,7 +35,7 @@ class ControlsExt(ModelStateBase):
     self.CP_SP = messaging.log_from_bytes(params.get("CarParamsSP", block=True), custom.CarParamsSP)
     cloudlog.info("controlsd_ext got CarParamsSP")
 
-    self.sm_services_ext = ['radarState', 'selfdriveStateSP']
+    self.sm_services_ext = ['radarState', 'selfdriveStateSP', 'pandaStates']
     self.pm_services_ext = ['carControlSP']
 
   def initialize_lateral_control(self, lac, CI, dt):
@@ -58,13 +62,50 @@ class ControlsExt(ModelStateBase):
 
       self._param_update_time = time.monotonic()
 
+  def _mazda_tja_lateral_allowed(self, sm: messaging.SubMaster) -> bool:
+    """Authoritative Panda lateral auth for Mazda TJA.
+
+    Missing / unseen / invalid / not-alive / empty / unknown → False (zero torque).
+    Never raise; never treat unknown as controlsAllowedLateral=True.
+    """
+    try:
+      seen = getattr(sm, "seen", None)
+      if isinstance(seen, dict) and "pandaStates" in seen and not seen["pandaStates"]:
+        return False
+      valid = getattr(sm, "valid", None)
+      if isinstance(valid, dict) and "pandaStates" in valid and not valid["pandaStates"]:
+        return False
+      alive = getattr(sm, "alive", None)
+      if isinstance(alive, dict) and "pandaStates" in alive and not alive["pandaStates"]:
+        return False
+      panda_states = sm["pandaStates"]
+    except Exception:
+      return False
+
+    if not panda_states:
+      return False
+
+    relevant = [ps for ps in panda_states if ps.safetyModel not in IGNORED_SAFETY_MODES]
+    if not relevant:
+      return False
+    return all(bool(ps.controlsAllowedLateral) for ps in relevant)
+
   def get_lat_active(self, sm: messaging.SubMaster) -> bool:
     if self.blinker_pause_lateral.update(sm['carState']):
       return False
 
     ss_sp = sm['selfdriveStateSP']
     if ss_sp.mads.available:
-      return bool(ss_sp.mads.active)
+      if not ss_sp.mads.active:
+        return False
+      # Fail-safe: if Panda has cleared lateral auth (or auth is unknown), command
+      # zero torque this cycle — do not wait for MADS mismatch / crash on missing SM.
+      tja = self.CP.brand == "mazda" and any(
+        (c.safetyParam & int(MazdaSafetyFlags.TJA)) for c in self.CP.safetyConfigs
+      )
+      if tja and not self._mazda_tja_lateral_allowed(sm):
+        return False
+      return True
 
     # MADS not available, use stock state to engage
     return bool(sm['selfdriveState'].active)

@@ -25,7 +25,6 @@ GEARS_ALLOW_PAUSED = [EventName.wrongGear, EventName.reverseGear, EventName.brak
 
 class StateMachine:
   def __init__(self, mads):
-    self.mads = mads
     self.selfdrive = mads.selfdrive
     self.ss_state_machine = mads.selfdrive.state_machine
     self._events = mads.selfdrive.events
@@ -39,11 +38,6 @@ class StateMachine:
 
   def check_contains(self, event_type: str) -> bool:
     return bool(self._events.contains(event_type) or self._events_sp.contains(event_type))
-
-  def check_enable(self) -> bool:
-    if getattr(self.mads, "mazda_tja_physical_button_only", False):
-      return bool(self._events_sp.contains(ET.ENABLE))
-    return self.check_contains(ET.ENABLE)
 
   def check_contains_in_list(self) -> bool:
     return bool(self._events.contains_in_list(GEARS_ALLOW_PAUSED) or self._events_sp.contains_in_list(GEARS_ALLOW_PAUSED_SILENT))
@@ -94,7 +88,7 @@ class StateMachine:
 
         # PAUSED
         elif self.state == State.paused:
-          if self.check_enable():
+          if self.check_contains(ET.ENABLE):
             if self.check_contains(ET.NO_ENTRY):
               self.add_current_alert_types(ET.NO_ENTRY)
 
@@ -119,7 +113,7 @@ class StateMachine:
 
     # DISABLED
     elif self.state == State.disabled:
-      if self.check_enable():
+      if self.check_contains(ET.ENABLE):
         if self.check_contains(ET.NO_ENTRY):
           if self.check_contains_in_list():
             self.state = State.paused
