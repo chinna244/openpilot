@@ -899,3 +899,94 @@ def test_transition_time_uses_transition_mono_ns_not_event_time():
   assert metrics.gps_source_transitions[0]["t"] == pytest.approx(100.0)
   assert metrics.first_authoritative == pytest.approx(100.0)
   assert metrics.first_authoritative != pytest.approx(100.8)
+
+
+def test_strict_ttff_ignores_flags_bit0_when_has_fix_false():
+  metrics = gps_drive_audit.RouteMetrics("strict-ttff")
+  metrics.note_time(100.0)
+  metrics.process_gps(
+    110.0,
+    SimpleNamespace(
+      flags=1,  # legacy bit would have counted under old OR semantics
+      hasFix=False,
+      unixTimestampMillis=1,
+      satelliteCount=4,
+      horizontalAccuracy=5.0,
+      latitude=32.8,
+      longitude=-96.8,
+    ),
+  )
+  assert metrics.first_fix is None
+  assert metrics.fix_samples == 0
+  assert metrics.first_fix_legacy_flags == pytest.approx(110.0)
+  assert metrics.ttff_fix_policy == "strict_has_fix"
+
+  metrics.process_gps(120.0, _gps_fix())
+  assert metrics.first_fix == pytest.approx(120.0)
+  assert metrics.ttff_fix_policy == "strict_has_fix"
+
+
+def test_legacy_ttff_flags_fallback_only_when_has_fix_absent():
+  metrics = gps_drive_audit.RouteMetrics("legacy-ttff")
+  metrics.note_time(100.0)
+  metrics.process_gps(
+    115.0,
+    SimpleNamespace(
+      flags=1,
+      # no hasFix attribute → explicitly labeled legacy path
+      unixTimestampMillis=1,
+      satelliteCount=4,
+      horizontalAccuracy=5.0,
+      latitude=32.8,
+      longitude=-96.8,
+    ),
+  )
+  assert metrics.ttff_fix_policy == "legacy_flags_bit0"
+  assert metrics.first_fix == pytest.approx(115.0)
+  assert metrics.first_fix_legacy_flags == pytest.approx(115.0)
+
+
+def test_optional_params_unknown_key_does_not_abort(tmp_path, monkeypatch):
+  class BoomParams:
+    def get(self, key):
+      if key in ("IsOffroad", "IsOnroad"):
+        raise RuntimeError("UnknownKeyName")
+      return b"ok"
+
+  monkeypatch.setattr(gps_drive_audit, "PARAM_KEYS", ("GitCommit",))
+  monkeypatch.setattr(gps_drive_audit, "OPTIONAL_PARAM_KEYS", ("IsOffroad", "IsOnroad"))
+  monkeypatch.setattr("openpilot.common.params.Params", BoomParams)
+
+  dest = tmp_path / "selected_params.txt"
+  gps_drive_audit.collect_params(dest)
+  text = dest.read_text(encoding="utf-8")
+  assert "GitCommit=ok" in text
+  assert "IsOffroad=OPTIONAL_UNAVAILABLE:RuntimeError:UnknownKeyName" in text
+  assert "IsOnroad=OPTIONAL_UNAVAILABLE:RuntimeError:UnknownKeyName" in text
+  # validate_bundle style gate must not trip on optional unavailable lines
+  assert "GitCommit=ERROR:" not in text
+
+
+def test_qcom_gnss_and_proc_diagnostics_captured():
+  metrics = gps_drive_audit.RouteMetrics("qcom-diag")
+  metrics.note_time(50.0)
+  metrics.process_qcom_gnss(51.0, SimpleNamespace(which=lambda: "measurementReport"))
+  metrics.process_qcom_gnss(52.0, SimpleNamespace(which=lambda: "measurementReport"))
+  metrics.process_proc_log(
+    53.0,
+    SimpleNamespace(
+      procs=[
+        SimpleNamespace(name="python3", cmdline="openpilot.system.qcomgpsd.qcomgpsd"),
+        SimpleNamespace(name="python3", cmdline="openpilot.system.gpsard"),
+      ]
+    ),
+  )
+  metrics.process_log_message(54.0, '{"msg":"qcomgpsd skipping GNSS_PWR_EN; ublox hardware owns rail"}')
+  assert metrics.has_qcom_gnss is True
+  assert metrics.qcom_gnss_counts["measurementReport"] == 2
+  assert "qcomgpsd" in metrics.proc_seen_names
+  assert "gpsard" in metrics.proc_seen_names
+  assert metrics.qcomgpsd_log_event_count >= 1
+  summary = "\n".join(metrics.summary_lines(1))
+  assert "===== QCOM / PROCESS DIAGNOSTICS =====" in summary
+  assert "has_qcom_gnss=True" in summary

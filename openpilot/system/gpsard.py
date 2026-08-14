@@ -51,8 +51,19 @@ def _age_or_neg1(now_mono: float, then: float | None) -> float:
   return float(age)
 
 
+def _vned_from_msg(vned) -> tuple[float, float, float]:
+  """Read NED velocity without slicing Cap'n Proto DynamicListReader.
+
+  Real cereal readers raise TypeError on vNED[:3] ("an integer is required").
+  Indexing with 0/1/2 is the supported access pattern.
+  """
+  if len(vned) >= 3:
+    return (float(vned[0]), float(vned[1]), float(vned[2]))
+  return (float("nan"), float("nan"), float("nan"))
+
+
 def _gps_msg_to_sample(msg, recv_mono: float) -> GpsSample:
-  vned = tuple(float(v) for v in msg.vNED[:3]) if len(msg.vNED) >= 3 else (float("nan"), float("nan"), float("nan"))
+  vned = _vned_from_msg(msg.vNED)
   meas_ns = int(msg.measurementMonoNs) if hasattr(msg, "measurementMonoNs") else 0
   return GpsSample(
     recv_mono=recv_mono,
@@ -66,7 +77,7 @@ def _gps_msg_to_sample(msg, recv_mono: float) -> GpsSample:
     speed_accuracy=float(msg.speedAccuracy),
     bearing_deg=float(msg.bearingDeg),
     bearing_accuracy_deg=float(msg.bearingAccuracyDeg),
-    v_ned=(vned[0], vned[1], vned[2]),
+    v_ned=vned,
     measurement_mono_ns=meas_ns if meas_ns > 0 else None,
   )
 

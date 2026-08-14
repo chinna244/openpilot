@@ -95,6 +95,9 @@ set_directory_permissions() {
 setup_directories() {
     echo "Creating necessary directories..."
     sudo mkdir -p "$RUNNER_DIR" "$BUILDS_DIR" "$LOGS_DIR" "$CACHE_DIR" "$OPENPILOT_DIR"
+    # Marker identifies the CI staging tree. The prebuilt workflow refuses to
+    # delete/rsync /data/openpilot unless that path is a bind-mount of this dir.
+    sudo touch "${OPENPILOT_DIR}/.ci_build_dir"
     mkdir -p "/data/openpilot"
     sudo chown -R comma:comma "/data/openpilot"
     sync

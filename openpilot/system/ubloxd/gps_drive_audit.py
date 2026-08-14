@@ -28,7 +28,9 @@ DEFAULT_ASSISTANCE_ROOT = Path("/data/gps_assistance")
 BOOT_ID_PATH = Path("/proc/sys/kernel/random/boot_id")
 SEGMENT_PATTERN = re.compile(r"^(?P<route>.+--[0-9a-fA-F]+)--(?P<segment>[0-9]+)$")
 LOG_NAMES = ("rlog.zst", "rlog.bz2", "rlog", "qlog.zst", "qlog.bz2", "qlog")
-PARAM_KEYS = ("GitCommit", "GitBranch", "Version", "PublicYumaAlmanacEnabled", "IsOnroad", "IsOffroad")
+PARAM_KEYS = ("GitCommit", "GitBranch", "Version", "PublicYumaAlmanacEnabled")
+# Optional diagnostics only — UnknownKeyName / read failures must never abort the bundle.
+OPTIONAL_PARAM_KEYS = ("IsOffroad",)
 STATE_FILES = (
   "navigation_cache.json",
   "navigation_cache_previous.json",
@@ -57,6 +59,15 @@ EVENT_KEYWORDS = (
   "pigeond",
   "ubloxd",
   "gpsard",
+  "qcomgpsd",
+  "quectel",
+  "qcom diag",
+  "modemdiag",
+  "timed",
+  "locationd",
+  "locationd_llk",
+  "manager failed",
+  "process died",
   "position assistance",
   "dbd",
   "yuma",
@@ -189,6 +200,19 @@ class RouteMetrics:
   has_sat_report: bool = False
   has_rf_observability_logs: bool = False
   has_qcom_gps: bool = False
+  has_qcom_gnss: bool = False
+  qcom_gnss_counts: Counter[str] = field(default_factory=Counter)
+  qcom_log_event_count: int = 0
+  gpsard_log_event_count: int = 0
+  timed_log_event_count: int = 0
+  locationd_log_event_count: int = 0
+  qcomgpsd_log_event_count: int = 0
+  pigeond_log_event_count: int = 0
+  ubloxd_log_event_count: int = 0
+  manager_process_events: list[str] = field(default_factory=list)
+  proc_seen_names: set[str] = field(default_factory=set)
+  first_fix_legacy_flags: float | None = None
+  ttff_fix_policy: str = "strict_has_fix"
   first_nav_pvt: float | None = None
   first_fix_ok: float | None = None
   first_reliable_fix: float | None = None
@@ -403,6 +427,23 @@ class RouteMetrics:
     if self.first_receiver_utc is None and is_independent_receiver_utc_event(text):
       self.first_receiver_utc = monotonic_time
 
+    if "qcomgpsd" in lowered or "quectel" in lowered or "qcom diag" in lowered or "modemdiag" in lowered:
+      self.qcomgpsd_log_event_count += 1
+      self.qcom_log_event_count += 1
+    if "gpsard" in lowered:
+      self.gpsard_log_event_count += 1
+    if "timed" in lowered and ("gps" in lowered or "time" in lowered):
+      self.timed_log_event_count += 1
+    if "locationd" in lowered:
+      self.locationd_log_event_count += 1
+    if "pigeond" in lowered:
+      self.pigeond_log_event_count += 1
+    if "ubloxd" in lowered:
+      self.ubloxd_log_event_count += 1
+    if "manager failed" in lowered or "process died" in lowered or "restarting" in lowered:
+      if len(self.manager_process_events) < 200:
+        self.manager_process_events.append(f"{monotonic_time:.3f}:{text[:240]}")
+
   def process_car_state(self, monotonic_time: float, car_state: object) -> None:
     speed = abs(float(safe_get(car_state, "vEgo", 0.0)))
     if self.previous_car is not None:
@@ -430,7 +471,18 @@ class RouteMetrics:
           self.measurement_mono_max_age_s = age_s
 
     flags = as_int(safe_get(gps, "flags", 0), 0) or 0
-    has_fix = bool(flags & 1) or bool(safe_get(gps, "hasFix", False))
+    flags_fix = bool(flags & 1)
+    # Modern logs: strict hasFix only. Legacy fallback only when hasFix is absent.
+    if hasattr(gps, "hasFix"):
+      has_fix = bool(gps.hasFix)
+      self.ttff_fix_policy = "strict_has_fix"
+    else:
+      has_fix = flags_fix
+      self.ttff_fix_policy = "legacy_flags_bit0"
+
+    if flags_fix and self.first_fix_legacy_flags is None:
+      self.first_fix_legacy_flags = monotonic_time
+
     timestamp_ms = as_int(safe_get(gps, "unixTimestampMillis", 0), 0) or 0
     if timestamp_ms > 0:
       self.positive_timestamp_samples += 1
@@ -486,6 +538,38 @@ class RouteMetrics:
         if distance / delta <= 100.0:
           self.gps_distance_m += distance
     self.previous_gps = (monotonic_time, latitude, longitude)
+
+  def process_qcom_gnss(self, monotonic_time: float, qcom: object) -> None:
+    self.has_qcom_gnss = True
+    try:
+      kind = qcom.which()
+    except Exception:
+      kind = "unknown"
+    self.qcom_gnss_counts[str(kind)] += 1
+    if self.qcom_gnss_counts[str(kind)] <= 3 and len(self.events) < 5000:
+      self.events.append((monotonic_time, f"qcomGnss kind={kind}"))
+
+  def process_proc_log(self, _monotonic_time: float, proc_log: object) -> None:
+    interesting = (
+      "qcomgpsd",
+      "gpsard",
+      "timed",
+      "locationd",
+      "ubloxd",
+      "pigeond",
+      "yumaalmanacd",
+    )
+    try:
+      procs = proc_log.procs
+    except Exception:
+      return
+    for proc in procs:
+      name = decode_text(safe_get(proc, "name", "") or "")
+      cmdline = decode_text(safe_get(proc, "cmdline", "") or "")
+      blob = f"{name} {cmdline}".lower()
+      for token in interesting:
+        if token in blob:
+          self.proc_seen_names.add(token)
 
   def _close_no_healthy_interval(self, end_t: float | None) -> None:
     if not self._no_healthy_active or self._no_healthy_start is None:
@@ -710,6 +794,8 @@ class RouteMetrics:
       f"first_valid_leap_second_seconds={self.relative(self.first_valid_leap_second)}",
       f"first_receiver_utc_seconds={self.relative(self.first_receiver_utc)}",
       f"first_fix_seconds={self.relative(self.first_fix)}",
+      f"first_fix_legacy_flags_seconds={self.relative(self.first_fix_legacy_flags)}",
+      f"ttff_fix_policy={self.ttff_fix_policy}",
       f"first_25m_seconds={self.relative(self.first_25m)}",
       f"first_10m_seconds={self.relative(self.first_10m)}",
       f"first_5m_seconds={self.relative(self.first_5m)}",
@@ -717,6 +803,19 @@ class RouteMetrics:
       f"max_satellites={self.max_satellites}",
       "",
       *self.ttff_report_lines(),
+      "",
+      "===== QCOM / PROCESS DIAGNOSTICS =====",
+      f"has_qcom_gps={self.has_qcom_gps}",
+      f"has_qcom_gnss={self.has_qcom_gnss}",
+      f"qcom_gnss_counts={dict(self.qcom_gnss_counts)}",
+      f"qcomgpsd_log_events={self.qcomgpsd_log_event_count}",
+      f"gpsard_log_events={self.gpsard_log_event_count}",
+      f"timed_log_events={self.timed_log_event_count}",
+      f"locationd_log_events={self.locationd_log_event_count}",
+      f"pigeond_log_events={self.pigeond_log_event_count}",
+      f"ubloxd_log_events={self.ubloxd_log_event_count}",
+      f"proc_seen={','.join(sorted(self.proc_seen_names)) if self.proc_seen_names else 'none'}",
+      f"manager_process_event_count={len(self.manager_process_events)}",
       "",
       "===== LOG FILES =====",
       *self.used_logs,
@@ -815,6 +914,10 @@ def analyze_route(selection: RouteSelection, output_root: Path) -> list[str]:
             metrics.process_gps(monotonic_time, message.gpsLocationExternal, source="ublox")
           elif service == "gpsLocation":
             metrics.process_gps(monotonic_time, message.gpsLocation, source="qcom")
+          elif service == "qcomGnss":
+            metrics.process_qcom_gnss(monotonic_time, message.qcomGnss)
+          elif service == "procLog":
+            metrics.process_proc_log(monotonic_time, message.procLog)
           elif service == "gpsSourceState":
             metrics.process_gps_source_state(monotonic_time, message.gpsSourceState)
           elif service == "ubloxGnss":
@@ -871,7 +974,14 @@ def collect_params(destination: Path) -> None:
     try:
       lines.append(f"{key}={decode_param(params.get(key))}")
     except Exception as exc:
-      raise RuntimeError(f"Params read failed for {key}: {type(exc).__name__}: {exc}") from exc
+      # Core identity params failing is still recorded, but must not raise —
+      # validate_bundle checks for ERROR: on required keys only.
+      lines.append(f"{key}=ERROR:{type(exc).__name__}:{exc}")
+  for key in OPTIONAL_PARAM_KEYS:
+    try:
+      lines.append(f"{key}={decode_param(params.get(key))}")
+    except Exception as exc:
+      lines.append(f"{key}=OPTIONAL_UNAVAILABLE:{type(exc).__name__}:{exc}")
   destination.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
@@ -931,6 +1041,7 @@ def copy_state_files(assistance_root: Path, destination: Path, current_boot_id: 
 
 
 def write_system_snapshot(destination: Path, current_boot_id: str) -> None:
+  process_pattern = "qcomgpsd|gpsard|timed|locationd|ubloxd|pigeond|yumaalmanacd|manager\\.py"
   lines = [
     f"captured_at_utc={datetime.now(UTC).isoformat()}",
     f"current_boot_id={current_boot_id}",
@@ -941,8 +1052,17 @@ def write_system_snapshot(destination: Path, current_boot_id: str) -> None:
     "===== UPTIME =====",
     run_capture("cat", "/proc/uptime").rstrip(),
     "",
-    "===== PIGEOND/MANAGER PROCESSES =====",
-    run_capture("pgrep", "-af", "system\\.ubloxd\\.pigeond|manager\\.py").rstrip(),
+    "===== GPS-RELATED PROCESSES =====",
+    run_capture("pgrep", "-af", process_pattern).rstrip(),
+    "",
+    "===== RECENT SWAGLOG GPS/QCOM HITS =====",
+    run_capture(
+      "bash",
+      "-lc",
+      "ls -t /data/log/swaglog* 2>/dev/null | head -3 | xargs -r grep -a -h -E -m 40 "
+      + "'qcomgpsd|gpsard|QCOM DIAG|quectel|TypeError|vNED|Manager failed|locationd|timed|pigeond|ubloxd' "
+      + "2>/dev/null | tail -n 80",
+    ).rstrip(),
   ]
   destination.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
@@ -986,8 +1106,12 @@ def validate_bundle(bundle_root: Path, selected_routes: Iterable[RouteSelection]
   for selection in selected_routes:
     if f"route={selection.route}" not in summary:
       raise RuntimeError(f"Requested route missing from summary: {selection.route}")
-  if not params_path.is_file() or "ERROR:" in params_path.read_text(encoding="utf-8"):
+  if not params_path.is_file():
     raise RuntimeError("Params collection failed")
+  params_text = params_path.read_text(encoding="utf-8")
+  for key in PARAM_KEYS:
+    if f"{key}=ERROR:" in params_text:
+      raise RuntimeError(f"Params collection failed for required key {key}")
   verify_checksums(bundle_root)
 
 
