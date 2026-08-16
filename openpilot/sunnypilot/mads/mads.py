@@ -121,6 +121,10 @@ class ModularAssistiveDrivingSystem:
     # Therefore we allow a mismatch for two samples, then we trigger the disengagement.
     if not self.active or self.selfdrive.enabled:
       self.lateral_mismatch_counter = 0
+    elif self.CP.brand == "mazda":
+      # Torque is paused in controlsd.get_lat_active until panda lateral auth.
+      # Do not disengage MADS; resume automatically when auth returns.
+      self.lateral_mismatch_counter = 0
     elif any(not ps.controlsAllowedLateral for ps in self.selfdrive.sm['pandaStates']
              if ps.safetyModel not in IGNORED_SAFETY_MODES):
       self.lateral_mismatch_counter += 1

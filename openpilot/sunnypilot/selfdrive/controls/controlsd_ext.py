@@ -31,7 +31,7 @@ class ControlsExt(ModelStateBase):
     self.CP_SP = messaging.log_from_bytes(params.get("CarParamsSP", block=True), custom.CarParamsSP)
     cloudlog.info("controlsd_ext got CarParamsSP")
 
-    self.sm_services_ext = ['radarState', 'selfdriveStateSP']
+    self.sm_services_ext = ['radarState', 'selfdriveStateSP', 'pandaStates']
     self.pm_services_ext = ['carControlSP']
 
   def initialize_lateral_control(self, lac, CI, dt):
@@ -64,10 +64,27 @@ class ControlsExt(ModelStateBase):
 
     ss_sp = sm['selfdriveStateSP']
     if ss_sp.mads.available:
-      return bool(ss_sp.mads.active)
+      mads_active = bool(ss_sp.mads.active)
+      if self.CP.brand == "mazda":
+        # Route 39: latActive and nonzero CAM_LKAS at t=111.884 before panda
+        # lateral auth at t=112.021. MADS stays enabled; torque waits for auth.
+        return mads_active and self._panda_lateral_allowed(sm)
+      return mads_active
 
     # MADS not available, use stock state to engage
     return bool(sm['selfdriveState'].active)
+
+  @staticmethod
+  def _panda_lateral_allowed(sm: messaging.SubMaster) -> bool:
+    try:
+      pss = sm['pandaStates']
+    except Exception:
+      return False
+    ignored = {"silent", "noOutput", "elm327"}
+    relevant = [ps for ps in pss if str(ps.safetyModel) not in ignored]
+    if not relevant:
+      return False
+    return any(bool(ps.controlsAllowedLateral) or bool(ps.controlsAllowed) for ps in relevant)
 
   @staticmethod
   def get_lead_data(_lead, src: log.RadarState.LeadData) -> None:

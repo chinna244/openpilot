@@ -301,3 +301,34 @@ class TestMazdaTjaMadsCruiseState:
     assert active.cruiseState.available
     assert active.cruiseState.enabled
     assert not h.mads.enabled
+
+
+class TestMazdaPandaAuthPause:
+  def test_auth_loss_does_not_disengage_mads(self, mocker):
+    h = TjaMadsHarness(mocker, alpha_long=False)
+    h.step()
+    h.step(tja=1)
+    assert h.mads.enabled
+    h.mads.active = True
+    h.sd.sm["pandaStates"][0].controlsAllowedLateral = False
+    h.sd.sm["pandaStates"][0].safetyModel = SafetyModel.mazda
+    for _ in range(250):
+      h.mads.data_sample()
+    assert h.mads.lateral_mismatch_counter == 0
+    assert h.mads.enabled
+
+  def test_panda_lateral_allowed_helper(self):
+    from openpilot.sunnypilot.selfdrive.controls.controlsd_ext import ControlsExt
+
+    class PS:
+      def __init__(self, model, cal=False, ca=False):
+        self.safetyModel = model
+        self.controlsAllowedLateral = cal
+        self.controlsAllowed = ca
+
+    fn = ControlsExt._panda_lateral_allowed
+    assert fn({"pandaStates": [PS("elm327")]}) is False
+    assert fn({"pandaStates": [PS("mazda", cal=False, ca=False)]}) is False
+    assert fn({"pandaStates": [PS("mazda", cal=True)]}) is True
+    assert fn({"pandaStates": [PS("mazda", ca=True)]}) is True
+    assert fn({"pandaStates": []}) is False
