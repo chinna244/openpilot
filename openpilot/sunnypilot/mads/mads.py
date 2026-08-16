@@ -47,6 +47,11 @@ class ModularAssistiveDrivingSystem:
         self.allow_always = True
     if self.CP.brand == "tesla":
       self.allow_always = True
+    if self.CP.brand == "mazda":
+      # Physical TJA (ButtonType.lkas) is the only MADS toggle. MRCC is OEM-only
+      # and must not enable/disable MADS via cruiseState.available.
+      self.allow_always = True
+      self.no_main_cruise = True
 
     if self.CP.brand in MADS_NO_ACC_MAIN_BUTTON:
       self.no_main_cruise = True
@@ -56,10 +61,14 @@ class ModularAssistiveDrivingSystem:
     self.main_enabled_toggle = self.params.get_bool("MadsMainCruiseAllowed")
     self.steering_mode_on_brake = read_steering_mode_param(self.CP, self.CP_SP, self.params)
     self.unified_engagement_mode = self.params.get_bool("MadsUnifiedEngagementMode")
+    if self.CP.brand == "mazda":
+      self.main_enabled_toggle = False
 
   def read_params(self):
     self.main_enabled_toggle = self.params.get_bool("MadsMainCruiseAllowed")
     self.unified_engagement_mode = self.params.get_bool("MadsUnifiedEngagementMode")
+    if self.CP.brand == "mazda":
+      self.main_enabled_toggle = False
 
   def pedal_pressed_non_gas_pressed(self, CS: structs.CarState) -> bool:
     # ignore `pedalPressed` events caused by gas presses
