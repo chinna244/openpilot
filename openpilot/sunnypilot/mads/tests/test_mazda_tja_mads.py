@@ -1,5 +1,9 @@
 """Mazda TJA-only MADS toggle: physical TJA rising edge toggles MADS; MRCC does not."""
 
+import random
+
+import pytest
+
 from opendbc.can import CANPacker
 from opendbc.car import gen_empty_fingerprint, structs
 from opendbc.car.mazda.interface import CarInterface
@@ -12,13 +16,26 @@ from openpilot.sunnypilot.mads.mads import ModularAssistiveDrivingSystem
 ButtonType = structs.CarState.ButtonEvent.Type
 SafetyModel = structs.CarParams.SafetyModel
 
+# Same CRZ_BTNS TJA run-length as opendbc test_mazda_tja_button (route
+# ff7df7d6f9c3403b|00000033--7b0201ce40). One physical pulse = one MADS toggle.
+ROUTE_TJA_RLE = (
+  (0, 217), (1, 3), (0, 115), (1, 3), (0, 4), (1, 3), (0, 50), (1, 2), (0, 4), (1, 3),
+  (0, 18), (1, 2), (0, 30), (1, 3), (0, 102), (1, 3), (0, 8), (1, 3), (0, 12), (1, 3),
+  (0, 19), (1, 3), (0, 5), (1, 3), (0, 10), (1, 3), (0, 286), (1, 3), (0, 5), (1, 2),
+  (0, 18), (1, 3), (0, 12), (1, 3), (0, 33), (1, 3), (0, 6), (1, 3), (0, 6), (1, 3),
+  (0, 6), (1, 3), (0, 10), (1, 4), (0, 13), (1, 3), (0, 16), (1, 3), (0, 23), (1, 3),
+  (0, 14), (1, 3), (0, 8), (1, 4), (0, 22),
+)
+ROUTE_TJA_RISING_EDGES = 27
 
-def _car_interface():
+
+def _car_interface(*, alpha_long=True):
   fingerprint = gen_empty_fingerprint()
-  CP = CarInterface.get_params(CAR.MAZDA_CX5_2022, fingerprint, [], alpha_long=True,
+  CP = CarInterface.get_params(CAR.MAZDA_CX5_2022, fingerprint, [], alpha_long=alpha_long,
                                is_release=False, docs=False)
   CP_SP = CarInterface.get_params_sp(CP, CAR.MAZDA_CX5_2022, fingerprint, [],
-                                     alpha_long=True, is_release_sp=False, docs=False)
+                                     alpha_long=alpha_long, is_release_sp=False, docs=False)
+  assert CP.openpilotLongitudinalControl == alpha_long
   return CarInterface(CP, CP_SP)
 
 
@@ -54,14 +71,14 @@ def _make_mads(mocker, CP, CP_SP):
 
 
 class TjaMadsHarness:
-  def __init__(self, mocker):
-    self.ci = _car_interface()
+  def __init__(self, mocker, *, alpha_long=True):
+    self.ci = _car_interface(alpha_long=alpha_long)
     self.mads, self.sd = _make_mads(mocker, self.ci.CP, self.ci.CP_SP)
     self.packer = CANPacker("mazda_2017")
     self.t = 0
 
   def step(self, *, tja=0, mrcc=0, acc_off=0, acc_active=0, set_p=0, set_m=0,
-           res=0, can_off=0):
+           res=0, can_off=0, crz_available=0, crz_active=0):
     self.t += 10_000_000
     addr, dat, bus = self.packer.make_can_msg("CRZ_BTNS", 0, {
       "TJA_BUTTON": tja,
@@ -75,13 +92,17 @@ class TjaMadsHarness:
     })
     if mrcc:
       dat = bytes((dat[0], dat[1] | 0x80, *dat[2:]))
-    crz = (addr, dat, bus)
-    pedals = self.packer.make_can_msg("PEDALS", 0, {
+    msgs = [(addr, dat, bus), self.packer.make_can_msg("PEDALS", 0, {
       "ACC_OFF": acc_off,
       "ACC_ACTIVE": acc_active,
       "BRAKE_ON": 0,
-    })
-    cs, _ = self.ci.update([(self.t, [crz, pedals])])
+    })]
+    if not self.ci.CP.openpilotLongitudinalControl:
+      msgs.append(self.packer.make_can_msg("CRZ_CTRL", 0, {
+        "CRZ_AVAILABLE": crz_available,
+        "CRZ_ACTIVE": crz_active,
+      }))
+    cs, _ = self.ci.update([(self.t, msgs)])
     self.sd.events.clear()
     self.sd.events_sp.clear()
     self.mads.update(cs)
@@ -89,16 +110,17 @@ class TjaMadsHarness:
     return cs
 
 
+@pytest.mark.parametrize("alpha_long", [False, True])
 class TestMazdaTjaMads:
-  def test_1_tja_rising_edge_enables_mads(self, mocker):
-    h = TjaMadsHarness(mocker)
+  def test_1_tja_rising_edge_enables_mads(self, mocker, alpha_long):
+    h = TjaMadsHarness(mocker, alpha_long=alpha_long)
     h.step()
     assert not h.mads.enabled
     h.step(tja=1)
     assert h.mads.enabled
 
-  def test_2_tja_held_is_single_toggle(self, mocker):
-    h = TjaMadsHarness(mocker)
+  def test_2_tja_held_is_single_toggle(self, mocker, alpha_long):
+    h = TjaMadsHarness(mocker, alpha_long=alpha_long)
     h.step()
     h.step(tja=1)
     assert h.mads.enabled
@@ -106,23 +128,23 @@ class TestMazdaTjaMads:
       h.step(tja=1)
       assert h.mads.enabled
 
-  def test_3_tja_release_does_not_toggle(self, mocker):
-    h = TjaMadsHarness(mocker)
+  def test_3_tja_release_does_not_toggle(self, mocker, alpha_long):
+    h = TjaMadsHarness(mocker, alpha_long=alpha_long)
     h.step()
     h.step(tja=1)
     h.step(tja=0)
     assert h.mads.enabled
 
-  def test_4_second_tja_rising_edge_disables_mads(self, mocker):
-    h = TjaMadsHarness(mocker)
+  def test_4_second_tja_rising_edge_disables_mads(self, mocker, alpha_long):
+    h = TjaMadsHarness(mocker, alpha_long=alpha_long)
     h.step()
     h.step(tja=1)
     h.step(tja=0)
     h.step(tja=1)
     assert not h.mads.enabled
 
-  def test_5_one_mads_transition_per_rising_edge(self, mocker):
-    h = TjaMadsHarness(mocker)
+  def test_5_one_mads_transition_per_rising_edge(self, mocker, alpha_long):
+    h = TjaMadsHarness(mocker, alpha_long=alpha_long)
     h.step()
     expected = False
     transitions = 0
@@ -137,27 +159,33 @@ class TestMazdaTjaMads:
         assert h.mads.enabled is prev
     assert transitions == 4
 
-  def test_6_mrcc_with_mads_off_stays_off(self, mocker):
-    h = TjaMadsHarness(mocker)
+  def test_6_mrcc_with_mads_off_stays_off(self, mocker, alpha_long):
+    h = TjaMadsHarness(mocker, alpha_long=alpha_long)
     h.step()
-    h.step(mrcc=1, acc_off=1)
-    assert not h.mads.enabled
-    h.step(acc_off=1)
+    if alpha_long:
+      h.step(mrcc=1, acc_off=1)
+      h.step(acc_off=1)
+    else:
+      h.step(mrcc=1, crz_available=1)
+      h.step(crz_available=1)
     assert not h.mads.enabled
 
-  def test_7_mrcc_with_mads_on_stays_on(self, mocker):
-    h = TjaMadsHarness(mocker)
+  def test_7_mrcc_with_mads_on_stays_on(self, mocker, alpha_long):
+    h = TjaMadsHarness(mocker, alpha_long=alpha_long)
     h.step()
     h.step(tja=1)
     h.step(tja=0)
     assert h.mads.enabled
-    h.step(mrcc=1, acc_off=1)
-    assert h.mads.enabled
-    h.step(acc_off=0)
+    if alpha_long:
+      h.step(mrcc=1, acc_off=1)
+      h.step(acc_off=0)
+    else:
+      h.step(mrcc=1, crz_available=1)
+      h.step(crz_available=0)
     assert h.mads.enabled
 
-  def test_8_to_11_set_res_cancel_do_not_toggle_mads(self, mocker):
-    h = TjaMadsHarness(mocker)
+  def test_8_to_11_set_res_cancel_do_not_toggle_mads(self, mocker, alpha_long):
+    h = TjaMadsHarness(mocker, alpha_long=alpha_long)
     h.step()
     h.step(set_p=1)
     h.step()
@@ -172,16 +200,63 @@ class TestMazdaTjaMads:
     h.step(tja=1)
     h.step(tja=0)
     assert h.mads.enabled
-    h.step(set_p=1, acc_off=1)
-    h.step(acc_off=1)
-    h.step(set_m=1, acc_off=1)
-    h.step(acc_off=1)
-    h.step(res=1, acc_off=1)
-    h.step(acc_off=1)
-    h.step(can_off=1, acc_off=1)
-    h.step(acc_off=1)
+    cruise = {"acc_off": 1} if alpha_long else {"crz_available": 1}
+    h.step(set_p=1, **cruise)
+    h.step(**cruise)
+    h.step(set_m=1, **cruise)
+    h.step(**cruise)
+    h.step(res=1, **cruise)
+    h.step(**cruise)
+    h.step(can_off=1, **cruise)
+    h.step(**cruise)
     assert h.mads.enabled
 
+  def test_route_tja_pulses_toggle_mads_once_each(self, mocker, alpha_long):
+    h = TjaMadsHarness(mocker, alpha_long=alpha_long)
+    toggles = 0
+    prev = False
+    for tja, n in ROUTE_TJA_RLE:
+      for _ in range(n):
+        h.step(tja=tja)
+        if h.mads.enabled != prev:
+          toggles += 1
+          prev = h.mads.enabled
+    assert toggles == ROUTE_TJA_RISING_EDGES
+    assert h.mads.enabled is True  # odd pulse count, started off
+
+  def test_randomized_button_fuzz(self, mocker, alpha_long):
+    rng = random.Random(1)
+    h = TjaMadsHarness(mocker, alpha_long=alpha_long)
+    h.step()
+    prev_tja = 0
+    expected = False
+    expected_toggles = 0
+    for _ in range(400):
+      tja = rng.choice((0, 0, 0, 1))
+      kwargs = {
+        "tja": tja,
+        "mrcc": rng.choice((0, 0, 1)),
+        "set_p": rng.choice((0, 0, 1)),
+        "set_m": rng.choice((0, 0, 1)),
+        "res": rng.choice((0, 0, 1)),
+        "can_off": rng.choice((0, 0, 1)),
+      }
+      if alpha_long:
+        kwargs["acc_off"] = rng.choice((0, 1))
+        kwargs["acc_active"] = rng.choice((0, 1)) if kwargs["acc_off"] else 0
+      else:
+        kwargs["crz_available"] = rng.choice((0, 1))
+        kwargs["crz_active"] = rng.choice((0, 1)) if kwargs["crz_available"] else 0
+      h.step(**kwargs)
+      if tja == 1 and prev_tja == 0:
+        expected = not expected
+        expected_toggles += 1
+      assert h.mads.enabled is expected
+      prev_tja = tja
+    assert expected_toggles > 0
+
+
+class TestMazdaTjaMadsCruiseState:
   def test_12_13_tja_does_not_fabricate_cruise_state(self, mocker):
     h = TjaMadsHarness(mocker)
     h.step()
@@ -194,6 +269,23 @@ class TestMazdaTjaMads:
     assert armed.cruiseState.available
     assert not armed.cruiseState.enabled
     tja_armed = h.step(tja=1, acc_off=1)
+    assert tja_armed.cruiseState.available
+    assert not tja_armed.cruiseState.enabled
+    assert not h.mads.enabled
+
+  def test_stock_long_tja_keeps_oem_crz_ctrl(self, mocker):
+    h = TjaMadsHarness(mocker, alpha_long=False)
+    h.step()
+    cs = h.step(tja=1)
+    assert h.mads.enabled
+    assert not cs.cruiseState.available
+    assert not cs.cruiseState.enabled
+    h.step(tja=0)
+    armed = h.step(crz_available=1)
+    assert armed.cruiseState.available
+    assert not armed.cruiseState.enabled
+    assert h.mads.enabled
+    tja_armed = h.step(tja=1, crz_available=1)
     assert tja_armed.cruiseState.available
     assert not tja_armed.cruiseState.enabled
     assert not h.mads.enabled
