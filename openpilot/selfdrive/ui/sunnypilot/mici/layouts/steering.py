@@ -65,6 +65,7 @@ class SteeringLayoutMici(NavScroller):
 
     # Per-frame state the enable/depends_on callbacks read, so they cost no extra param reads
     self._mads_limited = False
+    self._tja_only = False
     self._alc_val = AutoLaneChangeMode.NUDGE
     self._torque_allowed = False
     self._enforce_torque = False
@@ -90,9 +91,9 @@ class SteeringLayoutMici(NavScroller):
     self._mads_toggle.set_enabled(ui_state.is_offroad)
     # depends_on reads the live toggle, not the param, so a tap lands the same frame
     self._mads_main_cruise = BigParamControlSP(tr("main cruise toggle"), "MadsMainCruiseAllowed",
-                                               depends_on=lambda: self._mads_toggle._checked and not self._mads_limited)
+                                               depends_on=lambda: self._mads_toggle._checked and not self._mads_limited and not self._tja_only)
     self._mads_unified = BigParamControlSP(tr("unified engagement"), "MadsUnifiedEngagementMode",
-                                           depends_on=lambda: self._mads_toggle._checked and not self._mads_limited)
+                                           depends_on=lambda: self._mads_toggle._checked and not self._mads_limited and not self._tja_only)
     self._mads_steering = BigMultiParamToggleSP(tr("steering on brake"), "MadsSteeringMode", MADS_STEERING_MODE_LABELS)
     self._mads_view = self._mads_settings_btn.link_sub_panel([self._mads_toggle, self._mads_main_cruise, self._mads_unified, self._mads_steering])
 
@@ -244,10 +245,14 @@ class SteeringLayoutMici(NavScroller):
     # Transition tracking — force safe defaults for MADS-limited brands (rivian, tesla w/o vehicle bus)
     is_mads_limited = self._mads_limited = bool(ui_state.CP is not None and ui_state.CP_SP is not None and
                                                 get_mads_limited_brands(ui_state.CP, ui_state.CP_SP))
+    self._tja_only = bool(ui_state.CP is not None and ui_state.CP.brand == "mazda")
     if is_mads_limited and self._prev_mads_limited is not True:
       ui_state.params.remove("MadsMainCruiseAllowed")
       ui_state.params.put_bool("MadsUnifiedEngagementMode", True)
       ui_state.params.put("MadsSteeringMode", MadsSteeringModeOnBrake.DISENGAGE)
+    elif self._tja_only:
+      ui_state.params.remove("MadsMainCruiseAllowed")
+      ui_state.params.put_bool("MadsUnifiedEngagementMode", False)
     self._prev_mads_limited = is_mads_limited
 
     # Sub-panels refresh their own widgets (SubPanelSP); only the mads-limited lockout, which

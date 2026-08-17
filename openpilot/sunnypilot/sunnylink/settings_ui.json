@@ -77,6 +77,14 @@
                           }
                         ]
                       }
+                    },
+                    {
+                      "type": "not",
+                      "condition": {
+                        "type": "capability",
+                        "field": "brand",
+                        "equals": "mazda"
+                      }
                     }
                   ]
                 },
@@ -118,6 +126,14 @@
                             ]
                           }
                         ]
+                      }
+                    },
+                    {
+                      "type": "not",
+                      "condition": {
+                        "type": "capability",
+                        "field": "brand",
+                        "equals": "mazda"
                       }
                     }
                   ]

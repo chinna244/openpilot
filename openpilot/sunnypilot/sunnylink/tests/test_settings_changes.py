@@ -125,6 +125,13 @@ class TestMadsBrandGates:
     assert _references_capability_field(item.get("enablement"), "brand")
     assert _references_capability_field(item.get("enablement"), "tesla_has_vehicle_bus")
 
+  def test_mads_main_cruise_and_uem_hidden_on_mazda(self, schema):
+    for key in ("MadsMainCruiseAllowed", "MadsUnifiedEngagementMode"):
+      item = _find_item(schema, key)
+      assert item is not None
+      blob = json.dumps(item.get("enablement"))
+      assert "mazda" in blob
+
 
 class TestTestManeuversSection:
   def test_lateral_maneuver_mode_in_test_maneuvers(self, schema):

@@ -32,6 +32,10 @@ STATUS_CHECK_COMPATIBILITY = tr("Start the vehicle to check vehicle compatibilit
 DEFAULT_TO_OFF = tr("This feature defaults to OFF, and does not allow selection due to vehicle limitations.")
 DEFAULT_TO_ON = tr("This feature defaults to ON, and does not allow selection due to vehicle limitations.")
 STATUS_DISENGAGE_ONLY = tr("This platform only supports Disengage mode due to vehicle limitations.")
+TJA_ONLY_MADS_DESC = tr("Mazda uses the physical TJA button as the only MADS master. Main Cruise and UEM are not available.")
+
+
+class MadsSettingsLayout(Widget):
 
 
 class MadsSettingsLayout(Widget):
@@ -84,7 +88,7 @@ class MadsSettingsLayout(Widget):
     self._scroller.show_event()
 
   @staticmethod
-  def _mads_limited_settings() -> bool:
+  def _current_brand() -> str:
     brand = ""
     if ui_state.is_offroad():
       bundle = ui_state.params.get("CarPlatformBundle")
@@ -92,12 +96,21 @@ class MadsSettingsLayout(Widget):
         brand = bundle.get("brand", "")
     if not brand:
       brand = ui_state.CP.brand if ui_state.CP is not None else ""
+    return brand
+
+  @staticmethod
+  def _mads_limited_settings() -> bool:
+    brand = MadsSettingsLayout._current_brand()
 
     if brand == "rivian":
       return True
     elif brand == "tesla":
       return not (ui_state.CP_SP is not None and ui_state.CP_SP.flags & TeslaFlagsSP.HAS_VEHICLE_BUS)
     return False
+
+  @staticmethod
+  def _tja_only_mads() -> bool:
+    return MadsSettingsLayout._current_brand() == "mazda"
 
   def _update_steering_mode_description(self, button_index: int):
     base_desc = tr("Choose how Automatic Lane Centering (ALC) behaves after the brake pedal is manually pressed in sunnypilot.")
@@ -126,6 +139,20 @@ class MadsSettingsLayout(Widget):
       self._steering_mode.set_description(STATUS_DISENGAGE_ONLY)
       self._steering_mode.action_item.set_selected_button(MadsSteeringModeOnBrake.DISENGAGE)
       self._steering_mode.action_item.set_enabled_buttons({MadsSteeringModeOnBrake.DISENGAGE})
+    elif self._tja_only_mads():
+      ui_state.params.remove("MadsMainCruiseAllowed")
+      ui_state.params.put_bool("MadsUnifiedEngagementMode", False)
+
+      self._main_cruise_toggle.action_item.set_enabled(False)
+      self._main_cruise_toggle.action_item.set_state(False)
+      self._main_cruise_toggle.set_description("<b>" + TJA_ONLY_MADS_DESC + "</b><br>" + MADS_MAIN_CRUISE_BASE_DESC)
+
+      self._unified_engagement_toggle.action_item.set_enabled(False)
+      self._unified_engagement_toggle.action_item.set_state(False)
+      self._unified_engagement_toggle.set_description("<b>" + TJA_ONLY_MADS_DESC + "</b><br>" + MADS_UNIFIED_ENGAGEMENT_MODE_BASE_DESC)
+
+      self._steering_mode.action_item.set_enabled(True)
+      self._steering_mode.action_item.set_enabled_buttons(None)
     else:
       self._main_cruise_toggle.action_item.set_enabled(True)
       self._main_cruise_toggle.set_description(MADS_MAIN_CRUISE_BASE_DESC)

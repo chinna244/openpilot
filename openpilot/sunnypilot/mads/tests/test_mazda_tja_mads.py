@@ -79,8 +79,8 @@ class TjaMadsHarness:
     self.packer = CANPacker("mazda_2017")
     self.t = 0
 
-  def step(self, *, tja=0, mrcc=0, acc_off=0, acc_active=0, set_p=0, set_m=0,
-           res=0, can_off=0, crz_available=0, crz_active=0):
+  def step(self, *, tja=0, acc_off=0, acc_active=0, set_p=0, set_m=0,
+           res=0, can_off=0, crz_available=0, crz_active=0, mode_x=0, mode_y=0):
     self.t += 10_000_000
     addr, dat, bus = self.packer.make_can_msg("CRZ_BTNS", 0, {
       "TJA_BUTTON": tja,
@@ -88,12 +88,12 @@ class TjaMadsHarness:
       "SET_M": set_m,
       "RES": res,
       "CAN_OFF": can_off,
+      "MODE_X": mode_x,
+      "MODE_Y": mode_y,
       "BIT1": 1,
       "BIT2": 1,
       "BIT3": 1,
     })
-    if mrcc:
-      dat = bytes((dat[0], dat[1] | 0x80, *dat[2:]))
     msgs = [(addr, dat, bus), self.packer.make_can_msg("PEDALS", 0, {
       "ACC_OFF": acc_off,
       "ACC_ACTIVE": acc_active,
@@ -165,10 +165,10 @@ class TestMazdaTjaMads:
     h = TjaMadsHarness(mocker, alpha_long=alpha_long)
     h.step()
     if alpha_long:
-      h.step(mrcc=1, acc_off=1)
+      h.step(mode_x=1, mode_y=1, acc_off=1)
       h.step(acc_off=1)
     else:
-      h.step(mrcc=1, crz_available=1)
+      h.step(mode_x=1, mode_y=1, crz_available=1)
       h.step(crz_available=1)
     assert not h.mads.enabled
 
@@ -179,11 +179,28 @@ class TestMazdaTjaMads:
     h.step(tja=0)
     assert h.mads.enabled
     if alpha_long:
-      h.step(mrcc=1, acc_off=1)
+      h.step(mode_x=1, mode_y=1, acc_off=1)
       h.step(acc_off=0)
     else:
-      h.step(mrcc=1, crz_available=1)
+      h.step(mode_x=1, mode_y=1, crz_available=1)
       h.step(crz_available=0)
+    assert h.mads.enabled
+
+  def test_mode_x_y_do_not_toggle_mads(self, mocker, alpha_long):
+    h = TjaMadsHarness(mocker, alpha_long=alpha_long)
+    h.step()
+    h.step(mode_x=1)
+    h.step()
+    h.step(mode_y=1)
+    h.step()
+    h.step(mode_x=1, mode_y=1)
+    h.step()
+    assert not h.mads.enabled
+    h.step(tja=1)
+    h.step(tja=0)
+    assert h.mads.enabled
+    h.step(mode_x=1, mode_y=1)
+    h.step()
     assert h.mads.enabled
 
   def test_8_to_11_set_res_cancel_do_not_toggle_mads(self, mocker, alpha_long):
@@ -237,7 +254,8 @@ class TestMazdaTjaMads:
       tja = rng.choice((0, 0, 0, 1))
       kwargs = {
         "tja": tja,
-        "mrcc": rng.choice((0, 0, 1)),
+        "mode_x": rng.choice((0, 0, 1)),
+        "mode_y": rng.choice((0, 0, 1)),
         "set_p": rng.choice((0, 0, 1)),
         "set_m": rng.choice((0, 0, 1)),
         "res": rng.choice((0, 0, 1)),
@@ -295,7 +313,7 @@ class TestMazdaTjaMadsCruiseState:
   def test_14_mrcc_oem_cruise_unchanged(self, mocker):
     h = TjaMadsHarness(mocker)
     h.step()
-    armed = h.step(mrcc=1, acc_off=1)
+    armed = h.step(mode_x=1, mode_y=1, acc_off=1)
     assert armed.cruiseState.available
     assert not armed.cruiseState.enabled
     assert not h.mads.enabled

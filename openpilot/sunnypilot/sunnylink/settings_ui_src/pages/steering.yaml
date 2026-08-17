@@ -33,6 +33,7 @@ sections:
       enablement:
       - $ref: '#/macros/offroad'
       - $ref: '#/macros/mads_full_platforms'
+      - $ref: '#/macros/mads_not_tja_only'
     - key: MadsUnifiedEngagementMode
       widget: toggle
       title: Unified Engagement Mode (UEM)
@@ -41,6 +42,7 @@ sections:
       enablement:
       - $ref: '#/macros/offroad'
       - $ref: '#/macros/mads_full_platforms'
+      - $ref: '#/macros/mads_not_tja_only'
     - key: MadsSteeringMode
       widget: multiple_button
       title: Steering Mode on Brake Pedal

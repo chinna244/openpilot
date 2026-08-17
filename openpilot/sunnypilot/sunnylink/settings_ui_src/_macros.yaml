@@ -47,6 +47,11 @@ macros:
               - type: not
                 condition: {type: capability, field: tesla_has_vehicle_bus, equals: true}
 
+  # Mazda TJA is the only MADS master. Do not expose Main Cruise or UEM there.
+  mads_not_tja_only:
+    - type: not
+      condition: {type: capability, field: brand, equals: mazda}
+
   # Inverse of mads_full_platforms: present only on the limited platforms.
   # Useful for "show this only on rivian/tesla-no-bus" toggles.
   mads_limited_platforms:
