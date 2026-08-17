@@ -36,9 +36,6 @@ TJA_ONLY_MADS_DESC = tr("Mazda uses the physical TJA button as the only MADS mas
 
 
 class MadsSettingsLayout(Widget):
-
-
-class MadsSettingsLayout(Widget):
   def __init__(self, back_btn_callback: Callable):
     super().__init__()
     self._back_button = NavButton(tr("Back"))
