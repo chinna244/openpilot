@@ -77,3 +77,15 @@ def test_stale_transition_rejected_as_regression():
 def test_seconds_since_boot_used_for_gpsard_now():
   now = seconds_since_boot()
   assert now > 0.0
+
+
+def test_suspend_like_monotonic_vs_boottime_divergence_goes_stale():
+  # CLOCK_BOOTTIME includes suspend; CLOCK_MONOTONIC does not. A 10s suspend
+  # between a monotonic stamp and a boottime now exceeds the 3s freshness window.
+  # Same-domain boottime stamps stay fresh. This is the defect class gpsard
+  # fixed by publishing logMonoTime and transitionMonoNs from seconds_since_boot.
+  monotonic_stamp = 100.0
+  boottime_now = monotonic_stamp + 10.0
+  assert not gps_source_state_is_fresh(now_mono=boottime_now, last_state_recv_mono=monotonic_stamp)
+  assert gps_source_state_is_fresh(now_mono=boottime_now, last_state_recv_mono=boottime_now)
+  assert gps_source_state_is_fresh(now_mono=monotonic_stamp + 0.5, last_state_recv_mono=monotonic_stamp)
