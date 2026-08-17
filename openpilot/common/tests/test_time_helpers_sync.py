@@ -187,3 +187,15 @@ def test_repeated_receiver_source_preserves_marker_generation(
   )
 
   assert gps_marker.stat().st_mtime_ns == before
+
+
+def test_seconds_since_boot_matches_clock_boottime():
+  import time
+
+  boot = time_helpers.seconds_since_boot()
+  raw = time.clock_gettime(time.CLOCK_BOOTTIME)
+  assert boot == pytest.approx(raw, abs=0.05)
+  monotonic = time.monotonic()
+  # Without a suspend they track; the helper must not be wall-clock.
+  assert abs(boot - monotonic) < 3600.0
+

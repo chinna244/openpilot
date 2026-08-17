@@ -23,11 +23,11 @@ def test_timed_source_epoch_rejects_equal_transition():
   assert (transition_ns + 1) > transition_ns
 
 
-def test_timed_requires_fresh_gps_source_state():
-  assert GPS_SOURCE_STATE_FRESH_SECONDS == 3.0
-  assert not gps_source_state_is_fresh(now_mono=10.0, last_state_recv_mono=None)
-  assert not gps_source_state_is_fresh(now_mono=10.0, last_state_recv_mono=6.0)
-  assert gps_source_state_is_fresh(now_mono=10.0, last_state_recv_mono=8.0)
+def test_timed_freshness_fail_closed_on_boottime_vs_monotonic_divergence():
+  # locationd loop uses CLOCK_BOOTTIME; gpsSourceState Event.logMonoTime must too.
+  # After suspend, BOOTTIME - MONOTONIC > fresh window => permanent fail-closed.
+  assert not gps_source_state_is_fresh(now_mono=110.0, last_state_recv_mono=100.0)
+  assert gps_source_state_is_fresh(now_mono=110.0, last_state_recv_mono=108.0)
 
 
 def test_timed_qcom_clock_policy_no_gps_time_when_qcom_selected():

@@ -153,6 +153,17 @@ def _read_boottime_seconds() -> float | None:
   return value
 
 
+def seconds_since_boot() -> float:
+  """CLOCK_BOOTTIME seconds, matching C openpilot/common/timing.h seconds_since_boot().
+
+  Falls back to time.monotonic() when CLOCK_BOOTTIME is unavailable.
+  """
+  boottime = _read_boottime_seconds()
+  if boottime is not None:
+    return boottime
+  return time.monotonic()
+
+
 def _read_boot_id() -> str | None:
   try:
     value = BOOT_ID_PATH.read_text(encoding="utf-8").strip()

@@ -6,7 +6,6 @@ Publishes gpsSourceState for locationd and timed. Does not persist selection.
 
 from __future__ import annotations
 
-import time
 from typing import NoReturn
 
 import openpilot.cereal.messaging as messaging
@@ -17,6 +16,7 @@ from openpilot.common.gps_source_arbiter import (
   SourceHealth,
 )
 from openpilot.common.swaglog import cloudlog
+from openpilot.common.time_helpers import seconds_since_boot
 from openpilot.system.manager.process_config import ublox_available
 
 
@@ -87,6 +87,7 @@ def _publish_state(pm: messaging.PubMaster, arbiter: GpsSourceArbiter, now_mono:
   st = arbiter.state
   try:
     msg = messaging.new_message("gpsSourceState", valid=True)
+    msg.logMonoTime = int(max(0.0, now_mono) * 1e9)
     g = msg.gpsSourceState
     g.selected = _SELECTED_TO_CEREAL[st.selected]
     g.generation = int(st.generation)
@@ -111,7 +112,7 @@ def _publish_state(pm: messaging.PubMaster, arbiter: GpsSourceArbiter, now_mono:
 def main() -> NoReturn:
   hw = ublox_available()
   arbiter = GpsSourceArbiter(ublox_hardware_available=hw)
-  now0 = time.monotonic()
+  now0 = seconds_since_boot()
   arbiter.reset(now_mono=now0, ublox_hardware_available=hw)
 
   sm = messaging.SubMaster(["gpsLocationExternal", "gpsLocation"])
@@ -123,7 +124,7 @@ def main() -> NoReturn:
 
   while True:
     sm.update(100)
-    now = time.monotonic()
+    now = seconds_since_boot()
 
     # Re-check hardware presence rarely (USB/persist flag).
     hw_now = ublox_available()
@@ -132,11 +133,9 @@ def main() -> NoReturn:
       arbiter.reset(now_mono=now, ublox_hardware_available=hw_now)
 
     if sm.updated["gpsLocationExternal"]:
-      recv = sm.logMonoTime["gpsLocationExternal"] / 1e9
-      arbiter.observe_ublox(_gps_msg_to_sample(sm["gpsLocationExternal"], recv), now_mono=now)
+      arbiter.observe_ublox(_gps_msg_to_sample(sm["gpsLocationExternal"], now), now_mono=now)
     if sm.updated["gpsLocation"]:
-      recv = sm.logMonoTime["gpsLocation"] / 1e9
-      arbiter.observe_qcom(_gps_msg_to_sample(sm["gpsLocation"], recv), now_mono=now)
+      arbiter.observe_qcom(_gps_msg_to_sample(sm["gpsLocation"], now), now_mono=now)
 
     prev = arbiter.state.selected
     arbiter.step(now_mono=now)

@@ -9,6 +9,7 @@ import openpilot.cereal.messaging as messaging
 from openpilot.common.time_helpers import (
   HostTimeSource,
   mark_time_synced,
+  seconds_since_boot,
   set_system_time,
   system_time_valid,
   utc_within_exclusive_supported_range,
@@ -63,7 +64,7 @@ def main() -> NoReturn:
 
   while True:
     sm.update(1000)
-    now_mono = time.monotonic()
+    now_mono = seconds_since_boot()
 
     msg = messaging.new_message('clocks')
     msg.valid = system_time_valid()
