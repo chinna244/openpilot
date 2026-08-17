@@ -6,6 +6,7 @@ Publishes gpsSourceState for locationd and timed. Does not persist selection.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import NoReturn
 
 import openpilot.cereal.messaging as messaging
@@ -32,6 +33,36 @@ _SELECTED_TO_CEREAL = {
   SelectedSource.QCOM_FALLBACK: "qcomFallback",
   SelectedSource.NO_HEALTHY_SOURCE: "noHealthySource",
 }
+
+# gpsard loop is sm.update(100) ≈ 10 Hz. Three consecutive samples (300 ms) matches
+# the MADS heartbeat mismatch count: one USB/persist glitch must not reset
+# startup_complete / generation / health tracks.
+UBLOX_HW_CONFIRM_SAMPLES = 3
+
+
+@dataclass
+class UbloxHwPresence:
+  committed: bool
+  candidate: bool | None = None
+  streak: int = 0
+
+  def observe(self, available: bool) -> bool:
+    """Return True when committed hardware presence changed (caller resets arbiter)."""
+    if available == self.committed:
+      self.candidate = available
+      self.streak = 0
+      return False
+    if available == self.candidate:
+      self.streak += 1
+    else:
+      self.candidate = available
+      self.streak = 1
+    if self.streak >= UBLOX_HW_CONFIRM_SAMPLES:
+      self.committed = available
+      self.candidate = available
+      self.streak = 0
+      return True
+    return False
 
 
 def safe_cloudlog(method: str, message: str) -> None:
@@ -114,6 +145,7 @@ def main() -> NoReturn:
   arbiter = GpsSourceArbiter(ublox_hardware_available=hw)
   now0 = seconds_since_boot()
   arbiter.reset(now_mono=now0, ublox_hardware_available=hw)
+  presence = UbloxHwPresence(committed=hw)
 
   sm = messaging.SubMaster(["gpsLocationExternal", "gpsLocation"])
   pm = messaging.PubMaster(["gpsSourceState"])
@@ -126,11 +158,10 @@ def main() -> NoReturn:
     sm.update(100)
     now = seconds_since_boot()
 
-    # Re-check hardware presence rarely (USB/persist flag).
-    hw_now = ublox_available()
-    if hw_now != arbiter.state.ublox_hardware_available:
-      safe_cloudlog("warning", f"gpsard ublox_hw changed {arbiter.state.ublox_hardware_available} -> {hw_now}")
-      arbiter.reset(now_mono=now, ublox_hardware_available=hw_now)
+    # Re-check hardware presence (USB/persist flag) with consecutive-sample confirm.
+    if presence.observe(ublox_available()):
+      safe_cloudlog("warning", f"gpsard ublox_hw changed {arbiter.state.ublox_hardware_available} -> {presence.committed}")
+      arbiter.reset(now_mono=now, ublox_hardware_available=presence.committed)
 
     if sm.updated["gpsLocationExternal"]:
       arbiter.observe_ublox(_gps_msg_to_sample(sm["gpsLocationExternal"], now), now_mono=now)
