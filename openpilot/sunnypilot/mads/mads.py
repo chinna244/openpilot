@@ -62,13 +62,16 @@ class ModularAssistiveDrivingSystem:
     self.steering_mode_on_brake = read_steering_mode_param(self.CP, self.CP_SP, self.params)
     self.unified_engagement_mode = self.params.get_bool("MadsUnifiedEngagementMode")
     if self.CP.brand == "mazda":
+      # Physical TJA is the only MADS master. UEM would let pcmEnable/SET engage MADS.
       self.main_enabled_toggle = False
+      self.unified_engagement_mode = False
 
   def read_params(self):
     self.main_enabled_toggle = self.params.get_bool("MadsMainCruiseAllowed")
     self.unified_engagement_mode = self.params.get_bool("MadsUnifiedEngagementMode")
     if self.CP.brand == "mazda":
       self.main_enabled_toggle = False
+      self.unified_engagement_mode = False
 
   def pedal_pressed_non_gas_pressed(self, CS: structs.CarState) -> bool:
     # ignore `pedalPressed` events caused by gas presses

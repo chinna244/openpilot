@@ -12,7 +12,7 @@ from opendbc.sunnypilot.car.hyundai.values import HyundaiFlagsSP, HyundaiSafetyF
 from opendbc.sunnypilot.car.tesla.values import TeslaFlagsSP
 
 
-MADS_NO_ACC_MAIN_BUTTON = ("rivian", "tesla")
+MADS_NO_ACC_MAIN_BUTTON = ("rivian", "tesla", "mazda")
 
 
 class MadsSteeringModeOnBrake:
@@ -71,3 +71,7 @@ def set_car_specific_params(CP: structs.CarParams, CP_SP: structs.CarParamsSP, p
   # no ACC MAIN button for these brands
   if CP.brand in MADS_NO_ACC_MAIN_BUTTON:
     params.remove("MadsMainCruiseAllowed")
+
+  if CP.brand == "mazda":
+    # TJA-only MADS master: SET/pcmEnable must not engage MADS via UEM.
+    params.put_bool("MadsUnifiedEngagementMode", False, block=True)

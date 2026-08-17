@@ -8,12 +8,14 @@ from opendbc.can import CANPacker
 from opendbc.car import gen_empty_fingerprint, structs
 from opendbc.car.mazda.interface import CarInterface
 from opendbc.car.mazda.values import CAR
+from openpilot.cereal import log
 from openpilot.selfdrive.selfdrived.events import Events
 from openpilot.sunnypilot.selfdrive.selfdrived.events import EventsSP
-from openpilot.sunnypilot.mads.helpers import MadsSteeringModeOnBrake
+from openpilot.sunnypilot.mads.helpers import MadsSteeringModeOnBrake, set_car_specific_params
 from openpilot.sunnypilot.mads.mads import ModularAssistiveDrivingSystem
 
 ButtonType = structs.CarState.ButtonEvent.Type
+EventName = log.OnroadEvent.EventName
 SafetyModel = structs.CarParams.SafetyModel
 
 # Same CRZ_BTNS TJA run-length as opendbc test_mazda_tja_button (route
@@ -39,7 +41,7 @@ def _car_interface(*, alpha_long=True):
   return CarInterface(CP, CP_SP)
 
 
-def _make_mads(mocker, CP, CP_SP):
+def _make_mads(mocker, CP, CP_SP, *, uem=True):
   sd = mocker.MagicMock()
   sd.CP = CP
   sd.CP_SP = CP_SP
@@ -48,7 +50,7 @@ def _make_mads(mocker, CP, CP_SP):
     "Mads": True,
     "MadsMainCruiseAllowed": True,  # default ON; Mazda must ignore it
     "DisengageOnAccelerator": True,
-    "MadsUnifiedEngagementMode": False,
+    "MadsUnifiedEngagementMode": uem,  # default ON in params; Mazda must force off
   }.get(k, False))
   sd.params.get = mocker.MagicMock(return_value=MadsSteeringModeOnBrake.REMAIN_ACTIVE)
   sd.events = Events()
@@ -316,6 +318,39 @@ class TestMazdaPandaAuthPause:
       h.mads.data_sample()
     assert h.mads.lateral_mismatch_counter == 0
     assert h.mads.enabled
+
+  def test_uem_param_on_is_forced_off(self, mocker):
+    h = TjaMadsHarness(mocker)
+    assert h.mads.unified_engagement_mode is False
+    assert h.mads.main_enabled_toggle is False
+    h.mads.read_params()
+    assert h.mads.unified_engagement_mode is False
+    assert h.mads.main_enabled_toggle is False
+
+  def test_pcm_enable_does_not_enable_mads(self, mocker):
+    h = TjaMadsHarness(mocker)
+    h.step()
+    assert not h.mads.enabled
+    h.sd.events.add(EventName.pcmEnable)
+    h.mads.update(structs.CarState())
+    assert not h.mads.enabled
+    assert not h.sd.events.has(EventName.pcmEnable)
+
+  def test_button_enable_does_not_enable_mads(self, mocker):
+    h = TjaMadsHarness(mocker)
+    h.step()
+    h.sd.events.add(EventName.buttonEnable)
+    h.mads.update(structs.CarState())
+    assert not h.mads.enabled
+    assert not h.sd.events.has(EventName.buttonEnable)
+
+  def test_set_car_specific_params_disables_mazda_uem(self, mocker):
+    params = mocker.MagicMock()
+    CP = mocker.MagicMock()
+    CP.brand = "mazda"
+    set_car_specific_params(CP, mocker.MagicMock(), params)
+    params.put_bool.assert_any_call("MadsUnifiedEngagementMode", False, block=True)
+    params.remove.assert_any_call("MadsMainCruiseAllowed")
 
   def test_panda_lateral_allowed_helper(self):
     from openpilot.sunnypilot.selfdrive.controls.controlsd_ext import ControlsExt
