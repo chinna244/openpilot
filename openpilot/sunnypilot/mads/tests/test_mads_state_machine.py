@@ -24,13 +24,17 @@ ALL_STATES = (State.schema.enumerants.values())
 # The event types checked in DISABLED section of state machine
 ENABLE_EVENT_TYPES = (ET.ENABLE, ET.OVERRIDE_LATERAL)
 
+# make_event temporarily overwrites this mapping. Restore it after every test so
+# later MADS tests still see lkasEnable as an ENABLE event.
+_LKAS_ENABLE_MAPPING = EVENTS_SP[EventNameSP.lkasEnable]
+
 
 def make_event(event_types):
   event = {}
   for ev in event_types:
     event[ev] = NormalPermanentAlert("alert")
-  EVENTS_SP[0] = event  # type: ignore[assignment] # ty: ignore[invalid-assignment]
-  return 0
+  EVENTS_SP[EventNameSP.lkasEnable] = event  # type: ignore[assignment] # ty: ignore[invalid-assignment]
+  return EventNameSP.lkasEnable
 
 
 class MockMADS:
@@ -49,6 +53,8 @@ class TestMADSStateMachine:
     self.events = self.mads.selfdrive.events
     self.events_sp = self.mads.selfdrive.events_sp
     self.mads.selfdrive.state_machine.soft_disable_timer = int(SOFT_DISABLE_TIME / DT_CTRL)
+    yield
+    EVENTS_SP[EventNameSP.lkasEnable] = _LKAS_ENABLE_MAPPING
 
   def clear_events(self):
     self.events.clear()

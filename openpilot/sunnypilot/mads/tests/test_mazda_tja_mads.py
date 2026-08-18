@@ -10,7 +10,7 @@ from opendbc.can import CANPacker
 from opendbc.car import DT_CTRL, gen_empty_fingerprint, structs
 from opendbc.car.mazda.interface import CarInterface
 from opendbc.car.mazda.values import CAR, CarControllerParams
-from openpilot.cereal import log
+from openpilot.cereal import custom, log
 from openpilot.selfdrive.selfdrived.events import Events
 from openpilot.sunnypilot.selfdrive.selfdrived.events import EventsSP
 from openpilot.sunnypilot.mads.helpers import MadsSteeringModeOnBrake, set_car_specific_params
@@ -18,6 +18,7 @@ from openpilot.sunnypilot.mads.mads import ModularAssistiveDrivingSystem
 
 ButtonType = structs.CarState.ButtonEvent.Type
 EventName = log.OnroadEvent.EventName
+EventNameSP = custom.OnroadEventSP.EventName
 SafetyModel = structs.CarParams.SafetyModel
 
 # Same CRZ_BTNS TJA run-length as opendbc test_mazda_tja_button (route
@@ -365,6 +366,41 @@ class TestMazdaPandaAuthPause:
     for _ in range(MAZDA_LATERAL_MISMATCH_LIMIT):
       h.mads.data_sample()
     assert h.mads.lateral_mismatch_counter == MAZDA_LATERAL_AUTH_GRACE + MAZDA_LATERAL_MISMATCH_LIMIT - 1
+    assert h.mads.enabled
+    h.mads.data_sample()
+    assert h.mads.lateral_mismatch_counter == MAZDA_LATERAL_AUTH_GRACE + MAZDA_LATERAL_MISMATCH_LIMIT
+    h.mads.update_events(structs.CarState())
+    assert h.sd.events_sp.has(EventNameSP.controlsMismatchLateral)
+    assert h.mads.enabled
+
+  def test_missing_panda_counts_as_mismatch(self, mocker):
+    from openpilot.sunnypilot.mads.mads import MAZDA_LATERAL_AUTH_GRACE, MAZDA_LATERAL_MISMATCH_LIMIT
+
+    h = TjaMadsHarness(mocker, alpha_long=False)
+    h.step()
+    h.step(tja=1)
+    assert h.mads.enabled
+    h.mads.active = True
+    h.sd.sm["pandaStates"] = []
+    for _ in range(MAZDA_LATERAL_AUTH_GRACE + MAZDA_LATERAL_MISMATCH_LIMIT):
+      h.mads.data_sample()
+    h.mads.update_events(structs.CarState())
+    assert h.sd.events_sp.has(EventNameSP.controlsMismatchLateral)
+    assert h.mads.enabled
+
+  def test_all_ignored_pandas_count_as_mismatch(self, mocker):
+    from openpilot.sunnypilot.mads.mads import MAZDA_LATERAL_AUTH_GRACE, MAZDA_LATERAL_MISMATCH_LIMIT
+
+    h = TjaMadsHarness(mocker, alpha_long=False)
+    h.step()
+    h.step(tja=1)
+    h.mads.active = True
+    h.sd.sm["pandaStates"][0].safetyModel = SafetyModel.elm327
+    h.sd.sm["pandaStates"][0].controlsAllowedLateral = True
+    for _ in range(MAZDA_LATERAL_AUTH_GRACE + MAZDA_LATERAL_MISMATCH_LIMIT):
+      h.mads.data_sample()
+    h.mads.update_events(structs.CarState())
+    assert h.sd.events_sp.has(EventNameSP.controlsMismatchLateral)
     assert h.mads.enabled
 
   def test_uem_param_on_is_forced_off(self, mocker):

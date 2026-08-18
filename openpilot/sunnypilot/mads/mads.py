@@ -20,7 +20,7 @@ GearShifter = structs.CarState.GearShifter
 SafetyModel = structs.CarParams.SafetyModel
 
 SET_SPEED_BUTTONS = (ButtonType.accelCruise, ButtonType.resumeCruise, ButtonType.decelCruise, ButtonType.setCruise)
-IGNORED_SAFETY_MODES = (SafetyModel.silent, SafetyModel.noOutput)
+IGNORED_SAFETY_MODES = (SafetyModel.silent, SafetyModel.noOutput, SafetyModel.elm327)
 # Mazda: allow a brief panda-state delay before counting a lateral mismatch. After this grace,
 # the same 200-frame threshold as other brands raises controlsMismatchLateral.
 MAZDA_LATERAL_AUTH_GRACE = 50
@@ -128,10 +128,12 @@ class ModularAssistiveDrivingSystem:
     if not self.active or self.selfdrive.enabled:
       self.lateral_mismatch_counter = 0
     elif self.CP.brand == "mazda":
-      # Torque is paused in controlsd until panda lateral auth. Count sustained mismatch
-      # after a short grace so permanent auth loss surfaces as controlsMismatchLateral.
-      if any(not ps.controlsAllowedLateral for ps in self.selfdrive.sm['pandaStates']
-             if ps.safetyModel not in IGNORED_SAFETY_MODES):
+      # Same relevant-Panda filter as controlsd_ext._panda_lateral_allowed. Empty or
+      # all-ignored lists must not silently reset the counter (any([]) is False).
+      relevant = [ps for ps in self.selfdrive.sm['pandaStates']
+                  if ps.safetyModel not in IGNORED_SAFETY_MODES]
+      mismatch = (not relevant) or any(not ps.controlsAllowedLateral for ps in relevant)
+      if mismatch:
         self.lateral_mismatch_counter += 1
       else:
         self.lateral_mismatch_counter = 0
