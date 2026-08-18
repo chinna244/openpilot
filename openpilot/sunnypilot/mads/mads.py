@@ -21,6 +21,10 @@ SafetyModel = structs.CarParams.SafetyModel
 
 SET_SPEED_BUTTONS = (ButtonType.accelCruise, ButtonType.resumeCruise, ButtonType.decelCruise, ButtonType.setCruise)
 IGNORED_SAFETY_MODES = (SafetyModel.silent, SafetyModel.noOutput)
+# Mazda: allow a brief panda-state delay before counting a lateral mismatch. After this grace,
+# the same 200-frame threshold as other brands raises controlsMismatchLateral.
+MAZDA_LATERAL_AUTH_GRACE = 50
+MAZDA_LATERAL_MISMATCH_LIMIT = 200
 
 
 class ModularAssistiveDrivingSystem:
@@ -124,9 +128,13 @@ class ModularAssistiveDrivingSystem:
     if not self.active or self.selfdrive.enabled:
       self.lateral_mismatch_counter = 0
     elif self.CP.brand == "mazda":
-      # Torque is paused in controlsd.get_lat_active until panda lateral auth.
-      # Do not disengage MADS; resume automatically when auth returns.
-      self.lateral_mismatch_counter = 0
+      # Torque is paused in controlsd until panda lateral auth. Count sustained mismatch
+      # after a short grace so permanent auth loss surfaces as controlsMismatchLateral.
+      if any(not ps.controlsAllowedLateral for ps in self.selfdrive.sm['pandaStates']
+             if ps.safetyModel not in IGNORED_SAFETY_MODES):
+        self.lateral_mismatch_counter += 1
+      else:
+        self.lateral_mismatch_counter = 0
     elif any(not ps.controlsAllowedLateral for ps in self.selfdrive.sm['pandaStates']
              if ps.safetyModel not in IGNORED_SAFETY_MODES):
       self.lateral_mismatch_counter += 1
@@ -214,7 +222,10 @@ class ModularAssistiveDrivingSystem:
       if self.state_machine.state == State.paused:
         self.events_sp.add(EventNameSP.silentLkasEnable)
 
-    if self.lateral_mismatch_counter >= 200:
+    mismatch_limit = MAZDA_LATERAL_MISMATCH_LIMIT
+    if self.CP.brand == "mazda":
+      mismatch_limit += MAZDA_LATERAL_AUTH_GRACE
+    if self.lateral_mismatch_counter >= mismatch_limit:
       self.events_sp.add(EventNameSP.controlsMismatchLateral)
 
     self.events.remove(EventName.pcmDisable)

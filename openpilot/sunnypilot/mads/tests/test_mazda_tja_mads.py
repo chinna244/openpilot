@@ -7,9 +7,9 @@ import pytest
 pytestmark = pytest.mark.xdist_group("mazda_tja_mads")
 
 from opendbc.can import CANPacker
-from opendbc.car import gen_empty_fingerprint, structs
+from opendbc.car import DT_CTRL, gen_empty_fingerprint, structs
 from opendbc.car.mazda.interface import CarInterface
-from opendbc.car.mazda.values import CAR
+from opendbc.car.mazda.values import CAR, CarControllerParams
 from openpilot.cereal import log
 from openpilot.selfdrive.selfdrived.events import Events
 from openpilot.sunnypilot.selfdrive.selfdrived.events import EventsSP
@@ -81,6 +81,18 @@ class TjaMadsHarness:
     self.packer = CANPacker("mazda_2017")
     self.t = 0
     self._tja = 0
+    if alpha_long:
+      for _ in range(int(CarControllerParams.STOCK_RADAR_GUARD_T / DT_CTRL) + 1):
+        self.step()
+
+  def _cam_msgs(self):
+    lkas = self.packer.make_can_msg("CAM_LKAS", 0, {
+      "ERR_BIT_1": 0, "ERR_BIT_2": 0, "LINE_NOT_VISIBLE": 0, "BIT_1": 1,
+    })
+    lane = self.packer.make_can_msg("CAM_LANEINFO", 0, {
+      "LANE_LINES": 1, "NO_ERR_BIT": 0, "ERR_BIT": 0, "BIT2": 0,
+    })
+    return [(lkas[0], lkas[1], 2), (lane[0], lane[1], 2)]
 
   def step(self, *, tja=0, acc_off=0, acc_active=0, set_p=0, set_m=0,
            res=0, can_off=0, crz_available=0, crz_active=0, mode_x=0, mode_y=0):
@@ -102,6 +114,7 @@ class TjaMadsHarness:
       "ACC_ACTIVE": acc_active,
       "BRAKE_ON": 0,
     })]
+    msgs.extend(self._cam_msgs())
     if not self.ci.CP.openpilotLongitudinalControl:
       msgs.append(self.packer.make_can_msg("CRZ_CTRL", 0, {
         "CRZ_AVAILABLE": crz_available,
@@ -335,7 +348,9 @@ class TestMazdaTjaMadsCruiseState:
 
 
 class TestMazdaPandaAuthPause:
-  def test_auth_loss_does_not_disengage_mads(self, mocker):
+  def test_auth_loss_counts_after_grace_but_keeps_mads(self, mocker):
+    from openpilot.sunnypilot.mads.mads import MAZDA_LATERAL_AUTH_GRACE, MAZDA_LATERAL_MISMATCH_LIMIT
+
     h = TjaMadsHarness(mocker, alpha_long=False)
     h.step()
     h.step(tja=1)
@@ -343,9 +358,13 @@ class TestMazdaPandaAuthPause:
     h.mads.active = True
     h.sd.sm["pandaStates"][0].controlsAllowedLateral = False
     h.sd.sm["pandaStates"][0].safetyModel = SafetyModel.mazda
-    for _ in range(250):
+    for _ in range(MAZDA_LATERAL_AUTH_GRACE - 1):
       h.mads.data_sample()
-    assert h.mads.lateral_mismatch_counter == 0
+    assert h.mads.lateral_mismatch_counter == MAZDA_LATERAL_AUTH_GRACE - 1
+    assert h.mads.enabled
+    for _ in range(MAZDA_LATERAL_MISMATCH_LIMIT):
+      h.mads.data_sample()
+    assert h.mads.lateral_mismatch_counter == MAZDA_LATERAL_AUTH_GRACE + MAZDA_LATERAL_MISMATCH_LIMIT - 1
     assert h.mads.enabled
 
   def test_uem_param_on_is_forced_off(self, mocker):
@@ -383,6 +402,7 @@ class TestMazdaPandaAuthPause:
 
   def test_panda_lateral_allowed_helper(self):
     from openpilot.sunnypilot.selfdrive.controls.controlsd_ext import ControlsExt
+    from openpilot.cereal import custom, log
 
     class PS:
       def __init__(self, model, cal=False, ca=False):
@@ -390,9 +410,22 @@ class TestMazdaPandaAuthPause:
         self.controlsAllowedLateral = cal
         self.controlsAllowed = ca
 
+    def sm(pandas, *, mads_active=True, selfdrive_active=False):
+      ss = log.SelfdriveState()
+      ss.active = selfdrive_active
+      ss_sp = custom.SelfdriveStateSP()
+      ss_sp.mads.active = mads_active
+      return {
+        "pandaStates": pandas,
+        "selfdriveState": ss,
+        "selfdriveStateSP": ss_sp,
+      }
+
     fn = ControlsExt._panda_lateral_allowed
-    assert fn({"pandaStates": [PS("elm327")]}) is False  # ty: ignore[invalid-argument-type]
-    assert fn({"pandaStates": [PS("mazda", cal=False, ca=False)]}) is False  # ty: ignore[invalid-argument-type]
-    assert fn({"pandaStates": [PS("mazda", cal=True)]}) is True  # ty: ignore[invalid-argument-type]
-    assert fn({"pandaStates": [PS("mazda", ca=True)]}) is True  # ty: ignore[invalid-argument-type]
-    assert fn({"pandaStates": []}) is False  # ty: ignore[invalid-argument-type]
+    assert fn(sm([PS("elm327")])) is False
+    assert fn(sm([PS("mazda", cal=False, ca=False)])) is False
+    assert fn(sm([PS("mazda", cal=True)])) is True
+    assert fn(sm([PS("mazda", ca=True)])) is False
+    assert fn(sm([PS("mazda", ca=True)], mads_active=False, selfdrive_active=True)) is True
+    assert fn(sm([PS("mazda", cal=False), PS("mazda", cal=True)])) is False
+    assert fn(sm([])) is False

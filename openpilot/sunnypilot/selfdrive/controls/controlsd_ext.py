@@ -78,13 +78,27 @@ class ControlsExt(ModelStateBase):
   def _panda_lateral_allowed(sm: messaging.SubMaster) -> bool:
     try:
       pss = sm['pandaStates']
+      ss = sm['selfdriveState']
+      ss_sp = sm['selfdriveStateSP']
     except Exception:
       return False
     ignored = {"silent", "noOutput", "elm327"}
     relevant = [ps for ps in pss if str(ps.safetyModel) not in ignored]
     if not relevant:
       return False
-    return any(bool(ps.controlsAllowedLateral) or bool(ps.controlsAllowed) for ps in relevant)
+
+    mads_steering = bool(ss_sp.mads.active)
+    selfdrive_active = bool(ss.active)
+
+    def _lateral_ok(ps) -> bool:
+      if ps.controlsAllowedLateral:
+        return True
+      # Under MADS-only steering, generic MRCC controlsAllowed must not substitute for TJA auth.
+      if mads_steering and not selfdrive_active:
+        return False
+      return selfdrive_active and bool(ps.controlsAllowed)
+
+    return all(_lateral_ok(ps) for ps in relevant)
 
   @staticmethod
   def get_lead_data(_lead, src: log.RadarState.LeadData) -> None:
