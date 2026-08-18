@@ -4,6 +4,8 @@ import random
 
 import pytest
 
+pytestmark = pytest.mark.xdist_group("mazda_tja_mads")
+
 from opendbc.can import CANPacker
 from opendbc.car import gen_empty_fingerprint, structs
 from opendbc.car.mazda.interface import CarInterface
@@ -29,6 +31,17 @@ ROUTE_TJA_RLE = (
   (0, 14), (1, 3), (0, 8), (1, 4), (0, 22),
 )
 ROUTE_TJA_RISING_EDGES = 27
+
+
+@pytest.fixture(autouse=True)
+def _isolate_mads_from_shared_params(mocker):
+  """CI workers share on-disk Params; keep MADS unit tests off global state."""
+  fake = mocker.MagicMock()
+  fake.get_bool = mocker.MagicMock(
+    side_effect=lambda k: k in ("DisengageOnAccelerator", "Mads", "MadsMainCruiseAllowed", "MadsUnifiedEngagementMode")
+  )
+  fake.get = mocker.MagicMock(return_value="remain_active")
+  mocker.patch("openpilot.sunnypilot.mads.mads.Params", return_value=fake)
 
 
 def _car_interface(*, alpha_long=True):
@@ -380,8 +393,8 @@ class TestMazdaPandaAuthPause:
         self.controlsAllowed = ca
 
     fn = ControlsExt._panda_lateral_allowed
-    assert fn({"pandaStates": [PS("elm327")]}) is False
-    assert fn({"pandaStates": [PS("mazda", cal=False, ca=False)]}) is False
-    assert fn({"pandaStates": [PS("mazda", cal=True)]}) is True
-    assert fn({"pandaStates": [PS("mazda", ca=True)]}) is True
-    assert fn({"pandaStates": []}) is False
+    assert fn({"pandaStates": [PS("elm327")]}) is False  # ty: ignore[invalid-argument-type]
+    assert fn({"pandaStates": [PS("mazda", cal=False, ca=False)]}) is False  # ty: ignore[invalid-argument-type]
+    assert fn({"pandaStates": [PS("mazda", cal=True)]}) is True  # ty: ignore[invalid-argument-type]
+    assert fn({"pandaStates": [PS("mazda", ca=True)]}) is True  # ty: ignore[invalid-argument-type]
+    assert fn({"pandaStates": []}) is False  # ty: ignore[invalid-argument-type]

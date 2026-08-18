@@ -297,6 +297,15 @@ include = [
 [tool.ty.overrides.rules]
 unsupported-operator = "warn"
 
+[[tool.ty.overrides]]
+include = [
+  "openpilot/sunnypilot/mads/tests/test_mazda_tja_mads.py",
+  "openpilot/system/tests/test_gpsard_clock.py",
+]
+
+[tool.ty.overrides.rules]
+invalid-argument-type = "warn"
+
 # END MAZDA-DEV TY BASELINE OVERRIDES
 [tool.uv]
 python-preference = "only-managed"
