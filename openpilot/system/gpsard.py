@@ -147,7 +147,7 @@ def main() -> NoReturn:
   arbiter.reset(now_mono=now0, ublox_hardware_available=hw)
   presence = UbloxHwPresence(committed=hw)
 
-  sm = messaging.SubMaster(["gpsLocationExternal", "gpsLocation"])
+  sm = messaging.SubMaster(["gpsLocationExternal"])
   pm = messaging.PubMaster(["gpsSourceState"])
 
   last_unhealthy_log = 0.0
@@ -165,8 +165,6 @@ def main() -> NoReturn:
 
     if sm.updated["gpsLocationExternal"]:
       arbiter.observe_ublox(_gps_msg_to_sample(sm["gpsLocationExternal"], now), now_mono=now)
-    if sm.updated["gpsLocation"]:
-      arbiter.observe_qcom(_gps_msg_to_sample(sm["gpsLocation"], now), now_mono=now)
 
     prev = arbiter.state.selected
     arbiter.step(now_mono=now)
@@ -180,7 +178,7 @@ def main() -> NoReturn:
     if arbiter.state.selected == SelectedSource.NO_HEALTHY_SOURCE and (now - last_unhealthy_log) > 60.0:
       safe_cloudlog(
         "warning",
-        f"gpsard no_healthy_source ublox={arbiter.state.ublox.health.name} qcom={arbiter.state.qcom.health.name}",
+        f"gpsard no_healthy_source ublox={arbiter.state.ublox.health.name}",
       )
       last_unhealthy_log = now
 

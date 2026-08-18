@@ -16,10 +16,9 @@ def ublox_hardware_available() -> bool:
 
 def get_gps_location_service(params: Params) -> str:
   """Hardware-preferred GPS socket (static). Prefer gpsSourceState for authority."""
-  if params.get_bool("UbloxAvailable"):
+  if params.get_bool("UbloxAvailable") or ublox_hardware_available():
     return "gpsLocationExternal"
-  else:
-    return "gpsLocation"
+  return "gpsLocation"
 
 
 def selected_source_to_service(selected: str) -> str | None:

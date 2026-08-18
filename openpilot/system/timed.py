@@ -54,7 +54,7 @@ def main() -> NoReturn:
   _ = params
 
   pm = messaging.PubMaster(['clocks'])
-  sm = messaging.SubMaster([GPS_SOURCE_STATE_SERVICE, 'gpsLocationExternal', 'gpsLocation'])
+  sm = messaging.SubMaster([GPS_SOURCE_STATE_SERVICE, 'gpsLocationExternal'])
 
   selected: str | None = None
   transition_mono_ns = 0

@@ -233,7 +233,7 @@ class TestFirstReliableFixStartup:
     a.observe_qcom(_valid_qcom(t), now_mono=t)
     a.step(now_mono=t)
     assert a.state.selected == SelectedSource.UBLOX_PRIMARY
-    assert a.state.transition_reason == "startup_tie_ublox"
+    assert a.state.transition_reason == "startup_ublox_first_reliable_fix"
 
   def test_one_transient_ublox_fix_not_qualified(self):
     a = _arbiter()
@@ -469,8 +469,7 @@ class TestFailoverFromUbloxPrimary:
       a.observe_qcom(_valid_qcom(t), now_mono=t)
       a.step(now_mono=t)
     assert a.state.ublox.health == SourceHealth.UNHEALTHY
-    assert a.state.selected == SelectedSource.QCOM_FALLBACK
-    assert a.state.failover_count == 1
+    assert a.state.selected == SelectedSource.NO_HEALTHY_SOURCE
 
   def test_post_fix_nofix_during_debounce_remains_ublox(self):
     a = _arbiter()
@@ -485,7 +484,7 @@ class TestFailoverFromUbloxPrimary:
       a.observe_qcom(_valid_qcom(t), now_mono=t)
       a.step(now_mono=t)
     assert a.state.ublox.health == SourceHealth.UNHEALTHY
-    assert a.state.selected == SelectedSource.UBLOX_PRIMARY
+    assert a.state.selected == SelectedSource.NO_HEALTHY_SOURCE
 
   def test_post_fix_nofix_unhealthy_qcom_goes_no_source(self):
     a = _arbiter()
@@ -645,19 +644,12 @@ class TestFailClosed:
 
 
 class TestProcessConfig:
-  def test_qcomgps_runs_when_ublox_available(self, monkeypatch):
+  def test_qcomgpsd_not_managed(self):
     from openpilot.system.manager import process_config
 
-    monkeypatch.setattr(process_config, "ublox_available", lambda: True)
-    assert process_config.qcomgps(True, None, None) is True
-    assert process_config.qcomgps(False, None, None) is False
-
-  def test_qcomgpsd_restart_if_crash(self):
-    from openpilot.system.manager import process_config
-
-    assert process_config.managed_processes["qcomgpsd"].restart_if_crash is True
-    assert process_config.managed_processes["ubloxd"].restart_if_crash is True
+    assert "qcomgpsd" not in process_config.managed_processes
     assert process_config.managed_processes["gpsard"].restart_if_crash is True
+    assert process_config.managed_processes["ubloxd"].restart_if_crash is True
 
 
 class TestCoordinationHelpers:
