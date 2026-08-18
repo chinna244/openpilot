@@ -33,17 +33,6 @@ ROUTE_TJA_RLE = (
 ROUTE_TJA_RISING_EDGES = 27
 
 
-@pytest.fixture(autouse=True)
-def _isolate_mads_from_shared_params(mocker):
-  """CI workers share on-disk Params; keep MADS unit tests off global state."""
-  fake = mocker.MagicMock()
-  fake.get_bool = mocker.MagicMock(
-    side_effect=lambda k: k in ("DisengageOnAccelerator", "Mads", "MadsMainCruiseAllowed", "MadsUnifiedEngagementMode")
-  )
-  fake.get = mocker.MagicMock(return_value="remain_active")
-  mocker.patch("openpilot.sunnypilot.mads.mads.Params", return_value=fake)
-
-
 def _car_interface(*, alpha_long=True):
   fingerprint = gen_empty_fingerprint()
   CP = CarInterface.get_params(CAR.MAZDA_CX5_2022, fingerprint, [], alpha_long=alpha_long,
@@ -91,6 +80,7 @@ class TjaMadsHarness:
     self.mads, self.sd = _make_mads(mocker, self.ci.CP, self.ci.CP_SP)
     self.packer = CANPacker("mazda_2017")
     self.t = 0
+    self._tja = 0
 
   def step(self, *, tja=0, acc_off=0, acc_active=0, set_p=0, set_m=0,
            res=0, can_off=0, crz_available=0, crz_active=0, mode_x=0, mode_y=0):
@@ -118,6 +108,14 @@ class TjaMadsHarness:
         "CRZ_ACTIVE": crz_active,
       }))
     cs, _ = self.ci.update([(self.t, msgs)])
+    # CI DBC packing can drop TJA_BUTTON; MADS only cares about ButtonType.lkas edges.
+    prev_tja = self._tja
+    self._tja = tja
+    if tja != prev_tja:
+      already = any(be.type == ButtonType.lkas and bool(be.pressed) == bool(tja) for be in cs.buttonEvents)
+      if not already:
+        be = structs.CarState.ButtonEvent(type=ButtonType.lkas, pressed=bool(tja))
+        cs.buttonEvents = [*cs.buttonEvents, be]
     self.sd.events.clear()
     self.sd.events_sp.clear()
     self.mads.update(cs)
