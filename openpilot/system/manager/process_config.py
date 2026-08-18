@@ -82,13 +82,6 @@ def lat_maneuver(started: bool, params: Params, CP: car.CarParams) -> bool:
 def not_long_maneuver(started: bool, params: Params, CP: car.CarParams) -> bool:
   return started and not params.get_bool("LongitudinalManeuverMode")
 
-def qcomgps(started: bool, params: Params, CP: car.CarParams) -> bool:
-  # PR80: when u-blox hardware is present, still run qcomgpsd onroad so the
-  # arbiter can observe a healthy QCOM fallback. GPIO power for u-blox is owned
-  # by pigeond; qcomgpsd must not toggle GNSS_PWR_EN in that configuration.
-  return started
-
-
 def gpsard(started: bool, params: Params, CP: car.CarParams) -> bool:
   # Always-on arbiter so timed/locationd share one authoritative source policy.
   return True
@@ -182,7 +175,6 @@ procs = [
   PythonProcess("card", "openpilot.selfdrive.car.card", only_onroad),
   PythonProcess("deleter", "openpilot.system.loggerd.deleter", always_run),
   PythonProcess("dmonitoringd", "openpilot.selfdrive.monitoring.dmonitoringd", driverview, enabled=(WEBCAM or not PC)),
-  PythonProcess("qcomgpsd", "openpilot.system.qcomgpsd.qcomgpsd", qcomgps, enabled=TICI, restart_if_crash=True),
   PythonProcess("pandad", "openpilot.selfdrive.pandad.pandad", always_run),
   PythonProcess("paramsd", "openpilot.selfdrive.locationd.paramsd", only_onroad),
   PythonProcess("lagd", "openpilot.selfdrive.locationd.lagd", only_onroad),

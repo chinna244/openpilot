@@ -21,7 +21,7 @@ def test_publish_event_and_transition_share_now_domain():
   now = 100.5
   arbiter.reset(now_mono=now, ublox_hardware_available=True)
   pm = _CapturePM()
-  assert _publish_state(pm, arbiter, now)
+  assert _publish_state(pm, arbiter, now)  # ty: ignore[invalid-argument-type]  # test double PubMaster
   assert pm.msg.logMonoTime == int(now * 1e9)
   assert pm.msg.gpsSourceState.transitionMonoNs == int(now * 1e9)
   assert accept_gps_source_epoch(

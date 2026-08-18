@@ -1,9 +1,6 @@
-"""Authoritative GPS source arbitration for ublox primary / QCOM fallback.
+"""Authoritative GPS source arbitration (u-blox only on Comma 4 / mici).
 
 Single authority for locationd and timed. Runtime-only (not persisted).
-
-Startup: first sustained health-qualified fix wins (tie-break: ublox), once.
-Long-term: ublox preferred; runtime hysteresis after first award.
 """
 
 from __future__ import annotations
@@ -354,107 +351,41 @@ class GpsSourceArbiter:
     # NO_HEALTHY_SOURCE preserves startup_complete and last_authoritative_source.
 
   def step(self, *, now_mono: float) -> ArbiterState:
-    """Advance selection using current health tracks."""
+    """Advance selection using u-blox health only (no QCOM fallback on mici)."""
     if self._boot_mono is None:
       self._boot_mono = now_mono
     if not math.isfinite(now_mono):
       return self.state
 
     self.observe_ublox(None, now_mono=now_mono)
-    self.observe_qcom(None, now_mono=now_mono)
 
     ublox_ok = self.state.ublox.health == SourceHealth.HEALTHY
     ublox_acquiring = self.state.ublox.health == SourceHealth.ACQUIRING
-    qcom_ok = self.state.qcom.health == SourceHealth.HEALTHY
-
-    ublox_unhealthy_sustained = False
-    if self.state.ublox.health == SourceHealth.UNHEALTHY and self.state.ublox.unhealthy_since_mono is not None:
-      age = _age(now_mono, self.state.ublox.unhealthy_since_mono)
-      ublox_unhealthy_sustained = age is not None and age >= self.ublox_unhealthy_before_failover_seconds
-
-    ublox_healthy_sustained = False
-    if ublox_ok and self.state.ublox.healthy_since_mono is not None:
-      age = _age(now_mono, self.state.ublox.healthy_since_mono)
-      ublox_healthy_sustained = age is not None and age >= self.ublox_healthy_before_recovery_seconds
-
     ublox_startup_ok = self.state.ublox_hardware_available and self._startup_qualified(
       self.state.ublox, now_mono=now_mono, fresh_seconds=self.ublox_fresh_seconds
     )
-    qcom_startup_ok = self._startup_qualified(self.state.qcom, now_mono=now_mono, fresh_seconds=self.qcom_fresh_seconds)
 
     selected = self.state.selected
     reason = None
 
     if not self.state.ublox_hardware_available:
-      if not self.state.startup_complete and selected == SelectedSource.NO_HEALTHY_SOURCE:
-        if qcom_startup_ok:
-          selected = SelectedSource.QCOM_FALLBACK
-          reason = "startup_qcom_first_reliable_fix"
-      elif qcom_ok:
-        selected = SelectedSource.QCOM_FALLBACK
-      else:
-        if selected != SelectedSource.NO_HEALTHY_SOURCE:
-          reason = "qcom_only_hardware_unhealthy"
-        selected = SelectedSource.NO_HEALTHY_SOURCE
+      if selected != SelectedSource.NO_HEALTHY_SOURCE:
+        reason = "no_ublox_hardware"
+      selected = SelectedSource.NO_HEALTHY_SOURCE
     elif selected == SelectedSource.NO_HEALTHY_SOURCE and not self.state.startup_complete:
-      # One-time INITIAL STARTUP race only.
-      if ublox_startup_ok and qcom_startup_ok:
-        selected = SelectedSource.UBLOX_PRIMARY
-        reason = "startup_tie_ublox"
-      elif ublox_startup_ok:
+      if ublox_startup_ok:
         selected = SelectedSource.UBLOX_PRIMARY
         reason = "startup_ublox_first_reliable_fix"
-      elif qcom_startup_ok:
-        selected = SelectedSource.QCOM_FALLBACK
-        reason = "startup_qcom_first_reliable_fix"
     elif selected == SelectedSource.NO_HEALTHY_SOURCE and self.state.startup_complete:
-      # RUNTIME recovery — never re-enter 1s startup race.
-      last = self.state.last_authoritative_source
-      if last == SelectedSource.QCOM_FALLBACK:
-        if ublox_healthy_sustained:
-          selected = SelectedSource.UBLOX_PRIMARY
-          reason = "runtime_ublox_recovery_from_none"
-        elif qcom_ok:
-          selected = SelectedSource.QCOM_FALLBACK
-          reason = "runtime_qcom_restored_from_none"
-      elif last == SelectedSource.UBLOX_PRIMARY:
-        if ublox_ok:
-          selected = SelectedSource.UBLOX_PRIMARY
-          reason = "runtime_ublox_restored_from_none"
-        elif qcom_ok:
-          selected = SelectedSource.QCOM_FALLBACK
-          reason = "runtime_qcom_from_none_after_ublox"
-      else:
-        # Should not happen; prefer ublox if healthy else qcom.
-        if ublox_ok:
-          selected = SelectedSource.UBLOX_PRIMARY
-          reason = "runtime_ublox_from_none"
-        elif qcom_ok:
-          selected = SelectedSource.QCOM_FALLBACK
-          reason = "runtime_qcom_from_none"
-    elif selected == SelectedSource.UBLOX_PRIMARY:
-      # Post-fix ACQUIRING is no longer used; loss -> UNHEALTHY path.
+      if ublox_ok:
+        selected = SelectedSource.UBLOX_PRIMARY
+        reason = "runtime_ublox_restored_from_none"
+    elif selected in (SelectedSource.UBLOX_PRIMARY, SelectedSource.QCOM_FALLBACK):
       if ublox_ok or (ublox_acquiring and not self.state.ublox.ever_had_valid_fix):
         selected = SelectedSource.UBLOX_PRIMARY
-      elif ublox_unhealthy_sustained and qcom_ok:
-        selected = SelectedSource.QCOM_FALLBACK
-        reason = "ublox_sustained_unhealthy_qcom_healthy"
-      elif ublox_unhealthy_sustained and not qcom_ok:
-        selected = SelectedSource.NO_HEALTHY_SOURCE
-        reason = "ublox_sustained_unhealthy_qcom_unhealthy"
-      else:
-        selected = SelectedSource.UBLOX_PRIMARY
-    elif selected == SelectedSource.QCOM_FALLBACK:
-      dwell = _age(now_mono, self.state.transition_mono)
-      dwell_ok = dwell is not None and dwell >= self.qcom_fallback_min_dwell_seconds
-      if ublox_healthy_sustained and dwell_ok:
-        selected = SelectedSource.UBLOX_PRIMARY
-        reason = "ublox_sustained_recovery"
-      elif qcom_ok:
-        selected = SelectedSource.QCOM_FALLBACK
       else:
         selected = SelectedSource.NO_HEALTHY_SOURCE
-        reason = "qcom_lost"
+        reason = "ublox_unhealthy"
     else:
       selected = SelectedSource.NO_HEALTHY_SOURCE
 

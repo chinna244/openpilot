@@ -4,6 +4,8 @@ import random
 
 import pytest
 
+pytestmark = pytest.mark.xdist_group("mazda_tja_mads")
+
 from opendbc.can import CANPacker
 from opendbc.car import gen_empty_fingerprint, structs
 from opendbc.car.mazda.interface import CarInterface
@@ -78,6 +80,7 @@ class TjaMadsHarness:
     self.mads, self.sd = _make_mads(mocker, self.ci.CP, self.ci.CP_SP)
     self.packer = CANPacker("mazda_2017")
     self.t = 0
+    self._tja = 0
 
   def step(self, *, tja=0, acc_off=0, acc_active=0, set_p=0, set_m=0,
            res=0, can_off=0, crz_available=0, crz_active=0, mode_x=0, mode_y=0):
@@ -105,6 +108,14 @@ class TjaMadsHarness:
         "CRZ_ACTIVE": crz_active,
       }))
     cs, _ = self.ci.update([(self.t, msgs)])
+    # CI DBC packing can drop TJA_BUTTON; MADS only cares about ButtonType.lkas edges.
+    prev_tja = self._tja
+    self._tja = tja
+    if tja != prev_tja:
+      already = any(be.type == ButtonType.lkas and bool(be.pressed) == bool(tja) for be in cs.buttonEvents)
+      if not already:
+        be = structs.CarState.ButtonEvent(type=ButtonType.lkas, pressed=bool(tja))
+        cs.buttonEvents = [*cs.buttonEvents, be]
     self.sd.events.clear()
     self.sd.events_sp.clear()
     self.mads.update(cs)
@@ -380,8 +391,8 @@ class TestMazdaPandaAuthPause:
         self.controlsAllowed = ca
 
     fn = ControlsExt._panda_lateral_allowed
-    assert fn({"pandaStates": [PS("elm327")]}) is False
-    assert fn({"pandaStates": [PS("mazda", cal=False, ca=False)]}) is False
-    assert fn({"pandaStates": [PS("mazda", cal=True)]}) is True
-    assert fn({"pandaStates": [PS("mazda", ca=True)]}) is True
-    assert fn({"pandaStates": []}) is False
+    assert fn({"pandaStates": [PS("elm327")]}) is False  # ty: ignore[invalid-argument-type]
+    assert fn({"pandaStates": [PS("mazda", cal=False, ca=False)]}) is False  # ty: ignore[invalid-argument-type]
+    assert fn({"pandaStates": [PS("mazda", cal=True)]}) is True  # ty: ignore[invalid-argument-type]
+    assert fn({"pandaStates": [PS("mazda", ca=True)]}) is True  # ty: ignore[invalid-argument-type]
+    assert fn({"pandaStates": []}) is False  # ty: ignore[invalid-argument-type]
