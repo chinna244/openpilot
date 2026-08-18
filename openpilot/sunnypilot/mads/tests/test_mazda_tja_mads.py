@@ -15,6 +15,7 @@ from openpilot.selfdrive.selfdrived.events import Events
 from openpilot.sunnypilot.selfdrive.selfdrived.events import EventsSP
 from openpilot.sunnypilot.mads.helpers import MadsSteeringModeOnBrake, set_car_specific_params
 from openpilot.sunnypilot.mads.mads import ModularAssistiveDrivingSystem
+from openpilot.sunnypilot.mads.state import State
 
 ButtonType = structs.CarState.ButtonEvent.Type
 EventName = log.OnroadEvent.EventName
@@ -402,6 +403,28 @@ class TestMazdaPandaAuthPause:
     h.mads.update_events(structs.CarState())
     assert h.sd.events_sp.has(EventNameSP.controlsMismatchLateral)
     assert h.mads.enabled
+
+  def test_mismatch_disables_mads_end_to_end(self, mocker):
+    from openpilot.sunnypilot.mads.mads import MAZDA_LATERAL_AUTH_GRACE, MAZDA_LATERAL_MISMATCH_LIMIT
+
+    h = TjaMadsHarness(mocker, alpha_long=False)
+    h.step()
+    h.step(tja=1)
+    assert h.mads.enabled
+    h.mads.state_machine.state = State.enabled
+    h.mads.active = True
+    h.sd.sm["pandaStates"][0].controlsAllowedLateral = False
+
+    cs = structs.CarState()
+    for _ in range(MAZDA_LATERAL_AUTH_GRACE + MAZDA_LATERAL_MISMATCH_LIMIT):
+      h.sd.events.clear()
+      h.sd.events_sp.clear()
+      h.mads.update(cs)
+
+    assert h.sd.events_sp.has(EventNameSP.controlsMismatchLateral)
+    assert h.mads.state_machine.state == State.disabled
+    assert not h.mads.enabled
+    assert not h.mads.active
 
   def test_uem_param_on_is_forced_off(self, mocker):
     h = TjaMadsHarness(mocker)

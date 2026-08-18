@@ -203,6 +203,47 @@ class TestLateralMismatchCounter:
       mads.data_sample()
     assert mads.lateral_mismatch_counter == 200
 
+  def test_empty_panda_counts_as_mismatch(self, mocker):
+    mads, sd = make_mads(mocker, MadsSteeringModeOnBrake.PAUSE)
+    mads.enabled = True
+    mads.active = True
+    sd.sm['pandaStates'] = []
+
+    for _ in range(200):
+      mads.data_sample()
+    assert mads.lateral_mismatch_counter == 200
+
+  def test_all_ignored_pandas_count_as_mismatch(self, mocker):
+    mads, sd = make_mads(mocker, MadsSteeringModeOnBrake.PAUSE)
+    mads.enabled = True
+    mads.active = True
+    ps = make_panda_state(mocker, True)
+    ps.safetyModel = SafetyModel.elm327
+    sd.sm['pandaStates'] = [ps]
+
+    for _ in range(200):
+      mads.data_sample()
+    assert mads.lateral_mismatch_counter == 200
+
+  def test_counter_resets_when_panda_recovers(self, mocker):
+    mads, sd = make_mads(mocker, MadsSteeringModeOnBrake.PAUSE)
+    mads.enabled = True
+    mads.active = True
+    sd.sm['pandaStates'] = [make_panda_state(mocker, False)]
+
+    for _ in range(100):
+      mads.data_sample()
+    assert mads.lateral_mismatch_counter == 100
+
+    sd.sm['pandaStates'] = [make_panda_state(mocker, True)]
+    mads.data_sample()
+    assert mads.lateral_mismatch_counter == 0
+
+    sd.sm['pandaStates'] = [make_panda_state(mocker, False)]
+    for _ in range(100):
+      mads.data_sample()
+    assert mads.lateral_mismatch_counter == 100
+
 
 # brand restrictions
 

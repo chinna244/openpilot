@@ -121,25 +121,21 @@ class ModularAssistiveDrivingSystem:
     self.events_sp.add(new_event)
 
   def data_sample(self):
-    # When the safety and selfdrived do not agree on controls_allowed_lateral
-    # we want to disengage sunnypilot. However the status from the panda goes through
-    # another socket other than the CAN messages and one can arrive earlier than the other.
-    # Therefore we allow a mismatch for two samples, then we trigger the disengagement.
+    # Panda lateral authorization can lag selfdrived by a few frames. Require sustained
+    # mismatch before raising controlsMismatchLateral (200 frames; Mazda adds grace below).
     if not self.active or self.selfdrive.enabled:
       self.lateral_mismatch_counter = 0
-    elif self.CP.brand == "mazda":
-      # Same relevant-Panda filter as controlsd_ext._panda_lateral_allowed. Empty or
-      # all-ignored lists must not silently reset the counter (any([]) is False).
-      relevant = [ps for ps in self.selfdrive.sm['pandaStates']
-                  if ps.safetyModel not in IGNORED_SAFETY_MODES]
-      mismatch = (not relevant) or any(not ps.controlsAllowedLateral for ps in relevant)
-      if mismatch:
-        self.lateral_mismatch_counter += 1
-      else:
-        self.lateral_mismatch_counter = 0
-    elif any(not ps.controlsAllowedLateral for ps in self.selfdrive.sm['pandaStates']
-             if ps.safetyModel not in IGNORED_SAFETY_MODES):
+      return
+
+    # Same relevant-Panda filter as controlsd_ext._panda_lateral_allowed. Empty or
+    # all-ignored lists must count as mismatch, not leave the counter unchanged.
+    relevant = [ps for ps in self.selfdrive.sm['pandaStates']
+                if ps.safetyModel not in IGNORED_SAFETY_MODES]
+    mismatch = (not relevant) or any(not ps.controlsAllowedLateral for ps in relevant)
+    if mismatch:
       self.lateral_mismatch_counter += 1
+    else:
+      self.lateral_mismatch_counter = 0
 
   def update_events(self, CS: structs.CarState):
     if not self.selfdrive.enabled and self.enabled:
