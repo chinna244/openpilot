@@ -256,7 +256,7 @@ class SteeringLayoutMici(NavScroller):
   def _update_mads_state(self):
     # Transition tracking — force safe defaults for MADS-limited brands (rivian, tesla w/o vehicle bus)
     is_mads_limited = self._mads_limited = bool(ui_state.CP is not None and ui_state.CP_SP is not None and
-                                                get_mads_limited_brands(ui_state.CP, ui_state.CP_SP))
+                                                get_mads_limited_brands(ui_state.CP, ui_state.CP_SP, ui_state.params))
     if is_mads_limited and self._prev_mads_limited is not True:
       ui_state.params.remove("MadsMainCruiseAllowed")
       ui_state.params.put_bool("MadsUnifiedEngagementMode", True)

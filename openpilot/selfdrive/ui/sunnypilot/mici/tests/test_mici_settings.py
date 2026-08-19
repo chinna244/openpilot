@@ -260,6 +260,75 @@ class TestSteeringLayoutBadges:
       assert params.get_bool("AutoLaneChangeBsmDelay"), "badge suppression must not clear the param"
 
 
+class TestRoadEdgeLaneChange:
+  """RoadEdgeLaneChangeEnabled is ungated (matches TICI lane_change_settings) and works even
+  with auto lane change off, so it must keep the lane-change entry button alive on its own."""
+
+  def test_toggle_writes_param(self, params):
+    from openpilot.selfdrive.ui.sunnypilot.mici.layouts.steering import SteeringLayoutMici
+    from openpilot.system.ui.lib.application import MousePos
+
+    params.put_bool("RoadEdgeLaneChangeEnabled", False, block=True)
+    layout = SteeringLayoutMici()
+    render(layout._lc_view)  # sub-panel self-refresh must not fight the tap
+    assert not layout._lc_road_edge._checked
+    assert layout._lc_road_edge.enabled, "toggle is ungated — no BSM/timer/offroad dependency"
+
+    layout._lc_road_edge._handle_mouse_release(MousePos(0, 0))
+    assert layout._lc_road_edge._checked
+    assert params.get_bool("RoadEdgeLaneChangeEnabled")
+
+    render(layout._lc_view)
+    assert layout._lc_road_edge._checked, "self-refresh must not flip the tap back"
+
+  def test_button_badge_when_only_road_edge_on(self, params):
+    from openpilot.selfdrive.ui.sunnypilot.mici.layouts.steering import SteeringLayoutMici
+    from openpilot.sunnypilot.selfdrive.controls.lib.auto_lane_change import AutoLaneChangeMode
+
+    params.put("AutoLaneChangeTimer", AutoLaneChangeMode.OFF, block=True)
+    params.put_bool("AutoLaneChangeBsmDelay", False, block=True)
+    params.put_bool("RoadEdgeLaneChangeEnabled", True, block=True)
+    layout = SteeringLayoutMici()
+    layout._update_state()
+    assert "road-edge" in (layout._lane_change_btn._badge_labels or [])
+    assert not layout._lane_change_btn._disabled
+
+    params.put_bool("RoadEdgeLaneChangeEnabled", False, block=True)
+    layout._update_state()
+    assert layout._lane_change_btn._disabled, "everything off must still read disabled"
+
+
+class TestDisplayScreenSaver:
+  def test_timeout_gated_on_toggle_but_keeps_value(self, params):
+    """Gated the way the file gates its brightness timer: set_enabled from _update_state.
+    The stored timeout must survive the toggle being off."""
+    from openpilot.selfdrive.ui.sunnypilot.mici.layouts.display import DisplayLayoutMici
+
+    params.put_bool("ScreenSaverEnabled", False, block=True)
+    params.put("ScreenSaverTimeout", 300, block=True)
+    layout = DisplayLayoutMici()
+    layout._update_state()
+    assert not layout._screensaver_timeout.enabled, "timeout must reject input while saver is off"
+    assert params.get("ScreenSaverTimeout") == 300, "gating must not touch the stored value"
+
+    params.put_bool("ScreenSaverEnabled", True, block=True)
+    layout._update_state()
+    assert layout._screensaver_timeout.enabled
+    assert layout._screensaver_timeout.value == "5 minutes", "300 s must read as minutes"
+
+  def test_toggle_writes_param(self, params):
+    from openpilot.selfdrive.ui.sunnypilot.mici.layouts.display import DisplayLayoutMici
+    from openpilot.system.ui.lib.application import MousePos
+
+    params.put_bool("ScreenSaverEnabled", True, block=True)
+    layout = DisplayLayoutMici()
+    layout._update_state()
+    layout._screensaver._handle_mouse_release(MousePos(0, 0))
+    assert not params.get_bool("ScreenSaverEnabled")
+    layout._update_state()
+    assert not layout._screensaver_timeout.enabled, "gate must follow the tap"
+
+
 class TestJerkAwareToggle:
   """LateralJerkTorqueController and NNLC are mutually exclusive (ui_state and the car interface
   both force-disable the pair); the layout must gate the toggles the same way or a tap on one
@@ -315,3 +384,31 @@ class TestJerkAwareToggle:
     params.put_bool("LateralJerkTorqueController", False, block=True)
     layout._update_state()
     assert layout._torque_settings_btn._disabled
+
+
+class TestMadsLimitedCallSignature:
+  """get_mads_limited_brands grew a params argument upstream (Tesla MADS screen activation).
+  The call only executes with a fingerprinted car AND CarParamsSP present, which no other
+  test provides, so a stale call site renders fine in tests and TypeErrors on the device."""
+
+  def test_update_state_with_fingerprinted_car(self, params):
+    from opendbc.car.structs import car
+    from openpilot.selfdrive.ui.sunnypilot.mici.layouts.steering import SteeringLayoutMici
+    from openpilot.selfdrive.ui.ui_state import ui_state
+
+    class _CP:
+      brand = "mazda"
+      steerControlType = car.CarParams.SteerControlType.torque
+      enableBsm = True
+
+    class _CPSP:
+      flags = 0
+
+    old_cp, old_cp_sp = ui_state.CP, ui_state.CP_SP
+    ui_state.CP, ui_state.CP_SP = _CP(), _CPSP()
+    try:
+      layout = SteeringLayoutMici()
+      layout._update_state()  # raises TypeError if the call site misses an argument
+      assert layout._mads_limited is False
+    finally:
+      ui_state.CP, ui_state.CP_SP = old_cp, old_cp_sp
