@@ -25,7 +25,7 @@ def log_fingerprint(CP: structs.CarParams) -> None:
     sentry.capture_fingerprint(CP.carFingerprint, CP.brand)
 
 
-def _seed_mazda_torque_defaults(CP: structs.CarParams, params: Params = None) -> None:
+def _seed_mazda_torque_defaults(CP: structs.CarParams, params: Params | None = None) -> None:
   """One-time: default the full torque-control stack ON for steer-to-zero Mazdas (2022+ CX-5 EPS).
 
   Gated on the EPS, not the model: minSteerSpeed == 0 is the same "CX-5 2022+ EPS present" proxy
@@ -48,7 +48,7 @@ def _seed_mazda_torque_defaults(CP: structs.CarParams, params: Params = None) ->
   cloudlog.warning("Seeded steer-to-zero Mazda torque-control defaults (EnforceTorqueControl, self-tune, speed-dependent)")
 
 
-def _enforce_torque_lateral_control(CP: structs.CarParams, params: Params = None, enabled: bool = False) -> bool:
+def _enforce_torque_lateral_control(CP: structs.CarParams, params: Params | None = None, enabled: bool = False) -> bool:
   if params is None:
     params = Params()
 
@@ -59,7 +59,7 @@ def _enforce_torque_lateral_control(CP: structs.CarParams, params: Params = None
 
 
 def _initialize_neural_network_lateral_control(CP: structs.CarParams, CP_SP: structs.CarParamsSP,
-                                               params: Params = None, enabled: bool = False) -> bool:
+                                               params: Params | None = None, enabled: bool = False) -> bool:
   if params is None:
     params = Params()
 
@@ -78,7 +78,7 @@ def _initialize_neural_network_lateral_control(CP: structs.CarParams, CP_SP: str
   return enabled
 
 
-def _initialize_intelligent_cruise_button_management(CP: structs.CarParams, CP_SP: structs.CarParamsSP, params: Params = None) -> None:
+def _initialize_intelligent_cruise_button_management(CP: structs.CarParams, CP_SP: structs.CarParamsSP, params: Params | None = None) -> None:
   if params is None:
     params = Params()
 
@@ -92,14 +92,20 @@ def _initialize_torque_lateral_control(CI: CarInterfaceBase, CP: structs.CarPara
     CI.configure_torque_tune(CP.carFingerprint, CP.lateralTuning)
 
 
-def _cleanup_unsupported_params(CP: structs.CarParams, CP_SP: structs.CarParamsSP, params: Params = None) -> None:
+def _cleanup_unsupported_params(CP: structs.CarParams, CP_SP: structs.CarParamsSP, params: Params | None = None) -> None:
   if params is None:
     params = Params()
+
+  if params.get_bool("LateralJerkTorqueController") and params.get_bool("NeuralNetworkLateralControl"):
+    cloudlog.warning("LateralJerkTorqueController and NeuralNetworkLateralControl both enabled, disabling both")
+    params.put_bool("LateralJerkTorqueController", False, block=True)
+    params.put_bool("NeuralNetworkLateralControl", False, block=True)
 
   if CP.steerControlType == structs.CarParams.SteerControlType.angle:
     cloudlog.warning("SteerControlType is angle, cleaning up params")
     params.remove("NeuralNetworkLateralControl")
     params.remove("EnforceTorqueControl")
+    params.remove("LateralJerkTorqueController")
 
   if not CP_SP.intelligentCruiseButtonManagementAvailable or CP.openpilotLongitudinalControl:
     cloudlog.warning("ICBM not available or openpilot Longitudinal Control enabled, cleaning up params")
@@ -115,7 +121,7 @@ def _cleanup_unsupported_params(CP: structs.CarParams, CP_SP: structs.CarParamsS
   set_speed_limit_assist_availability(CP, CP_SP, params)
 
 
-def setup_interfaces(CI: CarInterfaceBase, params: Params = None) -> None:
+def setup_interfaces(CI: CarInterfaceBase, params: Params | None = None) -> None:
   _seed_mazda_torque_defaults(CI.CP, params)
   enforce_torque = _enforce_torque_lateral_control(CI.CP, params)
   nnlc_enabled = _initialize_neural_network_lateral_control(CI.CP, CI.CP_SP, params)
@@ -147,6 +153,7 @@ def initialize_params(params) -> list[dict[str, Any]]:
   # tesla
   keys.extend([
     "TeslaCoopSteering",
+    "TeslaMadsScreenButton",
   ])
 
   # toyota

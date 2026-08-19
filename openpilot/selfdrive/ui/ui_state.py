@@ -6,12 +6,14 @@ from enum import Enum
 from openpilot.cereal import messaging, log
 from opendbc.car.structs import car
 from openpilot.common.filter_simple import FirstOrderFilter
+from openpilot.common.ignition import get_ignition_state
 from openpilot.common.params import Params
 from openpilot.common.realtime import drop_realtime
 from openpilot.common.swaglog import cloudlog
 from openpilot.selfdrive.ui.lib.prime_state import PrimeState
 from openpilot.system.ui.lib.application import gui_app
 from openpilot.common.hardware import HARDWARE, PC
+from openpilot.selfdrive.modeld.helpers import usbgpu_compiled
 
 from openpilot.selfdrive.ui.sunnypilot.ui_state import UIStateSP, DeviceSP
 
@@ -44,7 +46,7 @@ class UIState(UIStateSP):
         "modelV2",
         "controlsState",
         "onroadEvents",
-        "liveCalibration",
+        "extrinsicsCalibration",
         "radarState",
         "deviceState",
         "pandaStates",
@@ -52,7 +54,7 @@ class UIState(UIStateSP):
         "driverMonitoringState",
         "carState",
         "driverStateV2",
-        "roadCameraState",
+        "narrowRoadCameraState",
         "wideRoadCameraState",
         "managerState",
         "selfdriveState",
@@ -60,7 +62,7 @@ class UIState(UIStateSP):
         "gpsLocationExternal",
         "carOutput",
         "carControl",
-        "liveParameters",
+        "vehicleParameters",
         "testJoystick",
         "rawAudioData",
       ] + self.sm_services_ext
@@ -80,15 +82,18 @@ class UIState(UIStateSP):
     self.is_release = False  # self.params.get_bool("IsReleaseBranch")
     self.always_on_dm: bool = self.params.get_bool("AlwaysOnDM")
     self.experimental_mode: bool = self.params.get_bool("ExperimentalMode")
-    self.usbgpu: bool = self.params.get_bool("UsbGpuPresent")
-    self.usbgpu_compiled: bool = self.params.get_bool("UsbGpuCompiled")
+    self.experimental_mode_confirmed: bool = self.params.get_bool("ExperimentalModeConfirmed")
+    self.usbgpu: bool = False
+    self.usbgpu_compiled: bool = usbgpu_compiled()
+    self.usbgpu_active: bool | None = self.params.get("UsbGpuActive")
+    self.usbgpu_loading: bool = self.params.get_bool("UsbGpuLoading")
     self.started: bool = False
     self.ignition: bool = False
     self.recording_audio: bool = False
     self.panda_type: log.PandaState.PandaType = log.PandaState.PandaType.unknown
     self.personality: log.LongitudinalPersonality = log.LongitudinalPersonality.standard
     self.has_longitudinal_control: bool = False
-    self.is_body: bool | None = None
+    self.is_body: bool | None = False
     self.CP: car.CarParams | None = None
     self.light_sensor: float = -1.0
 
@@ -146,7 +151,7 @@ class UIState(UIStateSP):
         self.panda_type = panda_states[0].pandaType
         # Check ignition status across all pandas
         if self.panda_type != log.PandaState.PandaType.unknown:
-          self.ignition = any(state.ignitionLine or state.ignitionCan for state in panda_states)
+          self.ignition = get_ignition_state(panda_states)
     elif not self.sm.alive["pandaStates"]:
       self.panda_type = log.PandaState.PandaType.unknown
 
@@ -211,8 +216,13 @@ class UIState(UIStateSP):
     self.is_metric = self.params.get_bool("IsMetric")
     self.always_on_dm = self.params.get_bool("AlwaysOnDM")
     self.experimental_mode = self.params.get_bool("ExperimentalMode")
-    self.usbgpu = self.params.get_bool("UsbGpuPresent")
-    self.usbgpu_compiled = self.params.get_bool("UsbGpuCompiled")
+    self.experimental_mode_confirmed = self.params.get_bool("ExperimentalModeConfirmed")
+    # keep usbgpu UI active until offroad transition when gpu disappears
+    self.usbgpu = self.sm["deviceState"].chestnutPresent or (self.usbgpu and self.started)
+    if not self.usbgpu_compiled:
+      self.usbgpu_compiled = usbgpu_compiled()
+    self.usbgpu_active = self.params.get("UsbGpuActive")
+    self.usbgpu_loading = self.params.get_bool("UsbGpuLoading")
 
     UIStateSP.update_params(self)
 
@@ -338,8 +348,14 @@ class Device(DeviceSP):
     self._set_awake(ui_state.ignition or not interaction_timeout or PC)
 
   def _set_awake(self, on: bool, _ui_state=None):
+    # screensaver holds _awake True, so waking is not a state change
+    if on and self._blocked_by_screensaver:
+      self.dismiss_screensaver(_ui_state or ui_state)
+
     if on != self._awake:
       super()._set_awake(on, _ui_state or ui_state)
+      if self._blocked_by_screensaver:
+        return
       self._awake = on
       cloudlog.debug(f"setting display power {int(on)}")
       HARDWARE.set_display_power(on)

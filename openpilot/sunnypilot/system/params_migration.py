@@ -27,6 +27,26 @@ LEGACY_ORIGINS: tuple[str, ...] = ("github.com/zephleggett/openpilot",)
 LEGACY_BRANCHES: tuple[str, ...] = ("mazda-dev", "zoompilot")
 
 
+def _resolve_brand(_params) -> str:
+  bundle = _params.get("CarPlatformBundle")
+  if isinstance(bundle, dict) and bundle.get("brand"):
+    return str(bundle["brand"])
+
+  # Auto-fingerprinted cars have no bundle, fall back to the last known CarParams.
+  CP_bytes = _params.get("CarParamsPersistent")
+  if CP_bytes is None:
+    return ""
+
+  # Never raises: callers rely on "" to mean "brand unknown, skip the migration".
+  try:
+    from openpilot.cereal import messaging  # lazy: avoids heavy import at module level
+    from opendbc.car.structs import car
+    return str(messaging.log_from_bytes(CP_bytes, car.CarParams).brand)
+  except Exception as e:
+    cloudlog.exception(f"params_migration: failed to resolve brand from CarParamsPersistent: {e}")
+    return ""
+
+
 def _migrate_car_platform_bundle(_params):
   bundle = _params.get("CarPlatformBundle")
   if bundle is None:
@@ -90,6 +110,23 @@ def _migrate_zoompilot_channel(_params):
   cloudlog.info(f"params_migration: UpdaterTargetBranch set to {ZOOMPILOT_BRANCH!r} (on {branch!r})")
 
 
+def _migrate_tesla_mads_screen_button(_params):
+  # TeslaMadsScreenButton defaults to Off for fresh installs, but the screen button was previously always
+  # active on Teslas with a vehicle bus. Seed existing Tesla installs with 3-finger to preserve that.
+  try:
+    if _params.get("TeslaMadsScreenButton") is not None:
+      return
+
+    if _resolve_brand(_params) != "tesla":
+      return
+
+    from opendbc.sunnypilot.car.tesla.values import MadsScreenButtonType  # lazy: avoids heavy import at module level
+    _params.put("TeslaMadsScreenButton", MadsScreenButtonType.THREE_FINGER, block=True)
+    cloudlog.info("params_migration: seeded TeslaMadsScreenButton with 3-finger to preserve existing behavior")
+  except Exception as e:
+    cloudlog.exception(f"Error migrating TeslaMadsScreenButton: {e}")
+
+
 def run_migration(_params):
   # migrate OnroadScreenOffBrightness
   if _params.get("OnroadScreenOffBrightnessMigrated") != ONROAD_BRIGHTNESS_MIGRATION_VERSION:
@@ -123,6 +160,9 @@ def run_migration(_params):
       cloudlog.exception(f"Error migrating OnroadScreenOffTimer: {e}")
 
   _migrate_car_platform_bundle(_params)
+
+  # seed TeslaMadsScreenButton for existing Tesla installs
+  _migrate_tesla_mads_screen_button(_params)
 
   try:
     _migrate_zoompilot_channel(_params)

@@ -1,18 +1,19 @@
-import pytest
 import time
 
+from openpilot.common.test import OpenpilotTestCase
 import openpilot.cereal.messaging as messaging
 from openpilot.cereal.services import SERVICE_LIST
 from openpilot.common.gpio import gpio_read
 from openpilot.selfdrive.test.helpers import with_processes
 from openpilot.system.manager.process_config import managed_processes
-from openpilot.common.hardware.tici.pins import GPIO
+from openpilot.common.hardware.comma.pins import GPIO
 
 
 # TODO(PR82): optional offline TTFF fixture once a representative route corpus is checked in.
 # AssistNow Online is retired; remaining assistance is YUMA/AOP/DBD (not a blocking correctness gap).
-@pytest.mark.tici
-class TestPigeond:
+class TestPigeond(OpenpilotTestCase):
+  COMMA_HARDWARE_TEST = True
+
   def teardown_method(self):
     managed_processes['pigeond'].stop()
 

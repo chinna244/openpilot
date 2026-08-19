@@ -122,6 +122,12 @@ class SteeringLayoutMici(NavScroller):
     self._torque_toggle.set_enabled(lambda: self._torque_allowed and ui_state.is_offroad() and
                                     not ui_state.params.get_bool("NeuralNetworkLateralControl"))
 
+    # Mutually exclusive with NNLC; unlike the rest of this panel it works without
+    # EnforceTorqueControl on torque-native cars, so it is not gated on _enforce_torque
+    self._jerk_aware_toggle = BigParamControl(tr("jerk aware"), "LateralJerkTorqueController")
+    self._jerk_aware_toggle.set_enabled(lambda: ui_state.is_offroad() and
+                                        not ui_state.params.get_bool("NeuralNetworkLateralControl"))
+
     # Torque tune version selector — inline pill selector over the TICI TorqueControlTune options,
     # oldest first. No "default" option: the param's own default (0.0, v0) is what unset resolves to.
     # The fallback keeps the widget constructible if the versions file is ever unreadable.
@@ -160,7 +166,7 @@ class SteeringLayoutMici(NavScroller):
     self._tq_items_rest = [self._tq_self_tune_btn, self._tq_custom_btn]
     for item in [self._tq_version] + self._tq_items_rest:
       item.set_enabled(lambda: self._enforce_torque)
-    self._tq_view = self._torque_settings_btn.link_sub_panel([self._torque_toggle, self._tq_version] + self._tq_items_rest)
+    self._tq_view = self._torque_settings_btn.link_sub_panel([self._torque_toggle, self._jerk_aware_toggle, self._tq_version] + self._tq_items_rest)
 
   # --- Torque tune version selector ---
   @staticmethod
@@ -193,6 +199,7 @@ class SteeringLayoutMici(NavScroller):
     if ui_state.CP is not None and not torque_allowed and self._prev_torque_allowed is not False:
       ui_state.params.remove("EnforceTorqueControl")
       ui_state.params.remove("NeuralNetworkLateralControl")
+      ui_state.params.remove("LateralJerkTorqueController")
     self._prev_torque_allowed = torque_allowed
 
     mads_on = ui_state.params.get_bool("Mads")
@@ -226,15 +233,18 @@ class SteeringLayoutMici(NavScroller):
       self._lane_change_btn.set_badges([(tr("auto"), auto_badge), (tr("bsm-delay"), lc_bsm)])
 
     enforce_torque = self._enforce_torque = ui_state.params.get_bool("EnforceTorqueControl")
+    jerk_aware = ui_state.params.get_bool("LateralJerkTorqueController")
     self_tune_on = ui_state.params.get_bool("LiveTorqueParamsToggle")
     custom_on = ui_state.params.get_bool("CustomTorqueParams")
 
     self._torque_settings_btn.set_enabled(torque_allowed)
-    if not enforce_torque:
+    if not enforce_torque and not jerk_aware:
       self._torque_settings_btn.set_disabled()
     else:
-      self._torque_settings_btn.set_badges([(tr("enabled"), "on"), (tr("self-tune"), _on_off(self_tune_on)), (tr("custom-tuning"), _on_off(custom_on))])
-    self._nnlc_toggle.set_enabled(torque_allowed and offroad and not enforce_torque)
+      # "off" badges are hidden by set_badges, so jerk-aware-only shows a single pill
+      self._torque_settings_btn.set_badges([(tr("enabled"), _on_off(enforce_torque)), (tr("jerk-aware"), _on_off(jerk_aware)),
+                                            (tr("self-tune"), _on_off(self_tune_on)), (tr("custom-tuning"), _on_off(custom_on))])
+    self._nnlc_toggle.set_enabled(torque_allowed and offroad and not enforce_torque and not jerk_aware)
 
     # --- Sub-panel state (sub-panels refresh themselves; this is transition cleanup + badges) ---
     self._update_mads_state()
