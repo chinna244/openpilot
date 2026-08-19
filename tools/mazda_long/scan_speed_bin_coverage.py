@@ -234,7 +234,17 @@ def main():
       print("rejected on config change, so those logs predate the current speed_bp.")
     return
 
-  n_bins = len(seed_bp) if seed_bp else len(snaps[0]["centers"])
+  # no TOML entry yet (seeding a new car): work off the bin layout the logs learned on,
+  # and compare against the offline global values, which is what the learner seeds from
+  if not seed_bp:
+    seed_bp = list(snaps[0]["centers"])
+    with open(TOML_PATH.parent / "params.toml", "rb") as f:
+      offline = tomllib.load(f).get(args.car)
+    seed_laf = [offline[0] if offline else 0.0] * len(seed_bp)
+    seed_fric = [offline[2] if offline else 0.0] * len(seed_bp)
+    print(f"no TOML seeds for {args.car}; bin centers from the logs: {seed_bp}")
+    print(f"reference = offline globals (the unconfigured learner's seed): laf {seed_laf[0]:.2f}, friction {seed_fric[0]:.3f}")
+  n_bins = len(seed_bp)
   for s in snaps:
     s["n_valid"] = sum(1 for x in s["valid"] if x)
     s["total_points"] = sum(s["points"])
