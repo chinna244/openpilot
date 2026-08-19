@@ -16,7 +16,6 @@ from openpilot.common.swaglog import cloudlog
 from openpilot.common.hardware.hw import Paths
 
 from openpilot.cereal import messaging, custom
-from openpilot.sunnypilot.models.default_bootstrap import maybe_apply_default_model
 from openpilot.sunnypilot.models.fetcher import ModelFetcher
 from openpilot.sunnypilot.models.helpers import get_active_bundle, validate_active_bundle, verify_file
 
@@ -258,7 +257,6 @@ class ModelManagerSP:
       try:
         self.available_models = self.model_fetcher.get_available_bundles()
         validate_active_bundle(self.params, self.available_models)
-        maybe_apply_default_model(self.params, self.available_models)
         self.active_bundle = get_active_bundle(self.params)
 
         if (index_to_download := self.params.get("ModelManager_DownloadIndex")) is not None:

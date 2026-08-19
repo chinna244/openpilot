@@ -509,3 +509,28 @@ class TestCruiseArbiterNonPcm:
     self.press(ButtonType.accelCruise, 40, 45)
     assert self.arb.state == SpeedLimitAssistState.active
     assert round(self.v_cruise_kph * CV.KPH_TO_MPH) == 45
+
+
+class TestAssistMirrorDefaultMessage:
+  """plannerd ignores carStateSP in its health checks, so the mirror can be fed capnp's
+  default CruiseSession (vCap=0.0) before the first card message arrives or in process
+  replay without a carStateSP pub. That 0 must not become the plan target."""
+
+  def _mirror(self):
+    from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.assist_mirror import SpeedLimitAssistMirror
+    return SpeedLimitAssistMirror(None, None)
+
+  def test_default_session_yields_unset(self):
+    from openpilot.sunnypilot.selfdrive.selfdrived.events import EventsSP
+    session = custom.CarStateSP.new_message().cruiseSession
+    mirror = self._mirror()
+    mirror.update(session, a_ego=0.0, events_sp=EventsSP())
+    assert mirror.output_v_target == V_CRUISE_UNSET
+
+  def test_real_cap_passes_through(self):
+    from openpilot.sunnypilot.selfdrive.selfdrived.events import EventsSP
+    session = custom.CarStateSP.new_message().cruiseSession
+    session.vCap = 22.5
+    mirror = self._mirror()
+    mirror.update(session, a_ego=0.0, events_sp=EventsSP())
+    assert mirror.output_v_target == pytest.approx(22.5)
