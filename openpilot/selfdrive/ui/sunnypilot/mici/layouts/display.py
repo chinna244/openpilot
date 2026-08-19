@@ -6,6 +6,7 @@ See the LICENSE.md file in the root directory for more details.
 """
 
 
+from openpilot.selfdrive.ui.mici.widgets.button import BigParamControl
 from openpilot.selfdrive.ui.sunnypilot.mici.widgets.button import BigParamOption
 from openpilot.selfdrive.ui.sunnypilot.layouts.settings.display import ONROAD_BRIGHTNESS_TIMER_VALUES, OnroadBrightness
 from openpilot.selfdrive.ui.ui_state import ui_state
@@ -86,15 +87,30 @@ class DisplayLayoutMici(NavScroller):
       picker_unit=tr("seconds"),
     )
 
-    self._scroller.add_widgets([self._brightness, self._brightness_timer, self._ui_timeout])
+    self._screensaver = BigParamControl(tr("screen saver"), "ScreenSaverEnabled")
+    # 60-600 s in whole minutes — same range/step as the TICI screen saver duration
+    self._screensaver_timeout = BigParamOption(
+      tr("saver duration"), "ScreenSaverTimeout",
+      min_value=60, max_value=600, value_change_step=60,
+      label_callback=_timer_label,
+      picker_label_callback=_timer_picker_label,
+      picker_unit=tr("minutes"),
+    )
+
+    self._scroller.add_widgets([self._brightness, self._brightness_timer, self._ui_timeout,
+                                self._screensaver, self._screensaver_timeout])
 
   def _update_state(self):
     super()._update_state()
     self._brightness.refresh()
     self._brightness_timer.refresh()
     self._ui_timeout.refresh()
+    self._screensaver.refresh()
+    self._screensaver_timeout.refresh()
 
     brightness_val = ui_state.params.get("OnroadScreenOffBrightness", return_default=True)
     self._brightness_timer.set_enabled(
       brightness_val not in (OnroadBrightness.AUTO, OnroadBrightness.AUTO_DARK)
     )
+    # gated like the brightness timer above; the param keeps its value while the toggle is off
+    self._screensaver_timeout.set_enabled(self._screensaver._checked)

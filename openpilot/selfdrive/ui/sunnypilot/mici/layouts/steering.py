@@ -102,7 +102,9 @@ class SteeringLayoutMici(NavScroller):
                                            list(ALC_LABELS.values()), values=list(ALC_LABELS))
     self._lc_bsm = BigParamControlSP(tr("bsm delay"), "AutoLaneChangeBsmDelay",
                                      depends_on=lambda: self._bsm_applies(self._alc_val) and self._car_has_bsm())
-    self._lc_view = self._lane_change_btn.link_sub_panel([self._lc_timer, self._lc_bsm])
+    # blocks lane changes toward a detected road edge — ungated, matching TICI lane_change_settings
+    self._lc_road_edge = BigParamControl(tr("road edge"), "RoadEdgeLaneChangeEnabled")
+    self._lc_view = self._lane_change_btn.link_sub_panel([self._lc_timer, self._lc_bsm, self._lc_road_edge])
 
     # --- Blinker sub-panel ---
     self._blinker_toggle = BigParamControl(tr("enable blinker pause"), "BlinkerPauseLateralControl")
@@ -225,11 +227,12 @@ class SteeringLayoutMici(NavScroller):
     # Show BSM delay off where it does nothing, but leave the param alone — auto_lane_change
     # already ignores it below Nudgeless, and the user's choice comes back when they re-enable
     lc_bsm = _on_off(ui_state.params.get_bool("AutoLaneChangeBsmDelay") and self._bsm_applies(alc_val))
-    if alc_val <= AutoLaneChangeMode.OFF and lc_bsm == "off":
+    road_edge = _on_off(ui_state.params.get_bool("RoadEdgeLaneChangeEnabled"))
+    if alc_val <= AutoLaneChangeMode.OFF and lc_bsm == "off" and road_edge == "off":
       self._lane_change_btn.set_disabled()
     else:
       auto_badge = _alc_label(alc_val) if alc_val > AutoLaneChangeMode.OFF else "off"
-      self._lane_change_btn.set_badges([(tr("auto"), auto_badge), (tr("bsm-delay"), lc_bsm)])
+      self._lane_change_btn.set_badges([(tr("auto"), auto_badge), (tr("bsm-delay"), lc_bsm), (tr("road-edge"), road_edge)])
 
     enforce_torque = self._enforce_torque = ui_state.params.get_bool("EnforceTorqueControl")
     jerk_aware = ui_state.params.get_bool("LateralJerkTorqueController")
