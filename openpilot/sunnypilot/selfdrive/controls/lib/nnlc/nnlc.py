@@ -65,6 +65,10 @@ class NeuralNetworkLateralControl(LatControlTorqueJerkAware):
   def _nnlc_enabled(self):
     return self.enabled and self.model_valid and self.has_nn_model
 
+  @property
+  def overrides_output(self) -> bool:
+    return self._nnlc_enabled or super().overrides_output
+
   def update_limits(self):
     super().update_limits()
     if not self._nnlc_enabled:
