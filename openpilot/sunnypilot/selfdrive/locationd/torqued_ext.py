@@ -189,7 +189,7 @@ class TorqueEstimatorExt:
         if not cache:
           return
         with log.Event.from_bytes(cache) as evt:
-          cache_ltp = evt.liveTorqueParameters
+          cache_ltp = evt.lateralTorqueParameters
       from openpilot.selfdrive.locationd.torqued import MIN_FILTER_DECAY
       n_bins = len(self.speed_bin_bounds)
       # Reject cache from a different config (e.g. TOML update changed bin centers).

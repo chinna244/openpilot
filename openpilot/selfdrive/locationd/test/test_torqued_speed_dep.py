@@ -128,7 +128,7 @@ class TestSpeedBinnedLearning:
       centers, bounds = _get_car_bins(fingerprint)
       est = TorqueEstimator(make_mock_CP(fingerprint=fingerprint))
       msg = est.get_msg()
-      ltp = msg.liveTorqueParameters
+      ltp = msg.lateralTorqueParameters
       assert len(ltp.speedBinCenters) == len(centers)
       assert len(ltp.speedBinLatAccelFactors) == len(bounds)
       assert len(ltp.speedBinFrictions) == len(bounds)
@@ -141,7 +141,7 @@ class TestSpeedBinnedLearning:
     _setup_ext_mock(mock_ext, speed_dep_on=True)
     est = TorqueEstimator(make_mock_CP(lat_accel_factor=1.25, friction=0.125))
     msg = est.get_msg()
-    ltp = msg.liveTorqueParameters
+    ltp = msg.lateralTorqueParameters
     assert ltp.latAccelFactorFiltered == pytest.approx(1.25, abs=1e-2)
     assert ltp.frictionCoefficientFiltered == pytest.approx(0.125, abs=1e-3)
 
@@ -185,7 +185,7 @@ class TestBackwardCompatibility:
     _setup_ext_mock(mock_ext, speed_dep_on=False)
     est = TorqueEstimator(make_mock_CP(fingerprint=NON_SPEED_DEP_FINGERPRINT))
     msg = est.get_msg()
-    ltp = msg.liveTorqueParameters
+    ltp = msg.lateralTorqueParameters
     assert len(ltp.speedBinCenters) == 0
     assert len(ltp.speedBinLatAccelFactors) == 0
     assert len(ltp.speedBinFrictions) == 0
@@ -198,7 +198,7 @@ class TestBackwardCompatibility:
     _setup_ext_mock(mock_ext, speed_dep_on=False)
     est = TorqueEstimator(make_mock_CP(fingerprint=NON_SPEED_DEP_FINGERPRINT, lat_accel_factor=2.0, friction=0.15))
     msg = est.get_msg()
-    ltp = msg.liveTorqueParameters
+    ltp = msg.lateralTorqueParameters
     assert ltp.latAccelFactorFiltered == pytest.approx(2.0, abs=1e-2)
     assert ltp.frictionCoefficientFiltered == pytest.approx(0.15, abs=1e-3)
     assert not est.speed_binned
@@ -223,7 +223,7 @@ class TestBackwardCompatibility:
     for fp in fingerprints:
       est = TorqueEstimator(make_mock_CP(fingerprint=fp))
       msg = est.get_msg()
-      assert msg.liveTorqueParameters.calPerc == 0
+      assert msg.lateralTorqueParameters.calPerc == 0
 
 
 class TestCentersToBounds:
@@ -476,7 +476,7 @@ class TestGetMsgWithPoints:
     est._on_torque_point(0.2, 0.4, v2)
 
     msg = est.get_msg(with_points=True)
-    ltp = msg.liveTorqueParameters
+    ltp = msg.lateralTorqueParameters
     assert len(ltp.speedBinPoints) == len(bounds)
     total_points = sum(len(bin_pts) for bin_pts in ltp.speedBinPoints)
     assert total_points >= 2
@@ -492,7 +492,7 @@ class TestGetMsgWithPoints:
     est._on_torque_point(0.1, 0.3, v1)
 
     msg = est.get_msg(with_points=False)
-    ltp = msg.liveTorqueParameters
+    ltp = msg.lateralTorqueParameters
     assert len(ltp.speedBinPoints) == 0
 
 

@@ -34,7 +34,7 @@ def confirm_needed_for_change(cluster_conv: int, target_conv: int, is_metric: bo
   return target_conv < cst
 
 
-def set_speed_limit_assist_availability(CP: car.CarParams, CP_SP: custom.CarParamsSP, params: Params = None) -> bool:
+def set_speed_limit_assist_availability(CP: car.CarParams, CP_SP: custom.CarParamsSP, params: Params | None = None) -> bool:
   if params is None:
     params = Params()
 
