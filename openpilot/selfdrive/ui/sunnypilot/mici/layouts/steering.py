@@ -103,7 +103,7 @@ class SteeringLayoutMici(NavScroller):
     self._lc_bsm = BigParamControlSP(tr("bsm delay"), "AutoLaneChangeBsmDelay",
                                      depends_on=lambda: self._bsm_applies(self._alc_val) and self._car_has_bsm())
     # blocks lane changes toward a detected road edge — ungated, matching TICI lane_change_settings
-    self._lc_road_edge = BigParamControl(tr("road edge"), "RoadEdgeLaneChangeEnabled")
+    self._lc_road_edge = BigParamControl(tr("road edge block"), "RoadEdgeLaneChangeEnabled")
     self._lc_view = self._lane_change_btn.link_sub_panel([self._lc_timer, self._lc_bsm, self._lc_road_edge])
 
     # --- Blinker sub-panel ---
