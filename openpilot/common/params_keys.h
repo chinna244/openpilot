@@ -191,6 +191,8 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"MadsMainCruiseAllowed", {PERSISTENT | BACKUP, BOOL, "1"}},
     {"MadsSteeringMode", {PERSISTENT | BACKUP, INT, "0"}},
     {"MadsUnifiedEngagementMode", {PERSISTENT | BACKUP, BOOL, "1"}},
+    // Mazda: default-off experimental engaged HUD (OFF/WHITE unless every GREEN guard is true).
+    {"MazdaExperimentalMadsGreenHud", {PERSISTENT | BACKUP, BOOL, "0"}},
 
     // Model Manager params
     {"ModelManager_ActiveBundle", {PERSISTENT, JSON}},
