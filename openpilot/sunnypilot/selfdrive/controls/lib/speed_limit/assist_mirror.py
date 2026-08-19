@@ -43,7 +43,11 @@ class SpeedLimitAssistMirror:
 
   def update(self, session, a_ego: float, events_sp: EventsSP) -> None:
     self.state = session.state
-    self.output_v_target = float(session.vCap)
+    # The arbiter publishes vCap as a real target, a frozen hold, or V_CRUISE_UNSET —
+    # never 0. A 0 can only be capnp's float default from a not-yet-received carStateSP,
+    # and without this guard it would win the plan min() as a full-stop target.
+    v_cap = float(session.vCap)
+    self.output_v_target = v_cap if v_cap > 0.0 else V_CRUISE_UNSET
     self.output_a_target = a_ego
 
     if self.state == SessionState.preActive:
