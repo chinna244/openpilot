@@ -93,7 +93,8 @@ jobs:
           ln -sfn teleoprtc_repo/teleoprtc teleoprtc
           ln -sfn tinygrad_repo/tinygrad tinygrad
           sed -i '/from .board.jungle import PandaJungle, PandaJungleDFU/s/^/#/' panda/__init__.py
-          scons -j$(nproc) cache_dir=${{ env.SCONS_CACHE_DIR }} --minimal openpilot/sunnypilot/modeld_v2
+          # sunnypilot/modeld_v2 lost its SConscript upstream (chestnut refactor moved SP model
+          # compilation out of scons), so it is no longer a warm-up target here
           scons -j2 cache_dir=${{ env.SCONS_CACHE_DIR }} --minimal openpilot/sunnypilot/selfdrive/locationd
           scons -j1 cache_dir=${{ env.SCONS_CACHE_DIR }} --minimal openpilot/selfdrive/locationd
           scons -j$(nproc) cache_dir=${{ env.SCONS_CACHE_DIR }} --minimal
