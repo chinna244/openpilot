@@ -24,7 +24,10 @@ if arch != "Darwin":
   lenv["LINKFLAGS"] += ["-Wl,--no-as-needed"]
 
 lenv["LIBPATH"].append(Dir(rednose_gen_dir).abspath)
-lenv["RPATH"].append(Dir(rednose_gen_dir).abspath)
+# Keep the native LLK binary relocatable. Prebuilt/updater staging builds are
+# moved into /data/openpilot after linking, so an absolute staging RUNPATH makes
+# locationd_llk exit 127 even though liblive.so moved with it.
+lenv["LINKFLAGS"] += ["'-Wl,-rpath,$$ORIGIN/models/generated'"]
 locationd = lenv.Program("locationd", locationd_sources, LIBS=["live", "ekf_sym"] + loc_libs + transformations)
 lenv.Depends(locationd, rednose)
 lenv.Depends(locationd, live_ekf)
