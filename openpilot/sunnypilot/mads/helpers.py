@@ -8,6 +8,7 @@ See the LICENSE.md file in the root directory for more details.
 from openpilot.common.params import Params
 from opendbc.car import structs
 from opendbc.safety import ALTERNATIVE_EXPERIENCE
+from opendbc.car.mazda.values import has_tja_mads
 from opendbc.sunnypilot.car.hyundai.values import HyundaiFlagsSP, HyundaiSafetyFlagsSP
 from opendbc.sunnypilot.car.tesla.values import MadsScreenButtonType, TeslaFlagsSP
 
@@ -74,3 +75,9 @@ def set_car_specific_params(CP: structs.CarParams, CP_SP: structs.CarParamsSP, p
   # no ACC MAIN button for these brands
   if CP.brand in MADS_NO_ACC_MAIN_BUTTON:
     params.remove("MadsMainCruiseAllowed")
+
+  if has_tja_mads(CP):
+    # TJA-only MADS master: SET/pcmEnable must not engage MADS via UEM, and MRCC
+    # must not look like a MADS main-cruise button.
+    params.remove("MadsMainCruiseAllowed")
+    params.put_bool("MadsUnifiedEngagementMode", False, block=True)

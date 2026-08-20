@@ -10,6 +10,7 @@ import openpilot.cereal.messaging as messaging
 from openpilot.cereal import log, custom
 
 from opendbc.car import structs
+from opendbc.car.mazda.values import has_tja_mads
 from openpilot.common.params import Params
 from openpilot.common.swaglog import cloudlog
 from openpilot.sunnypilot import PARAMS_UPDATE_PERIOD
@@ -31,7 +32,7 @@ class ControlsExt(ModelStateBase):
     self.CP_SP = messaging.log_from_bytes(params.get("CarParamsSP", block=True), custom.CarParamsSP)
     cloudlog.info("controlsd_ext got CarParamsSP")
 
-    self.sm_services_ext = ['radarState', 'selfdriveStateSP']
+    self.sm_services_ext = ['radarState', 'selfdriveStateSP', 'pandaStates']
     self.pm_services_ext = ['carControlSP']
 
   def initialize_lateral_control(self, lac, CI, dt):
@@ -64,10 +65,45 @@ class ControlsExt(ModelStateBase):
 
     ss_sp = sm['selfdriveStateSP']
     if ss_sp.mads.available:
-      return bool(ss_sp.mads.active)
+      mads_active = bool(ss_sp.mads.active)
+      if has_tja_mads(self.CP):
+        # MADS stays enabled; torque waits for panda lateral authorization.
+        return mads_active and self._panda_lateral_allowed(sm)
+      return mads_active
 
     # MADS not available, use stock state to engage
     return bool(sm['selfdriveState'].active)
+
+  @staticmethod
+  def _panda_lateral_allowed(sm: messaging.SubMaster) -> bool:
+    try:
+      # SubMaster retains the last pandaStates list when the service goes stale/dead.
+      # Never authorize lateral from a cached controlsAllowedLateral sample.
+      if not sm.all_checks(['pandaStates']):
+        return False
+      pss = sm['pandaStates']
+      ss = sm['selfdriveState']
+      ss_sp = sm['selfdriveStateSP']
+    except Exception:
+      return False
+    ignored = {structs.CarParams.SafetyModel.silent, structs.CarParams.SafetyModel.noOutput,
+               structs.CarParams.SafetyModel.elm327, "silent", "noOutput", "elm327"}
+    relevant = [ps for ps in pss if ps.safetyModel not in ignored]
+    if not relevant:
+      return False
+
+    mads_steering = bool(ss_sp.mads.active)
+    selfdrive_active = bool(ss.active)
+
+    def _lateral_ok(ps) -> bool:
+      if ps.controlsAllowedLateral:
+        return True
+      # Under MADS-only steering, generic MRCC controlsAllowed must not substitute for TJA auth.
+      if mads_steering and not selfdrive_active:
+        return False
+      return selfdrive_active and bool(ps.controlsAllowed)
+
+    return all(_lateral_ok(ps) for ps in relevant)
 
   @staticmethod
   def get_lead_data(_lead, src: log.RadarState.LeadData) -> None:

@@ -23,13 +23,18 @@ ALL_STATES = (State.schema.enumerants.values())
 # The event types checked in DISABLED section of state machine
 ENABLE_EVENT_TYPES = (ET.ENABLE, ET.OVERRIDE_LATERAL)
 
+# Dedicated synthetic event id. Do not overwrite EVENTS_SP[0] (lkasEnable); that
+# poisons later MADS tests in the same process so TJA no longer enables.
+_TEST_EVENT = max(EVENTS_SP.keys(), default=0) + 1
+_LKAS_ENABLE_MAPPING = EVENTS_SP[EventNameSP.lkasEnable]
+
 
 def make_event(event_types):
   event = {}
   for ev in event_types:
     event[ev] = NormalPermanentAlert("alert")
-  EVENTS_SP[0] = event  # type: ignore[assignment] # ty: ignore[invalid-assignment]
-  return 0
+  EVENTS_SP[_TEST_EVENT] = event  # type: ignore[assignment] # ty: ignore[invalid-assignment]
+  return _TEST_EVENT
 
 
 class MockMADS:
@@ -48,6 +53,10 @@ class TestMADSStateMachine(OpenpilotTestCase):
     self.events = self.mads.selfdrive.events
     self.events_sp = self.mads.selfdrive.events_sp
     self.mads.selfdrive.state_machine.soft_disable_timer = int(SOFT_DISABLE_TIME / DT_CTRL)
+
+  def teardown_method(self):
+    EVENTS_SP[EventNameSP.lkasEnable] = _LKAS_ENABLE_MAPPING
+    EVENTS_SP.pop(_TEST_EVENT, None)
 
   def clear_events(self):
     self.events.clear()

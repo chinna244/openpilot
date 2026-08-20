@@ -9,7 +9,7 @@ from openpilot.cereal import log, custom
 
 from opendbc.car import structs
 from opendbc.car.hyundai.values import HyundaiFlags
-from openpilot.common.params import Params
+from opendbc.car.mazda.values import has_tja_mads
 from openpilot.sunnypilot.mads.helpers import MadsSteeringModeOnBrake, read_steering_mode_param, MADS_NO_ACC_MAIN_BUTTON
 from openpilot.sunnypilot.mads.state import StateMachine, GEARS_ALLOW_PAUSED_SILENT
 
@@ -21,7 +21,11 @@ GearShifter = structs.CarState.GearShifter
 SafetyModel = structs.CarParams.SafetyModel
 
 SET_SPEED_BUTTONS = (ButtonType.accelCruise, ButtonType.resumeCruise, ButtonType.decelCruise, ButtonType.setCruise)
-IGNORED_SAFETY_MODES = (SafetyModel.silent, SafetyModel.noOutput)
+IGNORED_SAFETY_MODES = (SafetyModel.silent, SafetyModel.noOutput, SafetyModel.elm327)
+# Mazda TJA_MADS: allow a brief panda-state delay before counting a lateral mismatch.
+# After this grace, the same 200-frame threshold as other brands raises controlsMismatchLateral.
+MAZDA_LATERAL_AUTH_GRACE = 50
+MAZDA_LATERAL_MISMATCH_LIMIT = 200
 
 
 class ModularAssistiveDrivingSystem:
@@ -41,12 +45,18 @@ class ModularAssistiveDrivingSystem:
     self.state_machine = StateMachine(self)
     self.events = self.selfdrive.events
     self.events_sp = self.selfdrive.events_sp
-    self.disengage_on_accelerator = Params().get_bool("DisengageOnAccelerator")
+    self.disengage_on_accelerator = self.params.get_bool("DisengageOnAccelerator")
     if self.CP.brand == "hyundai":
       if self.CP.flags & (HyundaiFlags.HAS_LDA_BUTTON | HyundaiFlags.CANFD):
         self.allow_always = True
     if self.CP.brand == "tesla":
       self.allow_always = True
+    self.tja_mads = has_tja_mads(self.CP)
+    if self.tja_mads:
+      # Physical TJA (ButtonType.lkas) is the only MADS toggle. MRCC is OEM-only
+      # and must not enable/disable MADS via cruiseState.available.
+      self.allow_always = True
+      self.no_main_cruise = True
 
     if self.CP.brand in MADS_NO_ACC_MAIN_BUTTON:
       self.no_main_cruise = True
@@ -56,10 +66,17 @@ class ModularAssistiveDrivingSystem:
     self.main_enabled_toggle = self.params.get_bool("MadsMainCruiseAllowed")
     self.steering_mode_on_brake = read_steering_mode_param(self.CP, self.CP_SP, self.params)
     self.unified_engagement_mode = self.params.get_bool("MadsUnifiedEngagementMode")
+    if self.tja_mads:
+      # Physical TJA is the only MADS master. UEM would let pcmEnable/SET engage MADS.
+      self.main_enabled_toggle = False
+      self.unified_engagement_mode = False
 
   def read_params(self):
     self.main_enabled_toggle = self.params.get_bool("MadsMainCruiseAllowed")
     self.unified_engagement_mode = self.params.get_bool("MadsUnifiedEngagementMode")
+    if self.tja_mads:
+      self.main_enabled_toggle = False
+      self.unified_engagement_mode = False
 
   def pedal_pressed_non_gas_pressed(self, CS: structs.CarState) -> bool:
     # ignore `pedalPressed` events caused by gas presses
@@ -106,15 +123,27 @@ class ModularAssistiveDrivingSystem:
     self.events_sp.add(new_event)
 
   def data_sample(self):
-    # When the safety and selfdrived do not agree on controls_allowed_lateral
-    # we want to disengage sunnypilot. However the status from the panda goes through
-    # another socket other than the CAN messages and one can arrive earlier than the other.
-    # Therefore we allow a mismatch for two samples, then we trigger the disengagement.
+    # Panda lateral authorization can lag selfdrived by a few frames. Require sustained
+    # mismatch before raising controlsMismatchLateral (200 frames; Mazda TJA_MADS adds grace).
     if not self.active or self.selfdrive.enabled:
       self.lateral_mismatch_counter = 0
-    elif any(not ps.controlsAllowedLateral for ps in self.selfdrive.sm['pandaStates']
-             if ps.safetyModel not in IGNORED_SAFETY_MODES):
+      return
+
+    # Stale/invalid pandaStates retain the last list; treat that as mismatch instead of
+    # trusting a cached controlsAllowedLateral=True sample.
+    sm = self.selfdrive.sm
+    if not sm.all_checks(['pandaStates']):
       self.lateral_mismatch_counter += 1
+      return
+
+    # Empty or all-ignored Panda lists must count as mismatch, not leave the counter unchanged.
+    relevant = [ps for ps in sm['pandaStates']
+                if ps.safetyModel not in IGNORED_SAFETY_MODES]
+    mismatch = (not relevant) or any(not ps.controlsAllowedLateral for ps in relevant)
+    if mismatch:
+      self.lateral_mismatch_counter += 1
+    else:
+      self.lateral_mismatch_counter = 0
 
   def update_events(self, CS: structs.CarState):
     if not self.selfdrive.enabled and self.enabled:
@@ -199,7 +228,10 @@ class ModularAssistiveDrivingSystem:
       if self.state_machine.state == State.paused:
         self.events_sp.add(EventNameSP.silentLkasEnable)
 
-    if self.lateral_mismatch_counter >= 200:
+    mismatch_limit = MAZDA_LATERAL_MISMATCH_LIMIT
+    if self.tja_mads:
+      mismatch_limit += MAZDA_LATERAL_AUTH_GRACE
+    if self.lateral_mismatch_counter >= mismatch_limit:
       self.events_sp.add(EventNameSP.controlsMismatchLateral)
 
     self.events.remove(EventName.pcmDisable)
