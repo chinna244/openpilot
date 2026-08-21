@@ -12,4 +12,4 @@ from openpilot.system.ui.widgets.label import UnifiedLabel
 class MiciHomeLayoutSP(MiciHomeLayout):
   def __init__(self):
     super().__init__()
-    self._openpilot_label = UnifiedLabel("sunnypilot", font_size=88, font_weight=FontWeight.AUDIOWIDE, max_width=480, wrap_text=False)
+    self._openpilot_label = UnifiedLabel("zoompilot", font_size=88, font_weight=FontWeight.AUDIOWIDE, max_width=480, wrap_text=False)
