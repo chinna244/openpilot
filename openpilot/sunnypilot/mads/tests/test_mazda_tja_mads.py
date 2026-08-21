@@ -11,7 +11,7 @@ from opendbc.car import DT_CTRL, gen_empty_fingerprint, structs
 from opendbc.car.mazda.interface import CarInterface
 from opendbc.car.mazda.values import CAR, CarControllerParams, MazdaSafetyFlags
 from openpilot.cereal import custom, log
-from openpilot.selfdrive.selfdrived.events import Events
+from openpilot.selfdrive.selfdrived.events import ET, Events
 from openpilot.sunnypilot.selfdrive.selfdrived.events import EventsSP
 from openpilot.sunnypilot.mads.helpers import MadsSteeringModeOnBrake, set_car_specific_params
 from openpilot.sunnypilot.mads.mads import ModularAssistiveDrivingSystem
@@ -172,6 +172,70 @@ class TestMazdaTjaMads:
     h.step(tja=1)
     h.step(tja=0)
     assert h.mads.enabled
+
+  def test_tja_on_off_chimes_with_mrcc_selfdrive_active(self, mocker, alpha_long):
+    """Physical MADS toggles stay audible while longitudinal selfdrive is active."""
+    h = TjaMadsHarness(mocker, alpha_long=alpha_long)
+    h.step()
+    h.sd.enabled = True
+
+    h.sd.state_machine.current_alert_types = []
+    h.step(tja=1)
+    assert h.mads.enabled
+    assert h.sd.events_sp.has(EventNameSP.lkasEnable)
+    assert ET.ENABLE in h.sd.state_machine.current_alert_types
+    enable_alerts = h.sd.events_sp.create_alerts(h.sd.state_machine.current_alert_types)
+    assert any(a.alert_type == "lkasEnable/enable" and a.audible_alert == log.SelfdriveState.AudibleAlert.engage
+               for a in enable_alerts)
+
+    h.step(tja=0)
+    h.sd.state_machine.current_alert_types = []
+    h.step(tja=1)
+    assert not h.mads.enabled
+    assert h.sd.events_sp.has(EventNameSP.manualSteeringRequired)
+    assert ET.USER_DISABLE in h.sd.state_machine.current_alert_types
+    disable_alerts = h.sd.events_sp.create_alerts(h.sd.state_machine.current_alert_types)
+    assert any(a.alert_type == "manualSteeringRequired/userDisable" and a.audible_alert == log.SelfdriveState.AudibleAlert.disengage
+               for a in disable_alerts)
+
+  def test_mrcc_state_chimes_do_not_toggle_mads(self, mocker, alpha_long):
+    """Longitudinal chime mirrors are presentation-only and preserve independence."""
+    h = TjaMadsHarness(mocker, alpha_long=alpha_long)
+    h.step()
+    assert not h.mads.enabled
+
+    h.sd.enabled = True
+    h.step()
+    assert not h.mads.enabled
+    assert h.sd.events_sp.has(EventNameSP.longitudinalEnableChime)
+    enable_alerts = h.sd.events_sp.create_alerts([ET.PERMANENT])
+    assert any(a.alert_type == "longitudinalEnableChime/permanent" and a.audible_alert == log.SelfdriveState.AudibleAlert.engage
+               for a in enable_alerts)
+
+    h.sd.enabled = False
+    h.step()
+    assert not h.mads.enabled
+    assert h.sd.events_sp.has(EventNameSP.longitudinalDisableChime)
+    disable_alerts = h.sd.events_sp.create_alerts([ET.PERMANENT])
+    assert any(a.alert_type == "longitudinalDisableChime/permanent" and a.audible_alert == log.SelfdriveState.AudibleAlert.disengage
+               for a in disable_alerts)
+
+  def test_mrcc_state_chimes_preserve_enabled_mads(self, mocker, alpha_long):
+    h = TjaMadsHarness(mocker, alpha_long=alpha_long)
+    h.step()
+    h.step(tja=1)
+    h.step(tja=0)
+    assert h.mads.enabled
+
+    h.sd.enabled = True
+    h.step()
+    assert h.mads.enabled
+    assert h.sd.events_sp.has(EventNameSP.longitudinalEnableChime)
+
+    h.sd.enabled = False
+    h.step()
+    assert h.mads.enabled
+    assert h.sd.events_sp.has(EventNameSP.longitudinalDisableChime)
 
   def test_4_second_tja_rising_edge_disables_mads(self, mocker, alpha_long):
     h = TjaMadsHarness(mocker, alpha_long=alpha_long)
