@@ -134,10 +134,11 @@ class BigButtonSP(BigButton):
     super()._draw_content(btn_y)
     if self._badge_labels:
       label_x = self._rect.x + self.LABEL_HORIZONTAL_PADDING
-      label_y = btn_y + self.LABEL_VERTICAL_PADDING + self._label.get_content_height(self._width_hint())
+      label_y = btn_y + self.LABEL_VERTICAL_PADDING + self._label.get_content_height(self._title_width_hint())
       sub_label_height = btn_y + self._rect.height - self.LABEL_VERTICAL_PADDING - label_y
       badge_margin = 8
-      self._draw_badges(rl.Rectangle(label_x, label_y + badge_margin, self._width_hint(), sub_label_height - badge_margin))
+      self._draw_badges(rl.Rectangle(label_x, label_y + badge_margin, self._subtitle_width_hint(),
+                                     sub_label_height - badge_margin))
 
   def link_sub_panel(self, items) -> "SubPanelSP":
     """Create a self-refreshing sub-panel with the given items, linked to this button's click."""
