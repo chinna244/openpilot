@@ -1,11 +1,11 @@
-# Panda remains a temporary chinna244 pin. OpenDBC uses chinna244/opendbc-sunnypilot mazda-dev.
+# Panda remains a temporary chinna244 pin. OpenDBC uses chinna244/opendbc mazda-dev.
 # Touch this file to force `git submodule sync`.
 [submodule "panda"]
   path = panda
   url = https://github.com/chinna244/panda.git
 [submodule "opendbc"]
   path = opendbc_repo
-  url = https://github.com/chinna244/opendbc-sunnypilot.git
+  url = https://github.com/chinna244/opendbc.git
   branch = mazda-dev
 [submodule "msgq"]
   path = msgq_repo
