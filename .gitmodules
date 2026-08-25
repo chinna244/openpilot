@@ -1,12 +1,12 @@
-# zoompilot develop: temporary chinna244 fork pins so a clean C4 install can
-# fetch the reviewed Mazda TJA/MADS + MRCC independence commits before they
-# land on the org remotes. Touch this file to force `git submodule sync`.
+# Panda remains a temporary chinna244 pin. OpenDBC uses chinna244/opendbc-sunnypilot mazda-dev.
+# Touch this file to force `git submodule sync`.
 [submodule "panda"]
   path = panda
   url = https://github.com/chinna244/panda.git
 [submodule "opendbc"]
   path = opendbc_repo
   url = https://github.com/chinna244/opendbc-sunnypilot.git
+  branch = mazda-dev
 [submodule "msgq"]
   path = msgq_repo
   url = https://github.com/sunnypilot/msgq.git
