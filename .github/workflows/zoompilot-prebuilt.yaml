@@ -18,7 +18,7 @@ env:
   SCONS_CACHE_DIR: ${{ github.workspace }}/release/ci/scons_cache
   SOURCE_BRANCH: ${{ github.ref_name }}
   TARGET_BRANCH: main
-  PUBLIC_REPO_URL: "https://github.com/${{ github.repository }}"
+  PUBLIC_REPO_URL: "https://github.com/zoompilot/zoompilot"
 
 on:
   workflow_dispatch:
@@ -85,7 +85,7 @@ jobs:
       - name: Build
         run: |
           export PYTHONPATH="$BUILD_DIR"
-          ./tools/release/release_files.py | sort -z | uniq -z | rsync --from0 -rRl${RUNNER_DEBUG:+v} --files-from=- . $BUILD_DIR/
+          ./tools/release/release_files.py | xargs -0 cp -pR --parents -t "$BUILD_DIR" --
           cd $BUILD_DIR
           ln -sfn msgq_repo/msgq msgq
           ln -sfn opendbc_repo/opendbc opendbc
@@ -178,5 +178,5 @@ jobs:
             "${{ env.OUTPUT_DIR }}" \
             "${{ env.TARGET_BRANCH }}" \
             "${{ needs.build.outputs.version }}" \
-            "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" \
+            "https://x-access-token:${{ github.token }}@github.com/zoompilot/zoompilot.git" \
             "prebuilt"
