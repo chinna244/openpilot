@@ -12,6 +12,7 @@ See the LICENSE.md file in the root directory for more details.
 # must be frame-for-frame identical to v0 — everything else is a deliberate, tested delta.
 
 import math
+from collections import deque
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -56,6 +57,10 @@ def make_lac(cls, friction=0.0):
   return cls(make_cp(friction=friction), custom.CarParamsSP.new_message().as_reader(), make_ci(), DT)
 
 
+def make_pair(friction=0.0):
+  return make_lac(LatControlTorqueV0, friction=friction), make_lac(LatControlTorqueV2, friction=friction)
+
+
 def make_cs(v_ego=15.0, lat_accel=0.0, pressed=False):
   """CarState whose measured lateral accel equals lat_accel at v_ego."""
   angle = -lat_accel / (CURV_PER_DEG * v_ego ** 2)
@@ -78,8 +83,7 @@ class TestLatControlTorqueV2:
     """At constant speed with friction 0 and predictive turn-in off, the curvature-domain
     buffer is provably identical to v0's lat-accel buffer and the setpoint algebra collapses
     to v0's — outputs must match frame for frame."""
-    v0 = make_lac(LatControlTorqueV0)
-    v2 = make_lac(LatControlTorqueV2)
+    v0, v2 = make_pair()
     v_ego = 15.0
     # slow sine: setpoint rate stays under the unwind threshold, so v2's integrator
     # policy is quiescent and the equivalence is exact
@@ -89,15 +93,14 @@ class TestLatControlTorqueV2:
       out0, _, log0 = v0.update(True, make_cs(v_ego, measured * v_ego ** 2), VM, LP, False, desired, None, False, LAT_DELAY)
       out2, _, log2 = v2.update(True, make_cs(v_ego, measured * v_ego ** 2), VM, LP, False, desired, None, False, LAT_DELAY)
       assert out2 == pytest.approx(out0, abs=1e-9), f"frame {i}"
-      assert log0.version == 0
-      assert log2.version == 2
+    assert log0.version == 0
+    assert log2.version == 2
 
   def test_no_phantom_jerk_when_decelerating_through_constant_curvature(self, params):
     """Mechanism 1: braking through a constant-curvature arc, the delayed request rescaled by
     the current v^2 equals the live request, so v2 sees zero desired jerk. v0's lat-accel
     buffer replays the higher old-speed values and reads a phantom jerk."""
-    v0 = make_lac(LatControlTorqueV0)
-    v2 = make_lac(LatControlTorqueV2)
+    v0, v2 = make_pair()
     desired = 2e-3
     v_ego = 25.0
     for _ in range(150):  # settle in the curve at constant speed first
@@ -136,21 +139,24 @@ class TestLatControlTorqueV2:
     assert transient_diff > 0.05  # the lead reshapes the transient
     assert log_pred.desiredLateralAccel == pytest.approx(2e-3 * v_ego ** 2, abs=1e-3)  # steady state converges
 
-  def test_jerk_aware_and_nnlc_forced_off(self, params):
-    """v2 owns the friction shaping and integrator policy, so an extension that overrides the
-    shared PID is forced off no matter what the params say, and the PID limits stay in
-    lat-accel space. v0 constructed with the same params keeps jerk-aware on (torque-space
-    limits) — pinning that the force-off is v2's, not a side effect."""
+  def test_extension_output_overrides_disabled(self, params):
+    """v2 owns the friction shaping and integrator policy, so extension controllers that
+    override the shared PID (jerk-aware, NNLC, any future sibling) are disabled no matter
+    what the params say, and the PID limits stay in lat-accel space. v0 constructed with
+    the same params keeps jerk-aware on (torque-space limits) — pinning that the disable
+    is v2's, not a side effect."""
     params.put_bool("LateralJerkTorqueController", True, block=True)
     params.put_bool("NeuralNetworkLateralControl", True, block=True)
     v2 = make_lac(LatControlTorqueV2)
-    assert not v2.extension._jerk_aware_enabled
-    assert not v2.extension.enabled
     assert not v2.extension.overrides_output
+    assert v2.pid.pos_limit == pytest.approx(LAF)
+    # update_limits must stay a no-op on the extension, or the per-frame speed-dep
+    # override path would restore torque-space limits
+    v2.update_limits()
     assert v2.pid.pos_limit == pytest.approx(LAF)
 
     v0 = make_lac(LatControlTorqueV0)
-    assert v0.extension._jerk_aware_enabled
+    assert v0.extension.overrides_output
     assert v0.pid.pos_limit == pytest.approx(v0.steer_max)
 
   def test_release_decay_is_one_shot(self, params):
@@ -189,8 +195,7 @@ class TestLatControlTorqueV2:
   def test_integrator_active_at_creep_speeds(self, params):
     """v0 freezes the integrator below 5 m/s; v2 keys the freeze/reset to
     max(minSteerSpeed, 0.3) so it keeps working at creep speeds."""
-    v0 = make_lac(LatControlTorqueV0)
-    v2 = make_lac(LatControlTorqueV2)
+    v0, v2 = make_pair()
     v_ego = 3.0
     desired = 0.05 / v_ego ** 2  # small error: the boosted low-speed P gain must not clip the output
     for _ in range(50):
@@ -207,8 +212,7 @@ class TestLatControlTorqueV2:
     re-engage shove) and the integrator is deliberately NOT cleared (MADS cycles lateral
     often; the release decay and unwind freeze replace a blunt reset). v0's stale buffer
     reads a large phantom jerk on the first active frame."""
-    v0 = make_lac(LatControlTorqueV0)
-    v2 = make_lac(LatControlTorqueV2)
+    v0, v2 = make_pair()
     v2.pid.i = 0.5
     v_ego = 15.0
     desired = 2e-3
@@ -225,8 +229,7 @@ class TestLatControlTorqueV2:
   def test_roll_compensation_fades_at_creep(self, params):
     """Below walking pace the road-crown feedforward fades out instead of unwinding a held
     wheel at pull-away. At 1.0 m/s the fade is 0.25 of v0's full compensation."""
-    v0 = make_lac(LatControlTorqueV0)
-    v2 = make_lac(LatControlTorqueV2)
+    v0, v2 = make_pair()
     lp_roll = SimpleNamespace(angleOffsetDeg=0.0, roll=0.1)
     log0 = step(v0, make_cs(1.0), 0.0, lp=lp_roll)
     log2 = step(v2, make_cs(1.0), 0.0, lp=lp_roll)
@@ -237,19 +240,18 @@ class TestLatControlTorqueV2:
     log2 = step(v2, make_cs(15.0), 0.0, lp=lp_roll)
     assert log2.f == pytest.approx(log0.f)  # fully faded in above 2.5 m/s
 
-  def test_center_chatter_jerk_deadzone(self, params):
-    """The deadzone is full-strength at lane center, gone above 0.35 m/s^2 of demand; with
-    the wheel tracking the delayed command, planner wobble that flips v0's friction term
-    stays inside the deadzone for v2."""
+  def test_center_chatter_deadzone_curve(self):
+    """Full-strength at lane center, gone above 0.35 m/s^2 of demand."""
     assert get_center_chatter_jerk_deadzone(25.0, 0.0) == pytest.approx(0.18)
     assert get_center_chatter_jerk_deadzone(25.0, 0.5) == pytest.approx(0.0)
     assert get_center_chatter_jerk_deadzone(0.0, 0.0) == pytest.approx(0.08)
 
-    friction = 0.25
-    v0 = make_lac(LatControlTorqueV0, friction=friction)
-    v2 = make_lac(LatControlTorqueV2, friction=friction)
+  def test_center_wobble_reduces_friction_activity(self, params):
+    """With the wheel tracking the delayed command, planner wobble that flips v0's
+    friction term stays inside the deadzone for v2."""
+    v0, v2 = make_pair(friction=0.25)
     v_ego = 25.0
-    history = [0.0] * DELAY_FRAMES
+    history = deque([0.0] * (DELAY_FRAMES + 1), maxlen=DELAY_FRAMES + 1)
     v0_friction, v2_friction = [], []
     for i in range(600):
       # planner wobble around center: +-0.04 m/s^2 flipping every 0.4 s

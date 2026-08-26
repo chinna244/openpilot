@@ -28,7 +28,9 @@ from openpilot.sunnypilot.selfdrive.controls.lib.latcontrol_torque_v0 import (
 
 VERSION = 2
 
-MAX_LATERAL_JERK = 2.5  # m/s^3, clip on the desired lateral jerk used for the setpoint lead
+# distinct from opendbc.car.lateral.MAX_LATERAL_JERK and drive_helpers.MAX_LATERAL_JERK,
+# which are curvature rate limits — this one only clips the setpoint-lead jerk
+MAX_SETPOINT_LATERAL_JERK = 2.5  # m/s^3
 UNWIND_JERK_THRESHOLD = -1.0  # m/s^3, setpoint rate below this while near zero means the plan is unwinding
 UNWIND_LAT_ACCEL_NEAR_ZERO = 0.3  # m/s^2
 MIN_LATERAL_CONTROL_SPEED = 0.3  # m/s
@@ -50,22 +52,22 @@ CENTER_CHATTER_JERK_DEADZONE_LAT_ACCEL_V = [1.0, 1.0, 0.0]
 
 
 def get_center_chatter_jerk_deadzone(v_ego, setpoint):
-  """Small-signal jerk deadzone for the friction input, faded out with lateral demand."""
-  speed_deadzone = np.interp(max(v_ego, 0.0), CENTER_CHATTER_JERK_DEADZONE_SPEED_BP,
-                             CENTER_CHATTER_JERK_DEADZONE_SPEED_V)
+  """Small-signal jerk deadzone for the friction input (see the constants above)."""
   center_weight = np.interp(abs(setpoint), CENTER_CHATTER_JERK_DEADZONE_LAT_ACCEL_BP,
                             CENTER_CHATTER_JERK_DEADZONE_LAT_ACCEL_V)
+  if center_weight == 0.0:  # in a real turn most of the time: skip the second interp
+    return 0.0
+  speed_deadzone = np.interp(max(v_ego, 0.0), CENTER_CHATTER_JERK_DEADZONE_SPEED_BP,
+                             CENTER_CHATTER_JERK_DEADZONE_SPEED_V)
   return float(speed_deadzone * center_weight)
 
 
 class LatControlTorque(LatControlTorqueV0):
   def __init__(self, CP, CP_SP, CI, dt):
     super().__init__(CP, CP_SP, CI, dt)
-    # The request buffer stores CURVATURE, scaled by the current v^2 on read. Storing
-    # lateral accel directly makes the delayed request lag the measurement whenever speed
-    # is changing (both scale with v^2 but the buffered value used the old speed), which
-    # reads as a phantom tracking error braking into or accelerating out of a curve.
-    # Same length as v0's buffer so the delay clamp stays valid; v0's own buffer is unused here.
+    # Stores CURVATURE, scaled by the current v^2 on read — buffered lateral accel keeps the
+    # old speed's v^2 and reads as phantom tracking error whenever speed changes in the delay
+    # window. Same length as v0's (unused here) buffer so the delay clamp stays valid.
     self.curvature_request_buffer = deque([0.] * self.lat_accel_request_buffer_len, maxlen=self.lat_accel_request_buffer_len)
     self.jerk_filter = FirstOrderFilter(0.0, 1 / (2 * np.pi * LP_FILTER_CUTOFF_HZ), self.dt)
     self.low_speed_pid_threshold = max(CP.minSteerSpeed, MIN_LATERAL_CONTROL_SPEED)
@@ -73,16 +75,14 @@ class LatControlTorque(LatControlTorqueV0):
     self.prev_setpoint = 0.0
     self.predictive_turn_in = Params().get_bool("TorqueTuneV2PredictiveTurnIn")
 
-    # The jerk-aware and NNLC extension controllers recompute error/feedforward/friction in
-    # torque space and step the shared PID themselves, silently replacing v2's friction
-    # shaping and integrator policy while the setpoint changes still flow through. Force both
-    # off regardless of the params. NNLC is already excluded structurally (enabling it
-    # disables EnforceTorqueControl, which forces v0) — this covers the params disagreeing.
-    if self.extension._jerk_aware_enabled or self.extension.enabled:
-      cloudlog.warning("LatControlTorque v2: jerk-aware/NNLC extension controllers are incompatible with the v2 tune, forcing off")
-      self.extension._jerk_aware_enabled = False
-      self.extension.enabled = False
-      self.update_limits()  # jerk-aware had retuned the shared PID to torque-space limits
+    # The extension's override controllers (jerk-aware, NNLC) recompute error/feedforward/
+    # friction in torque space and step the shared PID themselves, silently replacing v2's
+    # friction shaping and integrator policy while the setpoint changes still flow through.
+    # Disable them regardless of the params; NNLC is already excluded structurally (enabling
+    # it disables EnforceTorqueControl, which forces v0) — this covers the params disagreeing.
+    cloudlog.info("LatControlTorque v2: extension output overrides (jerk-aware/NNLC) disabled")
+    self.extension.disable_output_overrides()
+    self.update_limits()  # an override controller may have retuned the shared PID to torque-space limits
 
   def update(self, active, CS, VM, params, steer_limited_by_safety, desired_curvature, calibrated_pose, curvature_limited, lat_delay):
     # Override torque params from extension
@@ -126,9 +126,10 @@ class LatControlTorque(LatControlTorqueV0):
       self.curvature_request_buffer.append(desired_curvature)
       gravity_adjusted_future_lateral_accel = future_desired_lateral_accel - roll_compensation
 
-      raw_lateral_jerk = np.clip((future_desired_lateral_accel - expected_lateral_accel) / max(lat_delay, self.dt),
-                                 -MAX_LATERAL_JERK, MAX_LATERAL_JERK)
-      desired_lateral_jerk = float(np.clip(self.jerk_filter.update(raw_lateral_jerk), -MAX_LATERAL_JERK, MAX_LATERAL_JERK))
+      raw_lateral_jerk = (future_desired_lateral_accel - expected_lateral_accel) / max(lat_delay, self.dt)
+      raw_lateral_jerk = min(max(raw_lateral_jerk, -MAX_SETPOINT_LATERAL_JERK), MAX_SETPOINT_LATERAL_JERK)
+      # the filter is a convex combination of clipped inputs, so its output needs no second clip
+      desired_lateral_jerk = self.jerk_filter.update(raw_lateral_jerk)
 
       if self.predictive_turn_in:
         # first-order lead: delayed request plus one lat_delay of planned jerk. The clip
@@ -171,8 +172,8 @@ class LatControlTorque(LatControlTorqueV0):
       freeze_integrator = (steer_limited_by_safety or CS.steeringPressed or
                            CS.vEgo < self.low_speed_pid_threshold or unwind_detected)
       if self.extension.overrides_output:
-        # the extension runs its own torque-space pid.update on the shared PID; a stock
-        # update here would also integrate the lat-accel-space error into the integrator
+        # Unreachable while __init__ disables the output overrides; kept as the guard
+        # against a future override controller double-integrating the shared PID.
         output_torque = 0.0
       else:
         output_lataccel = self.pid.update(pid_log.error,
