@@ -34,7 +34,7 @@ ctrl = build_controller()
 t0 = rows[0][0]
 last = None
 for t, cc, cs, lead, hold in rows:
-  out = SimpleNamespace(standstill=cs.standstill, gasPressed=cs.gasPressed,
+  out = SimpleNamespace(standstill=cs.standstill, gasPressed=cs.gasPressed, brakePressed=cs.brakePressed,
                         cruiseState=SimpleNamespace(available=cs.cruiseState.available,
                                                     enabled=cs.cruiseState.enabled))
   actuators = SimpleNamespace(accel=cc.actuators.accel, longControlState=cc.actuators.longControlState)
