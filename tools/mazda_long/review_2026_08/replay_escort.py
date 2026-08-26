@@ -3,7 +3,7 @@ import sys, os
 sys.path.insert(0, "/Users/zeph/Developer/experiments/sunnypilot_proj/sunnypilot")
 sys.path.insert(0, "/Users/zeph/Developer/experiments/sunnypilot_proj/sunnypilot/opendbc_repo")
 sys.path.append("/Users/zeph/Developer/experiments/sunnypilot_proj/sunnypilot/tools/mazda_long")
-from replay_standstill_hold import build_controller, frames, decode_cmd
+from replay_standstill_hold import build_controller, frames, decode_cmd, mock_inputs
 
 base = "tools/mazda_long/device_data/000000fe--757df8e60f--"
 os.chdir("/Users/zeph/Developer/experiments/sunnypilot_proj/sunnypilot")
@@ -16,19 +16,7 @@ ctrl = build_controller()
 t0 = rows[0][0]
 last = None
 for t, cc, cs, brake_hold in rows:
-    from types import SimpleNamespace
-    out = SimpleNamespace(standstill=cs.standstill, gasPressed=cs.gasPressed, brakePressed=cs.brakePressed,
-                          cruiseState=SimpleNamespace(available=cs.cruiseState.available,
-                                                      enabled=cs.cruiseState.enabled))
-    actuators = SimpleNamespace(accel=cc.actuators.accel, longControlState=cc.actuators.longControlState)
-    control = SimpleNamespace(enabled=cc.enabled, longActive=cc.longActive, actuators=actuators,
-                              cruiseControl=SimpleNamespace(resume=cc.cruiseControl.resume,
-                                                            override=cc.cruiseControl.override, cancel=False),
-                              hudControl=SimpleNamespace(leadVisible=cc.hudControl.leadVisible,
-                                                         leadDistanceBars=cc.hudControl.leadDistanceBars))
-    control_sp = SimpleNamespace(stockEcuHandBack=False, leadOne=SimpleNamespace(dRel=0.0, vRel=0.0))
-    carstate = SimpleNamespace(out=out, resume_button=0, brake_hold=brake_hold,
-                               stock_radar_alive=False, fsc_settled=True, radar_session_refused=False)
+    control, control_sp, carstate = mock_inputs(cc, cs, brake_hold)
     sends = ctrl.update_longitudinal(control, control_sp, carstate)
     ctrl.frame += 1
     info = next((d for a, d, b in sends if a == 0x21b and b == 0), None)
