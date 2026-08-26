@@ -62,6 +62,22 @@ class TestTorqueTuneSelection:
     params.put("TorqueControlTune", version, block=True)
     assert select(controls) == expected
 
+  def test_every_declared_version_is_wired(self, ctx):
+    """The versions file is what the UI selectors and the sunnylink schema offer, while
+    initialize_lateral_control decides what is constructible. A version added to the file
+    but not wired here would surface in every selector and silently run v1."""
+    from openpilot.sunnypilot.selfdrive.controls.lib.torque_tune import load_versions
+
+    wired = {0.0: V0, 1.0: V1, 2.0: V2}
+    declared = {float(info["version"]) for info in load_versions().values()}
+    assert declared == set(wired), "declared tune versions must match the wired controllers"
+
+    params, controls = ctx
+    params.put_bool("EnforceTorqueControl", True, block=True)
+    for version, expected in wired.items():
+      params.put("TorqueControlTune", version, block=True)
+      assert select(controls) == expected
+
   @pytest.mark.parametrize("version", [1.0, 2.0])
   def test_torque_control_not_enforced_still_uses_v0_for_torque_cars(self, ctx, version):
     """Pre-existing behavior worth pinning: torque-tuned cars get v0 even with the toggle off.

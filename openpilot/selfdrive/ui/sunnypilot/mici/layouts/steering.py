@@ -5,11 +5,7 @@ This file is part of sunnypilot and is licensed under the MIT License.
 See the LICENSE.md file in the root directory for more details.
 """
 
-import json
-import os
-
 from opendbc.car.structs import car
-from openpilot.common.basedir import BASEDIR
 from openpilot.selfdrive.ui.mici.widgets.button import BigParamControl
 from openpilot.selfdrive.ui.sunnypilot.mici.widgets.button import (
   BigButtonSP,
@@ -23,10 +19,8 @@ from openpilot.system.ui.widgets.scroller import NavScroller
 from openpilot.selfdrive.ui.ui_state import ui_state
 from openpilot.sunnypilot.mads.helpers import MadsSteeringModeOnBrake, get_mads_limited_brands
 from openpilot.sunnypilot.selfdrive.controls.lib.auto_lane_change import AUTO_LANE_CHANGE_TIMER, AutoLaneChangeMode
+from openpilot.sunnypilot.selfdrive.controls.lib.torque_tune import load_versions, resolved_tune_version
 from openpilot.system.ui.lib.application import gui_app
-
-TORQUE_VERSIONS_PATH = os.path.join(BASEDIR, "openpilot", "sunnypilot", "selfdrive", "controls", "lib",
-                                    "latcontrol_torque_versions.json")
 
 MADS_STEERING_MODE_LABELS = [tr("remain"), tr("pause"), tr("disengage")]
 
@@ -39,19 +33,6 @@ ALC_LABELS = {
 } | {mode: f"{AUTO_LANE_CHANGE_TIMER[mode]:g} {tr('s')}" for mode in
      (AutoLaneChangeMode.HALF_SECOND, AutoLaneChangeMode.ONE_SECOND,
       AutoLaneChangeMode.TWO_SECONDS, AutoLaneChangeMode.THREE_SECONDS)}
-
-
-def v2_tune_selected() -> bool:
-  """True when the v2 torque tune will actually run. With EnforceTorqueControl off the car
-  runs v0 regardless of the stored tune version (controlsd_ext forces it), so a stored 2.0
-  alone does not count."""
-  if not ui_state.params.get_bool("EnforceTorqueControl"):
-    return False
-  tune = ui_state.params.get("TorqueControlTune")
-  try:
-    return tune is not None and float(tune) == 2.0
-  except (TypeError, ValueError):
-    return False
 
 
 def _on_off(val: bool) -> str:
@@ -81,6 +62,7 @@ class SteeringLayoutMici(NavScroller):
     self._alc_val = AutoLaneChangeMode.NUDGE
     self._torque_allowed = False
     self._enforce_torque = False
+    self._v2_tune = False
 
     # --- Main view items ---
     self._mads_settings_btn = BigButtonSP(tr("mads"))
@@ -138,12 +120,12 @@ class SteeringLayoutMici(NavScroller):
 
     # Mutually exclusive with NNLC; unlike the rest of this panel it works without
     # EnforceTorqueControl on torque-native cars, so it is not gated on _enforce_torque.
-    # Also disabled while the v2 tune is selected: v2 replaces the jerk-aware mechanisms
-    # and forces the controller off, so an enabled toggle would claim a dead setting.
+    # Also disabled while the v2 tune will run (per-frame cached _v2_tune): v2 forces the
+    # jerk-aware controller off, so an enabled toggle would claim a dead setting.
     self._jerk_aware_toggle = BigParamControl(tr("jerk aware"), "LateralJerkTorqueController")
     self._jerk_aware_toggle.set_enabled(lambda: ui_state.is_offroad() and
                                         not ui_state.params.get_bool("NeuralNetworkLateralControl") and
-                                        not v2_tune_selected())
+                                        not self._v2_tune)
 
     # Torque tune version selector — inline pill selector over the TICI TorqueControlTune options,
     # oldest first. No "default" option: the param's own default (0.0, v0) is what unset resolves to.
@@ -191,8 +173,7 @@ class SteeringLayoutMici(NavScroller):
     """Load {label: version} from latcontrol_torque_versions.json, sorted oldest-first so the
     selector reads v0 → v1 and a future version appends at the newest end."""
     try:
-      with open(TORQUE_VERSIONS_PATH) as f:
-        data = json.load(f)
+      data = load_versions()
     except (OSError, ValueError):
       return {}
     versions: dict[str, float] = {}
@@ -251,6 +232,7 @@ class SteeringLayoutMici(NavScroller):
       self._lane_change_btn.set_badges([(tr("auto"), auto_badge), (tr("bsm-delay"), lc_bsm), (tr("road-edge"), road_edge)])
 
     enforce_torque = self._enforce_torque = ui_state.params.get_bool("EnforceTorqueControl")
+    self._v2_tune = resolved_tune_version(ui_state.params) == 2.0
     jerk_aware = ui_state.params.get_bool("LateralJerkTorqueController")
     self_tune_on = ui_state.params.get_bool("LiveTorqueParamsToggle")
     custom_on = ui_state.params.get_bool("CustomTorqueParams")

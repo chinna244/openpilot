@@ -4,14 +4,12 @@ Copyright (c) 2021-, Haibin Wen, sunnypilot, and a number of other contributors.
 This file is part of sunnypilot and is licensed under the MIT License.
 See the LICENSE.md file in the root directory for more details.
 """
-import json
 import math
-import os
 from collections.abc import Callable
 import pyray as rl
 
-from openpilot.common.basedir import BASEDIR
 from openpilot.selfdrive.ui.ui_state import ui_state
+from openpilot.sunnypilot.selfdrive.controls.lib.torque_tune import load_versions, resolved_tune_version
 from openpilot.system.ui.lib.application import gui_app, FontWeight
 from openpilot.system.ui.lib.multilang import tr
 from openpilot.system.ui.sunnypilot.lib.utils import NoElideButtonAction
@@ -21,7 +19,6 @@ from openpilot.system.ui.widgets import Widget, DialogResult
 from openpilot.system.ui.widgets.network import NavButton
 from openpilot.system.ui.widgets.scroller_tici import Scroller
 
-TORQUE_VERSIONS_PATH = os.path.join(BASEDIR, "openpilot", "sunnypilot", "selfdrive", "controls", "lib", "latcontrol_torque_versions.json")
 
 
 class TorqueSettingsLayout(Widget):
@@ -36,8 +33,7 @@ class TorqueSettingsLayout(Widget):
     self._scroller = Scroller(items, line_separator=True, spacing=0)
 
   def _load_versions(self):
-    with open(TORQUE_VERSIONS_PATH) as f:
-      self.cached_torque_versions = json.load(f)
+    self.cached_torque_versions = load_versions()
 
   def _initialize_items(self):
     self._jerk_aware_toggle = toggle_item_sp(
@@ -126,7 +122,7 @@ class TorqueSettingsLayout(Widget):
     # v2 tune replaces the jerk-aware mechanisms and forces the controller off, so the
     # toggle is disabled while v2 is the tune that will actually run
     self._jerk_aware_toggle.action_item.set_enabled(ui_state.is_offroad() and not nnlc_enabled and
-                                                    not self._v2_tune_selected())
+                                                    resolved_tune_version(ui_state.params) != 2.0)
     if not ui_state.params.get_bool("LiveTorqueParamsToggle"):
       ui_state.params.remove("LiveTorqueParamsRelaxedToggle")
       self._relaxed_tune_toggle.action_item.set_state(False)
@@ -159,18 +155,6 @@ class TorqueSettingsLayout(Widget):
 
   def show_event(self):
     self._scroller.show_event()
-
-  @staticmethod
-  def _v2_tune_selected() -> bool:
-    """True when the v2 torque tune will actually run. With EnforceTorqueControl off the car
-    runs v0 regardless of the stored tune version (controlsd_ext forces it)."""
-    if not ui_state.params.get_bool("EnforceTorqueControl"):
-      return False
-    tune = ui_state.params.get("TorqueControlTune")
-    try:
-      return tune is not None and float(tune) == 2.0
-    except (TypeError, ValueError):
-      return False
 
   def _get_current_torque_version_label(self):
     current_val_bytes = ui_state.params.get("TorqueControlTune")
