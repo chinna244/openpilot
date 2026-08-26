@@ -28,47 +28,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
 
 from openpilot.common.prefix import OpenpilotPrefix
-
-
-def load_frames(seg_paths):
-  """Extract per-controlsState-frame inputs from rlogs (100 Hz), forward-filling slower services."""
-  from openpilot.tools.lib.logreader import LogReader
-  frames = []
-  cs_last = None
-  lp_last = None
-  model_last = None
-  ltp_last = None
-  ltp_seq = 0
-  cp_reader = None
-  for seg in seg_paths:
-    for m in LogReader(str(seg / "rlog.zst")):
-      w = m.which()
-      if w == 'carParams' and cp_reader is None:
-        cp_reader = m.carParams
-      elif w == 'carState':
-        cs_last = m.carState
-      elif w in ('liveParameters', 'vehicleParameters'):  # renamed upstream 2026-08 (#38601)
-        lp_last = getattr(m, w)
-      elif w == 'modelV2':
-        model_last = m.modelV2
-      elif w == 'lateralTorqueParameters':
-        ltp_last = m.lateralTorqueParameters
-        ltp_seq += 1
-      elif w == 'controlsState':
-        st = m.controlsState.lateralControlState
-        if st.which() != 'torqueState' or cs_last is None or lp_last is None or model_last is None:
-          continue
-        ts = st.torqueState
-        frames.append(SimpleNamespace(
-          v_ego=cs_last.vEgo, a_ego=cs_last.aEgo,
-          steering_angle=cs_last.steeringAngleDeg, steering_rate=cs_last.steeringRateDeg,
-          steering_pressed=cs_last.steeringPressed,
-          roll=lp_last.roll, angle_offset=lp_last.angleOffsetDeg,
-          model=model_last, ltp=ltp_last, ltp_seq=ltp_seq,
-          active=ts.active, logged_output=ts.output, logged_i=ts.i,
-          desired_curvature=m.controlsState.desiredCurvature,
-        ))
-  return frames, cp_reader
+from replay_jerk_aware import load_frames  # shared rlog-to-controller-input adapter
 
 
 def make_controller(fingerprint, version: int, predictive: bool = False):
@@ -104,8 +64,8 @@ def run_variant(frames, fingerprint, version: int, predictive: bool = False):
   controller, VM, CP = make_controller(fingerprint, version, predictive)
 
   lat_delay = CP.steerActuatorDelay
-  last_ltp_seq = -1
-  keys = ('output', 'i', 'ff', 'error', 'setpoint', 'jerk', 'active', 'pressed', 'v_ego', 'logged_output')
+  last_ltp = None
+  keys = ('output', 'i', 'jerk', 'active', 'pressed', 'v_ego', 'logged_output')
   out = {k: [] for k in keys}
   for f in frames:
     # controlsd: global filtered params + extension limits, every frame the service is alive
@@ -113,10 +73,9 @@ def run_variant(frames, fingerprint, version: int, predictive: bool = False):
       controller.update_torque_parameters(f.ltp.latAccelFactorFiltered, f.ltp.latAccelOffsetFiltered, f.ltp.frictionCoefficientFiltered)
       controller.extension.update_limits()
       # controlsd_ext: per-bin values on each new lateralTorqueParameters message
-      if f.ltp_seq != last_ltp_seq:
+      if f.ltp is not last_ltp:
         controller.extension.update_speed_dep_torque(f.ltp)
-        last_ltp_seq = f.ltp_seq
-    controller.extension.update_model_v2(f.model)
+        last_ltp = f.ltp
     controller.extension.update_lateral_lag(lat_delay)
 
     CS = SimpleNamespace(vEgo=f.v_ego, aEgo=f.a_ego, steeringAngleDeg=f.steering_angle,
@@ -124,12 +83,10 @@ def run_variant(frames, fingerprint, version: int, predictive: bool = False):
     lp = SimpleNamespace(roll=f.roll, angleOffsetDeg=f.angle_offset)
     _, _, pid_log = controller.update(f.active, CS, VM, lp, False, f.desired_curvature, None, False, lat_delay)
 
-    out['output'].append(-pid_log.output if f.active else 0.0)
+    # inactive frames leave the capnp log fields at their 0.0 defaults
+    out['output'].append(-pid_log.output)
     out['i'].append(controller.pid.i)
-    out['ff'].append(controller.pid.f)
-    out['error'].append(pid_log.error if f.active else 0.0)
-    out['setpoint'].append(pid_log.desiredLateralAccel if f.active else 0.0)
-    out['jerk'].append(pid_log.desiredLateralJerk if f.active else 0.0)
+    out['jerk'].append(pid_log.desiredLateralJerk)
     out['active'].append(f.active)
     out['pressed'].append(f.steering_pressed)
     out['v_ego'].append(f.v_ego)
@@ -139,14 +96,13 @@ def run_variant(frames, fingerprint, version: int, predictive: bool = False):
 
 def report(name, r, base=None):
   act = r['active'].astype(bool)
-  out_a, i_a = r['output'][act], np.abs(r['i'][act])
+  out_a, i_a, jerk_a = r['output'][act], np.abs(r['i'][act]), np.abs(r['jerk'][act])
   logged = -r['logged_output'][act]  # logged field is pid_log.output = -torque; compare in torque convention
   rms_logged = float(np.sqrt(np.mean((out_a - logged) ** 2)))
   print(f"\n[{name}]  active frames: {act.sum()}")
   print(f"  RMS output vs logged v0 drive: {rms_logged:.4f}")
   print(f"  |integrator|: p50 {np.percentile(i_a, 50):.3f}  p99 {np.percentile(i_a, 99):.3f}  max {i_a.max():.3f}")
-  print(f"  |desired jerk|: p50 {np.percentile(np.abs(r['jerk'][act]), 50):.3f}  "
-        f"p99 {np.percentile(np.abs(r['jerk'][act]), 99):.3f}  max {np.abs(r['jerk'][act]).max():.3f}")
+  print(f"  |desired jerk|: p50 {np.percentile(jerk_a, 50):.3f}  p99 {np.percentile(jerk_a, 99):.3f}  max {jerk_a.max():.3f}")
   if base is not None:
     b_out = base['output'][act]
     diff = out_a - b_out
@@ -172,7 +128,9 @@ def main():
 
   segs = sorted(Path(s) for s in args.segments)
   print(f"loading {len(segs)} segments...")
-  frames, cp = load_frames(segs)
+  # no variant here runs an extension override controller, so modelV2 is never read;
+  # dropping it keeps long routes from pinning every segment's rlog buffer in memory
+  frames, cp = load_frames(segs, keep_model=False)
   fingerprint = cp.carFingerprint
   print(f"{len(frames)} controlsState frames, car: {fingerprint}")
 
