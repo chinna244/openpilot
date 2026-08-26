@@ -41,6 +41,19 @@ ALC_LABELS = {
       AutoLaneChangeMode.TWO_SECONDS, AutoLaneChangeMode.THREE_SECONDS)}
 
 
+def v2_tune_selected() -> bool:
+  """True when the v2 torque tune will actually run. With EnforceTorqueControl off the car
+  runs v0 regardless of the stored tune version (controlsd_ext forces it), so a stored 2.0
+  alone does not count."""
+  if not ui_state.params.get_bool("EnforceTorqueControl"):
+    return False
+  tune = ui_state.params.get("TorqueControlTune")
+  try:
+    return tune is not None and float(tune) == 2.0
+  except (TypeError, ValueError):
+    return False
+
+
 def _on_off(val: bool) -> str:
   return "on" if val else "off"
 
@@ -124,10 +137,13 @@ class SteeringLayoutMici(NavScroller):
                                     not ui_state.params.get_bool("NeuralNetworkLateralControl"))
 
     # Mutually exclusive with NNLC; unlike the rest of this panel it works without
-    # EnforceTorqueControl on torque-native cars, so it is not gated on _enforce_torque
+    # EnforceTorqueControl on torque-native cars, so it is not gated on _enforce_torque.
+    # Also disabled while the v2 tune is selected: v2 replaces the jerk-aware mechanisms
+    # and forces the controller off, so an enabled toggle would claim a dead setting.
     self._jerk_aware_toggle = BigParamControl(tr("jerk aware"), "LateralJerkTorqueController")
     self._jerk_aware_toggle.set_enabled(lambda: ui_state.is_offroad() and
-                                        not ui_state.params.get_bool("NeuralNetworkLateralControl"))
+                                        not ui_state.params.get_bool("NeuralNetworkLateralControl") and
+                                        not v2_tune_selected())
 
     # Torque tune version selector — inline pill selector over the TICI TorqueControlTune options,
     # oldest first. No "default" option: the param's own default (0.0, v0) is what unset resolves to.

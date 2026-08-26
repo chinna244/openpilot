@@ -123,7 +123,10 @@ class TorqueSettingsLayout(Widget):
   def _update_state(self):
     super()._update_state()
     nnlc_enabled = ui_state.params.get_bool("NeuralNetworkLateralControl")
-    self._jerk_aware_toggle.action_item.set_enabled(ui_state.is_offroad() and not nnlc_enabled)
+    # v2 tune replaces the jerk-aware mechanisms and forces the controller off, so the
+    # toggle is disabled while v2 is the tune that will actually run
+    self._jerk_aware_toggle.action_item.set_enabled(ui_state.is_offroad() and not nnlc_enabled and
+                                                    not self._v2_tune_selected())
     if not ui_state.params.get_bool("LiveTorqueParamsToggle"):
       ui_state.params.remove("LiveTorqueParamsRelaxedToggle")
       self._relaxed_tune_toggle.action_item.set_state(False)
@@ -156,6 +159,18 @@ class TorqueSettingsLayout(Widget):
 
   def show_event(self):
     self._scroller.show_event()
+
+  @staticmethod
+  def _v2_tune_selected() -> bool:
+    """True when the v2 torque tune will actually run. With EnforceTorqueControl off the car
+    runs v0 regardless of the stored tune version (controlsd_ext forces it)."""
+    if not ui_state.params.get_bool("EnforceTorqueControl"):
+      return False
+    tune = ui_state.params.get("TorqueControlTune")
+    try:
+      return tune is not None and float(tune) == 2.0
+    except (TypeError, ValueError):
+      return False
 
   def _get_current_torque_version_label(self):
     current_val_bytes = ui_state.params.get("TorqueControlTune")
