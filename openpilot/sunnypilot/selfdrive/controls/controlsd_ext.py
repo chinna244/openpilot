@@ -17,6 +17,8 @@ from openpilot.sunnypilot.livedelay.helpers import get_lat_delay
 from openpilot.sunnypilot.modeld_v2.modeld_base import ModelStateBase
 from openpilot.sunnypilot.selfdrive.controls.lib.blinker_pause_lateral import BlinkerPauseLateral
 from openpilot.sunnypilot.selfdrive.controls.lib.latcontrol_torque_v0 import LatControlTorque as LatControlTorqueV0
+from openpilot.sunnypilot.selfdrive.controls.lib.latcontrol_torque_v2 import LatControlTorque as LatControlTorqueV2
+from openpilot.sunnypilot.selfdrive.controls.lib.torque_tune import resolved_tune_version
 
 
 class ControlsExt(ModelStateBase):
@@ -35,17 +37,13 @@ class ControlsExt(ModelStateBase):
     self.pm_services_ext = ['carControlSP']
 
   def initialize_lateral_control(self, lac, CI, dt):
-    enforce_torque_control = self.params.get_bool("EnforceTorqueControl")
-    # return_default: params_keys.h declares 0.0 (v0) as the default, and an unset param would
-    # otherwise read as None and fall through to the newest tune
-    torque_versions = self.params.get("TorqueControlTune", return_default=True)
-    if not enforce_torque_control:
-      if self.CP.lateralTuning.which() == 'torque':
-        return LatControlTorqueV0(self.CP, self.CP_SP, CI, dt)  # FIXME-SP: revert when upstream fixes tuning issues with v1
-      return lac
-
-    if torque_versions == 0.0:  # v0
+    # the enforce-off v0 forcing and the unset-param default both live in the resolver,
+    # shared with the settings UIs so they gate on the tune that will actually run
+    version = resolved_tune_version(self.params, self.CP.lateralTuning.which() == 'torque')
+    if version == 0.0:  # v0
       return LatControlTorqueV0(self.CP, self.CP_SP, CI, dt)
+    elif version == 2.0:  # v2
+      return LatControlTorqueV2(self.CP, self.CP_SP, CI, dt)
     else:
       return lac
 
