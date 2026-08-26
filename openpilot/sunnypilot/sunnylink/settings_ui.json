@@ -495,24 +495,6 @@
                   "widget": "multiple_button",
                   "title": "Torque Control Tune Version",
                   "description": "Select the version of Torque Control Tune to use.",
-                  "options": [
-                    {
-                      "value": "",
-                      "label": "Default"
-                    },
-                    {
-                      "value": 2.0,
-                      "label": "v2.0"
-                    },
-                    {
-                      "value": 1.0,
-                      "label": "v1.0"
-                    },
-                    {
-                      "value": 0.0,
-                      "label": "v0.0"
-                    }
-                  ],
                   "enablement": [
                     {
                       "type": "offroad_only"

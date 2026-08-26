@@ -231,15 +231,8 @@ sections:
       widget: multiple_button
       title: Torque Control Tune Version
       description: Select the version of Torque Control Tune to use.
-      options:
-      - value: ''
-        label: Default
-      - value: 2.0
-        label: v2.0
-      - value: 1.0
-        label: v1.0
-      - value: 0.0
-        label: v0.0
+      # options come from latcontrol_torque_versions.json via generate_settings_schema's
+      # _inject_dynamic_options; a static list here would be dead data that drifts
       enablement:
       - $ref: '#/macros/offroad'
 - id: lane_change
