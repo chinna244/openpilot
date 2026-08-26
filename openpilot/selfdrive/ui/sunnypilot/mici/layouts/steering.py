@@ -134,6 +134,12 @@ class SteeringLayoutMici(NavScroller):
     self._tq_version = BigMultiParamToggleSP(tr("tune version"), "TorqueControlTune",
                                              list(tq_versions), values=list(tq_versions.values()))
 
+    # v2-only: earlier turn-in via the anticipated steering plan. Gated on the tune that
+    # will actually run (_v2_tune is per-frame fresh here; this panel is only 2 deep);
+    # the controller reads the param once at init, so flips take effect next drive
+    self._tq_predictive = BigParamControl(tr("predictive turn-in"), "TorqueTuneV2PredictiveTurnIn")
+    self._tq_predictive.set_enabled(lambda: ui_state.is_offroad() and self._v2_tune)
+
     self._tq_self_tune_btn = BigButtonSP(tr("self tune"))
     self._tq_self_tune_btn.set_subtitle_font_size(24)
     # Nested sub-panels sit 3 deep, and gui_app only renders the top 2 widgets — this layout's
@@ -165,7 +171,8 @@ class SteeringLayoutMici(NavScroller):
     self._tq_items_rest = [self._tq_self_tune_btn, self._tq_custom_btn]
     for item in [self._tq_version] + self._tq_items_rest:
       item.set_enabled(lambda: self._enforce_torque)
-    self._tq_view = self._torque_settings_btn.link_sub_panel([self._torque_toggle, self._jerk_aware_toggle, self._tq_version] + self._tq_items_rest)
+    self._tq_view = self._torque_settings_btn.link_sub_panel([self._torque_toggle, self._jerk_aware_toggle, self._tq_version,
+                                                              self._tq_predictive] + self._tq_items_rest)
 
   # --- Torque tune version selector ---
   @staticmethod

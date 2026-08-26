@@ -49,6 +49,13 @@ class TorqueSettingsLayout(Widget):
       action_item=NoElideButtonAction(tr("SELECT")),
       callback=self._show_torque_version_dialog,
     )
+    self._predictive_toggle = toggle_item_sp(
+      param="TorqueTuneV2PredictiveTurnIn",
+      title=lambda: tr("Predictive Turn-In (Alpha)"),
+      description=lambda: tr("Starts steering into curves slightly earlier by anticipating the planned steering, " +
+                             "compensating for the car's steering response delay. Only available with the v2.0 tune. " +
+                             "Takes effect on the next drive."),
+    )
     self._self_tune_toggle = toggle_item_sp(
       param="LiveTorqueParamsToggle",
       title=lambda: tr("Self-Tune"),
@@ -106,6 +113,7 @@ class TorqueSettingsLayout(Widget):
     items = [
       self._jerk_aware_toggle,
       self._torque_control_versions,
+      self._predictive_toggle,
       self._self_tune_toggle,
       self._relaxed_tune_toggle,
       self._speed_dep_toggle,
@@ -119,10 +127,13 @@ class TorqueSettingsLayout(Widget):
   def _update_state(self):
     super()._update_state()
     nnlc_enabled = ui_state.params.get_bool("NeuralNetworkLateralControl")
+    v2_tune = resolved_tune_version(ui_state.params) == 2.0
     # v2 tune replaces the jerk-aware mechanisms and forces the controller off, so the
     # toggle is disabled while v2 is the tune that will actually run
-    self._jerk_aware_toggle.action_item.set_enabled(ui_state.is_offroad() and not nnlc_enabled and
-                                                    resolved_tune_version(ui_state.params) != 2.0)
+    self._jerk_aware_toggle.action_item.set_enabled(ui_state.is_offroad() and not nnlc_enabled and not v2_tune)
+    # predictive turn-in is a v2-only mechanism: hidden unless v2 will actually run
+    self._predictive_toggle.set_visible(v2_tune)
+    self._predictive_toggle.action_item.set_enabled(ui_state.is_offroad())
     if not ui_state.params.get_bool("LiveTorqueParamsToggle"):
       ui_state.params.remove("LiveTorqueParamsRelaxedToggle")
       self._relaxed_tune_toggle.action_item.set_state(False)
