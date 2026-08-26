@@ -4,14 +4,12 @@ Copyright (c) 2021-, Haibin Wen, sunnypilot, and a number of other contributors.
 This file is part of sunnypilot and is licensed under the MIT License.
 See the LICENSE.md file in the root directory for more details.
 """
-import json
 import math
-import os
 from collections.abc import Callable
 import pyray as rl
 
-from openpilot.common.basedir import BASEDIR
 from openpilot.selfdrive.ui.ui_state import ui_state
+from openpilot.sunnypilot.selfdrive.controls.lib.torque_tune import load_versions, resolved_tune_version
 from openpilot.system.ui.lib.application import gui_app, FontWeight
 from openpilot.system.ui.lib.multilang import tr
 from openpilot.system.ui.sunnypilot.lib.utils import NoElideButtonAction
@@ -21,7 +19,6 @@ from openpilot.system.ui.widgets import Widget, DialogResult
 from openpilot.system.ui.widgets.network import NavButton
 from openpilot.system.ui.widgets.scroller_tici import Scroller
 
-TORQUE_VERSIONS_PATH = os.path.join(BASEDIR, "openpilot", "sunnypilot", "selfdrive", "controls", "lib", "latcontrol_torque_versions.json")
 
 
 class TorqueSettingsLayout(Widget):
@@ -36,8 +33,7 @@ class TorqueSettingsLayout(Widget):
     self._scroller = Scroller(items, line_separator=True, spacing=0)
 
   def _load_versions(self):
-    with open(TORQUE_VERSIONS_PATH) as f:
-      self.cached_torque_versions = json.load(f)
+    self.cached_torque_versions = load_versions()
 
   def _initialize_items(self):
     self._jerk_aware_toggle = toggle_item_sp(
@@ -52,6 +48,13 @@ class TorqueSettingsLayout(Widget):
       description="Select the version of Torque Control Tune to use.",
       action_item=NoElideButtonAction(tr("SELECT")),
       callback=self._show_torque_version_dialog,
+    )
+    self._predictive_toggle = toggle_item_sp(
+      param="TorqueTuneV2PredictiveTurnIn",
+      title=lambda: tr("Predictive Turn-In (Alpha)"),
+      description=lambda: tr("Starts steering into curves slightly earlier by anticipating the planned steering, " +
+                             "compensating for the car's steering response delay. Only available with the v2.0 tune. " +
+                             "Takes effect on the next drive."),
     )
     self._self_tune_toggle = toggle_item_sp(
       param="LiveTorqueParamsToggle",
@@ -110,6 +113,7 @@ class TorqueSettingsLayout(Widget):
     items = [
       self._jerk_aware_toggle,
       self._torque_control_versions,
+      self._predictive_toggle,
       self._self_tune_toggle,
       self._relaxed_tune_toggle,
       self._speed_dep_toggle,
@@ -123,7 +127,13 @@ class TorqueSettingsLayout(Widget):
   def _update_state(self):
     super()._update_state()
     nnlc_enabled = ui_state.params.get_bool("NeuralNetworkLateralControl")
-    self._jerk_aware_toggle.action_item.set_enabled(ui_state.is_offroad() and not nnlc_enabled)
+    v2_tune = resolved_tune_version(ui_state.params) == 2.0
+    # v2 tune replaces the jerk-aware mechanisms and forces the controller off, so the
+    # toggle is disabled while v2 is the tune that will actually run
+    self._jerk_aware_toggle.action_item.set_enabled(ui_state.is_offroad() and not nnlc_enabled and not v2_tune)
+    # predictive turn-in is a v2-only mechanism: hidden unless v2 will actually run
+    self._predictive_toggle.set_visible(v2_tune)
+    self._predictive_toggle.action_item.set_enabled(ui_state.is_offroad())
     if not ui_state.params.get_bool("LiveTorqueParamsToggle"):
       ui_state.params.remove("LiveTorqueParamsRelaxedToggle")
       self._relaxed_tune_toggle.action_item.set_state(False)
