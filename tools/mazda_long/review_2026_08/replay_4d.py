@@ -5,9 +5,8 @@ sys.path.insert(0, "/Users/zeph/Developer/experiments/sunnypilot_proj/sunnypilot
 sys.path.insert(0, "/Users/zeph/Developer/experiments/sunnypilot_proj/sunnypilot/opendbc_repo")
 sys.path.append("/Users/zeph/Developer/experiments/sunnypilot_proj/sunnypilot/tools/mazda_long")
 os.chdir("/Users/zeph/Developer/experiments/sunnypilot_proj/sunnypilot")
-from types import SimpleNamespace
 from openpilot.tools.lib.logreader import LogReader
-from replay_standstill_hold import build_controller, decode_cmd
+from replay_standstill_hold import build_controller, decode_cmd, mock_inputs
 
 BASE = "tools/mazda_long/test_data/route_4d_cx9/0000004d--3242c750a7--"
 rows = []
@@ -34,20 +33,7 @@ ctrl = build_controller()
 t0 = rows[0][0]
 last = None
 for t, cc, cs, lead, hold in rows:
-  out = SimpleNamespace(standstill=cs.standstill, gasPressed=cs.gasPressed, brakePressed=cs.brakePressed,
-                        cruiseState=SimpleNamespace(available=cs.cruiseState.available,
-                                                    enabled=cs.cruiseState.enabled))
-  actuators = SimpleNamespace(accel=cc.actuators.accel, longControlState=cc.actuators.longControlState)
-  control = SimpleNamespace(enabled=cc.enabled, longActive=cc.longActive, actuators=actuators,
-                            cruiseControl=SimpleNamespace(resume=cc.cruiseControl.resume,
-                                                          override=cc.cruiseControl.override, cancel=False),
-                            hudControl=SimpleNamespace(leadVisible=cc.hudControl.leadVisible,
-                                                       leadDistanceBars=cc.hudControl.leadDistanceBars))
-  control_sp = SimpleNamespace(stockEcuHandBack=False,
-                               leadOne=SimpleNamespace(dRel=lead[0] if lead else 0.0,
-                                                       vRel=lead[1] if lead else 0.0))
-  carstate = SimpleNamespace(out=out, resume_button=0, brake_hold=hold,
-                             stock_radar_alive=False, fsc_settled=True, radar_session_refused=False)
+  control, control_sp, carstate = mock_inputs(cc, cs, hold, lead)
   sends = ctrl.update_longitudinal(control, control_sp, carstate)
   ctrl.frame += 1
   info = next((d for a, d, b in sends if a == 0x21b and b == 0), None)
