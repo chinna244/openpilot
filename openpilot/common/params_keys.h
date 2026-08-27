@@ -194,6 +194,7 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"MadsSteeringMode", {PERSISTENT | BACKUP, INT, "0"}},
     {"MadsUnifiedEngagementMode", {PERSISTENT | BACKUP, BOOL, "1"}},
     {"MazdaExperimentalMadsWhiteHud", {PERSISTENT | BACKUP, BOOL, "1"}},
+    {"MazdaExperimentalMadsWhiteHudActive", {PERSISTENT | BACKUP, BOOL, "1"}},
 
     // Model Manager params
     {"ModelManager_ActiveBundle", {PERSISTENT, JSON}},
