@@ -318,8 +318,10 @@ class BigParamOption(BigButton):
     """Create a NumberPickerScreen from this option's config (also used by screenshot tests)."""
     from openpilot.selfdrive.ui.sunnypilot.mici.widgets.number_picker import NumberPickerScreen
     kwargs = {'item_width': self._picker_item_width} if self._picker_item_width else {}
+    # a newline in the button label is a narrow-button layout device; the picker title
+    # has the full screen width, so it renders on one line
     return NumberPickerScreen(
-      title=self.text, param=self._param, min_value=self._min_value, max_value=self._max_value,
+      title=self.text.replace("\n", " "), param=self._param, min_value=self._min_value, max_value=self._max_value,
       step=self._step, label_callback=self._picker_label_callback, value_map=self._value_map,
       float_param=self._float_param, unit=self._picker_unit, **kwargs,
     )

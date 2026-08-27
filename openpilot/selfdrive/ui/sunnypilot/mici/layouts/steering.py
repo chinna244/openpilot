@@ -19,7 +19,7 @@ from openpilot.system.ui.widgets.scroller import NavScroller
 from openpilot.selfdrive.ui.ui_state import ui_state
 from openpilot.sunnypilot.mads.helpers import MadsSteeringModeOnBrake, get_mads_limited_brands
 from openpilot.sunnypilot.selfdrive.controls.lib.auto_lane_change import AUTO_LANE_CHANGE_TIMER, AutoLaneChangeMode
-from openpilot.sunnypilot.selfdrive.controls.lib.lane_change_smoothing import PACE_MIN, PACE_MAX, pace_profile_time, read_pace
+from openpilot.sunnypilot.selfdrive.controls.lib.lane_change_smoothing import PACE_MIN, PACE_MAX, pace_profile_time
 from openpilot.sunnypilot.selfdrive.controls.lib.torque_tune import load_versions, resolved_tune_version
 from openpilot.system.ui.lib.application import gui_app
 
@@ -105,10 +105,10 @@ class SteeringLayoutMici(NavScroller):
                                      depends_on=lambda: self._bsm_applies(self._alc_val) and self._car_has_bsm())
     # blocks lane changes toward a detected road edge — ungated, matching TICI lane_change_settings
     self._lc_road_edge = BigParamControl(tr("road edge block"), "RoadEdgeLaneChangeEnabled")
-    self._lc_smooth = BigParamControl(tr("smooth pace"), "LaneChangeSmoothing")
-    # stored value is the 1-9 pace index; the label shows the sinusoidal profile time it
-    # selects, which is the physically meaningful quantity (higher pace = quicker)
-    self._lc_pace = BigParamOption(tr("duration"), "LaneChangeSmoothingPace",
+    self._lc_smooth = BigParamControl(tr("smoothing"), "LaneChangeSmoothing")
+    # stored value is the 1-9 pace index; every label shows the sinusoidal profile time
+    # it selects, the physically meaningful quantity (higher pace = quicker)
+    self._lc_pace = BigParamOption(tr("smoothing") + "\n" + tr("duration"), "LaneChangeSmoothingPace",
                                    min_value=PACE_MIN, max_value=PACE_MAX,
                                    label_callback=lambda v: f"~{pace_profile_time(v):.1f}s",
                                    picker_label_callback=lambda v: f"{pace_profile_time(v):.1f}",
@@ -248,9 +248,8 @@ class SteeringLayoutMici(NavScroller):
       self._lane_change_btn.set_disabled()
     else:
       auto_badge = _alc_label(alc_val) if alc_val > AutoLaneChangeMode.OFF else "off"
-      smooth_badge = f"~{pace_profile_time(read_pace(ui_state.params)):.1f}s" if lc_smooth_on else "off"
       self._lane_change_btn.set_badges([(tr("auto"), auto_badge), (tr("bsm-delay"), lc_bsm),
-                                        (tr("road-edge"), road_edge), (tr("smooth"), smooth_badge)])
+                                        (tr("road-edge"), road_edge), (tr("smooth"), _on_off(lc_smooth_on))])
 
     enforce_torque = self._enforce_torque = ui_state.params.get_bool("EnforceTorqueControl")
     self._v2_tune = resolved_tune_version(ui_state.params) == 2.0
