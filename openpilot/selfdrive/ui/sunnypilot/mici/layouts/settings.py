@@ -17,12 +17,22 @@ from openpilot.selfdrive.ui.sunnypilot.mici.layouts.sunnylink import SunnylinkLa
 from openpilot.selfdrive.ui.sunnypilot.mici.layouts.trips import TripsLayoutMici
 from openpilot.selfdrive.ui.sunnypilot.mici.layouts.visuals import VisualsLayoutMici
 from openpilot.selfdrive.ui.ui_state import ui_state
-from openpilot.system.ui.lib.application import gui_app
+from openpilot.system.ui.lib.application import gui_app, FontWeight
 from openpilot.system.ui.lib.multilang import tr
 from openpilot.sunnypilot.selfdrive.ui.offroad_mode import request_offroad_mode
 
 SP_ICON = "../../sunnypilot/selfdrive/assets/offroad"
 BIG_ICON_SIZE = 110
+
+
+class SunnylinkBigButton(SettingsBigButton):
+  def __init__(self, *args, **kwargs):
+    super().__init__(*args, **kwargs)
+    self._label.set_font_weight(FontWeight.AUDIOWIDE)
+
+  def _get_label_font_size(self):
+    # Audiowide runs wider than Inter: "sunnylink" wraps to two lines at 64
+    return 56
 
 
 class SettingsLayoutSP(OP.SettingsLayout):
@@ -39,19 +49,20 @@ class SettingsLayoutSP(OP.SettingsLayout):
     self.icon_offroad_slider = gui_app.texture("icons_mici/settings/device/lkas.png", BIG_ICON_SIZE, BIG_ICON_SIZE)
 
     panels = [
-      (tr("sunnylink"), SunnylinkLayoutMici, gui_app.texture("icons_mici/settings/developer/ssh.png", 56, 64)),
-      (tr("models"),    ModelsLayoutMici,    gui_app.texture(f"{SP_ICON}/icon_models.png", 64, 64)),
-      (tr("cruise"),    CruiseLayoutMici,    gui_app.texture(f"{SP_ICON}/icon_vehicle.png", 64, 64)),
-      (tr("steering"),  SteeringLayoutMici,  gui_app.texture(f"{SP_ICON}/icon_lateral.png", 64, 64)),
-      (tr("display"),   DisplayLayoutMici,   gui_app.texture(f"{SP_ICON}/icon_display.png", 64, 64)),
-      (tr("visuals"),   VisualsLayoutMici,   gui_app.texture(f"{SP_ICON}/icon_visuals.png", 64, 64)),
-      (tr("trips"),     TripsLayoutMici,     gui_app.texture(f"{SP_ICON}/icon_trips.png", 64, 64)),
+      (tr("sunnylink"), SunnylinkLayoutMici, SunnylinkBigButton,
+       gui_app.texture("../../sunnypilot/selfdrive/assets/icons_mici/sunnylink.png", 76, 44)),
+      (tr("models"),    ModelsLayoutMici,    SettingsBigButton, gui_app.texture(f"{SP_ICON}/icon_models.png", 64, 64)),
+      (tr("cruise"),    CruiseLayoutMici,    SettingsBigButton, gui_app.texture(f"{SP_ICON}/icon_vehicle.png", 64, 64)),
+      (tr("steering"),  SteeringLayoutMici,  SettingsBigButton, gui_app.texture(f"{SP_ICON}/icon_lateral.png", 64, 64)),
+      (tr("display"),   DisplayLayoutMici,   SettingsBigButton, gui_app.texture(f"{SP_ICON}/icon_display.png", 64, 64)),
+      (tr("visuals"),   VisualsLayoutMici,   SettingsBigButton, gui_app.texture(f"{SP_ICON}/icon_visuals.png", 64, 64)),
+      (tr("trips"),     TripsLayoutMici,     SettingsBigButton, gui_app.texture(f"{SP_ICON}/icon_trips.png", 64, 64)),
     ]
 
     sp_buttons = []
-    for label, panel_cls, icon in panels:
+    for label, panel_cls, btn_cls, icon in panels:
       panel = panel_cls()
-      btn = SettingsBigButton(label, "", icon)
+      btn = btn_cls(label, "", icon)
       btn.set_click_callback(lambda p=panel: gui_app.push_widget(p))
       sp_buttons.append(btn)
 
