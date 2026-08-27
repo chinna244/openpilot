@@ -31,7 +31,7 @@ def _seed_mazda_torque_defaults(CP: structs.CarParams, params: Params | None = N
   Gated on the EPS, not the model: minSteerSpeed == 0 is the same "CX-5 2022+ EPS present" proxy
   used by the steering tune (values.py) and carstate, so the CX-9 sharing this EPS and EPS swaps
   are covered. Seeded once via a marker param so the user can still toggle any of these off later.
-  TorqueControlTune defaults to 0.0 (== torque learner v0), so it needs no seeding here.
+  TorqueControlTune defaults to 2.0 (the v2 tune), so it needs no seeding here.
   """
   if params is None:
     params = Params()

@@ -49,13 +49,6 @@ class TorqueSettingsLayout(Widget):
       action_item=NoElideButtonAction(tr("SELECT")),
       callback=self._show_torque_version_dialog,
     )
-    self._predictive_toggle = toggle_item_sp(
-      param="TorqueTuneV2PredictiveTurnIn",
-      title=lambda: tr("Predictive Turn-In (Alpha)"),
-      description=lambda: tr("Starts steering into curves slightly earlier by anticipating the planned steering, " +
-                             "compensating for the car's steering response delay. Only available with the v2.0 tune. " +
-                             "Takes effect on the next drive."),
-    )
     self._self_tune_toggle = toggle_item_sp(
       param="LiveTorqueParamsToggle",
       title=lambda: tr("Self-Tune"),
@@ -113,7 +106,6 @@ class TorqueSettingsLayout(Widget):
     items = [
       self._jerk_aware_toggle,
       self._torque_control_versions,
-      self._predictive_toggle,
       self._self_tune_toggle,
       self._relaxed_tune_toggle,
       self._speed_dep_toggle,
@@ -131,9 +123,6 @@ class TorqueSettingsLayout(Widget):
     # v2 tune replaces the jerk-aware mechanisms and forces the controller off, so the
     # toggle is disabled while v2 is the tune that will actually run
     self._jerk_aware_toggle.action_item.set_enabled(ui_state.is_offroad() and not nnlc_enabled and not v2_tune)
-    # predictive turn-in is a v2-only mechanism: hidden unless v2 will actually run
-    self._predictive_toggle.set_visible(v2_tune)
-    self._predictive_toggle.action_item.set_enabled(ui_state.is_offroad())
     if not ui_state.params.get_bool("LiveTorqueParamsToggle"):
       ui_state.params.remove("LiveTorqueParamsRelaxedToggle")
       self._relaxed_tune_toggle.action_item.set_state(False)
@@ -168,19 +157,18 @@ class TorqueSettingsLayout(Widget):
     self._scroller.show_event()
 
   def _get_current_torque_version_label(self):
-    current_val_bytes = ui_state.params.get("TorqueControlTune")
-    if current_val_bytes is None:
-      return tr("Default")
-
+    # unset resolves through the declared param default, the same read controlsd_ext makes:
+    # showing a "Default" placeholder instead would hide which tune the car actually runs
+    current_val_bytes = ui_state.params.get("TorqueControlTune", return_default=True)
     try:
       current_val = float(current_val_bytes)
       for label, info in self.cached_torque_versions.items():
         if math.isclose(float(info["version"]), current_val, rel_tol=1e-5):
           return label
-    except (ValueError, KeyError):
+    except (TypeError, ValueError, KeyError):
       pass
 
-    return tr("Default")
+    return tr("Unknown")
 
   def _show_torque_version_dialog(self):
     options_map = {}
@@ -193,9 +181,7 @@ class TorqueSettingsLayout(Widget):
     # Sort options by label in descending order
     sorted_labels = sorted(options_map.keys(), key=lambda k: options_map[k], reverse=True)
 
-    nodes = [TreeNode(tr("Default"))]
-    for label in sorted_labels:
-      nodes.append(TreeNode(label))
+    nodes = [TreeNode(label) for label in sorted_labels]
 
     folders = [TreeFolder("", nodes)]
 
@@ -204,9 +190,7 @@ class TorqueSettingsLayout(Widget):
     def handle_selection(result: int):
       if result == DialogResult.CONFIRM and self._torque_version_dialog:
         selected_ref = self._torque_version_dialog.selection_ref
-        if selected_ref == tr("Default"):
-          ui_state.params.remove("TorqueControlTune")
-        elif selected_ref in options_map:
+        if selected_ref in options_map:
           ui_state.params.put("TorqueControlTune", options_map[selected_ref])
       self._torque_version_dialog = None
 
