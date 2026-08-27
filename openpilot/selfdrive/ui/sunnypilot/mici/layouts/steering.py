@@ -19,6 +19,7 @@ from openpilot.system.ui.widgets.scroller import NavScroller
 from openpilot.selfdrive.ui.ui_state import ui_state
 from openpilot.sunnypilot.mads.helpers import MadsSteeringModeOnBrake, get_mads_limited_brands
 from openpilot.sunnypilot.selfdrive.controls.lib.auto_lane_change import AUTO_LANE_CHANGE_TIMER, AutoLaneChangeMode
+from openpilot.sunnypilot.selfdrive.controls.lib.lane_change_smoothing import PACE_MIN, PACE_MAX, pace_profile_time, read_pace
 from openpilot.sunnypilot.selfdrive.controls.lib.torque_tune import load_versions, resolved_tune_version
 from openpilot.system.ui.lib.application import gui_app
 
@@ -63,6 +64,7 @@ class SteeringLayoutMici(NavScroller):
     self._torque_allowed = False
     self._enforce_torque = False
     self._v2_tune = False
+    self._blinker_pause_on = False
 
     # --- Main view items ---
     self._mads_settings_btn = BigButtonSP(tr("mads"))
@@ -70,14 +72,18 @@ class SteeringLayoutMici(NavScroller):
     self._blinker_settings_btn = BigButtonSP(tr("blinker pause"))
     self._torque_settings_btn = BigButtonSP(tr("torque control"))
     self._nnlc_toggle = BigParamControl(tr("nnlc"), "NeuralNetworkLateralControl")
+    # steers through slow signaled turns; blinker pause suppresses lateral in exactly that
+    # regime, so the pause wins and this reads off while it is enabled (param kept)
+    self._turn_assist_toggle = BigParamControlSP(tr("low speed") + "\n" + tr("turn assist"), "LowSpeedTurnAssist",
+                                                 depends_on=lambda: not self._blinker_pause_on)
 
     for btn in [self._mads_settings_btn, self._lane_change_btn, self._blinker_settings_btn, self._torque_settings_btn]:
       btn.set_subtitle_font_size(24)
 
     self._scroller.add_widgets([
       self._mads_settings_btn, self._lane_change_btn,
-      self._blinker_settings_btn, self._torque_settings_btn,
-      self._nnlc_toggle,
+      self._blinker_settings_btn, self._turn_assist_toggle,
+      self._torque_settings_btn, self._nnlc_toggle,
     ])
 
     # --- MADS sub-panel ---
@@ -99,7 +105,14 @@ class SteeringLayoutMici(NavScroller):
                                      depends_on=lambda: self._bsm_applies(self._alc_val) and self._car_has_bsm())
     # blocks lane changes toward a detected road edge — ungated, matching TICI lane_change_settings
     self._lc_road_edge = BigParamControl(tr("road edge block"), "RoadEdgeLaneChangeEnabled")
-    self._lc_view = self._lane_change_btn.link_sub_panel([self._lc_timer, self._lc_bsm, self._lc_road_edge])
+    self._lc_smooth = BigParamControl(tr("smooth pace"), "LaneChangeSmoothing")
+    self._lc_pace = BigParamOption(tr("pace"), "LaneChangeSmoothingPace",
+                                   min_value=PACE_MIN, max_value=PACE_MAX,
+                                   label_callback=lambda v: f"{v} (~{pace_profile_time(v):.0f}s)",
+                                   picker_label_callback=lambda v: f"{v}")
+    self._lc_pace.set_enabled(lambda: self._lc_smooth._checked)
+    self._lc_view = self._lane_change_btn.link_sub_panel([self._lc_timer, self._lc_bsm, self._lc_road_edge,
+                                                          self._lc_smooth, self._lc_pace])
 
     # --- Blinker sub-panel ---
     self._blinker_toggle = BigParamControl(tr("enable blinker pause"), "BlinkerPauseLateralControl")
@@ -213,7 +226,8 @@ class SteeringLayoutMici(NavScroller):
       steer_mode = MADS_STEERING_MODE_LABELS[min(steer_idx, len(MADS_STEERING_MODE_LABELS) - 1)]
       self._mads_settings_btn.set_badges([(tr("enabled"), "on"), (tr("main-cruise"), cruise), (tr("unified"), unified), (steer_mode, "on")])
 
-    blinker_on = ui_state.params.get_bool("BlinkerPauseLateralControl")
+    blinker_on = self._blinker_pause_on = ui_state.params.get_bool("BlinkerPauseLateralControl")
+    self._turn_assist_toggle.refresh()
     if not blinker_on:
       self._blinker_settings_btn.set_disabled()
     else:
@@ -226,11 +240,14 @@ class SteeringLayoutMici(NavScroller):
     # already ignores it below Nudgeless, and the user's choice comes back when they re-enable
     lc_bsm = _on_off(ui_state.params.get_bool("AutoLaneChangeBsmDelay") and self._bsm_applies(alc_val))
     road_edge = _on_off(ui_state.params.get_bool("RoadEdgeLaneChangeEnabled"))
-    if alc_val <= AutoLaneChangeMode.OFF and lc_bsm == "off" and road_edge == "off":
+    lc_smooth_on = ui_state.params.get_bool("LaneChangeSmoothing")
+    if alc_val <= AutoLaneChangeMode.OFF and lc_bsm == "off" and road_edge == "off" and not lc_smooth_on:
       self._lane_change_btn.set_disabled()
     else:
       auto_badge = _alc_label(alc_val) if alc_val > AutoLaneChangeMode.OFF else "off"
-      self._lane_change_btn.set_badges([(tr("auto"), auto_badge), (tr("bsm-delay"), lc_bsm), (tr("road-edge"), road_edge)])
+      smooth_badge = f"{read_pace(ui_state.params)}" if lc_smooth_on else "off"
+      self._lane_change_btn.set_badges([(tr("auto"), auto_badge), (tr("bsm-delay"), lc_bsm),
+                                        (tr("road-edge"), road_edge), (tr("smooth"), smooth_badge)])
 
     enforce_torque = self._enforce_torque = ui_state.params.get_bool("EnforceTorqueControl")
     self._v2_tune = resolved_tune_version(ui_state.params) == 2.0

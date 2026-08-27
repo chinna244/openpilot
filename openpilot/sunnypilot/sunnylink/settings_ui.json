@@ -265,6 +265,19 @@
                   ]
                 }
               ]
+            },
+            {
+              "key": "LowSpeedTurnAssist",
+              "widget": "toggle",
+              "title": "Low-Speed Turn Assist",
+              "description": "Steer through slow, signaled turns; hold the wheel wound at intersections and start turning on time instead of going wide. Active below 10 mph with the turn signal on. Unavailable while lateral control is paused on blinker.",
+              "enablement": [
+                {
+                  "type": "param",
+                  "key": "BlinkerPauseLateralControl",
+                  "equals": false
+                }
+              ]
             }
           ]
         },
@@ -552,6 +565,29 @@
               "widget": "toggle",
               "title": "Block Lane Change: Road Edge Detection",
               "description": "Blocks lane change when the model sees a road edge on the side you signal."
+            },
+            {
+              "key": "LaneChangeSmoothing",
+              "widget": "toggle",
+              "title": "Smooth Lane Changes",
+              "description": "Set the pace of automatic lane changes. Lower pace is gentler. The end-of-maneuver correction keeps its authority at every pace, so the car settles into the new lane without a wheel snap.",
+              "sub_items": [
+                {
+                  "key": "LaneChangeSmoothingPace",
+                  "widget": "option",
+                  "title": "Lane Change Pace",
+                  "min": 1,
+                  "max": 9,
+                  "step": 1,
+                  "enablement": [
+                    {
+                      "type": "param",
+                      "key": "LaneChangeSmoothing",
+                      "equals": true
+                    }
+                  ]
+                }
+              ]
             },
             {
               "key": "AutoLaneChangeBsmDelay",

@@ -16,9 +16,11 @@ from openpilot.sunnypilot import PARAMS_UPDATE_PERIOD
 from openpilot.sunnypilot.livedelay.helpers import get_lat_delay
 from openpilot.sunnypilot.modeld_v2.modeld_base import ModelStateBase
 from openpilot.sunnypilot.selfdrive.controls.lib.blinker_pause_lateral import BlinkerPauseLateral
+from openpilot.sunnypilot.selfdrive.controls.lib.lane_change_smoothing import LaneChangeSmoothing
 from openpilot.sunnypilot.selfdrive.controls.lib.latcontrol_torque_v0 import LatControlTorque as LatControlTorqueV0
 from openpilot.sunnypilot.selfdrive.controls.lib.latcontrol_torque_v2 import LatControlTorque as LatControlTorqueV2
 from openpilot.sunnypilot.selfdrive.controls.lib.torque_tune import resolved_tune_version
+from openpilot.sunnypilot.selfdrive.controls.lib.turn_assist import TurnAssistController
 
 
 class ControlsExt(ModelStateBase):
@@ -28,6 +30,8 @@ class ControlsExt(ModelStateBase):
     self.params = params
     self._param_update_time: float = 0.0
     self.blinker_pause_lateral = BlinkerPauseLateral()
+    self.turn_assist = TurnAssistController(CP)
+    self.lane_change_smoothing = LaneChangeSmoothing()
 
     cloudlog.info("controlsd_ext is waiting for CarParamsSP")
     self.CP_SP = messaging.log_from_bytes(params.get("CarParamsSP", block=True), custom.CarParamsSP)
@@ -50,6 +54,8 @@ class ControlsExt(ModelStateBase):
   def get_params_sp(self, sm: messaging.SubMaster) -> None:
     if time.monotonic() - self._param_update_time > PARAMS_UPDATE_PERIOD:
       self.blinker_pause_lateral.get_params()
+      self.turn_assist.get_params()
+      self.lane_change_smoothing.get_params()
 
       if self.CP.lateralTuning.which() == 'torque':
         self.lat_delay = get_lat_delay(self.params, sm["lateralDelay"].lateralDelay)
@@ -66,6 +72,19 @@ class ControlsExt(ModelStateBase):
 
     # MADS not available, use stock state to engage
     return bool(sm['selfdriveState'].active)
+
+  def update_lateral_assist(self, sm: messaging.SubMaster, lat_active: bool, new_desired_curvature: float,
+                            prev_desired_curvature: float, current_curvature: float) -> tuple[float, float]:
+    """Low-speed turn assist + lane-change smoothing over the desired curvature,
+    returning (new_desired_curvature, jerk_factor) for clip_curvature. The lateral
+    maneuver mode's scripted commands must pass through the stock clip untouched."""
+    if sm.valid['lateralManeuverPlan']:
+      return new_desired_curvature, 1.0
+    CS = sm['carState']
+    model_v2 = sm['modelV2']
+    new_desired_curvature = self.turn_assist.update(CS, lat_active, model_v2, new_desired_curvature, current_curvature)
+    jerk_factor = self.lane_change_smoothing.update(CS, model_v2, new_desired_curvature, prev_desired_curvature)
+    return new_desired_curvature, jerk_factor
 
   @staticmethod
   def get_lead_data(_lead, src: log.RadarState.LeadData) -> None:
@@ -103,6 +122,11 @@ class ControlsExt(ModelStateBase):
     CC_SP.intelligentCruiseButtonManagement.state = icbm_src.state
     CC_SP.intelligentCruiseButtonManagement.sendButton = icbm_src.sendButton
     CC_SP.intelligentCruiseButtonManagement.vTarget = icbm_src.vTarget
+
+    # lateral assist telemetry, for offline validation of the turn hold and pace clamp
+    CC_SP.turnAssist.holdCurvature = float(self.turn_assist.hold)
+    CC_SP.turnAssist.leadCurvature = float(self.turn_assist.lead_applied)
+    CC_SP.laneChangeSmoothing.jerkFactor = float(self.lane_change_smoothing.arrest_jerk_factor)
 
     return CC_SP
 
