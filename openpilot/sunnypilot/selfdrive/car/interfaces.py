@@ -159,7 +159,6 @@ def initialize_params(params) -> list[dict[str, Any]]:
   # mazda
   keys.extend([
     "MazdaExperimentalMadsWhiteHud",
-    "MazdaExperimentalMadsWhiteHudActive",
   ])
 
   # toyota
