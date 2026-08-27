@@ -6,9 +6,9 @@ See the LICENSE.md file in the root directory for more details.
 """
 
 # Which torque controller an unset TorqueControlTune selects. This is easy to get wrong by
-# dropping `return_default=True` from the params read: params_keys.h declares "0.0" (v0), but
-# a bare params.get() returns None for an unset param, and `None == 0.0` is False — which
-# silently selects the newest tune instead. Nothing errors; the car just steers on v1.
+# dropping `return_default=True` from the params read: params_keys.h declares "2.0" (v2), but
+# a bare params.get() returns None for an unset param, and float(None) raises — or, guarded,
+# silently falls through to the upstream controller. Nothing says the car dropped off v2.
 #
 # The v0 constructor is patched out: these tests pin the branch that gets taken, not the
 # controller's behavior, and building the real one pulls in NNLC model loading.
@@ -48,12 +48,13 @@ def select(controls):
 
 
 class TestTorqueTuneSelection:
-  def test_unset_selects_v0(self, ctx):
-    """The declared default in params_keys.h is 0.0 — an unset param must honor it."""
+  def test_unset_selects_v2(self, ctx):
+    """The declared default in params_keys.h is 2.0 — an unset param must honor it, so a
+    fresh install (and every car seeded into torque control) drives on the v2 tune."""
     params, controls = ctx
     params.put_bool("EnforceTorqueControl", True, block=True)
     params.remove("TorqueControlTune")
-    assert select(controls) == V0
+    assert select(controls) == V2
 
   @pytest.mark.parametrize(("version", "expected"), [(0.0, V0), (1.0, V1), (2.0, V2)])
   def test_explicit_version_is_honored(self, ctx, version, expected):
@@ -89,15 +90,17 @@ class TestTorqueTuneSelection:
     params.put("TorqueControlTune", version, block=True)
     assert select(controls) == V0
 
-  def test_ui_default_option_matches_what_controls_runs(self, ctx):
-    """The MICI selector shows the first (oldest) version for an unset param — it must be the
-    same tune initialize_lateral_control picks, or the UI claims a tune the car isn't running."""
+  def test_ui_default_matches_what_controls_runs(self, ctx):
+    """For an unset param the MICI selector lights up the declared default (the widget itself
+    is pinned by test_torque_tune_unset_is_v2) — that version must be the one
+    initialize_lateral_control picks, or the UI claims a tune the car isn't running."""
     from openpilot.selfdrive.ui.sunnypilot.mici.layouts.steering import SteeringLayoutMici
 
     params, controls = ctx
-    versions = SteeringLayoutMici._load_torque_versions()
-    shown_version = next(iter(versions.values()))  # oldest-first ordering
-
     params.put_bool("EnforceTorqueControl", True, block=True)
     params.remove("TorqueControlTune")
-    assert (select(controls) == V0) is (shown_version == 0.0)
+
+    shown = float(params.get("TorqueControlTune", return_default=True))
+    assert shown in set(SteeringLayoutMici._load_torque_versions().values()), \
+      "the declared default must be a version the selectors offer"
+    assert {0.0: V0, 1.0: V1, 2.0: V2}[shown] == select(controls)

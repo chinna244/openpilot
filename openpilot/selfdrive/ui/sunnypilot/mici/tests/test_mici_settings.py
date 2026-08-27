@@ -161,8 +161,8 @@ class TestMultiParamValueMapping:
     assert w.value == ALC_LABELS[AutoLaneChangeMode.OFF]
     assert params.get("AutoLaneChangeTimer") == AutoLaneChangeMode.OFF
 
-  def test_torque_tune_unset_is_v0(self, params):
-    """params_keys.h declares 0.0 (v0); controlsd_ext reads it with return_default, so the
+  def test_torque_tune_unset_is_v2(self, params):
+    """params_keys.h declares 2.0 (v2); controlsd_ext reads it with return_default, so the
     selector must agree. If these drift, the UI claims a tune the car isn't running."""
     from openpilot.selfdrive.ui.sunnypilot.mici.layouts.steering import SteeringLayoutMici
     from openpilot.selfdrive.ui.sunnypilot.mici.widgets.button import BigMultiParamToggleSP
@@ -172,7 +172,7 @@ class TestMultiParamValueMapping:
 
     params.remove("TorqueControlTune")
     w = BigMultiParamToggleSP("t", "TorqueControlTune", list(versions), values=list(versions.values()))
-    assert versions[w.value] == pytest.approx(0.0)
+    assert versions[w.value] == pytest.approx(2.0)
 
     for label, version in versions.items():
       params.put("TorqueControlTune", version, block=True)

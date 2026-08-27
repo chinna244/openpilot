@@ -12,7 +12,6 @@ from openpilot.cereal import log
 from opendbc.car.lateral import get_friction
 from openpilot.common.constants import ACCELERATION_DUE_TO_GRAVITY
 from openpilot.common.filter_simple import FirstOrderFilter
-from openpilot.common.params import Params
 from openpilot.common.swaglog import cloudlog
 
 from openpilot.sunnypilot.selfdrive.controls.lib.latcontrol_torque_v0 import (
@@ -73,7 +72,6 @@ class LatControlTorque(LatControlTorqueV0):
     self.low_speed_pid_threshold = max(CP.minSteerSpeed, MIN_LATERAL_CONTROL_SPEED)
     self.prev_steering_pressed = False
     self.prev_setpoint = 0.0
-    self.predictive_turn_in = Params().get_bool("TorqueTuneV2PredictiveTurnIn")
 
     # The extension's override controllers (jerk-aware, NNLC) recompute error/feedforward/
     # friction in torque space and step the shared PID themselves, silently replacing v2's
@@ -131,13 +129,11 @@ class LatControlTorque(LatControlTorqueV0):
       # the filter is a convex combination of clipped inputs, so its output needs no second clip
       desired_lateral_jerk = self.jerk_filter.update(raw_lateral_jerk)
 
-      if self.predictive_turn_in:
-        # first-order lead: delayed request plus one lat_delay of planned jerk. The clip
-        # and low-pass above keep a lagd mis-estimate from over-leading the setpoint.
-        setpoint = expected_lateral_accel + desired_lateral_jerk * lat_delay
-      else:
-        # identical to v0's setpoint algebra (the jerk term cancels back to the request)
-        setpoint = future_desired_lateral_accel
+      # first-order lead: delayed request plus one lat_delay of planned jerk, so turn-in
+      # starts a steering delay early instead of chasing the request. The clip and low-pass
+      # above keep a lagd mis-estimate from over-leading the setpoint. With the plan holding
+      # still the jerk term is zero and this collapses back to v0's setpoint algebra.
+      setpoint = expected_lateral_accel + desired_lateral_jerk * lat_delay
 
       measurement_rate = self.measurement_rate_filter.update((measurement - self.previous_measurement) / self.dt)
       self.previous_measurement = measurement

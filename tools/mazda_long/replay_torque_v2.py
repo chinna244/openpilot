@@ -3,9 +3,8 @@
 enabled, reporting what the v2 mechanisms change on real CX-5 inputs.
 
 Variants:
-  v0             the shipped default (harness sanity: must track the logged outputs)
-  v2             the v2 tune as it ships (predictive turn-in off)
-  v2-predictive  v2 with the TorqueTuneV2PredictiveTurnIn dev flag on
+  v0  the previous tune (harness sanity: must track the logged outputs, which v0 drove)
+  v2  the shipped default
 
 Open-loop caveat: the car in the log was driven by v0, so errors do not converge the way
 they would closed-loop. The comparison is still valid for setpoint/jerk shaping, friction
@@ -31,7 +30,7 @@ from openpilot.common.prefix import OpenpilotPrefix
 from replay_jerk_aware import load_frames  # shared rlog-to-controller-input adapter
 
 
-def make_controller(fingerprint, version: int, predictive: bool = False):
+def make_controller(fingerprint, version: int):
   from opendbc.car.car_helpers import interfaces
   from openpilot.common.params import Params
   from openpilot.common.realtime import DT_CTRL
@@ -46,7 +45,6 @@ def make_controller(fingerprint, version: int, predictive: bool = False):
     params.put_bool(k, True, block=True)
   params.put_bool("LateralJerkTorqueController", False, block=True)
   params.put_bool("NeuralNetworkLateralControl", False, block=True)
-  params.put_bool("TorqueTuneV2PredictiveTurnIn", predictive, block=True)
 
   CarInterface = interfaces[fingerprint]
   CP = CarInterface.get_non_essential_params(fingerprint)
@@ -60,8 +58,8 @@ def make_controller(fingerprint, version: int, predictive: bool = False):
   return controller, VM, CP
 
 
-def run_variant(frames, fingerprint, version: int, predictive: bool = False):
-  controller, VM, CP = make_controller(fingerprint, version, predictive)
+def run_variant(frames, fingerprint, version: int):
+  controller, VM, CP = make_controller(fingerprint, version)
 
   lat_delay = CP.steerActuatorDelay
   last_ltp = None
@@ -135,9 +133,9 @@ def main():
   print(f"{len(frames)} controlsState frames, car: {fingerprint}")
 
   results = {}
-  for name, version, predictive in (('v0', 0, False), ('v2', 2, False), ('v2-predictive', 2, True)):
+  for name, version in (('v0', 0), ('v2', 2)):
     with OpenpilotPrefix():
-      results[name] = run_variant(frames, fingerprint, version, predictive)
+      results[name] = run_variant(frames, fingerprint, version)
     report(name, results[name], base=None if name == 'v0' else results['v0'])
 
   if args.plots:

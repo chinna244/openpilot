@@ -8,8 +8,8 @@ See the LICENSE.md file in the root directory for more details.
 # Behavior tests for the v2 torque tune, run against the real controllers with a toy
 # steering geometry (curvature proportional to steering angle) and a mocked car interface
 # (torque == lat_accel / latAccelFactor). The load-bearing property is the first test:
-# with its mechanisms quiescent (constant speed, friction 0, predictive turn-in off), v2
-# must be frame-for-frame identical to v0 — everything else is a deliberate, tested delta.
+# with its mechanisms quiescent (constant speed, friction 0, a plan that is not changing),
+# v2 must be frame-for-frame identical to v0 — everything else is a deliberate, tested delta.
 
 import math
 from collections import deque
@@ -79,19 +79,23 @@ def params():
 
 
 class TestLatControlTorqueV2:
-  def test_constant_speed_matches_v0(self, params):
-    """At constant speed with friction 0 and predictive turn-in off, the curvature-domain
-    buffer is provably identical to v0's lat-accel buffer and the setpoint algebra collapses
-    to v0's — outputs must match frame for frame."""
+  def test_unchanging_plan_matches_v0(self, params):
+    """At constant speed with friction 0 and a plan that is not changing, the setpoint lead
+    is exactly zero and v2's setpoint algebra collapses to v0's — outputs must match frame
+    for frame while the measurement moves under both."""
     v0, v2 = make_pair()
     v_ego = 15.0
-    # slow sine: setpoint rate stays under the unwind threshold, so v2's integrator
-    # policy is quiescent and the equivalence is exact
+    desired = 2e-3
+    # prime v2's curvature buffer with the constant plan while inactive, so the lead term is
+    # zero from the first engaged frame; a zero measurement leaves both rate filters at rest
+    for _ in range(DELAY_FRAMES + 10):
+      step(v0, make_cs(v_ego), desired, active=False)
+      step(v2, make_cs(v_ego), desired, active=False)
     for i in range(300):
-      desired = 2e-3 * math.sin(i / 80)
-      measured = 1.5e-3 * math.sin((i - 20) / 80)
+      measured = 1.5e-3 * math.sin(i / 80)
       out0, _, log0 = v0.update(True, make_cs(v_ego, measured * v_ego ** 2), VM, LP, False, desired, None, False, LAT_DELAY)
       out2, _, log2 = v2.update(True, make_cs(v_ego, measured * v_ego ** 2), VM, LP, False, desired, None, False, LAT_DELAY)
+      assert log2.desiredLateralAccel == pytest.approx(log0.desiredLateralAccel, abs=1e-6), f"frame {i}"
       assert out2 == pytest.approx(out0, abs=1e-9), f"frame {i}"
     assert log0.version == 0
     assert log2.version == 2
@@ -116,28 +120,24 @@ class TestLatControlTorqueV2:
     assert max(v2_jerks) < 1e-3
     assert max(v0_jerks) > 0.2
 
-  def test_predictive_turn_in_flag(self, params):
-    """Off (default): the setpoint is exactly the live request, v0's algebra. On: the setpoint
-    is the delayed request plus one lat_delay of filtered jerk — different through the
-    transient, converging back to the request in steady state."""
-    plain = make_lac(LatControlTorqueV2)
-    assert not plain.predictive_turn_in
-    params.put_bool("TorqueTuneV2PredictiveTurnIn", True, block=True)
-    predictive = make_lac(LatControlTorqueV2)
-    assert predictive.predictive_turn_in
+  def test_setpoint_leads_the_request_by_the_steering_delay(self, params):
+    """v2 always steers to the delayed request plus one lat_delay of filtered planned jerk,
+    so turn-in starts a steering delay early. v0 steers to the live request; the two differ
+    through the transient and converge back to the request in steady state."""
+    v0, v2 = make_pair()
 
     v_ego = 15.0
     transient_diff = 0.0
     for i in range(400):
       desired = 0.0 if i < 100 else 2e-3  # step turn-in
-      log_plain = step(plain, make_cs(v_ego), desired)
-      log_pred = step(predictive, make_cs(v_ego), desired)
+      log_v0 = step(v0, make_cs(v_ego), desired)
+      log_v2 = step(v2, make_cs(v_ego), desired)
       request = desired * v_ego ** 2
-      assert log_plain.desiredLateralAccel == pytest.approx(request, abs=1e-6)  # float32 log field
+      assert log_v0.desiredLateralAccel == pytest.approx(request, abs=1e-6)  # float32 log field
       if 100 <= i < 120:
-        transient_diff = max(transient_diff, abs(log_pred.desiredLateralAccel - request))
+        transient_diff = max(transient_diff, abs(log_v2.desiredLateralAccel - request))
     assert transient_diff > 0.05  # the lead reshapes the transient
-    assert log_pred.desiredLateralAccel == pytest.approx(2e-3 * v_ego ** 2, abs=1e-3)  # steady state converges
+    assert log_v2.desiredLateralAccel == pytest.approx(2e-3 * v_ego ** 2, abs=1e-3)  # steady state converges
 
   def test_extension_output_overrides_disabled(self, params):
     """v2 owns the friction shaping and integrator policy, so extension controllers that
@@ -182,15 +182,25 @@ class TestLatControlTorqueV2:
     v2 = make_lac(LatControlTorqueV2)
     v_ego = 15.0
     hold = 0.25 / v_ego ** 2  # steady setpoint 0.25 m/s^2, inside the near-zero band
-    for _ in range(50):
-      step(v2, make_cs(v_ego), hold)  # measurement 0 -> error 0.25, integrator winds up
-    i_before = v2.pid.i
-    assert i_before > 0.0
-    step(v2, make_cs(v_ego), hold * 0.8)  # setpoint drops 0.05 in one frame: rate -5 m/s^3
-    assert v2.pid.i == pytest.approx(i_before)  # frozen through the unwind
-    for _ in range(5):
-      step(v2, make_cs(v_ego), hold * 0.8)  # settled again: rate 0, integrating resumes
-    assert v2.pid.i != pytest.approx(i_before)
+    # settle the setpoint lead's jerk filter with the measurement on the request, so the
+    # integrator enters the unwind at a value this test sets rather than a wound-up one
+    for _ in range(300):
+      step(v2, make_cs(v_ego, 0.25), hold)
+    assert v2.prev_setpoint == pytest.approx(0.25)
+    v2.pid.i = 0.05
+
+    # ramp the plan to zero over 4 frames; the measurement stays on the old request, so a
+    # live integrator would keep winding down against the error the unwind opens up
+    i_during = []
+    for k in range(10):
+      step(v2, make_cs(v_ego, 0.25), hold * max(0.0, 1 - 0.25 * k))
+      i_during.append(v2.pid.i)
+    assert i_during[2] != pytest.approx(0.05)  # the pre-freeze frames did integrate
+    assert all(i == pytest.approx(i_during[3]) for i in i_during[3:])  # frozen through the unwind
+
+    for _ in range(8):
+      step(v2, make_cs(v_ego, 0.25), 0.0)  # settled again: rate 0, integrating resumes
+    assert v2.pid.i != pytest.approx(i_during[-1])
 
   def test_integrator_active_at_creep_speeds(self, params):
     """v0 freezes the integrator below 5 m/s; v2 keys the freeze/reset to

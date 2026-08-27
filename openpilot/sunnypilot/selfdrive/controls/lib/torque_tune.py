@@ -27,8 +27,8 @@ def resolved_tune_version(params, torque_lateral_tuning: bool = True) -> float |
   - With EnforceTorqueControl off, torque-tuned cars run v0 regardless of the stored
     TorqueControlTune (FIXME-SP: revert when upstream fixes tuning issues with v1),
     and non-torque cars run the upstream controller.
-  - An unset TorqueControlTune must resolve through the declared param default (0.0):
-    a bare params.get() returns None, which silently selects the newest tune instead.
+  - An unset TorqueControlTune must resolve through the declared param default (2.0):
+    a bare params.get() returns None for an unset param, and float(None) raises.
   """
   if not params.get_bool("EnforceTorqueControl"):
     return 0.0 if torque_lateral_tuning else None
