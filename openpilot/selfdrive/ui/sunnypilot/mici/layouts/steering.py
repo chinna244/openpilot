@@ -106,10 +106,13 @@ class SteeringLayoutMici(NavScroller):
     # blocks lane changes toward a detected road edge — ungated, matching TICI lane_change_settings
     self._lc_road_edge = BigParamControl(tr("road edge block"), "RoadEdgeLaneChangeEnabled")
     self._lc_smooth = BigParamControl(tr("smooth pace"), "LaneChangeSmoothing")
-    self._lc_pace = BigParamOption(tr("pace"), "LaneChangeSmoothingPace",
+    # stored value is the 1-9 pace index; the label shows the sinusoidal profile time it
+    # selects, which is the physically meaningful quantity (higher pace = quicker)
+    self._lc_pace = BigParamOption(tr("duration"), "LaneChangeSmoothingPace",
                                    min_value=PACE_MIN, max_value=PACE_MAX,
-                                   label_callback=lambda v: f"{v} (~{pace_profile_time(v):.0f}s)",
-                                   picker_label_callback=lambda v: f"{v}")
+                                   label_callback=lambda v: f"~{pace_profile_time(v):.1f}s",
+                                   picker_label_callback=lambda v: f"{pace_profile_time(v):.1f}",
+                                   picker_unit=tr("seconds"))
     self._lc_pace.set_enabled(lambda: self._lc_smooth._checked)
     self._lc_view = self._lane_change_btn.link_sub_panel([self._lc_timer, self._lc_bsm, self._lc_road_edge,
                                                           self._lc_smooth, self._lc_pace])
@@ -245,7 +248,7 @@ class SteeringLayoutMici(NavScroller):
       self._lane_change_btn.set_disabled()
     else:
       auto_badge = _alc_label(alc_val) if alc_val > AutoLaneChangeMode.OFF else "off"
-      smooth_badge = f"{read_pace(ui_state.params)}" if lc_smooth_on else "off"
+      smooth_badge = f"~{pace_profile_time(read_pace(ui_state.params)):.1f}s" if lc_smooth_on else "off"
       self._lane_change_btn.set_badges([(tr("auto"), auto_badge), (tr("bsm-delay"), lc_bsm),
                                         (tr("road-edge"), road_edge), (tr("smooth"), smooth_badge)])
 

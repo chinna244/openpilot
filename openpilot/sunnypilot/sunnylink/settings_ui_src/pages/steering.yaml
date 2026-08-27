@@ -282,10 +282,28 @@ sections:
     sub_items:
     - key: LaneChangeSmoothingPace
       widget: option
-      title: Lane Change Pace
-      min: 1
-      max: 9
-      step: 1
+      title: Lane Change Duration
+      # values are the 1-9 pace index; labels show the sinusoidal profile time each
+      # selects (keep in sync with lane_change_smoothing.pace_profile_time)
+      options:
+      - value: 1
+        label: ~8.0 s
+      - value: 2
+        label: ~7.4 s
+      - value: 3
+        label: ~6.9 s
+      - value: 4
+        label: ~6.3 s
+      - value: 5
+        label: ~5.8 s
+      - value: 6
+        label: ~5.2 s
+      - value: 7
+        label: ~4.7 s
+      - value: 8
+        label: ~4.1 s
+      - value: 9
+        label: ~3.6 s
       enablement:
       - type: param
         key: LaneChangeSmoothing

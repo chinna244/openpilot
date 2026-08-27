@@ -59,14 +59,16 @@ class LaneChangeSettingsLayout(Widget):
                              "correction keeps its authority at every pace, so the car settles into the new lane " +
                              "without a wheel snap."),
     )
+    # stored value is the 1-9 pace index; the label shows the sinusoidal profile time it
+    # selects, which is the physically meaningful quantity (higher pace = quicker)
     self._smoothing_pace = option_item_sp(
       param="LaneChangeSmoothingPace",
-      title=lambda: tr("Lane Change Pace"),
+      title=lambda: tr("Lane Change Duration"),
       min_value=PACE_MIN,
       max_value=PACE_MAX,
       value_change_step=1,
       description="",
-      label_callback=lambda pace: f"{pace} (~{pace_profile_time(pace):.0f} {tr('s')})",
+      label_callback=lambda pace: f"~{pace_profile_time(pace):.1f} {tr('s')}",
     )
     self._road_edge_block = toggle_item_sp(
       param="RoadEdgeLaneChangeEnabled",
