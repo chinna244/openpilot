@@ -19,7 +19,7 @@ HEAD_BUTTON_FONT_SIZE = 40
 HOME_PADDING = 8
 ALERTS_ZONE_WIDTH = 180
 STATUS_BAR_SPACING = 18
-CLOCK_FONT_SIZE = 30
+CLOCK_FONT_SIZE = 36
 CLOCK_POLL_S = 1.0
 NITZ_POLL_S = 5.0
 # 3GPP/Quectel NITZ offset is in quarters of an hour.
@@ -169,7 +169,7 @@ class LocalClock(Widget):
 
   def _measure_width(self) -> float:
     try:
-      return float(measure_text_cached(gui_app.font(FontWeight.ROMAN), CLOCK_SAMPLE_TEXT, CLOCK_FONT_SIZE).x)
+      return float(measure_text_cached(gui_app.font(FontWeight.MEDIUM), CLOCK_SAMPLE_TEXT, CLOCK_FONT_SIZE).x)
     except Exception:
       return float(CLOCK_FALLBACK_WIDTH)
 
@@ -230,7 +230,7 @@ class LocalClock(Widget):
     if not self._text:
       return
     gui_label(self._rect, self._text, font_size=CLOCK_FONT_SIZE, color=rl.WHITE,
-              font_weight=FontWeight.ROMAN,
+              font_weight=FontWeight.MEDIUM,
               alignment=rl.GuiTextAlignment.TEXT_ALIGN_LEFT,
               alignment_vertical=rl.GuiTextAlignmentVertical.TEXT_ALIGN_MIDDLE,
               elide_right=False)
