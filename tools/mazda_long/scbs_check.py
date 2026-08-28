@@ -31,6 +31,10 @@ BITS = {
 }
 # the camera blips these while it boots; ignore anything before the trace settles
 SETTLE_T = 8.0
+# 0x440 b7.5 also asserts ALONE for seconds at a time mid-drive and clears again (route 53
+# t+666 for 16 s, route 11d t+47.8 for 3.1 s) -- a camera state, not the fault. The SCBS latch
+# is the whole trio going high together and never clearing, so that is what we test for.
+LATCH_BITS = ("21d.b1.7", "25d.b1.0")
 
 
 def segments(route_dir):
@@ -57,8 +61,8 @@ def scan(route_dir):
           name, get = BITS[c.address]
           v = get(d)
           state[name] = v
-          if v and tr > SETTLE_T and first_set is None:
-            first_set = (tr, name)
+          if tr > SETTLE_T and first_set is None and all(state.get(b) for b in LATCH_BITS):
+            first_set = (tr, "+".join(LATCH_BITS))
         elif c.src == 128 and c.address == 0x21b:
           unl = (d[6] >> 6) & 1
           pulses += int(unl and not prev_unl)
@@ -73,7 +77,7 @@ def main(dirs):
   for route_dir in dirs:
     settle, first_set, pulses = scan(route_dir)
     name = os.path.basename(route_dir.rstrip("/"))
-    started_dirty = any(settle.values())
+    started_dirty = any(settle.get(b) for b in LATCH_BITS)
     print(f"\n{name}")
     print(f"  fault bits after settle: {settle or 'no camera frames'}")
     print(f"  unlatch pulses emitted:  {pulses}")
