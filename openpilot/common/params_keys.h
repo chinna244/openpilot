@@ -70,6 +70,7 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"LastAthenaPingTime", {CLEAR_ON_MANAGER_START, INT}},
     {"LastGPSPosition", {PERSISTENT, STRING}},
     {"LastManagerExitReason", {CLEAR_ON_MANAGER_START, STRING}},
+    {"LastNetworkTimeZoneOffsetQuarters", {PERSISTENT, INT}},
     {"LastOffroadStatusPacket", {CLEAR_ON_MANAGER_START | CLEAR_ON_OFFROAD_TRANSITION, JSON}},
     {"LastAgnosPowerMonitorShutdown", {CLEAR_ON_MANAGER_START, STRING}},
     {"LastPowerDropDetected", {CLEAR_ON_MANAGER_START, STRING}},

@@ -67,21 +67,32 @@ INITIAL_STATE: dict[str, object] = {
   "tx_bytes": 0, "rx_bytes": 0,
   "network_time_utc": "",
   "network_time_monotonic": 0.0,
+  "network_timezone_offset_quarters": None,
+  "network_time_dst": None,
 }
 
 # NITZ is queried from CREG home/roaming, independent of CGREG/PPP.
 NETWORK_TIME_RETRY_INTERVAL = 2.0
 NETWORK_TIME_RETRY_WINDOW = 30.0
 NETWORK_TIME_REFRESH_INTERVAL = 45.0
-NETWORK_TIME_CLEARED = {"network_time_utc": "", "network_time_monotonic": 0.0}
+NETWORK_TIME_CLEARED = {
+  "network_time_utc": "",
+  "network_time_monotonic": 0.0,
+  "network_timezone_offset_quarters": None,
+  "network_time_dst": None,
+}
 
-# AT+QLTS=1: "YYYY/MM/DD,HH:MM:SS±TZ,DST" — the timestamp is already UTC; do not apply ±TZ.
-_QLTS_RE = re.compile(r'^"?(\d+)/(\d+)/(\d+),(\d+):(\d+):(\d+)([+-]\d+),\d+"?$')
+# AT+QLTS=1: "YYYY/MM/DD,HH:MM:SS±TZ,DST" — timestamp is already UTC.
+# ±TZ is the effective local offset in quarters of an hour; do not apply it to UTC,
+# and do not add DST on top of ±TZ.
+_QLTS_RE = re.compile(r'^"?(\d+)/(\d+)/(\d+),(\d+):(\d+):(\d+)([+-]\d+),(\d+)"?$')
+_QLTS_TZ_QUARTERS_MIN = -48
+_QLTS_TZ_QUARTERS_MAX = 56
 
 
-def parse_qlts_utc(value: str | None) -> str | None:
-  """Parse AT+QLTS=1 payload into ISO-8601 UTC. Returns None if missing or invalid."""
-  if not value:
+def parse_qlts(value: str | None) -> tuple[str, int, int] | None:
+  """Parse AT+QLTS=1 into (utc_iso, offset_quarters, dst). None if missing or invalid."""
+  if not isinstance(value, str) or not value:
     return None
   m = _QLTS_RE.match(value.strip())
   if not m:
@@ -91,10 +102,22 @@ def parse_qlts_utc(value: str | None) -> str | None:
   if any(v == 255 for v in (year, month, day, hour, minute, second)):
     return None
   try:
+    offset_quarters = int(m.group(7))
+    dst = int(m.group(8))
     dt = datetime.datetime(year, month, day, hour, minute, second)
   except ValueError:
     return None
-  return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+  if not (_QLTS_TZ_QUARTERS_MIN <= offset_quarters <= _QLTS_TZ_QUARTERS_MAX):
+    return None
+  if dst not in (0, 1, 2):
+    return None
+  return dt.strftime("%Y-%m-%dT%H:%M:%SZ"), offset_quarters, dst
+
+
+def parse_qlts_utc(value: str | None) -> str | None:
+  """Parse AT+QLTS=1 payload into ISO-8601 UTC. Returns None if missing or invalid."""
+  parsed = parse_qlts(value)
+  return None if parsed is None else parsed[0]
 
 
 @contextmanager
@@ -598,13 +621,15 @@ class Modem:
     return NETWORK_TIME_RETRY_INTERVAL
 
   def _poll_network_time(self, registration: str | None = None, now: float | None = None) -> dict:
-    """Read cellular network UTC (NITZ) via AT+QLTS=1. Does not set the system clock."""
+    """Read cellular network UTC and NITZ timezone (AT+QLTS=1). Does not set the system clock."""
     now = time.monotonic() if now is None else now
     reg = self.S.get("registration") if registration is None else registration
     if reg not in ("home", "roaming"):
       self._last_qlts_mono = 0.0
       self._qlts_registered_since = 0.0
-      if self.S.get("network_time_utc") or self.S.get("network_time_monotonic"):
+      if (self.S.get("network_time_utc") or self.S.get("network_time_monotonic") or
+          self.S.get("network_timezone_offset_quarters") is not None or
+          self.S.get("network_time_dst") is not None):
         return dict(NETWORK_TIME_CLEARED)
       return {}
 
@@ -615,10 +640,16 @@ class Modem:
       return {}
 
     self._last_qlts_mono = now
-    parsed = parse_qlts_utc(self._atv("AT+QLTS=1", "+QLTS:"))
+    parsed = parse_qlts(self._atv("AT+QLTS=1", "+QLTS:"))
     if parsed is None:
       return {}
-    return {"network_time_utc": parsed, "network_time_monotonic": now}
+    utc, offset_quarters, dst = parsed
+    return {
+      "network_time_utc": utc,
+      "network_time_monotonic": now,
+      "network_timezone_offset_quarters": offset_quarters,
+      "network_time_dst": dst,
+    }
 
   def _poll_byte_counters(self) -> dict:
     try:
