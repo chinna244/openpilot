@@ -1,0 +1,263 @@
+"""
+Copyright (c) 2021-, Haibin Wen, sunnypilot, and a number of other contributors.
+
+This file is part of sunnypilot and is licensed under the MIT License.
+See the LICENSE.md file in the root directory for more details.
+"""
+
+from openpilot.cereal import log, custom
+
+from opendbc.car import structs
+from opendbc.car.hyundai.values import HyundaiFlags
+from opendbc.car.mazda.values import has_tja_mads
+from openpilot.sunnypilot.mads.helpers import MadsSteeringModeOnBrake, read_steering_mode_param, MADS_NO_ACC_MAIN_BUTTON
+from openpilot.sunnypilot.mads.state import StateMachine, GEARS_ALLOW_PAUSED_SILENT
+
+State = custom.ModularAssistiveDrivingSystem.ModularAssistiveDrivingSystemState
+ButtonType = structs.CarState.ButtonEvent.Type
+EventName = log.OnroadEvent.EventName
+EventNameSP = custom.OnroadEventSP.EventName
+GearShifter = structs.CarState.GearShifter
+SafetyModel = structs.CarParams.SafetyModel
+
+SET_SPEED_BUTTONS = (ButtonType.accelCruise, ButtonType.resumeCruise, ButtonType.decelCruise, ButtonType.setCruise)
+IGNORED_SAFETY_MODES = (SafetyModel.silent, SafetyModel.noOutput, SafetyModel.elm327)
+# Mazda TJA_MADS: allow a brief panda-state delay before counting a lateral mismatch.
+# After this grace, the same 200-frame threshold as other brands raises controlsMismatchLateral.
+MAZDA_LATERAL_AUTH_GRACE = 50
+MAZDA_LATERAL_MISMATCH_LIMIT = 200
+
+
+class ModularAssistiveDrivingSystem:
+  def __init__(self, selfdrive):
+    self.CP = selfdrive.CP
+    self.CP_SP = selfdrive.CP_SP
+    self.params = selfdrive.params
+
+    self.enabled = False
+    self.active = False
+    self.available = False
+    self.lateral_mismatch_counter = 0
+    self.allow_always = False
+    self.no_main_cruise = False
+    self.selfdrive = selfdrive
+    self.selfdrive.enabled_prev = False
+    self.state_machine = StateMachine(self)
+    self.events = self.selfdrive.events
+    self.events_sp = self.selfdrive.events_sp
+    self.disengage_on_accelerator = self.params.get_bool("DisengageOnAccelerator")
+    if self.CP.brand == "hyundai":
+      if self.CP.flags & (HyundaiFlags.HAS_LDA_BUTTON | HyundaiFlags.CANFD):
+        self.allow_always = True
+    if self.CP.brand == "tesla":
+      self.allow_always = True
+    self.tja_mads = has_tja_mads(self.CP)
+    if self.tja_mads:
+      # Physical TJA (ButtonType.lkas) is the only MADS toggle. MRCC is OEM-only
+      # and must not enable/disable MADS via cruiseState.available.
+      self.allow_always = True
+      self.no_main_cruise = True
+
+    if self.CP.brand in MADS_NO_ACC_MAIN_BUTTON:
+      self.no_main_cruise = True
+
+    # read params on init
+    self.enabled_toggle = self.params.get_bool("Mads")
+    self.main_enabled_toggle = self.params.get_bool("MadsMainCruiseAllowed")
+    self.steering_mode_on_brake = read_steering_mode_param(self.CP, self.CP_SP, self.params)
+    self.unified_engagement_mode = self.params.get_bool("MadsUnifiedEngagementMode")
+    if self.tja_mads:
+      # Physical TJA is the only MADS master. UEM would let pcmEnable/SET engage MADS.
+      self.main_enabled_toggle = False
+      self.unified_engagement_mode = False
+
+  def read_params(self):
+    self.main_enabled_toggle = self.params.get_bool("MadsMainCruiseAllowed")
+    self.unified_engagement_mode = self.params.get_bool("MadsUnifiedEngagementMode")
+    if self.tja_mads:
+      self.main_enabled_toggle = False
+      self.unified_engagement_mode = False
+
+  def pedal_pressed_non_gas_pressed(self, CS: structs.CarState) -> bool:
+    # ignore `pedalPressed` events caused by gas presses
+    if self.events.has(EventName.pedalPressed) and not (CS.gasPressed and not self.selfdrive.CS_prev.gasPressed and self.disengage_on_accelerator):
+      return True
+
+    return False
+
+  def should_silent_lkas_enable(self, CS: structs.CarState) -> bool:
+    if self.steering_mode_on_brake == MadsSteeringModeOnBrake.PAUSE and (CS.brakePressed or CS.regenBraking or self.pedal_pressed_non_gas_pressed(CS)):
+      return False
+
+    if self.events_sp.contains_in_list(GEARS_ALLOW_PAUSED_SILENT):
+      return False
+
+    return True
+
+  def block_unified_engagement_mode(self) -> bool:
+    # UEM disabled
+    if not self.unified_engagement_mode:
+      return True
+
+    if self.enabled:
+      return True
+
+    if self.selfdrive.enabled and self.selfdrive.enabled_prev:
+      return True
+
+    return False
+
+  def get_wrong_car_mode(self, alert_only: bool) -> None:
+    if alert_only:
+      if self.events.has(EventName.wrongCarMode):
+        self.replace_event(EventName.wrongCarMode, EventNameSP.wrongCarModeAlertOnly)
+    else:
+      self.events.remove(EventName.wrongCarMode)
+
+  def transition_paused_state(self):
+    if self.state_machine.state != State.paused:
+      self.events_sp.add(EventNameSP.silentLkasDisable)
+
+  def replace_event(self, old_event: int, new_event: int):
+    self.events.remove(old_event)
+    self.events_sp.add(new_event)
+
+  def data_sample(self):
+    # Panda lateral authorization can lag selfdrived by a few frames. Require sustained
+    # mismatch before raising controlsMismatchLateral (200 frames; Mazda TJA_MADS adds grace).
+    if not self.active or self.selfdrive.enabled:
+      self.lateral_mismatch_counter = 0
+      return
+
+    # Stale/invalid pandaStates retain the last list; treat that as mismatch instead of
+    # trusting a cached controlsAllowedLateral=True sample.
+    sm = self.selfdrive.sm
+    if not sm.all_checks(['pandaStates']):
+      self.lateral_mismatch_counter += 1
+      return
+
+    # Empty or all-ignored Panda lists must count as mismatch, not leave the counter unchanged.
+    relevant = [ps for ps in sm['pandaStates']
+                if ps.safetyModel not in IGNORED_SAFETY_MODES]
+    mismatch = (not relevant) or any(not ps.controlsAllowedLateral for ps in relevant)
+    if mismatch:
+      self.lateral_mismatch_counter += 1
+    else:
+      self.lateral_mismatch_counter = 0
+
+  def update_events(self, CS: structs.CarState):
+    if not self.selfdrive.enabled and self.enabled:
+      if CS.standstill:
+        if self.events.has(EventName.doorOpen):
+          self.replace_event(EventName.doorOpen, EventNameSP.silentDoorOpen)
+          self.transition_paused_state()
+        if self.events.has(EventName.seatbeltNotLatched):
+          self.replace_event(EventName.seatbeltNotLatched, EventNameSP.silentSeatbeltNotLatched)
+          self.transition_paused_state()
+      if self.events.has(EventName.wrongGear) and (CS.vEgo < 2.5 or CS.gearShifter == GearShifter.reverse):
+        self.replace_event(EventName.wrongGear, EventNameSP.silentWrongGear)
+        self.transition_paused_state()
+      if self.events.has(EventName.reverseGear):
+        self.replace_event(EventName.reverseGear, EventNameSP.silentReverseGear)
+        self.transition_paused_state()
+      if self.events.has(EventName.brakeHold):
+        self.replace_event(EventName.brakeHold, EventNameSP.silentBrakeHold)
+        self.transition_paused_state()
+      if self.events.has(EventName.parkBrake):
+        self.replace_event(EventName.parkBrake, EventNameSP.silentParkBrake)
+        self.transition_paused_state()
+
+      if self.steering_mode_on_brake == MadsSteeringModeOnBrake.PAUSE:
+        if self.pedal_pressed_non_gas_pressed(CS):
+          self.transition_paused_state()
+
+      self.events.remove(EventName.preEnableStandstill)
+      self.events.remove(EventName.belowEngageSpeed)
+      self.events.remove(EventName.speedTooLow)
+      self.events.remove(EventName.cruiseDisabled)
+      self.events.remove(EventName.manualRestart)
+      self.events.remove(EventName.espActive)
+
+    selfdrive_enable_events = self.events.has(EventName.pcmEnable) or self.events.has(EventName.buttonEnable)
+    set_speed_btns_enable = any(be.type in SET_SPEED_BUTTONS for be in CS.buttonEvents)
+
+    # TJA_MADS filters the stock longitudinal transition events below so MRCC
+    # cannot toggle MADS. Preserve only their C4 chimes by mirroring the already
+    # computed selfdrive state transition as a presentation-only SP event.
+    if self.tja_mads:
+      if self.selfdrive.enabled and not self.selfdrive.enabled_prev:
+        self.events_sp.add(EventNameSP.longitudinalEnableChime)
+      elif not self.selfdrive.enabled and self.selfdrive.enabled_prev:
+        self.events_sp.add(EventNameSP.longitudinalDisableChime)
+
+    # wrongCarMode alert only or actively block control
+    self.get_wrong_car_mode(selfdrive_enable_events or set_speed_btns_enable)
+
+    if selfdrive_enable_events:
+      if self.pedal_pressed_non_gas_pressed(CS):
+        self.events_sp.add(EventNameSP.pedalPressedAlertOnly)
+
+      if self.block_unified_engagement_mode():
+        self.events.remove(EventName.pcmEnable)
+        self.events.remove(EventName.buttonEnable)
+    else:
+      if self.main_enabled_toggle:
+        if CS.cruiseState.available and not self.selfdrive.CS_prev.cruiseState.available:
+          self.events_sp.add(EventNameSP.lkasEnable)
+
+    for be in CS.buttonEvents:
+      if be.type == ButtonType.cancel:
+        if not self.selfdrive.enabled and self.selfdrive.enabled_prev:
+          self.events_sp.add(EventNameSP.manualLongitudinalRequired)
+      if be.type == ButtonType.lkas and be.pressed and (CS.cruiseState.available or self.allow_always):
+        if self.enabled:
+          if self.selfdrive.enabled:
+            self.events_sp.add(EventNameSP.manualSteeringRequired)
+          else:
+            self.events_sp.add(EventNameSP.lkasDisable)
+        else:
+          self.events_sp.add(EventNameSP.lkasEnable)
+
+    if not CS.cruiseState.available and not self.no_main_cruise:
+      self.events.remove(EventName.buttonEnable)
+      if self.selfdrive.CS_prev.cruiseState.available:
+        self.events_sp.add(EventNameSP.lkasDisable)
+
+    if self.steering_mode_on_brake == MadsSteeringModeOnBrake.DISENGAGE:
+      if self.pedal_pressed_non_gas_pressed(CS):
+        if self.enabled:
+          self.events_sp.add(EventNameSP.lkasDisable)
+        else:
+          # block lkasEnable if being sent, then send pedalPressedAlertOnly event
+          if self.events_sp.contains(EventNameSP.lkasEnable):
+            self.events_sp.remove(EventNameSP.lkasEnable)
+            self.events_sp.add(EventNameSP.pedalPressedAlertOnly)
+
+    if self.should_silent_lkas_enable(CS):
+      if self.state_machine.state == State.paused:
+        self.events_sp.add(EventNameSP.silentLkasEnable)
+
+    mismatch_limit = MAZDA_LATERAL_MISMATCH_LIMIT
+    if self.tja_mads:
+      mismatch_limit += MAZDA_LATERAL_AUTH_GRACE
+    if self.lateral_mismatch_counter >= mismatch_limit:
+      self.events_sp.add(EventNameSP.controlsMismatchLateral)
+
+    self.events.remove(EventName.pcmDisable)
+    self.events.remove(EventName.buttonCancel)
+    self.events.remove(EventName.pedalPressed)
+    self.events.remove(EventName.wrongCruiseMode)
+
+  def update(self, CS: structs.CarState):
+    if not self.enabled_toggle:
+      return
+
+    self.data_sample()
+
+    self.update_events(CS)
+
+    if not self.CP.passive and self.selfdrive.initialized:
+      self.enabled, self.active = self.state_machine.update()
+
+    # Copy of previous SelfdriveD states for MADS events handling
+    self.selfdrive.enabled_prev = self.selfdrive.enabled
