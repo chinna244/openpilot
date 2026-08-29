@@ -201,3 +201,38 @@ class TestSmartCruiseControlVision(OpenpilotTestCase):
     # the dash cannot track a profile; it gets sent to the dip itself
     v_dip = (2.0 * 0.95 / 0.012) ** 0.5
     assert abs(stock.output_v_target - v_dip) < 1.0
+
+
+class TestLookaheadWire(OpenpilotTestCase):
+  """v_ahead_min feeds the ICBM restore gate: 0 must mean exactly "no lookahead"."""
+
+  def setup_method(self):
+    self.params = Params()
+    self.params.put_bool("SmartCruiseControlVision", True, block=True)
+    self.scc_v = SmartCruiseControlVision(make_cp())
+
+  def step(self, v=V_EGO, kappa_fn=lambda s: 0., long_enabled=True):
+    sm = {'modelV2': model_for_road(v, kappa_fn).modelV2,
+          'controlsState': messaging.new_message('controlsState').controlsState}
+    self.scc_v.update(sm, long_enabled, False, v, 0., SETPOINT)
+
+  def test_clear_road_caps_at_unset(self):
+    self.step()
+    assert self.scc_v.v_ahead_min == 255.
+
+  def test_dip_passes_through(self):
+    self.step(kappa_fn=curve_at(60.))
+    assert 0. < self.scc_v.v_ahead_min < SETPOINT
+
+  def test_long_disabled_reports_no_lookahead(self):
+    self.step(kappa_fn=curve_at(60.))
+    self.step(long_enabled=False)
+    assert self.scc_v.v_ahead_min == 0.
+
+  def test_toggle_off_reports_no_lookahead(self):
+    self.params.put_bool("SmartCruiseControlVision", False, block=True)
+    scc = SmartCruiseControlVision(make_cp())
+    sm = {'modelV2': model_for_road(V_EGO, curve_at(60.)).modelV2,
+          'controlsState': messaging.new_message('controlsState').controlsState}
+    scc.update(sm, True, False, V_EGO, 0., SETPOINT)
+    assert scc.v_ahead_min == 0.

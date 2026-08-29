@@ -114,6 +114,7 @@ class LongitudinalPlannerSP:
     sccVision.maxPredictedLateralAccel = float(self.scc.vision.max_pred_lat_acc)
     sccVision.enabled = self.scc.vision.is_enabled
     sccVision.active = self.scc.vision.is_active
+    sccVision.vAheadMin = float(self.scc.vision.v_ahead_min)
     # Map Control
     sccMap = smartCruiseControl.map
     sccMap.state = self.scc.map.state

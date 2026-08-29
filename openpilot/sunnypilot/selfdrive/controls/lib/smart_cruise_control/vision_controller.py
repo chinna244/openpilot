@@ -71,6 +71,7 @@ class SmartCruiseControlVision:
     self.a_ego = 0.
 
     # solver
+    self.solver_valid = False
     self.solver_active = False
     self.a_required = 0.
     self.v_profile_now = float('inf')
@@ -85,6 +86,7 @@ class SmartCruiseControlVision:
     self.max_pred_lat_acc = 0.
 
   def _reset_solver(self) -> None:
+    self.solver_valid = False
     self.solver_active = False
     self.a_required = 0.
     self.v_profile_now = float('inf')
@@ -145,6 +147,7 @@ class SmartCruiseControlVision:
     in_curve = np.isfinite(self.v_near_min) and self.v_near_min < self.v_cruise_setpoint
     hold = self.a_required >= _RELEASE_FRAC * lim.a_budget or in_curve
     self.solver_active = commit or (self.solver_active and hold)
+    self.solver_valid = True
 
   def _update_state_machine(self) -> tuple[bool, bool]:
     # ENABLED, ENTERING, TURNING, LEAVING, OVERRIDING
@@ -204,6 +207,17 @@ class SmartCruiseControlVision:
   @property
   def _controlling(self) -> bool:
     return self.is_active and self.solver_active
+
+  @property
+  def v_ahead_min(self) -> float:
+    """Lowest planned speed on the horizon for the ICBM restore gate, m/s.
+
+    0 means no lookahead (feature off or no fresh profile) and the servo falls back to
+    its stillness heuristic; a clear road caps at 255 (V_CRUISE_UNSET convention).
+    """
+    if not (self.enabled and self.solver_valid):
+      return 0.
+    return float(min(self.v_dip_ahead, 255.))
 
   def get_a_target_from_control(self) -> float:
     if not self._controlling:
