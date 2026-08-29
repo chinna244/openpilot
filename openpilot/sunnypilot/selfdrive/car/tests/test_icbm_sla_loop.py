@@ -152,6 +152,12 @@ class Loop:
     self.tick_n = 0
     self.limit_mph = 0.
     self.scc_dip_mph = 0.  # SCC-vision target when active, 0 = inactive
+    # vEgo defaults to the set speed (enough for the button-timing scenarios). Override it,
+    # plus a_target, to exercise decel overshoot: the servo only builds the gap when the
+    # plan is asking for real decel AND the car is above the plan target.
+    self.v_ego_mph = None
+    self.a_target = 0.
+    self.decel_overshoot = False
     self.driver_queue = {}  # tick -> (ButtonType, hold_ticks)
     self._driver_active = None  # (button, remaining_ticks)
     self.sla_events = []  # (tick, event int) emitted by SLA, across the whole run
@@ -168,7 +174,8 @@ class Loop:
     CS = car.CarState(cruiseState={"available": True,
                                    "speed": self.ecu.dash * MPH_MS,
                                    "speedCluster": self.ecu.dash * MPH_MS})
-    CS.vEgo = float(self.helper.v_cruise_kph * CV.KPH_TO_MS)  # cruising at set speed; enough for these scenarios
+    v_ego_mph = self.v_ego_mph if self.v_ego_mph is not None else self.helper.v_cruise_kph / MPH_KPH
+    CS.vEgo = float(v_ego_mph * MPH_MS)
     CS.buttonEvents = button_events or []
     return CS
 
@@ -183,6 +190,7 @@ class Loop:
     source = min(targets, key=lambda k: targets[k])
     LP_SP.longitudinalPlanSource = source
     LP_SP.vTarget = float(targets[source])
+    LP_SP.aTarget = float(self.a_target)
     LP_SP.speedLimit.assist.state = self.mirror.state
     LP_SP.speedLimit.resolver.speedLimit = self.limit_mph * MPH_MS
     LP_SP.speedLimit.resolver.speedLimitFinalLast = self.limit_mph * MPH_MS
@@ -248,7 +256,8 @@ class Loop:
       # message hop old (carStateSP published at the end of the previous card frame)
       session_state_stale = self.helper.cruise_arbiter.state
       CC = car.CarControl(enabled=True)
-      self.servo.run(CS, CC, lp_msg, is_metric=False, session_state=session_state_stale)
+      self.servo.run(CS, CC, lp_msg, is_metric=False, decel_overshoot_enabled=self.decel_overshoot,
+                     session_state=session_state_stale)
 
       # card: arbiter (classification + session) runs inside update_v_cruise,
       # synchronous with the buttons
@@ -658,3 +667,64 @@ class TestDriverInteractions:
     loop.run(14.0)
     assert loop.ecu.dash == 60, f"restore stopped short: {loop.ecu.dash}"
     assert loop.v_cruise_mph == 60
+
+
+class TestPromptFreezeOvershoot:
+  """User report 2026-08-29 (routes ...acdc83b60f/3 and ...821e28d2fa/12): engaging near a
+  known limit dropped the set speed 2-4 mph roughly 5 s later, then walked it back.
+
+  The prompt's own freeze produced it. Capping the plan at the cluster round-tripped
+  through whole mph and landed ~7 mm/s under v_cruise, so SLA won the plan min() by
+  rounding error and relabelled the source as a limiter. That armed decel overshoot
+  against an ordinary cruise convergence, the servo's freeze banked the resulting gap
+  for the whole 5 s window, and the timeout dumped it as a SET- burst."""
+
+  def test_ignored_prompt_never_moves_the_dash(self):
+    """The reported drive: engaged at 40 with a 45 target, car 1.3 mph over the setpoint,
+    prompt left unanswered. Nothing may move -- during the prompt or after it times out."""
+    loop = Loop(baseline_mph=40, seed=31)
+    loop.decel_overshoot = True
+    loop.v_ego_mph = 41.3
+    loop.a_target = -0.5  # the plan converging on the setpoint the car is sitting above
+    loop.limit_mph = 45
+    loop.run(1.0)
+    assert loop.sla.state == SlaState.preActive
+
+    def never_moves(lo):
+      assert lo.ecu.dash == 40, f"dash moved at tick {lo.tick_n}: {lo.ecu.dash}"
+      assert lo.servo.overshoot_mph == 0., f"overshoot banked behind the freeze: {lo.servo.overshoot_mph}"
+
+    loop.run(10.0, assert_each=never_moves)  # 5 s prompt + timeout + the restore window
+    assert loop.sla.state == SlaState.inactive
+    assert loop.v_cruise_mph == 40
+
+  def test_prompt_does_not_relabel_the_plan_source(self):
+    """Layer 1 in isolation: prompting from idle must leave the plan on `cruise`. A cap
+    equal to the baseline changes no speed but does change the source, and the source is
+    what arms the overshoot."""
+    loop = Loop(baseline_mph=40, seed=32)
+    loop.v_ego_mph = 41.3
+    loop.limit_mph = 45
+    loop.run(1.0)
+    assert loop.sla.state == SlaState.preActive
+
+    def stays_cruise(lo):
+      if lo.sla.prompting:
+        assert lo._lp_sp().longitudinalPlanSource == PlanSource.cruise, "prompt relabelled the plan source"
+
+    loop.run(4.0, assert_each=stays_cruise)
+
+  def test_session_hold_still_freezes_an_active_session(self):
+    """Layer 1 must not cost the freeze its real job: prompting OUT OF an active session
+    still holds that session's cap, so the dash cannot restore un-confirmed."""
+    loop = Loop(baseline_mph=48, seed=33)
+    loop.limit_mph = 40
+    loop.run(2.0)
+    loop.driver_press(ButtonType.decelCruise, in_seconds=0.1)
+    loop.run(11.0)
+    assert loop.ecu.dash == 40
+
+    loop.limit_mph = 45  # a limit change out of an active session re-prompts
+    loop.run(0.5)
+    assert loop.sla.state == SlaState.preActive
+    assert loop.sla.v_cap < 45 * MPH_MS, f"active-session hold released: {loop.sla.v_cap}"

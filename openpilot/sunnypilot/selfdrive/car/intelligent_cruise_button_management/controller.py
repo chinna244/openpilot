@@ -124,7 +124,12 @@ class IntelligentCruiseButtonManagement:
 
     p = self.overshoot_params
     want = 0.0
-    if (self.decel_overshoot_enabled and self.is_ready
+    # Never integrate a command the servo cannot emit: is_ready covers a driver press,
+    # prompt_frozen a pending confirm. Both block emission, so winding up behind them
+    # only banks a stale gap to dump the moment the block lifts. Nothing is lost by
+    # waiting -- a limiter still asking for decel rebuilds at DECEL_OVERSHOOT_RISE, ~0.5 s
+    # to a full gap, well inside the REACT_TIMER the servo owes before it acts anyway.
+    if (self.decel_overshoot_enabled and self.is_ready and not self.prompt_frozen
         and LP_SP.longitudinalPlanSource in DECEL_OVERSHOOT_SOURCES
         and LP_SP.aTarget < -p['min_decel'] and CS.vEgo > LP_SP.vTarget):
       want = min(float(np.interp(-LP_SP.aTarget, p['decel_bp'], p['gap_v'])), p['max_gap'])
@@ -226,13 +231,22 @@ class IntelligentCruiseButtonManagement:
                       or not self.profile.decel_needs_stable_setpoint
                       or self.restore_quiet_timer >= RESTORE_QUIET_FRAMES)
 
+        # Down-moves skip the quiet window because a limiter's decel is urgent; that is
+        # only true while the limiter is live. The overshoot is a lever, not a
+        # destination, so a residual gap left over after a source flip back to cruise
+        # must not start a fresh descent (mirror of up_allowed's residual carve-out).
+        # Without overshoot in play a down-move is a plain setpoint correction (a dash
+        # residual from a dropped press) and stays unconditional.
+        down_allowed = self.limiter_active or self.overshoot_mph <= 0
+
         # PRE_ACTIVE
         if self.state == State.preActive:
           if self.pre_active_timer <= 0:
             if self.v_target - self.v_cruise_cluster >= self.react_deadband and up_allowed:
               self.state = State.increasing
 
-            elif self.v_cruise_cluster - self.v_target >= self.react_deadband and self.v_cruise_cluster > self.v_cruise_min:
+            elif self.v_cruise_cluster - self.v_target >= self.react_deadband \
+                 and self.v_cruise_cluster > self.v_cruise_min and down_allowed:
               self.state = State.decreasing
 
             else:
@@ -240,7 +254,7 @@ class IntelligentCruiseButtonManagement:
 
         # HOLDING
         elif self.state == State.holding and not self.prompt_frozen:
-          down_pending = self.v_cruise_cluster - self.v_target >= self.react_deadband
+          down_pending = self.v_cruise_cluster - self.v_target >= self.react_deadband and down_allowed
           up_pending = self.v_target - self.v_cruise_cluster >= self.react_deadband
           if down_pending or (up_pending and up_allowed):
             self.pre_active_timer = int(REACT_TIMER / DT_CTRL)
