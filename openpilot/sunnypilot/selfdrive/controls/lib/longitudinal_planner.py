@@ -69,7 +69,7 @@ class LongitudinalPlannerSP:
       self.sla.update(long_enabled, long_override, v_ego, a_ego, v_cruise_cluster, self.resolver.speed_limit,
                       self.resolver.speed_limit_final_last, has_speed_limit, self.resolver.distance, self.events_sp)
     else:
-      self.sla.update(sm['carStateSP'].cruiseSession, a_ego, self.events_sp)
+      self.sla.update(sm['carStateSP'].cruiseSession, v_ego, self.resolver.distance, a_ego, self.events_sp)
 
     targets = {
       LongitudinalPlanSource.cruise: (v_cruise, a_ego),

@@ -16,6 +16,11 @@ ACTIVE_STATES = (MapState.turning, )
 ENABLED_STATES = (MapState.enabled, MapState.overriding, *ACTIVE_STATES)
 
 R = 6373000.0  # approximate radius of earth in meters
+
+# Publication shaping shared by the limiter sources (see docs/curve-and-limit-planning.md)
+_A_PUB_MIN = -2.0  # m/s2
+_PUB_JERK = 2.0  # m/s3
+_T_FALLBACK = 2.8  # s; decel horizon when the target's distance is degenerate
 TO_RADIANS = math.pi / 180
 TO_DEGREES = 180 / math.pi
 TARGET_JERK = -0.6  # m/s^3 There's some jounce limits that are not consistent so we're fudging this some
@@ -82,6 +87,8 @@ class SmartCruiseControlMap:
     self.v_cruise = 0
     self.target_lat = 0.0
     self.target_lon = 0.0
+    self.target_distance = 0.0
+    self._a_out = 0.
     self.frame = -1
 
     self.last_position = coordinate_from_param("LastGPSPosition", self.mem_params) or Coordinate(0.0, 0.0)
@@ -94,7 +101,17 @@ class SmartCruiseControlMap:
     return V_CRUISE_UNSET
 
   def get_a_target_from_control(self) -> float:
-    return self.a_ego
+    # The decel actually required to arrive at the target: this keys ICBM's overshoot gap
+    # on stock ACC, so a_ego here meant map curves never braked the real car. Ramped: the
+    # plan aTarget seeds mpc.set_cur_state, which is not jerk-limited.
+    if self.is_active and 0. < self.v_target < self.v_ego:
+      d_eff = max(self.target_distance, self.v_ego * _T_FALLBACK)
+      a_des = max((self.v_target ** 2 - self.v_ego ** 2) / (2. * d_eff), _A_PUB_MIN)
+      step = _PUB_JERK * DT_MDL
+      self._a_out = min(max(a_des, self._a_out - step), self._a_out + step)
+    else:
+      self._a_out = self.a_ego
+    return self._a_out
 
   def update_params(self):
     if self.frame % int(PARAMS_UPDATE_PERIOD / DT_MDL) == 0:
@@ -170,17 +187,19 @@ class SmartCruiseControlMap:
         max_d += calculate_distance(t, 0, TARGET_ACCEL, min_accel_v)
 
       if d < max_d + tv * TARGET_OFFSET:
-        valid_velocities.append((float(tv), tlat, tlon))
+        valid_velocities.append((float(tv), tlat, tlon, d))
 
     # Find the smallest velocity we need to adjust for
     min_v = 100.0
     target_lat = 0.0
     target_lon = 0.0
-    for tv, lat, lon in valid_velocities:
+    target_dist = 0.0
+    for tv, lat, lon, d in valid_velocities:
       if tv < min_v:
         min_v = tv
         target_lat = lat
         target_lon = lon
+        target_dist = d
 
     if self.v_target < min_v and not (self.target_lat == 0 and self.target_lon == 0):
       for i in range(len(forward_points)):
@@ -198,10 +217,12 @@ class SmartCruiseControlMap:
       self.v_target = 0.0
       self.target_lat = 0.0
       self.target_lon = 0.0
+      self.target_distance = 0.0
 
     self.v_target = min_v
     self.target_lat = target_lat
     self.target_lon = target_lon
+    self.target_distance = target_dist
 
   def _update_state_machine(self) -> tuple[bool, bool]:
     # ENABLED, TURNING

@@ -8,6 +8,8 @@ import json
 import math
 import platform
 
+import pytest
+
 
 from openpilot.cereal import custom
 from openpilot.common.params import Params
@@ -73,3 +75,25 @@ class TestSmartCruiseControlMap(OpenpilotTestCase):
     self.assertAlmostEqual(self.scc_m.v_target, 24.0, delta=24.0 * 1e-6)
 
   # TODO-SP: mock data from modelV2 to test other states
+
+  def test_active_target_publishes_required_decel(self):
+    lat0, lon0 = 32.0, -117.0
+    dlat = 200.0 / 111194.9  # ~200 m north
+    self.mem_params.put("LastGPSPosition", json.dumps({"latitude": lat0, "longitude": lon0}), block=True)
+    self.mem_params.put("MapTargetVelocities", json.dumps([
+      {"latitude": lat0, "longitude": lon0, "velocity": 30.0},
+      {"latitude": lat0 + dlat, "longitude": lon0, "velocity": 15.0},
+    ]), block=True)
+
+    v_ego = 25.
+    for _ in range(3):
+      self.scc_m.update(True, False, v_ego, 0., 25.)
+    assert self.scc_m.state == MapState.turning
+    assert self.scc_m.output_v_target == pytest.approx(15.)
+    assert 150. < self.scc_m.target_distance < 250.
+
+    # required decel to the target, reached through the publication ramp
+    expected = (15. ** 2 - v_ego ** 2) / (2. * self.scc_m.target_distance)
+    for _ in range(40):
+      self.scc_m.update(True, False, v_ego, 0., 25.)
+    assert self.scc_m.output_a_target == pytest.approx(expected, abs=1e-3)
