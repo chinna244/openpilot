@@ -23,9 +23,11 @@ from openpilot.cereal import custom
 from openpilot.common.params import Params
 from openpilot.common.prefix import OpenpilotPrefix
 from openpilot.sunnypilot.selfdrive.controls.lib.latcontrol_torque_v0 import LatControlTorque as LatControlTorqueV0
+from openpilot.selfdrive.modeld.constants import ModelConstants
 from openpilot.sunnypilot.selfdrive.controls.lib.latcontrol_torque_v2 import (
   LatControlTorque as LatControlTorqueV2,
   get_center_chatter_jerk_deadzone,
+  MODEL_STALE_FRAMES,
 )
 
 DT = 0.01
@@ -371,3 +373,153 @@ class TestRailAwareSaturation:
     lac = make_lac(LatControlTorqueV2)
     log = self._run(lac, lat_accel_demand=6.0, sls=False, frames=self.SAT_FRAMES)
     assert log.saturated
+
+
+def make_plan_model(frame_id, curvature, v_plan=15.0):
+  """Fake modelV2 carrying a curvature plan over T_IDXS (constant, or a callable of plan
+  time). orientationRate.z = curvature * velocity, matching the on-wire convention."""
+  ks = [curvature(t) if callable(curvature) else curvature for t in ModelConstants.T_IDXS]
+  return SimpleNamespace(
+    frameId=frame_id,
+    orientation=SimpleNamespace(x=[0.0] * 33),
+    orientationRate=SimpleNamespace(z=[k * v_plan for k in ks]),
+    velocity=SimpleNamespace(x=[float(v_plan)] * 33),
+  )
+
+
+class TestPlanJerkSource:
+  """The setpoint jerk comes from the model trajectory secant while the plan is coherent,
+  and falls back to the request differencer (shipped v2 behavior) when it is not: no model,
+  stale model, short arrays, curvature_limited, steeringPressed, or request/plan divergence.
+  Every test above this class runs with no model attached and pins the fallback path."""
+
+  def test_coherent_flat_plan_matches_v0(self, params):
+    """A flat plan matching a flat request is the quiescent case on the plan path (w=1,
+    plan jerk 0): v2 must still be frame-for-frame identical to v0."""
+    v0, v2 = make_pair()
+    v_ego, k = 15.0, 2e-3
+    for i in range(DELAY_FRAMES + 10):
+      step(v0, make_cs(v_ego), k, active=False)
+      v2.extension.update_model_v2(make_plan_model(i // 5, k, v_plan=v_ego))
+      step(v2, make_cs(v_ego), k, active=False)
+    for i in range(300):
+      measured = 1.5e-3 * math.sin(i / 80)
+      if i % 5 == 0:
+        v2.extension.update_model_v2(make_plan_model(1000 + i, k, v_plan=v_ego))
+      out0, _, log0 = v0.update(True, make_cs(v_ego, measured * v_ego ** 2), VM, LP, False, k, None, False, LAT_DELAY)
+      out2, _, log2 = v2.update(True, make_cs(v_ego, measured * v_ego ** 2), VM, LP, False, k, None, False, LAT_DELAY)
+      assert out2 == pytest.approx(out0, abs=1e-9), f"frame {i}"
+    assert v2.plan_jerk_weight == 1.0
+
+  @pytest.mark.parametrize("turn_sign", [1.0, -1.0])
+  def test_secant_equals_differencer_on_coherent_ramp(self, params, turn_sign):
+    """The secant identity: with the request being the plan sampled at PLAN_REQUEST_T, the
+    plan secant over [T - lat_delay, T] reproduces the differencer exactly for any plan
+    shape — entry lead included. Both turn directions pin the sign convention."""
+    v_ego = 15.0
+    slope = turn_sign * 1.0 / v_ego ** 2  # 1 m/s^3 of lat accel per curvature-time second
+    plan_request_t = max(LAT_DELAY + 0.075, 0.3)
+    def world_k(tau):
+      return slope * tau  # linear everywhere: T_IDXS interp is then exact
+    lac_plan = make_lac(LatControlTorqueV2)
+    lac_diff = make_lac(LatControlTorqueV2)
+    for i in range(DELAY_FRAMES + 400):
+      tau = i * DT
+      request = world_k(tau + plan_request_t)
+      lac_plan.extension.update_model_v2(make_plan_model(i, lambda t, tau=tau: world_k(tau + t), v_plan=v_ego))
+      active = i >= DELAY_FRAMES
+      log_p = step(lac_plan, make_cs(v_ego), request, active=active)
+      log_d = step(lac_diff, make_cs(v_ego), request, active=active)
+      if active:
+        assert log_p.desiredLateralJerk == pytest.approx(log_d.desiredLateralJerk, abs=1e-6), f"frame {i}"
+        assert log_p.desiredLateralAccel == pytest.approx(log_d.desiredLateralAccel, abs=1e-6), f"frame {i}"
+        if turn_sign > 0 and world_k(tau) > 0:
+          assert log_p.desiredLateralAccel > 0  # sign convention: setpoint follows the turn
+    assert lac_plan.plan_jerk_weight == 1.0
+
+  def test_handback_revision_does_not_snap(self, params):
+    """The point of the plan path: at override release the request stream carries a plan
+    revision (old dragged plan vs new re-centered plan), which the differencer reads as
+    jerk and leads into — the hand-back snap. The plan secant never sees the revision, so
+    the setpoint drains to the new request without overshooting past it."""
+    v_ego = 15.0
+    k_hold = 1.5 / v_ego ** 2  # dragged against the driver at 1.5 m/s^2
+    results = {}
+    for name, with_model in (('plan', True), ('diff', False)):
+      lac = make_lac(LatControlTorqueV2)
+      for i in range(DELAY_FRAMES + 100):  # pressed drag, plan and request coherent at k_hold
+        if with_model:
+          lac.extension.update_model_v2(make_plan_model(i, k_hold, v_plan=v_ego))
+        step(lac, make_cs(v_ego, 1.5, pressed=True), k_hold, active=True)
+        if with_model:
+          assert lac.plan_jerk_weight == 0.0  # pressed frames belong to the differencer
+      setpoints = []
+      for i in range(100):  # release: the new plan and request re-center instantly
+        if with_model:
+          lac.extension.update_model_v2(make_plan_model(10_000 + i, 0.0, v_plan=v_ego))
+        log = step(lac, make_cs(v_ego, 0.0), 0.0, active=True)
+        setpoints.append(log.desiredLateralAccel)
+      results[name] = min(setpoints)
+    assert results['plan'] > -0.05, "plan path must not overshoot past the re-centered request"
+    assert results['diff'] < -0.3, "differencer overshoot vanished; the scenario no longer exercises the snap"
+
+  def test_divergence_gate_falls_back(self, params):
+    """Request held while the plan collapses (turn-assist hold shape): the raw plan would
+    unwind the held wheel, so the divergence blend must hand the jerk back to the
+    differencer and keep the setpoint on the request."""
+    v_ego = 15.0
+    k_hold = 1.5 / v_ego ** 2
+    lac = make_lac(LatControlTorqueV2)
+    for i in range(DELAY_FRAMES + 50):
+      lac.extension.update_model_v2(make_plan_model(i, k_hold, v_plan=v_ego))
+      step(lac, make_cs(v_ego, 1.5), k_hold, active=True)
+    log = None
+    for i in range(100):  # plan collapses, request (assist hold) stays
+      lac.extension.update_model_v2(make_plan_model(1000 + i, 0.0, v_plan=v_ego))
+      log = step(lac, make_cs(v_ego, 1.5), k_hold, active=True)
+      assert lac.plan_jerk_weight == 0.0, f"frame {i}"
+      assert log.desiredLateralAccel > 1.4, f"frame {i}: the hold unwound"
+
+  def test_stale_model_falls_back_without_a_step(self, params):
+    """A hung modeld must not sustain a frozen plan slope: after MODEL_STALE_FRAMES the
+    weight drops to zero, and on a coherent flat plan the setpoint does not step."""
+    v_ego, k = 15.0, 2e-3
+    lac = make_lac(LatControlTorqueV2)
+    lac.extension.update_model_v2(make_plan_model(7, k, v_plan=v_ego))  # one frame, then silence
+    for _ in range(DELAY_FRAMES + 10):  # prime the request buffer so both jerk sources read zero
+      step(lac, make_cs(v_ego), k, active=False)
+    prev = None
+    weights = []
+    for _ in range(DELAY_FRAMES + MODEL_STALE_FRAMES + 50):
+      log = step(lac, make_cs(v_ego, k * v_ego ** 2), k, active=True)
+      weights.append(lac.plan_jerk_weight)
+      if prev is not None:
+        assert abs(log.desiredLateralAccel - prev) < 1e-3
+      prev = log.desiredLateralAccel
+    assert weights[0] == 1.0
+    assert weights[-1] == 0.0
+
+  def test_short_arrays_fall_back(self, params):
+    v_ego, k = 15.0, 2e-3
+    lac = make_lac(LatControlTorqueV2)
+    model = SimpleNamespace(frameId=1, orientation=SimpleNamespace(x=[0.0] * 33),
+                            orientationRate=SimpleNamespace(z=[0.0] * 10), velocity=SimpleNamespace(x=[v_ego] * 10))
+    lac.extension.update_model_v2(model)
+    log = step(lac, make_cs(v_ego), k, active=True)
+    assert lac.plan_jerk_weight == 0.0
+    assert log.version == 2
+
+  def test_lead_fades_to_v0_at_low_speed(self, params):
+    """Below LEAD_SPEED_FADE_BP[0] the setpoint lead is fully faded and v2's setpoint is
+    v0's (the live request), even through a step transient — any lead at parking speeds
+    turns the low-speed KP schedule into rail-to-rail flapping."""
+    v0, v2 = make_pair()
+    v_ego = 4.0
+    for _ in range(DELAY_FRAMES + 10):
+      step(v0, make_cs(v_ego), 0.0, active=False)
+      step(v2, make_cs(v_ego), 0.0, active=False)
+    k_step = 1.0 / v_ego ** 2
+    for i in range(100):
+      out0, _, log0 = v0.update(True, make_cs(v_ego), VM, LP, False, k_step, None, False, LAT_DELAY)
+      out2, _, log2 = v2.update(True, make_cs(v_ego), VM, LP, False, k_step, None, False, LAT_DELAY)
+      assert log2.desiredLateralAccel == pytest.approx(log0.desiredLateralAccel, abs=1e-6), f"frame {i}"
