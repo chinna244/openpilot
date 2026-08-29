@@ -316,3 +316,58 @@ class TestLatControlTorqueV2:
         v0_friction.append(abs(log0.f - request))  # roll and offset are 0: f - request is the friction term
         v2_friction.append(abs(log2.f - request))
     assert sum(v2_friction) < 0.5 * sum(v0_friction)
+
+
+class TestRailAwareSaturation:
+  """A railed EPS must raise the saturation warning even though the carcontroller's
+  ceiling clamp reports it as steer_limited_by_safety; sub-rail safety limiting
+  (driver-torque narrowing) keeps its suppression, and platforms without a rail
+  schedule keep stock semantics."""
+
+  SAT_FRAMES = int(0.4 / DT) + 20  # steerLimitTimer plus margin
+
+  @staticmethod
+  def _step_sls(lac, cs, desired_curvature, sls):
+    _, _, pid_log = lac.update(True, cs, VM, LP, sls, desired_curvature, None, False, LAT_DELAY)
+    return pid_log
+
+  def _run(self, lac, lat_accel_demand, sls, frames):
+    cs = make_cs(v_ego=15.0, lat_accel=0.0)
+    desired_curvature = lat_accel_demand / 15.0 ** 2
+    log = None
+    for _ in range(frames):
+      log = self._step_sls(lac, cs, desired_curvature, sls)
+    return log
+
+  def test_railed_eps_raises_saturation(self, params):
+    lac = make_lac(LatControlTorqueV2)
+    lac.steer_rail_schedule = ([0.0, 30.0], [0.6, 0.6])
+    log = self._run(lac, lat_accel_demand=4.5, sls=True, frames=self.SAT_FRAMES)
+    assert log.saturated
+
+  def test_not_saturated_before_timer(self, params):
+    lac = make_lac(LatControlTorqueV2)
+    lac.steer_rail_schedule = ([0.0, 30.0], [0.6, 0.6])
+    log = self._run(lac, lat_accel_demand=4.5, sls=True, frames=5)
+    assert not log.saturated
+
+  def test_sub_rail_safety_limit_keeps_suppression(self, params):
+    lac = make_lac(LatControlTorqueV2)
+    lac.steer_rail_schedule = ([0.0, 30.0], [0.6, 0.6])
+    # measurement tracks the demand: no error, output = ff = 0.2 of scale, under the rail
+    cs = make_cs(v_ego=15.0, lat_accel=0.5)
+    log = None
+    for _ in range(self.SAT_FRAMES * 2):
+      log = self._step_sls(lac, cs, 0.5 / 15.0 ** 2, sls=True)
+    assert not log.saturated
+
+  def test_no_schedule_keeps_stock_suppression(self, params):
+    lac = make_lac(LatControlTorqueV2)
+    assert lac.steer_rail_schedule is None
+    log = self._run(lac, lat_accel_demand=6.0, sls=True, frames=self.SAT_FRAMES * 2)
+    assert not log.saturated
+
+  def test_no_schedule_full_scale_still_saturates_without_sls(self, params):
+    lac = make_lac(LatControlTorqueV2)
+    log = self._run(lac, lat_accel_demand=6.0, sls=False, frames=self.SAT_FRAMES)
+    assert log.saturated

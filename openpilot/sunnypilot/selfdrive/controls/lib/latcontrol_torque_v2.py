@@ -10,6 +10,7 @@ from collections import deque
 
 from openpilot.cereal import log
 from opendbc.car.lateral import get_friction
+from opendbc.sunnypilot.car.interfaces import get_steer_rail_schedule
 from openpilot.common.constants import ACCELERATION_DUE_TO_GRAVITY
 from openpilot.common.filter_simple import FirstOrderFilter
 from openpilot.common.swaglog import cloudlog
@@ -73,6 +74,9 @@ class LatControlTorque(LatControlTorqueV0):
     self.low_speed_pid_threshold = max(CP.minSteerSpeed, MIN_LATERAL_CONTROL_SPEED)
     self.prev_steering_pressed = False
     self.prev_setpoint = 0.0
+    # Fraction of the steer scale the EPS actually delivers, by speed (None: full scale).
+    # See the saturation check below for why the alert needs it.
+    self.steer_rail_schedule = get_steer_rail_schedule(CP)
 
     # The extension's override controllers (jerk-aware, NNLC) recompute error/feedforward/
     # friction in torque space and step the shared PID themselves, silently replacing v2's
@@ -199,7 +203,21 @@ class LatControlTorque(LatControlTorqueV0):
       pid_log.actualLateralAccel = float(measurement)
       pid_log.desiredLateralAccel = float(setpoint)
       pid_log.desiredLateralJerk = float(desired_lateral_jerk)
-      pid_log.saturated = bool(self._check_saturation(self.steer_max - abs(output_torque) < 1e-3, CS, steer_limited_by_safety, curvature_limited))
+      # The EPS delivers only rail(v) of the steer scale above the ceiling falloff, and the
+      # carcontroller's honest clamp reports reaching it as steer_limited_by_safety — which
+      # _check_saturation treats as not-saturated (its suppression is meant for driver-torque
+      # narrowing). Compare against the measured rail and drop the suppression while on it,
+      # so a railed EPS in a curve still raises the steering-limit warning. Driver-torque
+      # narrowing keeps its suppression: it shrinks the window below the rail, it does not
+      # push the command onto it. Platforms without a rail schedule keep stock semantics.
+      if self.steer_rail_schedule is not None:
+        steer_rail = float(np.interp(CS.vEgo, self.steer_rail_schedule[0], self.steer_rail_schedule[1]))
+        at_rail = steer_rail * self.steer_max - abs(output_torque) < 1e-3
+        alert_limited = steer_limited_by_safety and not at_rail
+      else:
+        at_rail = self.steer_max - abs(output_torque) < 1e-3
+        alert_limited = steer_limited_by_safety
+      pid_log.saturated = bool(self._check_saturation(at_rail, CS, alert_limited, curvature_limited))
 
     self.prev_steering_pressed = CS.steeringPressed
 
