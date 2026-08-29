@@ -24,6 +24,7 @@ ButtonEvent = car.CarState.ButtonEvent
 ButtonType = car.CarState.ButtonEvent.Type
 State = custom.IntelligentCruiseButtonManagement.IntelligentCruiseButtonManagementState
 SendButtonState = custom.IntelligentCruiseButtonManagement.SendButtonState
+SessionState = custom.LongitudinalPlanSP.SpeedLimit.AssistState
 
 MPH = CV.MPH_TO_KPH  # dash and v_cruise are tracked in kph; the CX-5 dash steps in whole mph
 
@@ -187,15 +188,20 @@ class TestServo:
   def setup_method(self):
     self.icbm = self.make_icbm()
 
-  def run_frames(self, target_mph, cluster_mph, n=1, source='sccVision', icbm=None, is_metric=False):
+  def run_frames(self, target_mph, cluster_mph, n=1, source='sccVision', icbm=None, is_metric=False,
+                 v_ego_mph=None, a_target=0., overshoot=False, session_state=SessionState.disabled):
     icbm = icbm or self.icbm
     sends = []
     for _ in range(n):
       CS = car.CarState(cruiseState={"speedCluster": cluster_mph * CV.MPH_TO_MS})
+      if v_ego_mph is not None:
+        CS.vEgo = float(v_ego_mph * CV.MPH_TO_MS)
       CC = car.CarControl(enabled=True)
       LP_SP = custom.LongitudinalPlanSP(vTarget=target_mph * CV.MPH_TO_MS)
       LP_SP.longitudinalPlanSource = source
-      icbm.run(CS, CC, LP_SP, is_metric=is_metric)
+      LP_SP.aTarget = float(a_target)
+      icbm.run(CS, CC, LP_SP, is_metric=is_metric, decel_overshoot_enabled=overshoot,
+               session_state=session_state)
       sends.append(icbm.cruise_button)
     return sends
 
@@ -378,3 +384,72 @@ class TestDecelOvershoot:
     icbm = self.make_icbm()
     self.run_frames(icbm, target_mph=40, v_ego_mph=45, a_target=-0.45, n=100, enabled=False)
     assert icbm.v_target == 40, icbm.v_target
+
+
+class TestDecelOvershootIsALever:
+  """The overshoot commands the dash BELOW vEgo to buy real decel from the stock ACC. It
+  is a lever the servo pulls, not a destination, so it is only valid while the servo can
+  actually pull it and while the limiter that asked for it is still live. Both halves
+  were missing: a pending SLA confirm prompt banked a gap for its whole 5 s window and
+  the timeout dumped it as a SET- burst (user report 2026-08-29)."""
+
+  def make_icbm(self):
+    return IntelligentCruiseButtonManagement(car.CarParams(pcmCruise=True, brand="mazda"),
+                                             custom.CarParamsSP(pcmCruiseSpeed=False))
+
+  def run_frames(self, *args, **kwargs):
+    return TestServo.run_frames(self, *args, **kwargs)
+
+  def test_no_wind_up_behind_a_confirm_prompt(self):
+    """Layer 2: a limiter asking for decel while a prompt is open must not accumulate a
+    gap the servo is forbidden to emit."""
+    icbm = self.make_icbm()
+    self.run_frames(40, 40, n=60, icbm=icbm, overshoot=True)
+
+    sends = self.run_frames(40, 40, n=500, icbm=icbm, source='speedLimitAssist', v_ego_mph=41.3,
+                            a_target=-0.5, overshoot=True, session_state=SessionState.preActive)
+    assert icbm.overshoot_mph == 0., f"banked behind the freeze: {icbm.overshoot_mph}"
+    assert all(s == SendButtonState.none for s in sends)
+
+    # prompt times out with the limiter gone: nothing is owed, so nothing moves
+    sends = self.run_frames(40, 40, n=200, icbm=icbm, source='cruise', v_ego_mph=41.3, overshoot=True)
+    assert all(s == SendButtonState.none for s in sends), "stale gap dumped at the timeout"
+    assert icbm.state == State.holding
+
+  def test_freeze_does_not_blunt_a_real_limiter(self):
+    """Layer 2 must cost nothing: if the limiter is still asking for decel when the prompt
+    clears, the gap rebuilds at DECEL_OVERSHOOT_RISE and the descent still happens."""
+    icbm = self.make_icbm()
+    self.run_frames(40, 40, n=60, icbm=icbm, overshoot=True)
+    self.run_frames(40, 40, n=500, icbm=icbm, source='speedLimitAssist', v_ego_mph=41.3,
+                    a_target=-0.5, overshoot=True, session_state=SessionState.preActive)
+    assert icbm.overshoot_mph == 0.
+
+    sends = self.run_frames(40, 40, n=100, icbm=icbm, source='speedLimitAssist', v_ego_mph=41.3,
+                            a_target=-0.5, overshoot=True)
+    assert icbm.overshoot_mph > 2., f"gap did not rebuild: {icbm.overshoot_mph}"
+    # tap or hold is the profile's call from the remaining distance; either is a descent
+    down = (SendButtonState.decrease, SendButtonState.decreaseHold)
+    assert any(s in down for s in sends), "real limiter decel was blunted"
+
+  def test_residual_gap_after_source_flip_starts_no_descent(self):
+    """Layer 3: the lever outlives its limiter by design (slow release), but a residual
+    must not START a fresh descent once the plan is back on cruise. Set directly: the
+    gate is a single boolean and the state that reaches it is what matters."""
+    icbm = self.make_icbm()
+    self.run_frames(40, 40, n=60, icbm=icbm)
+    icbm.overshoot_mph = 5.  # left over from a curve that just ended
+
+    sends = self.run_frames(40, 40, n=100, icbm=icbm, source='cruise', v_ego_mph=41.3, overshoot=True)
+    assert icbm.overshoot_mph > 0., "precondition: the residual is still bleeding off"
+    assert icbm.state == State.holding, f"descended on a residual: {icbm.state}"
+    assert all(s == SendButtonState.none for s in sends)
+
+  def test_plain_setpoint_correction_still_unconditional(self):
+    """Layer 3 must stay narrow: with no overshoot in play, a dash sitting above the
+    driver's setpoint is a plain residual (a dropped press) and still self-heals."""
+    icbm = self.make_icbm()
+    self.run_frames(40, 40, n=60, icbm=icbm, source='cruise')
+
+    sends = self.run_frames(40, 42, n=100, icbm=icbm, source='cruise')
+    assert any(s == SendButtonState.decrease for s in sends), "dash residual stranded high"
