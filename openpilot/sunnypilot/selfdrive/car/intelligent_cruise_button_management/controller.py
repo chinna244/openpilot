@@ -37,7 +37,10 @@ REACT_TIMER = 0.3
 # while the set speed is moving. The quiet window also gives card time to adopt the dash
 # after a driver press before the servo could chase a stale target. Decel-overshoot
 # release is exempt; its slow monotonic rise is measured as tolerated.
-RESTORE_QUIET_TIME = 3.0
+# Sized from an 11-route / 57k-frame sweep of the recorded target streams: the churn
+# suppression is all bought in the first second (regret 67.7% -> 27.0% at 1.0 s; 3.0 s
+# only reaches 26.2% while nearly doubling the speed lost to the wait).
+RESTORE_QUIET_TIME = 1.0
 RESTORE_QUIET_FRAMES = int(RESTORE_QUIET_TIME / DT_CTRL)
 
 # Deceleration overshoot: a stock ACC's deceleration scales with the gap between the dash
