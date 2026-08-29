@@ -24,7 +24,7 @@ from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.car.cruise import V_CRUISE_UNSET
 from openpilot.sunnypilot import PARAMS_UPDATE_PERIOD
 from openpilot.sunnypilot.selfdrive.controls.lib.smart_cruise_control import MIN_V
-from openpilot.sunnypilot.selfdrive.controls.lib.smart_cruise_control.limits import get_planning_limits
+from openpilot.sunnypilot.selfdrive.controls.lib.smart_cruise_control.limits import COMMIT_FRAC, get_planning_limits
 from openpilot.sunnypilot.selfdrive.controls.lib.smart_cruise_control.speed_profile import (
   allowed_speed, backward_pass, lead_distance, min_profile_speed, required_decel)
 
@@ -39,10 +39,7 @@ _A_LAT_REG_MAX = 2.  # m/s2; curves are taken at or below this lateral accelerat
 # that drops to 5% for 1.4% of speed given up.
 _PLAN_MARGIN = 0.95
 
-# Solver gate, as fractions of the platform budget. Committing below 1.0 leaves headroom
-# for slope and curvature error; releasing well below commit keeps the gate from
-# chattering on noise.
-_COMMIT_FRAC = 0.7
+# Release well below COMMIT_FRAC so the gate does not chatter on noise.
 _RELEASE_FRAC = 0.3
 
 _NEAR_T = 3.0  # s; "the curve is here" window for the in-curve speed hold
@@ -144,7 +141,7 @@ class SmartCruiseControlVision:
 
     # commit when the required decel approaches the budget; once braking, hold through the
     # curve (the near path stays below the setpoint) and release on real relaxation
-    commit = self.a_required >= _COMMIT_FRAC * lim.a_budget
+    commit = self.a_required >= COMMIT_FRAC * lim.a_budget
     in_curve = np.isfinite(self.v_near_min) and self.v_near_min < self.v_cruise_setpoint
     hold = self.a_required >= _RELEASE_FRAC * lim.a_budget or in_curve
     self.solver_active = commit or (self.solver_active and hold)

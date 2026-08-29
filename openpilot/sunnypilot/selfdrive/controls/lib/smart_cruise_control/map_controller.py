@@ -9,6 +9,8 @@ from openpilot.selfdrive.car.cruise import V_CRUISE_UNSET
 from openpilot.sunnypilot import PARAMS_UPDATE_PERIOD
 from openpilot.sunnypilot.navd.helpers import coordinate_from_param, Coordinate
 from openpilot.sunnypilot.selfdrive.controls.lib.smart_cruise_control import MIN_V
+from openpilot.sunnypilot.selfdrive.controls.lib.smart_cruise_control.limits import COMMIT_FRAC, get_planning_limits
+from openpilot.sunnypilot.selfdrive.controls.lib.smart_cruise_control.speed_profile import lead_distance
 
 MapState = VisionState = custom.LongitudinalPlanSP.SmartCruiseControl.MapState
 
@@ -23,14 +25,6 @@ _PUB_JERK = 2.0  # m/s3
 _T_FALLBACK = 2.8  # s; decel horizon when the target's distance is degenerate
 TO_RADIANS = math.pi / 180
 TO_DEGREES = 180 / math.pi
-TARGET_JERK = -0.6  # m/s^3 There's some jounce limits that are not consistent so we're fudging this some
-TARGET_ACCEL = -1.2  # m/s^2 should match up with the long planner limit
-TARGET_OFFSET = 1.0  # seconds - This controls how soon before the curve you reach the target velocity. It also helps
-                     # reach the target velocity when inaccuracies in the distance modeling logic would cause overshoot.
-                     # The value is multiplied against the target velocity to determine the additional distance. This is
-                     # done to keep the distance calculations consistent but results in the offset actually being less
-                     # time than specified depending on how much of a speed differential there is between v_ego and the
-                     # target velocity.
 
 
 def velocities_from_param(param: str, params: Params):
@@ -44,18 +38,6 @@ def velocities_from_param(param: str, params: Params):
   velocities = json.loads(json_str)
 
   return velocities
-
-
-def calculate_accel(t, target_jerk, a_ego):
-  return a_ego + target_jerk * t
-
-
-def calculate_velocity(t, target_jerk, a_ego, v_ego):
-  return v_ego + a_ego * t + target_jerk/2 * (t ** 2)
-
-
-def calculate_distance(t, target_jerk, a_ego, v_ego):
-  return t * v_ego + a_ego/2 * (t ** 2) + target_jerk/6 * (t ** 3)
 
 
 # points should be in radians
@@ -75,8 +57,9 @@ class SmartCruiseControlMap:
   output_v_target: float = V_CRUISE_UNSET
   output_a_target: float = 0.
 
-  def __init__(self):
+  def __init__(self, CP):
     self.params = Params()
+    self.limits = get_planning_limits(CP)
     self.mem_params = Params("/dev/shm/params") if platform.system() != "Darwin" else self.params
     self.enabled = self.params.get_bool("SmartCruiseControlMap")
     self.long_enabled = False
@@ -146,7 +129,10 @@ class SmartCruiseControlMap:
     forward_points = self.target_velocities[min_idx:]
     forward_distances = distances[min_idx:]
 
-    # find velocities that we are within the distance we need to adjust for
+    # a target binds once the decel it requires (past the actuation lead) reaches the
+    # commit fraction of the platform budget; same rule as the vision solver
+    lim = self.limits
+    jerk = lim.jerk(self.v_ego)
     valid_velocities = []
     for i in range(len(forward_points)):
       target_velocity = forward_points[i]
@@ -157,36 +143,10 @@ class SmartCruiseControlMap:
         continue
 
       d = forward_distances[i]
-
-      a_diff = (self.a_ego - TARGET_ACCEL)
-      accel_t = abs(a_diff / TARGET_JERK)
-      min_accel_v = calculate_velocity(accel_t, TARGET_JERK, self.a_ego, self.v_ego)
-
-      max_d = 0
-      if tv > min_accel_v:
-        # calculate time needed based on target jerk
-        a = 0.5 * TARGET_JERK
-        b = self.a_ego
-        c = self.v_ego - tv
-        t_a = -1 * ((b**2 - 4 * a * c) ** 0.5 + b) / (2 * a)
-        t_b = ((b**2 - 4 * a * c) ** 0.5 - b) / (2 * a)
-        if not isinstance(t_a, complex) and t_a > 0:
-          t = t_a
-        else:
-          t = t_b
-        if isinstance(t, complex):
-          continue
-
-        max_d = max_d + calculate_distance(t, TARGET_JERK, self.a_ego, self.v_ego)
-      else:
-        t = accel_t
-        max_d = calculate_distance(t, TARGET_JERK, self.a_ego, self.v_ego)
-
-        # calculate additional time needed based on target accel
-        t = abs((min_accel_v - tv) / TARGET_ACCEL)
-        max_d += calculate_distance(t, 0, TARGET_ACCEL, min_accel_v)
-
-      if d < max_d + tv * TARGET_OFFSET:
+      t_lead = lim.t_lead + lim.dash_traversal_time(max(self.v_ego - tv, 0.))
+      d_lead = lead_distance(self.v_ego, t_lead, lim.a_budget, jerk)
+      a_req = (self.v_ego ** 2 - tv ** 2) / (2. * max(d - d_lead, 0.5))
+      if a_req >= COMMIT_FRAC * lim.a_budget:
         valid_velocities.append((float(tv), tlat, tlon, d))
 
     # Find the smallest velocity we need to adjust for

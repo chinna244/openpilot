@@ -12,6 +12,7 @@ import pytest
 
 
 from openpilot.cereal import custom
+from opendbc.car import structs
 from openpilot.common.params import Params
 from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.car.cruise import V_CRUISE_UNSET
@@ -27,7 +28,8 @@ class TestSmartCruiseControlMap(OpenpilotTestCase):
     self.params = Params()
     self.mem_params = Params("/dev/shm/params") if platform.system() != "Darwin" else self.params
     self.reset_params()
-    self.scc_m = SmartCruiseControlMap()
+    cp = structs.CarParams(brand="mazda", openpilotLongitudinalControl=True, longitudinalActuatorDelay=0.36)
+    self.scc_m = SmartCruiseControlMap(cp)
 
   def reset_params(self):
     self.params.put_bool("SmartCruiseControlMap", True, block=True)

@@ -40,6 +40,11 @@ _STOCK_RESPONSE_T = 1.0
 
 _MPH_PER_MS = 2.23694
 
+# Shared solver gate: a constraint binds once the decel it requires reaches this fraction
+# of the budget. Below 1.0 leaves headroom for slope and curvature error; swept against
+# the corpus together with the vision planning margin (see vision_controller.py).
+COMMIT_FRAC = 0.7
+
 
 @dataclass(frozen=True)
 class PlanningLimits:
