@@ -548,7 +548,25 @@ class TestRestoreResponsiveness(TestServo):
     self.run_frames(30, 45, n=1, icbm=icbm, button_events=[ButtonEvent(type=ButtonType.accelCruise, pressed=False)])
     self.run_frames(30, 45, n=3, icbm=icbm, button_events=[ButtonEvent(type=ButtonType.decelCruise, pressed=True)])
     self.run_frames(30, 45, n=1, icbm=icbm, button_events=[ButtonEvent(type=ButtonType.decelCruise, pressed=False)])
-    assert icbm.driver_grace_timer == 0
+    assert icbm.down_grace_timer == 0
 
     sends = self.run_frames(30, 45, n=150, icbm=icbm)
     assert any(s in (SendButtonState.decrease, SendButtonState.decreaseHold) for s in sends)
+
+  def test_driver_down_press_grace_blocks_up(self):
+    """The mirror: after a genuine SET- press a refused re-anchor must not restore the
+    baseline over the driver's head, even with the lookahead clear."""
+    icbm = self.make_icbm(brand="mazda")
+    self.run_frames(40, 40, n=60, icbm=icbm, source='cruise')
+    self.run_frames(40, 40, n=5, icbm=icbm, source='cruise',
+                    button_events=[ButtonEvent(type=ButtonType.decelCruise, pressed=True)])
+    self.run_frames(40, 35, n=1, icbm=icbm, source='cruise',
+                    button_events=[ButtonEvent(type=ButtonType.decelCruise, pressed=False)])
+
+    quiet, resumed = [], []
+    for i in range(int(DRIVER_PRESS_GRACE_T / DT_CTRL) + 300):
+      sends = self.run_frames(40, 35, n=1, icbm=icbm, source='cruise', v_ahead_min_mph=200.)
+      (quiet if i * DT_CTRL < DRIVER_PRESS_GRACE_T - 0.1 else resumed).extend(sends)
+    assert all(s == SendButtonState.none for s in quiet), "servo restored over the driver's SET-"
+    assert any(s in (SendButtonState.increase, SendButtonState.increaseHold) for s in resumed), \
+      "restore never resumed after the grace window"

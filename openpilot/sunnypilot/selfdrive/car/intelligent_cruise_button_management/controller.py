@@ -23,10 +23,12 @@ SendButtonState = custom.IntelligentCruiseButtonManagement.SendButtonState
 SessionState = custom.LongitudinalPlanSP.SpeedLimit.AssistState
 
 INACTIVE_TIMER = 0.4
-# After a genuine driver SET+ press the servo yields for this long: the driver just chose
-# a speed and an immediate synthesized walk-back reads as a fight (route 126 t=341: the +5
-# was reverted within 1.4 s). Accountability mirrors the gas override: the press is the
-# driver's, so no urgency carve-out. A SET- press ends the grace (aligned intent).
+# After a genuine driver press the servo yields in the opposing direction for this long:
+# the driver just chose a speed and an immediate synthesized walk-back reads as a fight
+# (route 126 t=341: a +5 was reverted within 1.4 s). SET+ parks down-moves, SET- parks
+# up-moves (a refused re-anchor otherwise restores the baseline right over a fresh -5);
+# a press in the opposing direction cancels the other grace. Accountability mirrors the
+# gas override: the press is the driver's, so no urgency carve-out.
 DRIVER_PRESS_GRACE_T = 3.0
 DRIVER_PRESS_GRACE_FRAMES = int(DRIVER_PRESS_GRACE_T / DT_CTRL)
 # Reaction deadband in display units, applied only while a limiter (SCC/SLA) drives the
@@ -110,7 +112,8 @@ class IntelligentCruiseButtonManagement:
     self.react_deadband = REACT_DEADBAND
     self.lookahead_valid = False
     self.dip_ahead = False
-    self.driver_grace_timer = 0
+    self.down_grace_timer = 0
+    self.up_grace_timer = 0
 
     self.is_ready = False
     self.is_ready_prev = False
@@ -145,7 +148,7 @@ class IntelligentCruiseButtonManagement:
     # waiting -- a limiter still asking for decel rebuilds at DECEL_OVERSHOOT_RISE, ~0.5 s
     # to a full gap, well inside the REACT_TIMER the servo owes before it acts anyway.
     if (self.decel_overshoot_enabled and self.is_ready and not self.prompt_frozen
-        and self.driver_grace_timer <= 0
+        and self.down_grace_timer <= 0
         and LP_SP.longitudinalPlanSource in DECEL_OVERSHOOT_SOURCES
         and LP_SP.aTarget < -p['min_decel'] and CS.vEgo > LP_SP.vTarget):
       want = min(float(np.interp(-LP_SP.aTarget, p['decel_bp'], p['gap_v'])), p['max_gap'])
@@ -271,6 +274,7 @@ class IntelligentCruiseButtonManagement:
           up_allowed = ((self.overshoot_mph > 0 and self.limiter_active)
                         or not self.profile.decel_needs_stable_setpoint
                         or self.restore_quiet_timer >= RESTORE_QUIET_FRAMES)
+        up_allowed = up_allowed and self.up_grace_timer <= 0
 
         # Down-moves skip the quiet window because a limiter's decel is urgent; that is
         # only true while the limiter is live. The overshoot is a lever, not a
@@ -280,7 +284,7 @@ class IntelligentCruiseButtonManagement:
         # residual from a dropped press) and stays unconditional. A fresh driver SET+
         # press parks all down-moves for the grace window: the dash is the driver's for
         # a beat, and the plan keeps publishing its cap regardless.
-        down_allowed = (self.limiter_active or self.overshoot_mph <= 0) and self.driver_grace_timer <= 0
+        down_allowed = (self.limiter_active or self.overshoot_mph <= 0) and self.down_grace_timer <= 0
 
         # PRE_ACTIVE
         if self.state == State.preActive:
@@ -339,11 +343,14 @@ class IntelligentCruiseButtonManagement:
     # buttonEvents carry only the wheel's own presses (forged frames echo on src 128+ and
     # never reach carState), so this cannot latch on the servo's own sends
     if self.cruise_button_timers[ButtonType.accelCruise] > 0:
-      self.driver_grace_timer = DRIVER_PRESS_GRACE_FRAMES
+      self.down_grace_timer = DRIVER_PRESS_GRACE_FRAMES
+      self.up_grace_timer = 0
     elif self.cruise_button_timers[ButtonType.decelCruise] > 0:
-      self.driver_grace_timer = 0
+      self.up_grace_timer = DRIVER_PRESS_GRACE_FRAMES
+      self.down_grace_timer = 0
     else:
-      self.driver_grace_timer = max(0, self.driver_grace_timer - 1)
+      self.down_grace_timer = max(0, self.down_grace_timer - 1)
+      self.up_grace_timer = max(0, self.up_grace_timer - 1)
 
     self.is_ready = ready and not button_pressed
 

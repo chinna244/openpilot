@@ -474,6 +474,27 @@ class TestDriverInteractions:
     loop.run(4.0)
     assert loop.ecu.dash == dash_settled, "servo fought the driver's hold result"
 
+  def test_settled_longpress_descends_and_reanchors(self):
+    """The mirror exit: settled at the limit, the driver HOLDS - to ride below it. The
+    press dismisses the session, the ECU grid-descends, the setpoint re-anchors to the
+    result, and the SET- grace keeps the servo from restoring the old baseline over it."""
+    loop = Loop(baseline_mph=60, seed=14)
+    loop.limit_mph = 45
+    loop.run(2.0)
+    loop.driver_press(ButtonType.decelCruise, in_seconds=0.1)
+    loop.run(11.0)
+    assert loop.ecu.dash == 45
+
+    loop.driver_press(ButtonType.decelCruise, in_seconds=0.1, hold_s=1.3)
+    loop.run(6.0)
+    assert loop.sla.state == SlaState.inactive
+    assert loop.ecu.dash % 5 == 0 and loop.ecu.dash <= 40, f"no grid descent: {loop.ecu.dash}"
+    assert loop.v_cruise_mph == loop.ecu.dash, \
+      f"setpoint must re-anchor to the ECU result: dash {loop.ecu.dash}, setpoint {loop.v_cruise_mph}"
+    dash_settled = loop.ecu.dash
+    loop.run(4.0)
+    assert loop.ecu.dash == dash_settled, "servo fought the driver's hold result"
+
   def test_up_confirm_adopts_limit(self):
     """Drive 0000000b t=415/461: cruising below a rising limit, + on the prompt must take
     the setpoint and the dash TO the limit, not leave a +1 orphan with an inert session
