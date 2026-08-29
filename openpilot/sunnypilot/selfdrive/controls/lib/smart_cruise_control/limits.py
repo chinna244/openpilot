@@ -40,6 +40,13 @@ _STOCK_RESPONSE_T = 1.0
 
 _MPH_PER_MS = 2.23694
 
+# What the servo's button stream actually moves the dash at. The wheel keeps broadcasting
+# its genuine button-up frames, so forged hold frames interleave and register as discrete
+# presses, never as a held button: route 126 measured 294/294 dash steps at 1 mph (zero
+# grid snaps), 4.1 mph/s under hold frames and 3.8 mph/s under taps. The native 5 mph
+# grid timing only applies to a physical hold and must not size the actuation lead.
+_SERVO_WALK_RATE = {'mazda': 4.0}  # mph/s, measured
+
 # Shared solver gate: a constraint binds once the decel it requires reaches this fraction
 # of the budget. Below 1.0 leaves headroom for slope and curvature error; swept against
 # the corpus together with the vision planning margin (see vision_controller.py).
@@ -52,10 +59,7 @@ class PlanningLimits:
   t_lead: float  # fixed actuation lead, s
   op_long: bool
   # stock path only: the dash has to be walked down before the ECU sees the new set speed
-  dash_step: int = 0  # display units per hold step (0: taps only)
-  dash_first_step_s: float = 0.
-  dash_step_period_s: float = 0.
-  tap_rate_hz: float = 5.
+  walk_rate: float = 5.  # display units per second the servo actually achieves
 
   def jerk(self, v_ego: float) -> float:
     """The consumer's own jerk limit easing into a_budget; 0 where the ECU self-smooths."""
@@ -66,16 +70,14 @@ class PlanningLimits:
   def dash_traversal_time(self, delta_v_ms: float) -> float:
     """Seconds of dash walking to lower the set speed by delta_v (stock path only).
 
-    Display units are taken as mph: the measured grids are imperial-only so far, and for a
+    Display units are taken as mph: the measured rates are imperial-only so far, and for a
     lead estimate the ~1.6x metric error is inside the response-time uncertainty anyway.
+    Uses the measured servo walk rate, not the native hold grid: synthesized holds
+    register as discrete presses (see _SERVO_WALK_RATE).
     """
     if self.op_long or delta_v_ms <= 0.:
       return 0.
-    units = delta_v_ms * _MPH_PER_MS
-    if self.dash_step > 0:
-      steps = max(units / self.dash_step - 1., 0.)
-      return self.dash_first_step_s + steps * self.dash_step_period_s
-    return units / max(self.tap_rate_hz, 1.)
+    return delta_v_ms * _MPH_PER_MS / max(self.walk_rate, 1.)
 
 
 def get_planning_limits(CP: structs.CarParams) -> PlanningLimits:
@@ -85,7 +87,4 @@ def get_planning_limits(CP: structs.CarParams) -> PlanningLimits:
   profile = get_actuation_profile(CP.brand)
   return PlanningLimits(a_budget=_STOCK_A_BUDGET.get(CP.brand, _STOCK_A_BUDGET_DEFAULT),
                         t_lead=_STOCK_RESPONSE_T, op_long=False,
-                        dash_step=profile.longpress_step,
-                        dash_first_step_s=profile.longpress_first_step_s,
-                        dash_step_period_s=profile.longpress_step_period_s,
-                        tap_rate_hz=profile.tap_rate_hz)
+                        walk_rate=_SERVO_WALK_RATE.get(CP.brand, profile.tap_rate_hz))
