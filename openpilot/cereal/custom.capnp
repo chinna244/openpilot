@@ -42,8 +42,9 @@ struct IntelligentCruiseButtonManagement {
     none @0;
     increase @1;
     decrease @2;
-    # sustained hold at the button message's native rate, for ECUs whose long-press
-    # steps the set speed along a coarse grid (e.g. Mazda +5 mph)
+    # sustained button stream at the message's native rate: the fast walk for large
+    # moves (interleaved with the wheel's own frames it registers as paced presses,
+    # never as a held button)
     increaseHold @3;
     decreaseHold @4;
   }

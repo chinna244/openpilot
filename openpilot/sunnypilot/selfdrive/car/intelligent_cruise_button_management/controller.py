@@ -78,10 +78,16 @@ DECEL_OVERSHOOT_RELEASE = 3.  # mph/s
 DECEL_OVERSHOOT_SOURCES = (LongitudinalPlanSource.sccVision, LongitudinalPlanSource.sccMap,
                            LongitudinalPlanSource.speedLimitAssist)
 
-# Abandon a hold (and disable long-press for the drive) if the dash never moved this long
-# past the profile's expected step time. Synthesized holds interleave with the wheel's
-# genuine button-up frames, so an ECU may refuse them; taps are the proven fallback.
-HOLD_FIRST_STEP_MARGIN = 0.5  # s
+# The sustained 10 Hz stream registers on the ECU as paced discrete presses, never as a
+# held button (all-routes census: 149/149 stream-driven dash steps were 1 mph -- the
+# wheel's own button-up frames interleave with the forged ones, so the ECU never sees an
+# unbroken hold). At ~4 mph/s it is still the fastest walk available, so it takes any
+# move with a real distance to cover; discrete taps take the small remainder, where the
+# stream's in-flight frames would overshoot and ping-pong around the target.
+FAST_MODE_MIN = 3  # display units of remaining error to run the stream
+# If the dash never moves under the stream, this ECU is not registering it at all;
+# taps are the proven fallback for the rest of the drive.
+FAST_STALL_T = 1.5  # s
 
 TAP_BUTTONS = {
   State.increasing: SendButtonState.increase,
@@ -127,12 +133,11 @@ class IntelligentCruiseButtonManagement:
     self.overshoot_params = DECEL_OVERSHOOT_PARAMS.get(CP.brand)
     self.limiter_active = False
 
-    # Long-press (hold) execution
-    self.hold_active = False
-    self.hold_frames = 0
-    self.hold_start_cluster = 0
-    self.hold_step_landed = False
-    self.longpress_faulted = False  # set for the drive when a synthesized hold doesn't land
+    # Fast-walk stream execution
+    self.fast_active = False
+    self.fast_stall_frames = 0
+    self.fast_last_cluster = 0
+    self.fast_faulted = False  # set for the drive when the stream never moves the dash
 
     self.cruise_button_timers = dict(CRUISE_BUTTON_TIMER)
 
@@ -211,36 +216,29 @@ class IntelligentCruiseButtonManagement:
     else:
       self.restore_quiet_timer = 0
 
-  def plan_hold(self) -> None:
-    # Start a hold when the remaining error spans at least one ECU snap step; run taps for
-    # the remainder. Release is evaluated every frame against the live dash, so a snap that
-    # lands mid-grid (the ECU aligns first) just shrinks the remainder.
+  def plan_fast_mode(self) -> None:
+    # Run the stream while the remaining error is worth it; taps take the remainder.
+    # Evaluated every frame against the live dash. No grid or metric assumptions: the
+    # stream is just presses, so it is valid wherever taps are.
     remaining = abs(self.v_target - self.v_cruise_cluster)
-    use_hold = (self.profile.supports_longpress(self.is_metric) and not self.longpress_faulted
-                and remaining >= self.profile.longpress_step)
+    use_fast = not self.fast_faulted and remaining >= FAST_MODE_MIN
 
-    if use_hold and not self.hold_active:
-      self.hold_active = True
-      self.hold_frames = 0
-      self.hold_start_cluster = self.v_cruise_cluster
-      self.hold_step_landed = False
-    elif self.hold_active:
-      self.hold_frames += 1
-      if remaining < self.profile.longpress_step:
-        self.hold_active = False
-      elif self.v_cruise_cluster == self.hold_start_cluster:
-        # the ECU should have stepped by now; if the dash never moved, this ECU does not
-        # integrate synthesized holds; fall back to taps for the rest of the drive
-        due = self.profile.longpress_step_period_s if self.hold_step_landed else self.profile.longpress_first_step_s
-        if self.hold_frames * DT_CTRL > due + HOLD_FIRST_STEP_MARGIN:
-          self.longpress_faulted = True
-          self.hold_active = False
-          cloudlog.event("icbm_longpress_fallback", brand=self.CP.brand)
+    if use_fast and not self.fast_active:
+      self.fast_active = True
+      self.fast_stall_frames = 0
+      self.fast_last_cluster = self.v_cruise_cluster
+    elif self.fast_active:
+      if remaining < FAST_MODE_MIN:
+        self.fast_active = False
+      elif self.v_cruise_cluster != self.fast_last_cluster:
+        self.fast_last_cluster = self.v_cruise_cluster
+        self.fast_stall_frames = 0
       else:
-        # a step landed; re-arm the watchdog from the new dash value
-        self.hold_start_cluster = self.v_cruise_cluster
-        self.hold_frames = 0
-        self.hold_step_landed = True
+        self.fast_stall_frames += 1
+        if self.fast_stall_frames * DT_CTRL > FAST_STALL_T:
+          self.fast_faulted = True
+          self.fast_active = False
+          cloudlog.event("icbm_fast_mode_fallback", brand=self.CP.brand)
 
   def update_state_machine(self) -> custom.IntelligentCruiseButtonManagement.SendButtonState:
     self.pre_active_timer = max(0, self.pre_active_timer - 1)
@@ -326,10 +324,10 @@ class IntelligentCruiseButtonManagement:
         self.state = State.preActive
 
     if self.state in TAP_BUTTONS:
-      self.plan_hold()
-      send_button = HOLD_BUTTONS[self.state] if self.hold_active else TAP_BUTTONS[self.state]
+      self.plan_fast_mode()
+      send_button = HOLD_BUTTONS[self.state] if self.fast_active else TAP_BUTTONS[self.state]
     else:
-      self.hold_active = False
+      self.fast_active = False
       send_button = SendButtonState.none
 
     return send_button
