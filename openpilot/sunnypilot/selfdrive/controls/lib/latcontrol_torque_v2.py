@@ -13,7 +13,6 @@ from opendbc.car.lateral import get_friction
 from openpilot.common.constants import ACCELERATION_DUE_TO_GRAVITY
 from openpilot.common.filter_simple import FirstOrderFilter
 from openpilot.common.swaglog import cloudlog
-from openpilot.selfdrive.controls.lib.drive_helpers import MIN_SPEED
 from openpilot.sunnypilot.selfdrive.controls.lib.latcontrol_torque_ext_base import sign
 
 from openpilot.sunnypilot.selfdrive.controls.lib.latcontrol_torque_v0 import (
@@ -24,8 +23,8 @@ from openpilot.sunnypilot.selfdrive.controls.lib.latcontrol_torque_v0 import (
 
 # v2 keeps v0's error correction in lateral acceleration space and its extension
 # boundary (speed-dependent torque owns the feedforward params) unchanged. It
-# reworks the setpoint path, the low-speed error gain, the friction input shaping,
-# and the integrator policy around them.
+# reworks the setpoint path, the friction input shaping, and the integrator
+# policy around them.
 
 VERSION = 2
 
@@ -36,15 +35,6 @@ UNWIND_JERK_THRESHOLD = -1.0  # m/s^3, setpoint rate below this while near zero 
 UNWIND_LAT_ACCEL_NEAR_ZERO = 0.3  # m/s^2
 MIN_LATERAL_CONTROL_SPEED = 0.3  # m/s
 STEER_RELEASE_I_DECAY = 0.8  # one-shot integrator decay on steering-press release
-
-# StarPilot's low-speed error boost (their LOW_SPEED_X/Y, verbatim): the PID error is
-# scaled by 1 + lsf/kp, ~+45% at 5 m/s fading to ~+3% at 30, closing low-speed tracking
-# error faster than the KP ladder alone. Normalizing by the scheduled KP keeps the added
-# proportional authority roughly absolute across the ladder instead of compounding with
-# it. Applied to the PID error only — the friction input keeps the unboosted error, so
-# the stiction kick is unchanged (replay-validated orthogonal, 2026-08-27).
-LOW_SPEED_X = [0, 10, 20, 30]  # m/s
-LOW_SPEED_Y = [12, 10.5, 8, 5]
 
 # Roll compensation and latAccelOffset are lateral-accel-domain corrections; below
 # walking pace the desired lateral accel is ~0, so an unfaded road-crown term dominates
@@ -160,12 +150,6 @@ class LatControlTorque(LatControlTorqueV0):
       self.prev_setpoint = setpoint
 
       error = setpoint - measurement
-
-      # low-speed error boost (see the constants above); interp the schedule directly
-      # rather than reading pid.k_p, which still holds the previous frame's speed here
-      low_speed_factor = (np.interp(CS.vEgo, LOW_SPEED_X, LOW_SPEED_Y) / max(CS.vEgo, MIN_SPEED)) ** 2
-      current_kp = np.interp(CS.vEgo, self.pid._k_p[0], self.pid._k_p[1])
-      error *= 1.0 + low_speed_factor / max(current_kp, 1e-3)
 
       # do error correction in lateral acceleration space, convert at end to handle non-linear torque responses correctly
       pid_log.error = float(error)

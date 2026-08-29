@@ -80,78 +80,25 @@ def params():
 
 class TestLatControlTorqueV2:
   def test_unchanging_plan_matches_v0(self, params):
-    """At constant speed with friction 0, a plan that is not changing, and the wheel on the
-    request, the setpoint lead and the tracking error are both exactly zero, so v2's
-    setpoint algebra and error path collapse to v0's — outputs must match frame for frame.
-    (The v0 identity holds only on the zero-error manifold: v2's low-speed error boost
-    scales any nonzero error at every speed; that delta is pinned in
-    test_low_speed_error_boost.)"""
+    """At constant speed with friction 0 and a plan that is not changing, the setpoint lead
+    is exactly zero and v2's setpoint algebra collapses to v0's — outputs must match frame
+    for frame while the measurement moves under both."""
     v0, v2 = make_pair()
     v_ego = 15.0
     desired = 2e-3
     # prime v2's curvature buffer with the constant plan while inactive, so the lead term is
-    # zero from the first engaged frame; the on-request measurement leaves both rate filters at rest
-    for _ in range(DELAY_FRAMES + 10):
-      step(v0, make_cs(v_ego, desired * v_ego ** 2), desired, active=False)
-      step(v2, make_cs(v_ego, desired * v_ego ** 2), desired, active=False)
-    for i in range(300):
-      out0, _, log0 = v0.update(True, make_cs(v_ego, desired * v_ego ** 2), VM, LP, False, desired, None, False, LAT_DELAY)
-      out2, _, log2 = v2.update(True, make_cs(v_ego, desired * v_ego ** 2), VM, LP, False, desired, None, False, LAT_DELAY)
-      assert log2.desiredLateralAccel == pytest.approx(log0.desiredLateralAccel, abs=1e-6), f"frame {i}"
-      assert log2.error == pytest.approx(0.0, abs=1e-9), f"frame {i}"
-      assert out2 == pytest.approx(out0, abs=1e-9), f"frame {i}"
-    assert log0.version == 0
-    assert log2.version == 2
-
-  def test_low_speed_error_boost(self, params):
-    """v2 scales the PID error by StarPilot's 1 + lsf/kp — large at creep, small at highway
-    speed. With buffers primed and a constant plan the setpoints are identical, so the
-    logged error ratio against v0 is exactly the boost."""
-    from openpilot.selfdrive.controls.lib.drive_helpers import MIN_SPEED
-    from openpilot.sunnypilot.selfdrive.controls.lib.latcontrol_torque_v0 import INTERP_SPEEDS, KP_INTERP
-    from openpilot.sunnypilot.selfdrive.controls.lib.latcontrol_torque_v2 import LOW_SPEED_X, LOW_SPEED_Y
-
-    def expected_boost(v):
-      import numpy as np
-      lsf = (np.interp(v, LOW_SPEED_X, LOW_SPEED_Y) / max(v, MIN_SPEED)) ** 2
-      return 1.0 + lsf / np.interp(v, INTERP_SPEEDS, KP_INTERP)
-
-    boosts = {}
-    for v_ego in (3.0, 15.0, 30.0):
-      v0, v2 = make_pair()
-      desired = 2e-3
-      for _ in range(DELAY_FRAMES + 10):
-        step(v0, make_cs(v_ego), desired, active=False)
-        step(v2, make_cs(v_ego), desired, active=False)
-      for i in range(50):
-        measured = 1.5e-3 * math.sin(i / 20)
-        log0 = step(v0, make_cs(v_ego, measured * v_ego ** 2), desired)
-        log2 = step(v2, make_cs(v_ego, measured * v_ego ** 2), desired)
-        if abs(log0.error) > 1e-6:
-          assert log2.error / log0.error == pytest.approx(expected_boost(v_ego), rel=1e-4), f"v={v_ego} frame {i}"
-      boosts[v_ego] = expected_boost(v_ego)
-    # the schedule concentrates the extra authority at low speed
-    assert boosts[3.0] > 1.4
-    assert 1.1 < boosts[15.0] < 1.3
-    assert boosts[30.0] < 1.05
-
-  def test_boost_leaves_friction_unboosted(self, params):
-    """The friction input keeps the raw error: with a constant plan (jerk 0) the friction
-    term must match v0's exactly even while the PID error is boosted."""
-    v0, v2 = make_pair(friction=0.25)
-    v_ego = 5.0  # boost ~1.45: any leak of the boost into the friction input would show
-    desired = 2e-3
+    # zero from the first engaged frame; a zero measurement leaves both rate filters at rest
     for _ in range(DELAY_FRAMES + 10):
       step(v0, make_cs(v_ego), desired, active=False)
       step(v2, make_cs(v_ego), desired, active=False)
-    for i in range(80):
-      measured = 1e-3 * math.sin(i / 15)
-      log0 = step(v0, make_cs(v_ego, measured * v_ego ** 2), desired)
-      log2 = step(v2, make_cs(v_ego, measured * v_ego ** 2), desired)
-      # roll and offset are 0, so f is request + friction; identical f means identical friction
-      assert log2.f == pytest.approx(log0.f, abs=1e-9), f"frame {i}"
-      if abs(log0.error) > 1e-6:
-        assert abs(log2.error) > abs(log0.error), f"frame {i}"
+    for i in range(300):
+      measured = 1.5e-3 * math.sin(i / 80)
+      out0, _, log0 = v0.update(True, make_cs(v_ego, measured * v_ego ** 2), VM, LP, False, desired, None, False, LAT_DELAY)
+      out2, _, log2 = v2.update(True, make_cs(v_ego, measured * v_ego ** 2), VM, LP, False, desired, None, False, LAT_DELAY)
+      assert log2.desiredLateralAccel == pytest.approx(log0.desiredLateralAccel, abs=1e-6), f"frame {i}"
+      assert out2 == pytest.approx(out0, abs=1e-9), f"frame {i}"
+    assert log0.version == 0
+    assert log2.version == 2
 
   def test_no_phantom_jerk_when_decelerating_through_constant_curvature(self, params):
     """Mechanism 1: braking through a constant-curvature arc, the delayed request rescaled by
