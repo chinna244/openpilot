@@ -27,7 +27,7 @@ class LongitudinalPlannerSP:
     self.events_sp = EventsSP()
     self.resolver = SpeedLimitResolver()
     self.dec = DynamicExperimentalController(CP, mpc)
-    self.scc = SmartCruiseControl()
+    self.scc = SmartCruiseControl(CP)
     self.resolver = SpeedLimitResolver()
     # pcm-op-long cars run the SLA machine here; non-pcm cars run it in card (the
     # cruise arbiter, next to the buttons and the setpoint) and get mirrored
