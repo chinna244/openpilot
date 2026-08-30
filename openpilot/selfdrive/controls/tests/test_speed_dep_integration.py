@@ -23,6 +23,9 @@ PATCH_PARAMS_TORQUED_EXT = 'openpilot.sunnypilot.selfdrive.locationd.torqued_ext
 PATCH_PARAMS_TORQUED = 'openpilot.selfdrive.locationd.torqued.Params'
 PATCH_GET_SPEED_DEP_CONFIG = 'opendbc.sunnypilot.car.interfaces.get_speed_dep_config'
 
+# Sample tables
+SAMPLE_SPEED_BP = [6.5, 10.0, 15.0, 21.0, 26.5, 32.0, 37.5]
+SAMPLE_LAT_ACCEL_FACTOR_BP = [2.39, 2.52, 2.71, 2.39, 2.28, 2.22, 2.21]
 SAMPLE_FRICTION_BP = [0.177, 0.158, 0.131, 0.118, 0.113, 0.109, 0.108]
 
 
@@ -150,8 +153,11 @@ class TestToggleOffClearsState:
   def test_deactivated_does_not_modify_params(self):
     ovr = make_override()
     activate_speed_dep(ovr)
+    # Deactivate
     ovr._speed_dep_active = False
+
     tp = TorqueParams(latAccelFactor=99.0, friction=99.0)
+    ovr._last_vego = 15.0
     ovr.update_override_torque_params(tp)
 
     assert tp.latAccelFactor == 99.0, "Should not modify params when inactive"
@@ -180,10 +186,13 @@ class TestManualOverridePriority:
     ovr._last_vego = 15.0
 
     tp = TorqueParams()
+    # frame = -1, after +1 -> frame=0, 0 % 300 == 0 -> manual fires
     ovr.update_override_torque_params(tp)
 
+    assert tp.latAccelFactor == pytest.approx(350.0, abs=0.1), \
       "Manual latAccelFactor should overwrite speed-dep"
     assert tp.friction == pytest.approx(25.0, abs=0.1), \
+      "Manual friction should overwrite speed-dep"
 
   def test_manual_wins_every_frame(self):
     """The manual override must own the params on EVERY frame, not just the 3 s poll
@@ -241,13 +250,19 @@ class TestChangeDetection:
     ovr._last_vego = 15.0
 
     tp = TorqueParams()
+    # First call sets values
     ovr.update_override_torque_params(tp)
+    # Second call at same speed — no change
     changed = ovr.update_override_torque_params(tp)
     assert not changed, "Should return False when values haven't changed"
+
   def test_speed_change_returns_true(self):
+    ovr = make_override()
     activate_speed_dep(ovr)
 
+    tp = TorqueParams()
     ovr._last_vego = 6.5
+    ovr.update_override_torque_params(tp)
 
     ovr._last_vego = 37.5  # big speed change -> values change
     changed = ovr.update_override_torque_params(tp)
@@ -329,23 +344,31 @@ class TestToggleOffFallback:
     activate_speed_dep(ovr)
     assert ovr._speed_dep_active
 
+    # Simulate toggle-off (torqued sends empty speedBinCenters)
     ovr._speed_dep_active = False
 
     tp = TorqueParams(latAccelFactor=2.35, friction=0.12)
     ovr._last_vego = 15.0
     ovr.update_override_torque_params(tp)
+
+    # Global values should pass through unmodified
     assert tp.latAccelFactor == 2.35
     assert tp.friction == 0.12
 
   def test_reactivation_after_deactivation(self):
     """Speed-dep can be re-enabled after being disabled."""
+    ovr = make_override()
+    ovr._speed_dep_active = False
 
+    # Re-enable
     activate_speed_dep(ovr)
     assert ovr._speed_dep_active
 
     tp = TorqueParams()
     ovr._last_vego = 15.0
+    ovr.update_override_torque_params(tp)
 
+    expected_factor = float(np.interp(15.0, SAMPLE_SPEED_BP, SAMPLE_LAT_ACCEL_FACTOR_BP))
     assert tp.latAccelFactor == pytest.approx(expected_factor, abs=1e-4)
 
 
@@ -353,6 +376,8 @@ class TestPerCountLafInterp:
   """On a platform with a speed-dependent STEER_MAX, LAF interps in per-count space and
   rescales by the schedule at the current speed, so the scale's step lands at the cliff
   instead of being smeared across the cliff-spanning bin pair."""
+
+  # CX-5-shaped fixture: cliff at 14.2-14.5 m/s inside the 12.0-16.4 bin span
   SM_SCHEDULE = ([0.0, 14.2, 14.5], [1200.0, 1200.0, 800.0])
   SPEED_BP = [6.5, 9.5, 12.0, 16.4, 21.0, 28.0, 35.0]
   LAF_BP = [2.43, 2.93, 2.37, 1.21, 1.16, 1.53, 1.76]
@@ -361,6 +386,7 @@ class TestPerCountLafInterp:
     activate_speed_dep(ovr, speed_bp=list(self.SPEED_BP), lat_accel_factor_bp=list(self.LAF_BP))
     if schedule is not None:
       sm_bp, sm_v = schedule
+      ovr._speed_dep_steer_max_schedule = schedule
       ovr._speed_dep_laf_per_count_bp = [laf / float(np.interp(c, sm_bp, sm_v))
                                          for laf, c in zip(self.LAF_BP, self.SPEED_BP, strict=True)]
 
@@ -369,33 +395,46 @@ class TestPerCountLafInterp:
     tp = TorqueParams()
     ovr.update_override_torque_params(tp)
     return tp.latAccelFactor
+
   def test_step_lands_at_the_cliff(self):
     ovr = make_override()
     self._activate(ovr, schedule=self.SM_SCHEDULE)
     below, above = self._laf_at(ovr, 14.2), self._laf_at(ovr, 14.5)
+    # LAF steps down by ~the STEER_MAX ratio across 0.3 m/s (slightly more than 1.5:
+    # the smooth per-count decline adds its own slope over the same interval)
     assert below / above == pytest.approx(1200.0 / 800.0, rel=0.03)
 
   def test_no_smear_below_the_cliff(self):
     ovr = make_override()
     self._activate(ovr, schedule=self.SM_SCHEDULE)
+    # plain interp of normalized bins under-reads LAF here (over-torques ~+15%);
+    # per-count interp must sit well above it
     smeared = float(np.interp(14.0, self.SPEED_BP, self.LAF_BP))
     assert self._laf_at(ovr, 14.0) > smeared * 1.10
 
   def test_round_trips_at_bin_centers(self):
+    ovr = make_override()
+    self._activate(ovr, schedule=self.SM_SCHEDULE)
     for c, laf in zip(self.SPEED_BP, self.LAF_BP, strict=True):
       assert self._laf_at(ovr, c) == pytest.approx(laf, abs=1e-9)
 
   def test_flat_platform_unchanged(self):
     ovr = make_override()
+    self._activate(ovr, schedule=None)
+    for v in [10.0, 13.4, 14.35, 15.0, 25.0]:
       assert self._laf_at(ovr, v) == pytest.approx(float(np.interp(v, self.SPEED_BP, self.LAF_BP)), abs=1e-9)
 
   def test_friction_stays_plain_interp(self):
     ovr = make_override()
+    self._activate(ovr, schedule=self.SM_SCHEDULE)
+    ovr._speed_dep_friction_bp = list(SAMPLE_FRICTION_BP[:len(self.SPEED_BP)])
     ovr._last_vego = 14.35
     tp = TorqueParams()
     ovr.update_override_torque_params(tp)
     assert tp.friction == pytest.approx(float(np.interp(14.35, self.SPEED_BP, ovr._speed_dep_friction_bp)), abs=1e-9)
 
+  @patch(PATCH_GET_SPEED_DEP_CONFIG)
+  def test_update_speed_dep_torque_builds_per_count_table(self, mock_get_config):
     """The per-count table is built from the config's schedule for learned and seed bins alike."""
     mock_get_config.return_value = {
       'TEST_CAR': {'speed_bp': self.SPEED_BP, 'laf_bp': self.LAF_BP,
@@ -486,6 +525,7 @@ class TestUpdateSpeedDepTorqueFallback:
     """Config with laf_bp but no friction_bp should use global fallback (not crash)."""
     mock_get_config.return_value = {
       'TEST_CAR': {'speed_bp': SAMPLE_SPEED_BP, 'laf_bp': [2.1, 2.2, 2.3, 2.4, 2.5, 2.6, 2.7]}
+      # 'friction_bp' intentionally missing
     }
 
     mock_self = self._make_mock_self()
@@ -499,6 +539,7 @@ class TestUpdateSpeedDepTorqueFallback:
 
   @patch(PATCH_GET_SPEED_DEP_CONFIG)
   def test_laf_bp_length_mismatch_uses_global_fallback(self, mock_get_config):
+    """Config with wrong-length laf_bp should use global fallback."""
     mock_get_config.return_value = {
       'TEST_CAR': {'speed_bp': SAMPLE_SPEED_BP, 'laf_bp': [2.1, 2.2], 'friction_bp': [0.1, 0.2]}
     }
@@ -512,6 +553,7 @@ class TestUpdateSpeedDepTorqueFallback:
     assert mock_self._speed_dep_lat_accel_factor_bp == [2.0] * 7
     assert mock_self._speed_dep_friction_bp == [0.15] * 7
 
+  @patch(PATCH_GET_SPEED_DEP_CONFIG)
   def test_mixed_valid_invalid_bins(self, mock_get_config):
     """Valid bins use learned values, invalid bins use TOML seeds."""
     seed_lafs = [2.1, 2.2, 2.3, 2.4, 2.5, 2.6, 2.7]

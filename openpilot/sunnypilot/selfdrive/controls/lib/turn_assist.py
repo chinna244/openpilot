@@ -4,10 +4,19 @@ Copyright (c) 2026-, Zeph Leggett.
 This file is part of zoompilot and is licensed under the MIT License.
 See the LICENSE.md file in the root directory for more details.
 
-Low-speed turn assist for signaled intersection turns.
+Low-speed turn assist: keeps signaled intersection turns wound instead of going wide.
 
-A curvature hold preserves turn demand as the time-based model horizon collapses near
-standstill. A constant-time plan probe starts turn-in earlier while the car is rolling.
+Approaching a turn with the blinker on, the model's time-based plan collapses as the
+car slows: desiredCurvature decays to zero, the controller actively unwinds the wheel
+at the intersection, and on pull-away it re-winds too late — the car goes wide. Two
+mechanisms fix the two halves:
+
+  - a curvature HOLD that ratchets up on the blinker-matching model command below the
+    release speed and floors the command magnitude afterwards, with a plan-sourced
+    pre-wind near standstill and driver nudge-to-commit capture;
+  - a turn-initiation LEAD that probes the plan at a constant-TIME distance while
+    still rolling (9-12 mph), where the model's meter-anchored horizon gives too
+    little warning to wind the wheel.
 
 Ported from StarPilot (github.com/firestar5683/StarPilot, controlsd.py); the tuning
 constants and the failure evidence cited beside them are theirs, from rlog-driven
@@ -21,44 +30,105 @@ from openpilot.common.constants import CV
 from openpilot.common.params import Params
 from openpilot.common.realtime import DT_CTRL
 
-# Keep the floor firm below HOLD_HARD_SPEED and decay it above. Do not key retention
-# on the blinker, latActive, or steeringPressed; all can change during a valid turn.
+# The hold ratchets up on the blinker-matching model command below the release speed
+# and floors the command magnitude afterwards. Below the hard speed the floor is firm;
+# between hard and release speed it decays toward the model's sustained demand, so a
+# transient model dip barely sags it while a genuine end-of-turn unwind or an aborted
+# turn still drains it in a few seconds. Retention deliberately does NOT depend on the
+# blinker (the stalk auto-cancels during the stop), on latActive (lateral goes inactive
+# at standstill on torque cars; the wheel parks on rack friction), or on
+# steeringPressed (the driver's instinctive grip during the unwind is what let the
+# collapse through, and the driver physically overpowers a torque command regardless).
 HOLD_HARD_SPEED = 4.5 * CV.MPH_TO_MS
-# Release above the measured 3.5-4 m/s model wake-up range for left turns.
+# Release must sit ABOVE the speed where the model's action wakes up mid-turn: left
+# turns cross the intersection before arcing, reaching ~3.5-4 m/s with the action still
+# ~0 (a 6 mph release dropped the floor mid-turn and visibly unwound the wheel 50 deg;
+# rights wake at ~2.2 m/s). Hold authority above creep speed is bounded by the
+# opposite-command release and the decay band, not by this ceiling.
 HOLD_RELEASE_SPEED = 10.0 * CV.MPH_TO_MS
-# Limit plan-sourced pre-wind to near standstill; rate-limit model-sourced growth above it.
+# Pre-wind is a NEAR-STANDSTILL device: winding the wheel is only free when the car
+# isn't moving. On rolling slow turns a plan-sourced floor applies the turn's final
+# curvature at the entry, starting the arc 4-7 m early. Above this speed only the
+# model's own action can raise the hold, rate-limited so a single-frame action spike
+# can't get captured and floored for seconds.
 HOLD_PLAN_SOURCE_SPEED = 2.0 * CV.MPH_TO_MS
 HOLD_RATCHET_RATE = 0.04  # 1/m per s, hold growth limit above the plan-source speed
-# Clear the hold after sustained model takeover and keep it off for the blinker cycle.
+# Once the model's action has sustainably taken over the turn, hand off COMPLETELY:
+# clear the hold and don't re-engage until the blinker cycle ends. A floor that chases
+# the awake action only distorts the model's entry spiral, mid-turn shape, and exit
+# unwind — the bridge job is done the moment the action is awake.
 HOLD_HANDOFF_FRAC = 0.75
 HOLD_HANDOFF_TIME = 0.3  # s of sustained action >= frac*hold before handoff
 HOLD_DECAY_TAU = 2.0     # s; hold tracks a sustained lower model demand with this time constant
-# Use faster decay after sufficient heading sweep because exit unwind begins before
-# model curvature changes sign.
+# At a turn exit the model unwinds through small SAME-sign commands (curvature only
+# flips negative for the final counter-steer), so the opposite-release fires late and
+# the tau-2 decay melts the floor slower than the model's exit ramp. Turn progress
+# discriminates a mid-turn dip (protect the floor; sags happen ~20 deg of swept
+# heading) from an exit (drop it; sticks happen past ~80 deg): past the swept
+# threshold the decay switches to the fast tau and runs at ANY speed, including below
+# the hard-hold speed. Swept resets whenever the hold disengages.
 HOLD_SWEPT_EXIT = 0.9      # rad of heading actually turned (~52 deg)
 HOLD_EXIT_DECAY_TAU = 0.5  # s
 HOLD_STANDSTILL_TIMEOUT = 30.0  # s stopped before the held turn intent is dropped
 
-# Use spatial plan curvature below ~2.5 m/s, where the time-domain model horizon is too short.
+# The model's time-domain action.desiredCurvature is blind below ~2.5 m/s (0.3 s ahead
+# at creep speed is centimeters of road), but the plan's spatial geometry already shows
+# the turn at standstill (plan curvature 0.13-0.16 with the action at 0.005, matching
+# the demand the action produced once rolling). Feeding it into the ratchet lets the
+# wheel pre-wind toward the real turn before the car moves. Scaled and capped
+# conservatively: a too-high floor turns in tighter than the path (mild at creep lat
+# accel), while a too-low one just reduces the head start. The plan flickers straight
+# for ~1-2 s right at the standstill->motion transition; the ratchet holds through it
+# by design.
 HOLD_PLAN_LOOKAHEAD_NEAR = 4.0  # m; reads whether the turn starts NOW
 HOLD_PLAN_LOOKAHEAD_FAR = 7.0   # m; reads the turn's curvature
 HOLD_PLAN_SCALE = 0.85
 HOLD_PLAN_CAP = 0.12            # 1/m
-# Fade pre-wind by distance to the first plan bend to avoid turning in before the corner.
+# Proximity gate on the pre-wind: the 4/7 m probe reads the corner's full curvature the
+# instant the plan bends toward it, which at a stop-line turn is several meters before
+# the car reaches the line — winding the wheel while still rolling cuts the inside
+# curb, and an early blinker turns in before the corner. The plan itself carries the
+# distance: the onset probe finds where the path bends. Scale the pre-wind from full at
+# ONSET_NEAR to zero at ONSET_FAR_GATE so it winds only as the corner closes. At a real
+# stop the onset collapses to ~0 m once stopped, so the stop-line pre-wind still
+# reaches full strength — just later, at the line instead of 3 m short of it.
 HOLD_ONSET_HEADING = 10.0   # deg of plan heading change that marks the corner
 HOLD_ONSET_NEAR = 1.5       # m; corner this close -> full pre-wind
 HOLD_ONSET_FAR_GATE = 5.0   # m; corner past this -> no pre-wind yet
 HOLD_ONSET_FAR = 100.0      # m; sentinel "no corner found"
 HOLD_REACH_MIN = 7.0        # m of plan reach below which the pre-wind is untrusted
 HOLD_REACH_FULL = 12.0
-# Release on sustained opposite model curvature; ignore pull-away noise.
+# The model counter-steers at every turn exit; an opposite-direction command is the
+# "turn is over" signal at any speed. Without this the floor converts the exit unwind
+# into a stuck same-sign command the driver has to fight. Deadband rejects the ~0.002
+# pull-away flickers.
 HOLD_OPPOSITE_RELEASE = 0.01  # 1/m
-# A driver push into the signaled turn captures the curvature already wound into the wheel.
+# Nudge-to-commit: creeping toward a rolling turn below the release speed, the model
+# often does not commit until the geometry is entered, leaving the driver to wind the
+# whole turn by hand. The driver's own torque separates a premature machine wind (they
+# BRACE against it) from a gap that is theirs (they PUSH into it), so a matching push
+# is the "go" signal: capture the curvature they have physically wound into the hold,
+# un-rate-limited (the wheel is already there; holding adds no motion), so the car
+# grabs the turn at a nudge. Allowed anywhere the hold exists (< release speed); the
+# decay/handoff/opposite-release machinery already bounds the captured floor.
 HOLD_CONFIRM_MIN = 0.003   # 1/m (~7 deg of wheel) of wound curvature before capture
 HOLD_CONFIRM_SWEPT = 0.6   # rad swept this blinker cycle; past this a push is exit-shaping, not initiation
 
-# Probe at a constant-time distance while rolling, then fade authority as measured
-# curvature approaches the lead. Disable at creep speed, where fixed-distance probes suffice.
+# Turn-initiation lead. The model's action and the fixed 4/7 m probes are anchored in
+# METERS, so the seconds of warning they give shrinks with speed — at 12 mph a corner
+# enters the 7 m window only ~1.3 s out, too late to wind the wheel. This lead probes
+# the plan at a constant-TIME distance instead and max-mag blends into the command, so
+# initiation can start while still rolling at 9-12 mph. The engagement fade (authority
+# ramps to zero as measured curvature approaches the lead) limits it to the initiation
+# phase: once the car is tracking the arc, the model owns the turn shape. A binary gate
+# here limit-cycles (cutting drops demand to a still-small action, the wheel unwinds
+# below the threshold, the lead re-fires — a 5 Hz demand sawtooth felt as wiggle); the
+# fade instead settles at a stable ~2/3-of-lead equilibrium until the action takes over
+# via the max-mag blend. Below TURN_LEAD_MIN_SPEED the lead must stay OFF: at creep
+# speed the probe's 4 m distance floor chord-fits a turn's straight-then-arc entry as
+# "arc now", demanding 3-5x the model's intent, and the model fights back — while its
+# meter-anchored horizon already gives 2+ s of warning there, so the lead's reason to
+# exist does not apply.
 TURN_LEAD_T = 1.3           # s of travel the probe looks ahead (~wind-up time + lat delay)
 TURN_LEAD_MIN_M = 4.0
 TURN_LEAD_MAX_M = 14.0
@@ -69,7 +139,11 @@ TURN_LEAD_SCALE = 0.85
 TURN_LEAD_CAP = 0.12        # 1/m
 TURN_LEAD_ENGAGED_FRAC = 0.5    # engagement fade starts here, zero authority at 1.0
 TURN_LEAD_MODEL_OPPOSE = 0.003  # 1/m: model steering this hard against the blinker vetoes the lead
-# Veto the rolling lead when projected stopping distance ends before the probed arc.
+# Braking-to-a-stop veto: if sustaining the current decel parks the car within this
+# factor of the probe distance, the driver intends to stop short of the arc — demanding
+# that arc's curvature NOW winds the wheel at a stop approach the model didn't plan.
+# Turn-approach braking releases before this trips; a held brake to standstill keeps it
+# tripped, deferring the turn to the pre-wind.
 TURN_LEAD_STOP_MARGIN = 1.5
 TURN_LEAD_DECEL_GATE = -0.5  # m/s^2: only project a stop when genuinely braking
 

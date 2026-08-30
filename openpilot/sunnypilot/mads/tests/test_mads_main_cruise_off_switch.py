@@ -73,3 +73,6 @@ class TestMainCruiseOffSwitch(OpenpilotTestCase):
     assert not self._run("mazda", prev_available=False, enabled=False)
 
   def test_own_button_brands_keep_the_edge_only_behavior(self):
+    # a hyundai with an LDA button engages MADS with main cruise off, so a low availability
+    # level is a normal state there and must not disable it
+    assert not self._run("hyundai", prev_available=False, enabled=True, flags=HyundaiFlags.HAS_LDA_BUTTON)

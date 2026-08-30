@@ -16,8 +16,14 @@ from openpilot.sunnypilot.selfdrive.locationd.torqued_ext import (
   TorqueEstimatorExt,
 )
 
+# Discover configured cars
+SPEED_DEP_CARS = get_speed_dep_config()
+SPEED_DEP_FINGERPRINT = next(iter(SPEED_DEP_CARS)) if SPEED_DEP_CARS else None
 
+# Sentinel fingerprint that must not appear in speed_dependent.toml
 NON_SPEED_DEP_FINGERPRINT = 'NOT_IN_SPEED_DEP_TOML'
+assert NON_SPEED_DEP_FINGERPRINT not in SPEED_DEP_CARS, f"{NON_SPEED_DEP_FINGERPRINT} unexpectedly in speed_dependent.toml"
+
 
 def _get_car_bins(fingerprint):
   """Get actual bin centers and bounds for a configured car (or defaults for unconfigured)."""
@@ -30,10 +36,13 @@ def _get_car_bins(fingerprint):
     bounds = list(SPEED_BIN_BOUNDS)
   return centers, bounds
 
+# Both Params locations need mocking: torqued.py (cache) and torqued_ext.py (toggles)
 PATCH_PARAMS = 'openpilot.selfdrive.locationd.torqued.Params'
 PATCH_EXT_PARAMS = 'openpilot.sunnypilot.selfdrive.locationd.torqued_ext.Params'
 
+
 def _setup_ext_mock(mock_ext_params_cls, speed_dep_on):
+  """Configure the torqued_ext Params mock for toggle state.
 
   Speed-dep learning requires the full activation chain the UI enforces before the toggle
   is even reachable (Enforce Torque Control + Self-Tune), so enable those alongside it —
@@ -461,12 +470,15 @@ class TestGetMsgWithPoints:
     _setup_ext_mock(mock_ext, speed_dep_on=True)
     centers, bounds = _get_car_bins(SPEED_DEP_FINGERPRINT)
     est = TorqueEstimator(make_mock_CP())
+    # Pick speeds inside two different bins
     v1 = (bounds[0][0] + bounds[0][1]) / 2
     v2 = (bounds[-1][0] + bounds[-1][1]) / 2
     est._on_torque_point(0.1, 0.3, v1)
+    est._on_torque_point(0.2, 0.4, v2)
 
     msg = est.get_msg(with_points=True)
     ltp = msg.lateralTorqueParameters
+    assert len(ltp.speedBinPoints) == len(bounds)
     total_points = sum(len(bin_pts) for bin_pts in ltp.speedBinPoints)
     assert total_points >= 2
 
@@ -536,9 +548,12 @@ class TestSpeedBinInitIdempotency:
     _setup_ext_mock(mock_ext, speed_dep_on=True)
     est = TorqueEstimator(make_mock_CP())
 
+    # Pick the midpoint of the first bin
     centers, bounds = _get_car_bins(SPEED_DEP_FINGERPRINT)
     vego = (bounds[0][0] + bounds[0][1]) / 2
     est._on_torque_point(0.1, 0.3, vego)
     assert len(est.speed_bin_points[0]) == 1
+
     est._on_torque_point(0.2, 0.4, vego)
+    # Should now have 2 points (not re-initialized)
     assert len(est.speed_bin_points[0]) == 2

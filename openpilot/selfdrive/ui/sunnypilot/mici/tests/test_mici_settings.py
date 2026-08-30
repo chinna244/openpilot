@@ -5,6 +5,15 @@ This file is part of zoompilot and is licensed under the MIT License.
 See the LICENSE.md file in the root directory for more details.
 """
 
+# Regression tests for the SP MICI settings widgets. These cover the param<->display contracts
+# that are easy to break silently: nothing renders differently when a scaling factor or a value
+# map is wrong, the setting just quietly writes the wrong number.
+
+import os
+
+import pytest
+
+os.environ["BIG"] = "0"
 os.environ.setdefault("SCALE", "1")
 
 
@@ -29,12 +38,21 @@ def params(gui):
 
   p = Params()
   ui_state.params = p
+  # on device update_params() runs every frame before anything draws, so attributes it
+  # sets (always_offroad, screensaver_enabled, ...) exist by render time. Without this a
+  # layout reading one of them fails in the test for a reason the device never sees.
   ui_state.update_params()
   return p
 
+
+def render(widget):
+  """Drive one frame the way gui_app does — Widget.render() is what calls _update_state()."""
   import pyray as rl
   widget.render(rl.Rectangle(0, 0, 800, 600))
 
+
+def wait_for_param(params, key, timeout=2.0):
+  """Widgets write with a non-blocking put(), which lands on a background thread."""
   import time
   deadline = time.monotonic() + timeout
   last = params.get(key)
@@ -92,18 +110,21 @@ class TestFloatParamScaling:
       picker._commit_value()
       assert wait_for_param(params, param) == pytest.approx(physical), f"{physical} did not survive"
 
+      # and the value we just wrote reads back as the same picker position
       assert NumberPickerScreen(title="t", param=param, min_value=1, max_value=100,
                                 float_param=True)._read_value() == target
 
   def test_int_params_are_not_scaled(self, params):
     from openpilot.selfdrive.ui.sunnypilot.mici.widgets.button import BigParamOption
 
+    params.put("BlinkerMinLateralControlSpeed", 25, block=True)
     opt = BigParamOption("t", "BlinkerMinLateralControlSpeed", min_value=0, max_value=255)
     assert opt._read_value() == 25
 
 
 class TestMultiParamValueMapping:
   """BigMultiParamToggleSP stores the option index by default, or a mapped value with `values=`."""
+
   def test_alc_modes_map_to_stored_value_not_index(self, params):
     from openpilot.selfdrive.ui.sunnypilot.mici.layouts.steering import ALC_LABELS
     from openpilot.selfdrive.ui.sunnypilot.mici.widgets.button import BigMultiParamToggleSP
@@ -119,6 +140,8 @@ class TestMultiParamValueMapping:
     from openpilot.selfdrive.ui.sunnypilot.mici.widgets.button import BigMultiParamToggleSP
     from openpilot.sunnypilot.selfdrive.controls.lib.auto_lane_change import AutoLaneChangeMode
 
+    # AutoLaneChangeTimer defaults to "0" (nudge) in params_keys.h — an unset param must not
+    # read as "off" (-1), which is a different index AND a different stored value
     params.remove("AutoLaneChangeTimer")
     w = BigMultiParamToggleSP("t", "AutoLaneChangeTimer", list(ALC_LABELS.values()), values=list(ALC_LABELS))
     assert w.value == ALC_LABELS[AutoLaneChangeMode.NUDGE]
@@ -126,19 +149,25 @@ class TestMultiParamValueMapping:
   def test_tap_writes_mapped_value_and_wraps(self, params):
     from openpilot.selfdrive.ui.sunnypilot.mici.layouts.steering import ALC_LABELS
     from openpilot.selfdrive.ui.sunnypilot.mici.widgets.button import BigMultiParamToggleSP
+    from openpilot.system.ui.lib.application import MousePos
+    from openpilot.sunnypilot.selfdrive.controls.lib.auto_lane_change import AutoLaneChangeMode
 
     modes = list(ALC_LABELS)
     params.put("AutoLaneChangeTimer", modes[-1], block=True)
     w = BigMultiParamToggleSP("t", "AutoLaneChangeTimer", list(ALC_LABELS.values()), values=modes)
     w.refresh()
     w._handle_mouse_release(MousePos(0, 0))
+    # wraps to the first option, and stores -1 (the mode) rather than 0 (the index)
     assert w.value == ALC_LABELS[AutoLaneChangeMode.OFF]
+    assert params.get("AutoLaneChangeTimer") == AutoLaneChangeMode.OFF
+
   def test_torque_tune_unset_is_v2(self, params):
     """params_keys.h declares 2.0 (v2); controlsd_ext reads it with return_default, so the
     selector must agree. If these drift, the UI claims a tune the car isn't running."""
     from openpilot.selfdrive.ui.sunnypilot.mici.layouts.steering import SteeringLayoutMici
     from openpilot.selfdrive.ui.sunnypilot.mici.widgets.button import BigMultiParamToggleSP
 
+    versions = SteeringLayoutMici._load_torque_versions()
     assert list(versions.values()) == sorted(versions.values()), "must be oldest-first"
 
     params.remove("TorqueControlTune")
@@ -148,6 +177,7 @@ class TestMultiParamValueMapping:
     for label, version in versions.items():
       params.put("TorqueControlTune", version, block=True)
       w.refresh()
+      assert w.value == label
 
 
 class TestDependentSettings:
@@ -194,6 +224,7 @@ class TestSubPanelSelfRefresh:
     panel = SubPanelSP([toggle])
     assert not toggle._checked
 
+    # an external writer (sunnylink, another panel) changes the param
     params.put_bool("AutoLaneChangeBsmDelay", True, block=True)
     render(panel)
     assert toggle._checked, "panel must pick up param changes without a parent driving it"
@@ -204,6 +235,7 @@ class TestSubPanelSelfRefresh:
 
     params.put_bool("LiveTorqueParamsToggle", False, block=True)
     params.put_bool("SpeedDependentTorqueToggle", True, block=True)
+    layout = SteeringLayoutMici()
 
     render(layout._tq_self_tune_view)
     assert not layout._tq_speed_dep._checked, "inert child must read off"
@@ -213,6 +245,7 @@ class TestSubPanelSelfRefresh:
     params.put_bool("LiveTorqueParamsToggle", True, block=True)
     render(layout._tq_self_tune_view)
     assert layout._tq_speed_dep._checked, "comes back when self-tune returns"
+
 
 class TestSteeringLayoutBadges:
   def test_bsm_badge_hidden_when_auto_lane_change_cannot_feed_it(self, params):
@@ -385,6 +418,11 @@ class TestMadsLimitedCallSignature:
       ui_state.CP, ui_state.CP_SP = old_cp, old_cp_sp
 
 
+# Everything above drives _update_state() and asserts on widget state, so nothing here ever
+# executed a _draw_content override. That is exactly where the SP widgets reach into upstream
+# internals, and it is how BigButtonSP kept calling BigButton._width_hint() after the
+# 2026-08-24 sync split it into _title_width_hint()/_subtitle_width_hint(): the suite stayed
+# green and the UI died on the first frame with AttributeError. These tests draw.
 
 LAYOUT_TARGETS = [
   ("cruise", "CruiseLayoutMici"),
@@ -396,6 +434,11 @@ LAYOUT_TARGETS = [
   ("trips", "TripsLayoutMici"),
   ("visuals", "VisualsLayoutMici"),
 ]
+
+
+class TestSubtitleAreaRenders:
+  """BigButtonSP's three subtitle modes are drawn, not stored, so each needs a real frame."""
+
   def _button(self, **kwargs):
     from openpilot.selfdrive.ui.sunnypilot.mici.widgets.button import BigButtonSP
     return BigButtonSP("Lane change", **kwargs)
@@ -407,17 +450,25 @@ LAYOUT_TARGETS = [
     render(btn)
 
   def test_wrapped_badges_render(self, params):
+    # more pills than fit on one row exercises the multi-row layout in _draw_badges
+    btn = self._button()
+    btn.set_badges([(f"badge-{i}", "on") for i in range(8)])
+    render(btn)
+
+  def test_disabled_pill_renders(self, params):
     btn = self._button()
     btn.set_disabled()
     assert btn._disabled
     render(btn)
 
   def test_plain_value_subtitle_renders(self, params):
+    # upstream's own path: no badges, so _draw_content must fall through to BigButton
     btn = self._button(value="on")
     assert btn._badge_labels is None
     render(btn)
 
 
+class TestLayoutsSurviveRender:
   """Post-sync guard. A layout that imports and updates cleanly can still crash on draw."""
 
   @pytest.mark.parametrize(("module", "cls"), LAYOUT_TARGETS)
@@ -429,17 +480,23 @@ LAYOUT_TARGETS = [
     render(layout)
     render(layout)  # second frame: first one only populates the scroller's visible set
 
+  @pytest.mark.parametrize(("module", "cls"), LAYOUT_TARGETS)
   def test_every_scroller_item_renders(self, params, module, cls):
+    # The scroller culls anything off screen, so rendering the layout alone only proves the
+    # top of the list draws. Draw every item so a break further down cannot hide behind a
+    # scroll position no test ever reaches.
     import importlib
 
     mod = importlib.import_module(f"openpilot.selfdrive.ui.sunnypilot.mici.layouts.{module}")
     layout = getattr(mod, cls)()
+    render(layout)
     items = layout._scroller.items
     assert items, f"{cls} rendered no items, so this guard would pass vacuously"
     for item in items:
       render(item)
 
   def test_home_layout_renders(self, params):
+    # the boot screen, and the only SP layout that is not a scroller
     from openpilot.selfdrive.ui.sunnypilot.mici.layouts.home import MiciHomeLayoutSP
 
     render(MiciHomeLayoutSP())

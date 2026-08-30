@@ -5,6 +5,21 @@ This file is part of zoompilot and is licensed under the MIT License.
 See the LICENSE.md file in the root directory for more details.
 """
 
+# Behavior tests for the v2 torque tune, run against the real controllers with a toy
+# steering geometry (curvature proportional to steering angle) and a mocked car interface
+# (torque == lat_accel / latAccelFactor). The load-bearing property is the first test:
+# with its mechanisms quiescent (constant speed, friction 0, a plan that is not changing),
+# v2 must be frame-for-frame identical to v0 — everything else is a deliberate, tested delta.
+
+import math
+from collections import deque
+from types import SimpleNamespace
+from unittest.mock import MagicMock
+
+import pytest
+
+from opendbc.car.structs import car
+from openpilot.cereal import custom
 from openpilot.common.params import Params
 from openpilot.common.prefix import OpenpilotPrefix
 from openpilot.sunnypilot.selfdrive.controls.lib.latcontrol_torque_v0 import LatControlTorque as LatControlTorqueV0
@@ -74,16 +89,22 @@ class TestLatControlTorqueV2:
     v0, v2 = make_pair()
     v_ego = 15.0
     desired = 2e-3
+    # prime v2's curvature buffer with the constant plan while inactive, so the lead term is
+    # zero from the first engaged frame; a zero measurement leaves both rate filters at rest
     for _ in range(DELAY_FRAMES + 10):
       step(v0, make_cs(v_ego), desired, active=False)
       step(v2, make_cs(v_ego), desired, active=False)
     for i in range(300):
       measured = 1.5e-3 * math.sin(i / 80)
+      out0, _, log0 = v0.update(True, make_cs(v_ego, measured * v_ego ** 2), VM, LP, False, desired, None, False, LAT_DELAY)
+      out2, _, log2 = v2.update(True, make_cs(v_ego, measured * v_ego ** 2), VM, LP, False, desired, None, False, LAT_DELAY)
       assert log2.desiredLateralAccel == pytest.approx(log0.desiredLateralAccel, abs=1e-6), f"frame {i}"
       assert out2 == pytest.approx(out0, abs=1e-9), f"frame {i}"
     assert log0.version == 0
     assert log2.version == 2
 
+  def test_no_phantom_jerk_when_decelerating_through_constant_curvature(self, params):
+    """Mechanism 1: braking through a constant-curvature arc, the delayed request rescaled by
     the current v^2 equals the live request, so v2 sees zero desired jerk. v0's lat-accel
     buffer replays the higher old-speed values and reads a phantom jerk."""
     v0, v2 = make_pair()
@@ -132,6 +153,8 @@ class TestLatControlTorqueV2:
     v2 = make_lac(LatControlTorqueV2)
     assert not v2.extension.overrides_output
     assert v2.pid.pos_limit == pytest.approx(LAF)
+    # update_limits must stay a no-op on the extension, or the per-frame speed-dep
+    # override path would restore torque-space limits
     v2.update_limits()
     assert v2.pid.pos_limit == pytest.approx(LAF)
 
@@ -139,6 +162,8 @@ class TestLatControlTorqueV2:
     assert v0.extension.overrides_output
     assert v0.pid.pos_limit == pytest.approx(v0.steer_max)
 
+  def test_release_decay_is_one_shot(self, params):
+    """Handing back the wheel decays the integrator once (x0.8), not every frame."""
     v2 = make_lac(LatControlTorqueV2)
     v2.pid.i = 1.0
     step(v2, make_cs(pressed=True), 0.0)  # frozen while pressed
@@ -146,6 +171,8 @@ class TestLatControlTorqueV2:
     step(v2, make_cs(pressed=False), 0.0)  # falling edge: one-shot decay, error is 0
     assert v2.pid.i == pytest.approx(0.8)
     step(v2, make_cs(pressed=False), 0.0)
+    assert v2.pid.i == pytest.approx(0.8)
+
     v0 = make_lac(LatControlTorqueV0)
     v0.pid.i = 1.0
     step(v0, make_cs(pressed=True), 0.0)
@@ -158,29 +185,41 @@ class TestLatControlTorqueV2:
     v2 = make_lac(LatControlTorqueV2)
     v_ego = 15.0
     hold = 0.25 / v_ego ** 2  # steady setpoint 0.25 m/s^2, inside the near-zero band
+    # settle the setpoint lead's jerk filter with the measurement on the request, so the
+    # integrator enters the unwind at a value this test sets rather than a wound-up one
     for _ in range(300):
       step(v2, make_cs(v_ego, 0.25), hold)
     assert v2.prev_setpoint == pytest.approx(0.25)
     v2.pid.i = 0.05
 
+    # ramp the plan to zero over 4 frames; the measurement stays on the old request, so a
+    # live integrator would keep winding down against the error the unwind opens up
     i_during = []
     for k in range(10):
       step(v2, make_cs(v_ego, 0.25), hold * max(0.0, 1 - 0.25 * k))
       i_during.append(v2.pid.i)
+    assert i_during[2] != pytest.approx(0.05)  # the pre-freeze frames did integrate
+    assert all(i == pytest.approx(i_during[3]) for i in i_during[3:])  # frozen through the unwind
 
     for _ in range(8):
       step(v2, make_cs(v_ego, 0.25), 0.0)  # settled again: rate 0, integrating resumes
     assert v2.pid.i != pytest.approx(i_during[-1])
 
+  def test_unwind_freezes_integrator_left_turn(self, params):
+    """Mirror of the test above with a negative setpoint: exiting a LEFT turn the setpoint
     rate is POSITIVE, so unwind detection must be measured relative to the side being
     exited — a bare `rate < threshold` never fires here (the original sign bug)."""
     v2 = make_lac(LatControlTorqueV2)
     v_ego = 15.0
+    hold = -0.25 / v_ego ** 2
+    for _ in range(300):
       step(v2, make_cs(v_ego, -0.25), hold)
     assert v2.prev_setpoint == pytest.approx(-0.25)
     v2.pid.i = -0.05
 
     i_during = []
+    for k in range(10):
+      step(v2, make_cs(v_ego, -0.25), hold * max(0.0, 1 - 0.25 * k))
       i_during.append(v2.pid.i)
     assert i_during[2] != pytest.approx(-0.05)  # the pre-freeze frames did integrate
     assert all(i == pytest.approx(i_during[3]) for i in i_during[3:])  # frozen through the unwind
@@ -196,6 +235,9 @@ class TestLatControlTorqueV2:
       step(v2, make_cs(v_ego, 0.0), 0.0)
     v2.pid.i = 0.0
 
+    # ramp the plan into the left turn fast enough that the raw setpoint rate crosses
+    # the -1 m/s^3 threshold while |setpoint| is still inside the 0.3 m/s^2 band;
+    # the measurement lags at zero, so a live integrator winds negative
     i_vals = []
     for k in range(20):
       step(v2, make_cs(v_ego, 0.0), target * min(1.0, 0.1 * (k + 1)))
@@ -209,6 +251,9 @@ class TestLatControlTorqueV2:
     max(minSteerSpeed, 0.3) so it keeps working at creep speeds."""
     v0, v2 = make_pair()
     v_ego = 3.0
+    desired = 0.05 / v_ego ** 2  # small error: the boosted low-speed P gain must not clip the output
+    for _ in range(50):
+      log0 = step(v0, make_cs(v_ego), desired)
       log2 = step(v2, make_cs(v_ego), desired)
     assert log0.i == pytest.approx(0.0)
     assert log2.i > 0.0
@@ -222,6 +267,9 @@ class TestLatControlTorqueV2:
     often; the release decay and unwind freeze replace a blunt reset). v0's stale buffer
     reads a large phantom jerk on the first active frame."""
     v0, v2 = make_pair()
+    v2.pid.i = 0.5
+    v_ego = 15.0
+    desired = 2e-3
     for _ in range(2 * DELAY_FRAMES):
       step(v0, make_cs(v_ego, desired * v_ego ** 2), desired, active=False)
       step(v2, make_cs(v_ego, desired * v_ego ** 2), desired, active=False)
@@ -260,6 +308,7 @@ class TestLatControlTorqueV2:
     history = deque([0.0] * (DELAY_FRAMES + 1), maxlen=DELAY_FRAMES + 1)
     v0_friction, v2_friction = [], []
     for i in range(600):
+      # planner wobble around center: +-0.04 m/s^2 flipping every 0.4 s
       desired = math.copysign(0.04, math.sin(2 * math.pi * i / 80)) / v_ego ** 2
       measured_lat_accel = history[-DELAY_FRAMES] * v_ego ** 2  # wheel tracks the delayed command
       history.append(desired)
@@ -276,6 +325,7 @@ class TestRailAwareSaturation:
   """A railed EPS must raise the saturation warning even though the carcontroller's
   ceiling clamp reports it as steer_limited_by_safety; sub-rail safety limiting
   (driver-torque narrowing) keeps its suppression, and platforms without a rail
+  schedule keep stock semantics."""
 
   SAT_FRAMES = int(0.4 / DT) + 20  # steerLimitTimer plus margin
 
@@ -292,6 +342,7 @@ class TestRailAwareSaturation:
       log = self._step_sls(lac, cs, desired_curvature, sls)
     return log
 
+  def test_railed_eps_raises_saturation(self, params):
     lac = make_lac(LatControlTorqueV2)
     lac.steer_rail_schedule = ([0.0, 30.0], [0.6, 0.6])
     log = self._run(lac, lat_accel_demand=4.5, sls=True, frames=self.SAT_FRAMES)
@@ -306,6 +357,7 @@ class TestRailAwareSaturation:
   def test_sub_rail_safety_limit_keeps_suppression(self, params):
     lac = make_lac(LatControlTorqueV2)
     lac.steer_rail_schedule = ([0.0, 30.0], [0.6, 0.6])
+    # measurement tracks the demand: no error, output = ff = 0.2 of scale, under the rail
     cs = make_cs(v_ego=15.0, lat_accel=0.5)
     log = None
     for _ in range(self.SAT_FRAMES * 2):
@@ -323,7 +375,13 @@ class TestRailAwareSaturation:
     log = self._run(lac, lat_accel_demand=6.0, sls=False, frames=self.SAT_FRAMES)
     assert log.saturated
 
+
 class TestRailLimitedPid:
+  """The PID is limited to the torque the EPS will actually deliver, not the full steer scale,
+  so its own directional anti-windup engages at the real rail. Delivered counts are unchanged
+  (the carcontroller clamps there regardless); what changes is that a railed integrator can
+  still unwind instead of only being frozen from outside."""
+
   RAIL = 0.5
 
   def _railed(self, rail=RAIL):
@@ -442,7 +500,10 @@ class TestLowSpeedGain:
     assert abs(out2) < 0.9 * v2.steer_max
     assert log2.p == pytest.approx(err * KP_LOW_SPEED[3.0], rel=1e-6)
 
+
 def make_plan_model(frame_id, curvature, v_plan=15.0):
+  """Fake modelV2 carrying a curvature plan over T_IDXS (constant, or a callable of plan
+  time). orientationRate.z = curvature * velocity, matching the on-wire convention."""
   ks = [curvature(t) if callable(curvature) else curvature for t in ModelConstants.T_IDXS]
   return SimpleNamespace(
     frameId=frame_id,
@@ -457,6 +518,7 @@ class TestPlanJerkSource:
   and falls back to the request differencer (shipped v2 behavior) when it is not: no model,
   stale model, short arrays, curvature_limited, steeringPressed, or request/plan divergence.
   Every test above this class runs with no model attached and pins the fallback path."""
+
   def test_coherent_flat_plan_matches_v0(self, params):
     """A flat plan matching a flat request is the quiescent case on the plan path (w=1,
     plan jerk 0): v2 must still be frame-for-frame identical to v0."""
@@ -615,8 +677,10 @@ class TestReleaseRampAndRailTaper:
     errors, ps, _ = self._steady_error_run(v2, v_ego=15.0, lat_accel=-0.5, press_frames=50)
     full = errors[-1]
     assert abs(full) > 0.4  # the standing error survives the run
+    # first post-release frame carries ~dt/RAMP_T of the error, not all of it
     assert abs(errors[0]) < 0.1 * abs(full)
     assert abs(ps[0]) < 0.1 * abs(ps[-1])
+    # monotone ramp-in, complete within RELEASE_ERROR_RAMP_T
     assert abs(errors[9]) < abs(errors[19]) < abs(errors[29])
     assert errors[35] == pytest.approx(full, rel=1e-6)
 
@@ -624,6 +688,7 @@ class TestReleaseRampAndRailTaper:
     """The ramp eases the PID error only: feedforward (the curve hold the driver expects
     back immediately) must not dip at the release edge."""
     v2 = make_lac(LatControlTorqueV2)
+    # nonzero desired so the FF is meaningful; measurement matches desired (no error)
     for _ in range(DELAY_FRAMES + 10):
       step(v2, make_cs(15.0), 2e-3, active=False)
     for _ in range(50):
@@ -633,8 +698,10 @@ class TestReleaseRampAndRailTaper:
 
   def test_no_ramp_without_a_release_edge(self, params):
     """A steady active run never engages the ramp: error is full-scale from the start."""
+    v2 = make_lac(LatControlTorqueV2)
     for _ in range(DELAY_FRAMES + 10):
       step(v2, make_cs(15.0), 0.0, active=False)
+    log = step(v2, make_cs(15.0, -0.5), 0.0)
     assert abs(log.error) > 0.4
 
   def _railed_run(self, v2, frames=120):
@@ -642,6 +709,7 @@ class TestReleaseRampAndRailTaper:
     v_ego = 15.0
     logs = []
     desired = 0.0
+    for _ in range(DELAY_FRAMES + 10):
       step(v2, make_cs(v_ego), desired, active=False)
     for _ in range(frames):
       desired = min(desired + 2e-4, 1.5e-2)  # ramps toward 3.4 m/s^2, output >> rail
@@ -651,8 +719,11 @@ class TestReleaseRampAndRailTaper:
   def test_rail_taper_collapses_lead_to_live_request(self, params):
     v2 = make_lac(LatControlTorqueV2)
     v2.steer_rail_schedule = ([0.0], [0.5])
+    logs = self._railed_run(v2)
+    # once the output has been on the rail for a few frames, the setpoint is the live request
     railed = [(future, log) for future, log in logs[10:] if abs(log.output) >= 0.5]
     assert len(railed) > 20
+    for future, log in railed[3:]:
       assert log.desiredLateralAccel == pytest.approx(future, abs=1e-6)
 
   def test_lead_survives_without_a_rail_schedule(self, params):
@@ -660,6 +731,7 @@ class TestReleaseRampAndRailTaper:
     (setpoint ahead of the live request while the demand ramps)."""
     v2 = make_lac(LatControlTorqueV2)
     assert v2.steer_rail_schedule is None
+    logs = self._railed_run(v2)
     leads = [log.desiredLateralAccel - future for future, log in logs[40:80]]
     assert max(abs(l) for l in leads) > 0.05
 
@@ -670,6 +742,7 @@ class TestReleaseRampAndRailTaper:
     v2a.steer_rail_schedule = ([0.0], [0.5])
     v2b = make_lac(LatControlTorqueV2)
     v_ego = 15.0
+    for _ in range(DELAY_FRAMES + 10):
       step(v2a, make_cs(v_ego), 0.0, active=False)
       step(v2b, make_cs(v_ego), 0.0, active=False)
     for i in range(200):

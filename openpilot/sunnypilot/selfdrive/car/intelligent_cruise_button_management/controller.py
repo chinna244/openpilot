@@ -23,22 +23,47 @@ SendButtonState = custom.IntelligentCruiseButtonManagement.SendButtonState
 SessionState = custom.LongitudinalPlanSP.SpeedLimit.AssistState
 
 INACTIVE_TIMER = 0.4
-# After a driver press, delay synthesized movement in the opposite direction.
+# After a genuine driver press the servo yields in the opposing direction for this long:
+# the driver just chose a speed and an immediate synthesized walk-back reads as a fight
+# (route 126 t=341: a +5 was reverted within 1.4 s). SET+ parks down-moves, SET- parks
+# up-moves (a refused re-anchor otherwise restores the baseline right over a fresh -5);
+# a press in the opposing direction cancels the other grace. Accountability mirrors the
+# gas override: the press is the driver's, so no urgency carve-out.
 DRIVER_PRESS_GRACE_T = 3.0
 DRIVER_PRESS_GRACE_FRAMES = int(DRIVER_PRESS_GRACE_T / DT_CTRL)
-# Apply a display-unit deadband to noisy limiter targets; track driver setpoints exactly.
+# Reaction deadband in display units, applied only while a limiter (SCC/SLA) drives the
+# plan; those targets jitter 1-2 units frame to frame and an undamped servo ping-pongs
+# SET+/SET- around the noise. A cruise-source target is the driver setpoint, a stable
+# integer, so track it exactly: a dash residual from a dropped press self-heals instead
+# of stranding the dash low.
 REACT_DEADBAND = 2
-# Require persistent error before sending buttons.
+# The error must persist this long before acting, so a single-frame target glitch
+# (e.g. a bad map sample) or a momentary dip can't trigger a button burst.
 REACT_TIMER = 0.3
-# Cars that defer deceleration while set speed changes require a stable target before
-# restoring speed. A 1 s window captured nearly all measured churn reduction.
+# Down moves act after REACT_TIMER. Up moves on decel_needs_stable_setpoint cars wait for
+# the target to hold still this long first: limiter dips arrive in trains, and restoring
+# between them churns the dash and delays the next decel on an ECU that will not commit
+# while the set speed is moving. The quiet window also gives card time to adopt the dash
+# after a driver press before the servo could chase a stale target. Decel-overshoot
+# release is exempt; its slow monotonic rise is measured as tolerated.
+# Sized from an 11-route / 57k-frame sweep of the recorded target streams: the churn
+# suppression is all bought in the first second (regret 67.7% -> 27.0% at 1.0 s; 3.0 s
+# only reaches 26.2% while nearly doubling the speed lost to the wait).
 RESTORE_QUIET_TIME = 1.0
 RESTORE_QUIET_FRAMES = int(RESTORE_QUIET_TIME / DT_CTRL)
 
-# Stock ACC deceleration follows the dash-to-actual-speed gap. Map requested deceleration
-# to that gap, never command above the planner target, and calibrate each brand from logs.
+# Deceleration overshoot: a stock ACC's deceleration scales with the gap between the dash
+# set speed and the ACTUAL speed, not the target: commanding dash = target produces almost
+# nothing until the car is already several mph over it, so it arrives at curves hot. When the
+# planner demands deceleration, command the dash below vEgo by the gap that yields the
+# requested decel, capped at the planner target from above (down-only: a stale command
+# fail-safes to the car slowing). The command tracks vEgo down through the maneuver and rises
+# back to the target on its own as the car converges and aTarget relaxes.
+# The mechanism is brand-agnostic; the response curve is not. To enable a brand, measure its
+# achieved decel vs (dash - vEgo) gap from logs and add an inverse map entry here.
 DECEL_OVERSHOOT_PARAMS = {
-  # Mazda CX-5 2022: 422k samples across 447 segments.
+  # Mazda CX-5 2022, 422k hands-off cruise samples across 447 rlog segments:
+  # ~0.09 m/s^2 per mph of gap, dead below ~2 mph, saturating near -0.75 m/s^2 by ~9 mph
   'mazda': {
     'decel_bp': [0.02, 0.09, 0.26, 0.44, 0.73],  # desired decel magnitude, m/s^2
     'gap_v': [1.5, 2.5, 4.0, 6.0, 8.5],  # required gap below vEgo, mph
@@ -46,16 +71,22 @@ DECEL_OVERSHOOT_PARAMS = {
     'min_decel': 0.15,  # m/s^2; leave gentle coast-downs to the stock behavior
   },
 }
-# Apply quickly and release slowly across the ECU's discrete deceleration stages.
+# Apply fast (the curve is coming), release slowly so the command doesn't pump between the
+# ECU's discrete coast/downshift/brake stages.
 DECEL_OVERSHOOT_RISE = 10.  # mph/s
 DECEL_OVERSHOOT_RELEASE = 3.  # mph/s
 DECEL_OVERSHOOT_SOURCES = (LongitudinalPlanSource.sccVision, LongitudinalPlanSource.sccMap,
                            LongitudinalPlanSource.speedLimitAssist)
 
-# A 10 Hz stream registers as paced discrete presses, not a hold. Use it for large moves
-# and finish with taps to avoid overshoot.
+# The sustained 10 Hz stream registers on the ECU as paced discrete presses, never as a
+# held button (all-routes census: 149/149 stream-driven dash steps were 1 mph -- the
+# wheel's own button-up frames interleave with the forged ones, so the ECU never sees an
+# unbroken hold). At ~4 mph/s it is still the fastest walk available, so it takes any
+# move with a real distance to cover; discrete taps take the small remainder, where the
+# stream's in-flight frames would overshoot and ping-pong around the target.
 FAST_MODE_MIN = 3  # display units of remaining error to run the stream
-# Fall back to taps for the drive if the stream does not move the dash.
+# If the dash never moves under the stream, this ECU is not registering it at all;
+# taps are the proven fallback for the rest of the drive.
 FAST_STALL_T = 1.5  # s
 
 TAP_BUTTONS = {

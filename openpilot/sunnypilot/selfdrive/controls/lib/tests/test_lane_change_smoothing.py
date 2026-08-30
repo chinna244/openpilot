@@ -35,6 +35,9 @@ OFF = make_model()
 
 class TestPaceMapping:
   def test_profile_time_span(self):
+    # pace 1 is the gentlest (~8 s), pace 9 just under stock timing
+    assert pace_profile_time(PACE_MIN) == pytest.approx(8.0, abs=0.1)
+    assert pace_profile_time(PACE_MAX) == pytest.approx(3.6, abs=0.1)
 
   def test_jerk_factor_monotonic_and_bounded(self):
     factors = [pace_jerk_factor(p) for p in range(PACE_MIN, PACE_MAX + 1)]
@@ -42,8 +45,11 @@ class TestPaceMapping:
     assert factors == sorted(factors)
 
   def test_pace5_matches_sinusoid(self):
+    # j = pi^3 * 3.5 / t^3 * 1.3 headroom over the 5.0 ISO limit
     t = pace_profile_time(5)
+    expected = (3.141592653589793 ** 3) * 3.5 / t ** 3 * 1.3 / MAX_LATERAL_JERK
     assert pace_jerk_factor(5) == pytest.approx(expected)
+
   def test_time_extra(self):
     assert lane_change_time_extra(PACE_MIN) == pytest.approx(2.0)
     assert lane_change_time_extra(9) == pytest.approx(2.0 / 9.0)
@@ -76,23 +82,32 @@ class TestLaneChangeSmoothing(OpenpilotTestCase):
     assert all(b >= a - 1e-9 for a, b in zip(jfs[:-1], jfs[1:], strict=True))  # monotonic release
 
   def test_arrest_gets_extra_authority(self):
+    # entry establishes the sign, then the model unwinds: the pursuit must raise the
+    # factor above the entry clamp, up to the arrest floor
     self.lcs.update(make_cs(15.0), IN_CHANGE, 0.001, 0.0)
     jf = self.lcs.set_jerk
+    for _ in range(100):
+      jf = self.lcs.update(make_cs(15.0), IN_CHANGE, -0.002, 0.0)
     assert jf > self.lcs.set_jerk * 2
     assert jf <= ARREST_JERK_FLOOR + 1e-6
+
+  def test_arrest_deadband_rejects_noise(self):
     self.lcs.update(make_cs(15.0), IN_CHANGE, 0.001, 0.0)
     jf = self.lcs.update(make_cs(15.0), IN_CHANGE, -0.00003, 0.0)
     assert jf == pytest.approx(self.lcs.set_jerk)
 
   def test_arrest_rise_is_smoothed(self):
+    # the boost must ramp with the rise tau, not step
     self.lcs.update(make_cs(15.0), IN_CHANGE, 0.001, 0.0)
     jf1 = self.lcs.update(make_cs(15.0), IN_CHANGE, -0.005, 0.0)
     jf2 = self.lcs.update(make_cs(15.0), IN_CHANGE, -0.005, 0.0)
     assert jf1 < ARREST_JERK_FLOOR * 0.5  # far from the cap on the first boosted frame
+    assert jf2 > jf1
 
   def test_finishing_state_keeps_clamp(self):
     jf = self.lcs.update(make_cs(15.0), FINISHING, 0.001, 0.0)
     assert jf == pytest.approx(self.lcs.set_jerk)
+
   def test_clip_curvature_scales_with_factor(self):
     full, _ = clip_curvature(15.0, 0.0, 0.01, 0.0)
     half, _ = clip_curvature(15.0, 0.0, 0.01, 0.0, jerk_factor=0.5)
