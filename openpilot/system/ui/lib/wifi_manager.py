@@ -178,6 +178,7 @@ class WifiManager:
     # State
     self._connections: dict[str, str] = {}  # ssid -> connection path, updated via NM signals
     self._wifi_state: WifiState = WifiState()
+    self._wifi_enabled: bool = True  # NetworkManager WirelessEnabled; refreshed from D-Bus
     self._user_epoch: int = 0
     self._ipv4_address: str = ""
     self._current_network_metered: MeteredType = MeteredType.UNKNOWN
@@ -209,6 +210,7 @@ class WifiManager:
   def _initialize(self):
     def worker():
       self._wait_for_wifi_device()
+      self._refresh_wifi_enabled()
 
       # TODO: wait for state thread to start before adding tethering connection, tiny race currently
       self._scan_thread.start()
@@ -284,6 +286,10 @@ class WifiManager:
     return self._wifi_state
 
   @property
+  def wifi_enabled(self) -> bool:
+    return self._wifi_enabled
+
+  @property
   def ipv4_address(self) -> str:
     return self._ipv4_address
 
@@ -325,6 +331,7 @@ class WifiManager:
 
     # Update networks and WiFi state (to self-heal) immediately when activating for UI
     if active:
+      self._refresh_wifi_enabled(block=False)
       self._init_wifi_state(block=False)
       self._update_networks(block=False)
 
@@ -355,6 +362,12 @@ class WifiManager:
         member="PropertiesChanged",
         path=self._wifi_device,
       ),
+      MatchRule(
+        type="signal",
+        interface=NM_PROPERTIES_IFACE,
+        member="PropertiesChanged",
+        path=NM_PATH,
+      ),
     )
 
     for rule in rules:
@@ -363,7 +376,8 @@ class WifiManager:
     with (self._conn_monitor.filter(rules[0], bufsize=SIGNAL_QUEUE_SIZE) as state_q,
           self._conn_monitor.filter(rules[1], bufsize=SIGNAL_QUEUE_SIZE) as new_conn_q,
           self._conn_monitor.filter(rules[2], bufsize=SIGNAL_QUEUE_SIZE) as removed_conn_q,
-          self._conn_monitor.filter(rules[3], bufsize=SIGNAL_QUEUE_SIZE) as props_q):
+          self._conn_monitor.filter(rules[3], bufsize=SIGNAL_QUEUE_SIZE) as props_q,
+          self._conn_monitor.filter(rules[4], bufsize=SIGNAL_QUEUE_SIZE) as nm_props_q):
       while not self._exit:
         try:
           self._conn_monitor.recv_messages(timeout=1)
@@ -377,6 +391,12 @@ class WifiManager:
         while len(new_conn_q):
           conn_path = new_conn_q.popleft().body[0]
           self._new_connection(conn_path)
+
+        # PropertiesChanged on NetworkManager (WirelessEnabled) - apply before scan results
+        while len(nm_props_q):
+          iface, changed, _ = nm_props_q.popleft().body
+          if iface == NM_IFACE and 'WirelessEnabled' in changed:
+            self._apply_wifi_enabled(bool(changed['WirelessEnabled'][1]))
 
         # PropertiesChanged on wifi device (LastScan = scan complete)
         while len(props_q):
@@ -405,6 +425,11 @@ class WifiManager:
 
     # TODO: Handle (FAILED, SSID_NOT_FOUND) and emit for UI to show error
     #  Happens when network drops off after starting connection
+
+    # Stale StateChanged may still be queued after WirelessEnabled=False.
+    # Ignore device transitions so they cannot repopulate _wifi_state.
+    if not self._wifi_enabled:
+      return
 
     if new_state == NMDeviceState.DISCONNECTED:
       if change_reason == NMDeviceStateReason.NEW_ACTIVATION:
@@ -498,7 +523,7 @@ class WifiManager:
 
   def _network_scanner(self):
     while not self._exit:
-      if self._active:
+      if self._active and self._wifi_enabled:
         if time.monotonic() - self._last_network_scan > SCAN_PERIOD_SECONDS:
           self._request_scan()
           self._last_network_scan = time.monotonic()
@@ -838,7 +863,62 @@ class WifiManager:
 
     threading.Thread(target=worker, daemon=True).start()
 
+  def _clear_wifi_runtime_state(self):
+    self._networks = []
+    self._ipv4_address = ""
+    self._current_network_metered = MeteredType.UNKNOWN
+    # Clear even when ssid is None (e.g. CONNECTING with no ssid yet)
+    self._set_connecting(None)
+
+  def _apply_wifi_enabled(self, enabled: bool):
+    was_enabled = self._wifi_enabled
+    self._wifi_enabled = enabled
+    if was_enabled and not enabled:
+      self._clear_wifi_runtime_state()
+      self._enqueue_callbacks(self._networks_updated, [])
+    elif not was_enabled and enabled:
+      # Resume scanning on the scanner thread; NM auto-reconnects to saved networks
+      self._last_network_scan = 0.0
+
+  def _refresh_wifi_enabled(self, block: bool = True):
+    def worker():
+      if self._router_main is None:
+        return
+      try:
+        reply = self._router_main.send_and_get_reply(Properties(self._nm).get('WirelessEnabled'))
+        if reply.header.message_type == MessageType.error:
+          cloudlog.warning(f"Failed to get WirelessEnabled: {reply}")
+          return
+        self._apply_wifi_enabled(bool(reply.body[0][1]))
+      except Exception:
+        cloudlog.exception("Failed to get WirelessEnabled")
+
+    if block:
+      worker()
+    else:
+      threading.Thread(target=worker, daemon=True).start()
+
+  def set_wifi_enabled(self, enabled: bool):
+    if self._router_main is None:
+      return
+
+    def worker():
+      try:
+        reply = self._router_main.send_and_get_reply(Properties(self._nm).set('WirelessEnabled', 'b', enabled))
+        if reply.header.message_type == MessageType.error:
+          cloudlog.warning(f"Failed to set WirelessEnabled: {reply}")
+          self._refresh_wifi_enabled()
+          return
+        self._apply_wifi_enabled(enabled)
+      except Exception:
+        cloudlog.exception("Failed to set WirelessEnabled")
+        self._refresh_wifi_enabled()
+
+    threading.Thread(target=worker, daemon=True).start()
+
   def _request_scan(self):
+    if not self._wifi_enabled:
+      return
     if self._wifi_device is None:
       cloudlog.warning("No WiFi device found")
       return
@@ -850,13 +930,14 @@ class WifiManager:
       cloudlog.warning(f"Failed to request scan: {reply}")
 
   def _update_networks(self, block: bool = True):
-    if not self._active:
+    if not self._active or not self._wifi_enabled:
       return
 
     def worker():
       with self._scan_lock:
-        if self._wifi_device is None:
-          cloudlog.warning("No WiFi device found")
+        if not self._wifi_enabled or self._wifi_device is None:
+          if self._wifi_device is None:
+            cloudlog.warning("No WiFi device found")
           return
 
         # NOTE: AccessPoints property may exclude hidden APs (use GetAllAccessPoints method if needed)
@@ -892,8 +973,19 @@ class WifiManager:
             # catch all for parsing errors
             cloudlog.exception(f"Failed to parse AP properties for {ap_path}")
 
+        if not self._wifi_enabled:
+          return
+
         self._networks = [Network.from_dbus(ssid, ap_list, ssid == self._tethering_ssid) for ssid, ap_list in aps.items()]
         self._update_active_connection_info()
+
+        # Wi-Fi may have been disabled while this scan/update was in flight
+        if not self._wifi_enabled:
+          self._networks = []
+          self._ipv4_address = ""
+          self._current_network_metered = MeteredType.UNKNOWN
+          return
+
         self._enqueue_callbacks(self._networks_updated, self.networks)  # sorted
 
     if block:
@@ -902,6 +994,11 @@ class WifiManager:
       threading.Thread(target=worker, daemon=True).start()
 
   def _update_active_connection_info(self):
+    if not self._wifi_enabled:
+      self._ipv4_address = ""
+      self._current_network_metered = MeteredType.UNKNOWN
+      return
+
     ipv4_address = ""
     metered = MeteredType.UNKNOWN
 
@@ -930,6 +1027,11 @@ class WifiManager:
           metered = MeteredType.YES
         elif metered_prop == MeteredType.NO:
           metered = MeteredType.NO
+
+    if not self._wifi_enabled:
+      self._ipv4_address = ""
+      self._current_network_metered = MeteredType.UNKNOWN
+      return
 
     self._ipv4_address = ipv4_address
     self._current_network_metered = metered

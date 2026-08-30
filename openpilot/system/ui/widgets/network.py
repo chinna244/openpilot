@@ -14,6 +14,7 @@ from openpilot.system.ui.widgets.keyboard import Keyboard
 from openpilot.system.ui.widgets.label import gui_label
 from openpilot.system.ui.widgets.scroller_tici import Scroller
 from openpilot.system.ui.widgets.list_view import ButtonAction, ListItem, MultipleButtonAction, ToggleAction, button_item, text_item
+from openpilot.system.ui.widgets.toggle import WIDTH as TOGGLE_WIDTH, HEIGHT as TOGGLE_HEIGHT
 
 if gui_app.sunnypilot_ui():
   from openpilot.system.ui.sunnypilot.widgets.list_view import button_item_sp as button_item
@@ -79,6 +80,7 @@ class NetworkUI(Widget):
     self._advanced_panel = self._child(AdvancedNetworkSettings(wifi_manager))
     self._nav_button = self._child(NavButton(tr("Advanced")))
     self._nav_button.set_click_callback(self._cycle_panel)
+    self._wifi_toggle = self._child(ToggleAction(initial_state=wifi_manager.wifi_enabled, callback=self._on_wifi_toggled))
 
   def show_event(self):
     super().show_event()
@@ -90,6 +92,13 @@ class NetworkUI(Widget):
     else:
       self._set_current_panel(PanelType.WIFI)
 
+  def _on_wifi_toggled(self, enabled: bool):
+    self._wifi_manager.set_wifi_enabled(enabled)
+
+  def _update_state(self):
+    # Reflect NetworkManager's WirelessEnabled, not a UI-only cache
+    self._wifi_toggle.set_state(self._wifi_manager.wifi_enabled)
+
   def _render(self, _):
     # subtract button
     content_rect = rl.Rectangle(self._rect.x, self._rect.y + self._nav_button.rect.height + 40,
@@ -97,6 +106,15 @@ class NetworkUI(Widget):
     if self._current_panel == PanelType.WIFI:
       self._nav_button.text = tr("Advanced")
       self._nav_button.set_position(self._rect.x + self._rect.width - self._nav_button.rect.width, self._rect.y + 20)
+
+      toggle_w = self._wifi_toggle.rect.width or TOGGLE_WIDTH
+      toggle_rect = rl.Rectangle(self._nav_button.rect.x - 30 - toggle_w,
+                                 self._rect.y + 20 + (self._nav_button.rect.height - TOGGLE_HEIGHT) / 2,
+                                 toggle_w, TOGGLE_HEIGHT)
+      label_rect = rl.Rectangle(toggle_rect.x - 20 - 280, self._rect.y + 20, 280, self._nav_button.rect.height)
+      gui_label(label_rect, tr("Wi-Fi"), font_size=60, alignment=rl.GuiTextAlignment.TEXT_ALIGN_RIGHT)
+      self._wifi_toggle.render(toggle_rect)
+
       self._wifi_panel.render(content_rect)
     else:
       self._nav_button.text = tr("Back")
@@ -312,8 +330,17 @@ class WifiManagerUI(Widget):
 
   def _update_state(self):
     self._wifi_manager.process_callbacks()
+    if not self._wifi_manager.wifi_enabled:
+      self._networks = []
+      if self.state != UIState.IDLE:
+        self.state = UIState.IDLE
+        self._state_network = None
 
   def _render(self, rect: rl.Rectangle):
+    if not self._wifi_manager.wifi_enabled:
+      gui_label(rect, tr("Wi-Fi is off"), 72, alignment=rl.GuiTextAlignment.TEXT_ALIGN_CENTER)
+      return
+
     if not self._networks:
       gui_label(rect, tr("Scanning Wi-Fi networks..."), 72, alignment=rl.GuiTextAlignment.TEXT_ALIGN_CENTER)
       return
@@ -452,6 +479,9 @@ class WifiManagerUI(Widget):
     self._wifi_manager.forget_connection(network.ssid)
 
   def _on_network_updated(self, networks: list[Network]):
+    if not self._wifi_manager.wifi_enabled:
+      self._networks = []
+      return
     self._networks = networks
     for n in self._networks:
       self._networks_buttons[n.ssid] = Button(normalize_ssid(n.ssid), partial(self._networks_buttons_callback, n), font_size=55,
