@@ -97,6 +97,23 @@ MODEL_STALE_FRAMES = 25  # fresh modelV2 lands every ~5 frames; a hung modeld mu
 LEAD_SPEED_FADE_BP = [4.0, 8.0]  # m/s
 LEAD_SPEED_FADE_V = [0.0, 1.0]
 
+# Low-speed damping on the measurement rate. The EPS slews torque at 12 counts/frame, so a
+# rail-to-rail traverse takes ~2 s: through a low-speed step the command rails, the applied
+# torque walks far behind it, and by the time the measurement reaches the setpoint the EPS
+# still carries most of a second of stale torque — the loop sails through, then swings back
+# (route 12e lateral maneuvers at 9 m/s: 35-100% overshoot on every 0.5 m/s^2 step, i frozen
+# near zero throughout, so not windup). The D term is the phase lead that unwinds the command
+# before the crossing: kd = 0.3 s * KP(v), the 0.3 s covering the fitted plant delay (0.15 s)
+# plus the measurement-rate filter's own lag at 1.2 Hz. Validated on the 12e steps two ways:
+# closed-loop sim against the fitted 9 m/s plant (overshoot 1.63 -> 1.21, rise unchanged) and
+# a model-free replay (command leaves the rail a median 0.13 s earlier). Capped below 7.5 m/s
+# — the naive product tracks KP toward 250 where the measured rate is mostly noise — and
+# faded to zero by 14.5 m/s: above the rail falloff the loop is well damped, and on 20+ m/s
+# transients the product term would exceed P (measured on routes 12d/12f), reshaping a
+# highway feel that is not broken. v0 keeps KD = 0.
+KD_INTERP_SPEEDS = [7.5, 10.0, 12.0, 14.5]  # m/s
+KD_INTERP = [1.65, 1.05, 0.85, 0.0]
+
 
 def get_center_chatter_jerk_deadzone(v_ego, setpoint):
   """Small-signal jerk deadzone for the friction input (see the constants above)."""
@@ -115,6 +132,9 @@ class LatControlTorque(LatControlTorqueV0):
   # default rather than a per-call guard.
   _rail_limit_scale = 1.0
   extension = None
+  # Built into the PID by v0's constructor; the -measurement_rate error_rate v0 already
+  # feeds it stops being a dead argument here.
+  KD_SCHEDULE = [KD_INTERP_SPEEDS, KD_INTERP]
 
   def __init__(self, CP, CP_SP, CI, dt):
     super().__init__(CP, CP_SP, CI, dt)
