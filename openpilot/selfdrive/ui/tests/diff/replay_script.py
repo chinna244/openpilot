@@ -307,8 +307,9 @@ def build_mici_script(pm: PubMaster, main_layout, script: Script) -> None:
   ]
 
   network_cases: Cases = [
+    None,  # Wi-Fi radio toggle (do not depend on NetworkManager in replay)
     explore_setting,  # select wifi (just open and close)
-    None, None,
+    None, None,  # network usage, tethering
     lambda: run_actions(click, interact_keyboard),  # tether password keyboard
   ]
 

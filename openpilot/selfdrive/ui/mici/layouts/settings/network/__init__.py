@@ -22,6 +22,13 @@ class WifiNetworkButton(BigButton):
   def _update_state(self):
     super()._update_state()
 
+    if not self._wifi_manager.wifi_enabled:
+      self.set_text("wi-fi")
+      self.set_value("off")
+      self.set_icon(self._wifi_slash_txt)
+      self._draw_lock = False
+      return
+
     # Update wi-fi button with ssid and ip address
     # TODO: make sure we handle hidden ssids
     wifi_state = self._wifi_manager.wifi_state
