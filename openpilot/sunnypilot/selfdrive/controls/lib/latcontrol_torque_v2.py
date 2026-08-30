@@ -22,6 +22,8 @@ from openpilot.sunnypilot.selfdrive.controls.lib.latcontrol_torque_ext_base impo
 from openpilot.sunnypilot.selfdrive.controls.lib.latcontrol_torque_v0 import (
   LatControlTorque as LatControlTorqueV0,
   FRICTION_THRESHOLD,
+  INTERP_SPEEDS,
+  KP_INTERP,
   LP_FILTER_CUTOFF_HZ,
 )
 
@@ -92,6 +94,23 @@ DIVERGENCE_BLEND_BP = [0.2, 0.5]  # m/s^2, |request - plan|; measured coherent-d
 DIVERGENCE_BLEND_V = [1.0, 0.0]
 MODEL_STALE_FRAMES = 25  # fresh modelV2 lands every ~5 frames; a hung modeld must not sustain a frozen slope
 
+# Low-speed proportional gain, replacing v0's inherited schedule below 7.5 m/s. The output the
+# EPS can actually deliver is rail(v) * latAccelFactor (~2.67 m/s^2 at low speed), so the error
+# that saturates the P term on its own is err_rail = that over KP(v) -- 0.04 m/s^2 at 2 m/s and
+# 0.23 at 5 under the inherited 65/11.5, which is a relay, not a proportional controller.
+# Measured corpus-wide on turning frames (|setpoint| > 0.5 m/s^2), the share already past
+# err_rail is 60-98% below 6.5 m/s under BOTH tunes, 13% at 7.5-9, and 1-4% above 9: the knee
+# sits at 7.5 m/s and it is inherited, not a v2 regression.
+# Nothing in the plant justifies the ramp below that knee -- the learned LAF table clamps to its
+# first bin under 6.5 m/s, the EPS ceiling is flat at 1148 counts under 8 m/s and its slew rate
+# is flat at 1200 counts/s everywhere -- so the gain is held near what the healthy 7.5-9 m/s
+# band already runs. err_rail then clears the measured MEDIAN turning error in every bin
+# (0.14-0.41) instead of sitting under it, while a genuine ~0.4 m/s^2 excursion still commands
+# full scale. Deliberately not fitted to the p90: that tail is limit-cycle amplitude produced by
+# the gain being retuned, so targeting it would over-correct.
+# At and above 7.5 m/s the schedule is v0's untouched, which the v0-equivalence tests pin.
+KP_LOW_SPEED = {1.0: 7.0, 1.5: 7.0, 2.0: 7.0, 3.0: 7.0, 5.0: 6.5}  # m/s -> KP
+
 # The setpoint lead itself fades out below driving speed, collapsing to v0's algebra
 # (setpoint = live request): the raw differencer times lat_delay reconstructs the request
 # from the delayed one exactly, so blending the shaped jerk toward it is a continuous morph
@@ -129,8 +148,9 @@ class LatControlTorque(LatControlTorqueV0):
     self._release_error_ramp = 1.0
     self._rail_lead_headroom = 1.0  # last frame's headroom-to-rail factor for the lead taper
     # Fraction of the steer scale the EPS actually delivers, by speed (None: full scale).
-    # See the saturation check below for why the alert needs it.
+    # Feeds both the saturation alert below and the PID's own limits (see update_limits).
     self.steer_rail_schedule = get_steer_rail_schedule(CP)
+    self._rail_limit_scale = 1.0  # last frame's rail fraction, refreshed per frame in update()
     # Planned-curvature cache for the setpoint jerk source (see the block comment above the
     # constants). Rebuilt only when a new modelV2 frame arrives (~20 Hz), not at 100 Hz.
     self._plan_curvature = None
@@ -145,7 +165,37 @@ class LatControlTorque(LatControlTorqueV0):
     # it disables EnforceTorqueControl, which forces v0) — this covers the params disagreeing.
     cloudlog.info("LatControlTorque v2: extension output overrides (jerk-aware/NNLC) disabled")
     self.extension.disable_output_overrides()
+
+    # Retune the P gain below 7.5 m/s (see KP_LOW_SPEED). The gain table is replaced in place
+    # rather than by a fresh PIDController: the extension caches lac_torque.pid at construction
+    # and drives it directly, so swapping the object would leave it holding an orphan.
+    missing = sorted(s for s in KP_LOW_SPEED if s not in INTERP_SPEEDS)
+    if missing:
+      raise ValueError(f"v2 low-speed KP breakpoints missing from the shared schedule: {missing}")
+    self.pid._k_p = ([float(s) for s in INTERP_SPEEDS],
+                     [KP_LOW_SPEED.get(s, k) for s, k in zip(INTERP_SPEEDS, KP_INTERP, strict=True)])
+
     self.update_limits()  # an override controller may have retuned the shared PID to torque-space limits
+
+  def update_limits(self):
+    """Limit the PID to the torque the EPS will actually deliver at this speed, not to the full
+    steer scale. The carcontroller already clamps the command to the measured ceiling, so this
+    costs no delivered count; what it buys is that the PID's OWN anti-windup engages at the real
+    rail. That one is directional -- it blocks the integrator growing into the limit while still
+    letting it decay back out -- whereas the only thing reaching a railed command today is
+    controlsd's steer_limited_by_safety, which freezes in both directions at once. Measured: it
+    holds 62-71% of low-speed frames, pinning the integrator through whole corners against a
+    standing 0.4 m/s^2 error it is never allowed to absorb or unwind.
+
+    Platforms with no rail schedule keep the full scale, so this is a no-op for them.
+    """
+    scale = getattr(self, '_rail_limit_scale', 1.0) * self.steer_max
+    self.pid.set_limits(self.lateral_accel_from_torque(scale, self.torque_params),
+                        self.lateral_accel_from_torque(-scale, self.torque_params))
+    # torque-space extension controllers need +-steer_max instead; re-assert on every reset
+    # path. hasattr: v0's __init__ calls this before the extension exists.
+    if hasattr(self, 'extension'):
+      self.extension.update_limits()
 
   def _update_plan_curvature(self):
     """Refresh the planned-curvature curve from the extension's modelV2 (populated by
@@ -169,8 +219,16 @@ class LatControlTorque(LatControlTorqueV0):
       self._plan_curvature = None
 
   def update(self, active, CS, VM, params, steer_limited_by_safety, desired_curvature, calibrated_pose, curvature_limited, lat_delay):
+    # The deliverable rail moves with speed, so the PID limits have to be refreshed here:
+    # update_limits is otherwise only reached when the torque params themselves change.
+    rail_scale = 1.0
+    if self.steer_rail_schedule is not None:
+      rail_scale = float(np.interp(CS.vEgo, self.steer_rail_schedule[0], self.steer_rail_schedule[1]))
+    rail_changed = rail_scale != self._rail_limit_scale
+    self._rail_limit_scale = rail_scale
+
     # Override torque params from extension
-    if self.extension.update_override_torque_params(self.torque_params):
+    if self.extension.update_override_torque_params(self.torque_params) or rail_changed:
       self.update_limits()
 
     pid_log = log.ControlsState.LateralTorqueState.new_message()
@@ -322,11 +380,13 @@ class LatControlTorque(LatControlTorqueV0):
       # so a railed EPS in a curve still raises the steering-limit warning. Driver-torque
       # narrowing keeps its suppression: it shrinks the window below the rail, it does not
       # push the command onto it. Platforms without a rail schedule keep stock semantics.
+      # The PID limits sit on this same rail (see update_limits), so at_rail is now exactly
+      # "the PID is at its own limit" rather than "the carcontroller is about to clamp us".
       if self.steer_rail_schedule is not None:
-        steer_rail = float(np.interp(CS.vEgo, self.steer_rail_schedule[0], self.steer_rail_schedule[1]))
-        at_rail = steer_rail * self.steer_max - abs(output_torque) < 1e-3
+        rail_limit = rail_scale * self.steer_max
+        at_rail = rail_limit - abs(output_torque) < 1e-3
         alert_limited = steer_limited_by_safety and not at_rail
-        headroom = (steer_rail * self.steer_max - abs(output_torque)) / (RAIL_LEAD_TAPER_MARGIN * self.steer_max)
+        headroom = (rail_limit - abs(output_torque)) / (RAIL_LEAD_TAPER_MARGIN * self.steer_max)
         self._rail_lead_headroom = float(np.clip(headroom, 0.0, 1.0))
       else:
         at_rail = self.steer_max - abs(output_torque) < 1e-3
