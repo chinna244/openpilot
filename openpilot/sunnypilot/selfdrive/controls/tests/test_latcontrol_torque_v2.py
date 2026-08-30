@@ -437,15 +437,15 @@ class TestRailLimitedPid:
     return lac.pid.i
 
   def test_railed_integrator_decays_toward_a_reversing_error(self, params):
-    """The load-bearing property. steer_limited_by_safety -- the only mechanism that reached a
-    railed command before the limits moved -- freezes both directions at once, so the
-    integrator sits pinned through a whole corner. With the limits on the rail the PID's own
-    anti-windup takes over: still no growth INTO the rail, but the integrator tracks an error
-    that has reversed."""
-    frozen = self._rail_then_reverse(sls=True)
+    """The load-bearing property: with the PID limits on the rail, an integrator facing a
+    reversed error decays back out -- and since the safety freeze went directional, it does
+    so whether or not steer_limited_by_safety is asserted (it used to sit pinned at the seed
+    through a whole corner whenever sls fired)."""
+    limited = self._rail_then_reverse(sls=True)
     free = self._rail_then_reverse(sls=False)
-    assert frozen == pytest.approx(0.4)      # pinned at the seed, both directions
+    assert limited < 0.4 - 0.05              # decays even while sls is asserted
     assert free < 0.4 - 0.05                 # decays back out of the rail
+    assert limited == pytest.approx(free)    # sls no longer changes a pure-decay trajectory
 
   def test_railed_integrator_still_cannot_wind_into_the_rail(self, params):
     """The other half: a standing error that pushes further into the rail must not wind up."""
@@ -459,6 +459,41 @@ class TestRailLimitedPid:
       lac.update(True, make_cs(v_ego, 0.0), VM, LP, False, demand, None, False, LAT_DELAY)
     # unconstrained, ki * dt * error * 200 frames would be ~1.8
     assert lac.pid.i < 0.05
+
+
+class TestDirectionalSafetyFreeze:
+  """steer_limited_by_safety fires on any command motion faster than the winddown slew (34%
+  of active frames on the 2026-08-30 drive), so its integrator freeze must be directional:
+  block integration that deepens |i|, keep decay toward a reversing error live (it was
+  blocked on 12.7% of all frames). steeringPressed keeps the unconditional freeze."""
+
+  def _primed(self, i_seed):
+    v2 = make_lac(LatControlTorqueV2)
+    for _ in range(DELAY_FRAMES + 10):
+      step(v2, make_cs(15.0), 0.0, active=False)
+    step(v2, make_cs(15.0), 0.0)
+    v2.pid.i = i_seed
+    return v2
+
+  def _run_sls(self, v2, lat_accel, pressed=False, frames=20):
+    for _ in range(frames):
+      v2.update(True, make_cs(15.0, lat_accel, pressed=pressed), VM, LP, True, 0.0, None, False, LAT_DELAY)
+    return v2.pid.i
+
+  def test_sls_still_freezes_a_deepening_update(self, params):
+    # error and integrator same-signed: integrating would deepen |i| -> frozen, as before
+    i = self._run_sls(self._primed(0.1), lat_accel=-0.5)  # error = +0.5, i = +0.1
+    assert i == pytest.approx(0.1)
+
+  def test_sls_allows_integrator_decay(self, params):
+    # error opposes the integrator: the update shrinks |i| and must not be blocked
+    i = self._run_sls(self._primed(0.1), lat_accel=+0.5)  # error = -0.5, i = +0.1
+    assert 0.0 < i < 0.1 - 1e-4
+
+  def test_pressed_freeze_stays_bidirectional(self, params):
+    # driver override owns the wheel: even an opposing error must not move the integrator
+    i = self._run_sls(self._primed(0.1), lat_accel=+0.5, pressed=True)
+    assert i == pytest.approx(0.1)
 
 
 class TestSharedGainSchedule:

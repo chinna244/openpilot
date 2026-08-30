@@ -167,6 +167,18 @@ class LatControlTorque(LatControlTorqueV0):
     if self.extension is not None:
       self.extension.update_limits()
 
+  def _integrator_deepened_while_limited(self, steer_limited_by_safety, error):
+    """steer_limited_by_safety means the applied torque differs from the request by more than
+    0.01 -- which, with the winddown slew matched to the EPS (12/frame), fires on ANY command
+    motion faster than 1200 counts/s: 34% of active frames on the 2026-08-30 drive, not just
+    genuine clamping. Freezing the integrator outright on it blocked updates that would have
+    SHRUNK the integrator on 12.7% of all frames -- a standing stale-integrator bias. Freeze
+    only integration that would deepen |i| (error and integrator same-signed); decay toward a
+    reversing error stays live, mirroring the directional anti-windup the PID itself runs at
+    the rail limits. steeringPressed keeps its unconditional freeze -- there the driver owns
+    the wheel and the error is theirs, not the plant's."""
+    return steer_limited_by_safety and error * self.pid.i >= 0.0
+
   def _update_plan_curvature(self):
     """Refresh the planned-curvature curve from the extension's modelV2 (populated by
     controlsd every frame) when a new model frame arrives, and track staleness. The
@@ -313,7 +325,8 @@ class LatControlTorque(LatControlTorqueV0):
       # cars anyway
       if CS.vEgo < self.low_speed_pid_threshold:
         self.pid.reset()
-      freeze_integrator = (steer_limited_by_safety or CS.steeringPressed or
+      freeze_integrator = (self._integrator_deepened_while_limited(steer_limited_by_safety, error) or
+                           CS.steeringPressed or
                            CS.vEgo < self.low_speed_pid_threshold or unwind_detected)
       if self.extension.overrides_output:
         # Unreachable while __init__ disables the output overrides; kept as the guard
