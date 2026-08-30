@@ -13,29 +13,48 @@ from opendbc.car.lateral import get_friction
 from opendbc.sunnypilot.car.interfaces import get_steer_rail_schedule
 from openpilot.common.constants import ACCELERATION_DUE_TO_GRAVITY
 from openpilot.common.filter_simple import FirstOrderFilter
+from openpilot.common.realtime import DT_MDL
 from openpilot.common.swaglog import cloudlog
+from openpilot.selfdrive.controls.lib.drive_helpers import MIN_SPEED, MIN_STABLE_DELAY
+from openpilot.selfdrive.modeld.constants import ModelConstants
 from openpilot.sunnypilot.selfdrive.controls.lib.latcontrol_torque_ext_base import sign
 
 from openpilot.sunnypilot.selfdrive.controls.lib.latcontrol_torque_v0 import (
   LatControlTorque as LatControlTorqueV0,
   FRICTION_THRESHOLD,
+  INTERP_SPEEDS,
+  KP_INTERP,
   LP_FILTER_CUTOFF_HZ,
 )
 
 # v2 keeps v0's error correction in lateral acceleration space and its extension
 # boundary (speed-dependent torque owns the feedforward params) unchanged. It
-# reworks the setpoint path, the friction input shaping, and the integrator
-# policy around them.
+# reworks the setpoint path (jerk sourced from the model trajectory, not the
+# request differencer — see the setpoint jerk block comment below), the friction
+# input shaping, and the integrator policy around them.
 
 VERSION = 2
 
 # distinct from opendbc.car.lateral.MAX_LATERAL_JERK and drive_helpers.MAX_LATERAL_JERK,
-# which are curvature rate limits — this one only clips the setpoint-lead jerk
+# which are curvature rate limits — this one only clips the shaped setpoint-lead jerk (the
+# low-speed fade's raw-differencer leg is bounded by clip_curvature's 5 m/s^3 instead)
 MAX_SETPOINT_LATERAL_JERK = 2.5  # m/s^3
 UNWIND_JERK_THRESHOLD = -1.0  # m/s^3, setpoint rate below this while near zero means the plan is unwinding
 UNWIND_LAT_ACCEL_NEAR_ZERO = 0.3  # m/s^2
 MIN_LATERAL_CONTROL_SPEED = 0.3  # m/s
 STEER_RELEASE_I_DECAY = 0.8  # one-shot integrator decay on steering-press release
+# At the release edge the tracking error is whatever the driver left (p90 0.67 m/s^2 on the
+# 2026-08-29 override drive) and the P term lands all of it within one frame (P swing p90
+# 2.24 within 100 ms) — the felt "abrupt at first" hand-back. Easing the error in over the
+# ramp turns the step into a slope; feedforward is untouched, so the curve hold the driver
+# expects on release is immediate.
+RELEASE_ERROR_RAMP_T = 0.3  # s
+# While the command sits on the measured EPS rail, setpoint lead beyond the live request
+# buys no torque — the EPS is already delivering its maximum — it only inflates the error
+# the P term swings from when the corner exits (90-degree corners ran 58-100% rail duty
+# with ~1 m/s^2 of exit ringing, integrator frozen throughout, on the same drive). Taper
+# the lead to the live request as headroom to the rail vanishes; v0's algebra at the rail.
+RAIL_LEAD_TAPER_MARGIN = 0.1  # fraction of the steer scale over which the lead fades out
 
 # Roll compensation and latAccelOffset are lateral-accel-domain corrections; below
 # walking pace the desired lateral accel is ~0, so an unfaded road-crown term dominates
@@ -50,6 +69,58 @@ CENTER_CHATTER_JERK_DEADZONE_SPEED_BP = [0.0, 5.0, 12.0, 25.0]  # m/s
 CENTER_CHATTER_JERK_DEADZONE_SPEED_V = [0.08, 0.12, 0.18, 0.18]  # m/s^3
 CENTER_CHATTER_JERK_DEADZONE_LAT_ACCEL_BP = [0.0, 0.18, 0.35]  # m/s^2
 CENTER_CHATTER_JERK_DEADZONE_LAT_ACCEL_V = [1.0, 1.0, 0.0]
+
+# Setpoint jerk source. The request differencer (future - expected) reads plan REVISIONS —
+# override hand-back, model flicker — as planned jerk and leads into them; the 1.2 Hz filter
+# then carries the spike ~0.13 s past the swing. That is the hand-back snap (route a9: worst
+# release-window output delta vs v0 was 1.45, ~5x the route's other release windows).
+# The model trajectory separates road from revision: the request is the plan sampled at
+# modeld's lat_action_t = lat_delay + PLAN_ACTION_OFFSET (floored by MIN_STABLE_DELAY), and
+# expected is the request from one lat_delay ago, so while the plan is coherent the secant
+#   (k_plan(T) - k_plan(T - lat_delay)) / lat_delay
+# equals the differencer (exactly for curvature-linear plans; within ~0.1 m/s^3 on real
+# road features, sharp S-flicks excepted) — but a revision moves both samples
+# together and cancels instead of reading as jerk. The differencer stays as the fallback,
+# blended in by request-vs-plan divergence: turn assist, lane-change smoothing and
+# clip_curvature shape the request without touching the trajectory, and the raw plan would
+# fight them (a turn-assist hold floors the request while the plan collapses — pure plan
+# jerk would unwind the held wheel). In those shaped regimes the request is rate-limited
+# smooth by construction, so the differencer cannot snap there; revisions happen in the
+# coherent regime, where the plan path is active. The curvature curve is scaled by the live
+# vEgo^2 for the same reason the request buffer stores curvature: plan velocities embed the
+# planned speed change and would read as phantom jerk under braking.
+PLAN_ACTION_OFFSET = DT_MDL + DT_MDL / 2  # modeld's frame_delay + action_delay (modeld.py lat_action_t)
+DIVERGENCE_BLEND_BP = [0.2, 0.5]  # m/s^2, |request - plan|; measured coherent-drive divergence is ~0.01-0.03
+DIVERGENCE_BLEND_V = [1.0, 0.0]
+MODEL_STALE_FRAMES = 25  # fresh modelV2 lands every ~5 frames; a hung modeld must not sustain a frozen slope
+
+# Low-speed proportional gain, replacing v0's inherited schedule below 7.5 m/s. The output the
+# EPS can actually deliver is rail(v) * latAccelFactor (~2.67 m/s^2 at low speed), so the error
+# that saturates the P term on its own is err_rail = that over KP(v) -- 0.04 m/s^2 at 2 m/s and
+# 0.23 at 5 under the inherited 65/11.5, which is a relay, not a proportional controller.
+# Measured corpus-wide on turning frames (|setpoint| > 0.5 m/s^2), the share already past
+# err_rail is 60-98% below 6.5 m/s under BOTH tunes, 13% at 7.5-9, and 1-4% above 9: the knee
+# sits at 7.5 m/s and it is inherited, not a v2 regression.
+# Nothing in the plant justifies the ramp below that knee -- the learned LAF table clamps to its
+# first bin under 6.5 m/s, the EPS ceiling is flat at 1148 counts under 8 m/s and its slew rate
+# is flat at 1200 counts/s everywhere -- so the gain is held near what the healthy 7.5-9 m/s
+# band already runs. err_rail then clears the measured MEDIAN turning error in every bin
+# (0.14-0.41) instead of sitting under it, while a genuine ~0.4 m/s^2 excursion still commands
+# full scale. Deliberately not fitted to the p90: that tail is limit-cycle amplitude produced by
+# the gain being retuned, so targeting it would over-correct.
+# At and above 7.5 m/s the schedule is v0's untouched, which the v0-equivalence tests pin.
+KP_LOW_SPEED = {1.0: 7.0, 1.5: 7.0, 2.0: 7.0, 3.0: 7.0, 5.0: 6.5}  # m/s -> KP
+
+# The setpoint lead itself fades out below driving speed, collapsing to v0's algebra
+# (setpoint = live request): the raw differencer times lat_delay reconstructs the request
+# from the delayed one exactly, so blending the shaped jerk toward it is a continuous morph
+# between the two setpoints. At parking speeds the low-speed KP schedule turns ANY lead —
+# plan-sourced or differencer — into rail-to-rail flapping (route a9 t=356, 4 m/s: worst
+# release-window delta 1.45 with the lead vs 0.28 without), the wheel is fast relative to
+# the plan there, and every measured lead pathology sits below 8 m/s. The friction input
+# keeps the shaped jerk at all speeds (it is deadzoned, not lead-scaled).
+LEAD_SPEED_FADE_BP = [4.0, 8.0]  # m/s
+LEAD_SPEED_FADE_V = [0.0, 1.0]
 
 
 def get_center_chatter_jerk_deadzone(v_ego, setpoint):
@@ -74,9 +145,18 @@ class LatControlTorque(LatControlTorqueV0):
     self.low_speed_pid_threshold = max(CP.minSteerSpeed, MIN_LATERAL_CONTROL_SPEED)
     self.prev_steering_pressed = False
     self.prev_setpoint = 0.0
+    self._release_error_ramp = 1.0
+    self._rail_lead_headroom = 1.0  # last frame's headroom-to-rail factor for the lead taper
     # Fraction of the steer scale the EPS actually delivers, by speed (None: full scale).
-    # See the saturation check below for why the alert needs it.
+    # Feeds both the saturation alert below and the PID's own limits (see update_limits).
     self.steer_rail_schedule = get_steer_rail_schedule(CP)
+    self._rail_limit_scale = 1.0  # last frame's rail fraction, refreshed per frame in update()
+    # Planned-curvature cache for the setpoint jerk source (see the block comment above the
+    # constants). Rebuilt only when a new modelV2 frame arrives (~20 Hz), not at 100 Hz.
+    self._plan_curvature = None
+    self._prev_model_frame_id = -1
+    self._frames_since_model = MODEL_STALE_FRAMES
+    self.plan_jerk_weight = 0.0  # last blend weight, read by the replay harness and tests
 
     # The extension's override controllers (jerk-aware, NNLC) recompute error/feedforward/
     # friction in torque space and step the shared PID themselves, silently replacing v2's
@@ -85,11 +165,70 @@ class LatControlTorque(LatControlTorqueV0):
     # it disables EnforceTorqueControl, which forces v0) — this covers the params disagreeing.
     cloudlog.info("LatControlTorque v2: extension output overrides (jerk-aware/NNLC) disabled")
     self.extension.disable_output_overrides()
+
+    # Retune the P gain below 7.5 m/s (see KP_LOW_SPEED). The gain table is replaced in place
+    # rather than by a fresh PIDController: the extension caches lac_torque.pid at construction
+    # and drives it directly, so swapping the object would leave it holding an orphan.
+    missing = sorted(s for s in KP_LOW_SPEED if s not in INTERP_SPEEDS)
+    if missing:
+      raise ValueError(f"v2 low-speed KP breakpoints missing from the shared schedule: {missing}")
+    self.pid._k_p = ([float(s) for s in INTERP_SPEEDS],
+                     [KP_LOW_SPEED.get(s, k) for s, k in zip(INTERP_SPEEDS, KP_INTERP, strict=True)])
+
     self.update_limits()  # an override controller may have retuned the shared PID to torque-space limits
 
+  def update_limits(self):
+    """Limit the PID to the torque the EPS will actually deliver at this speed, not to the full
+    steer scale. The carcontroller already clamps the command to the measured ceiling, so this
+    costs no delivered count; what it buys is that the PID's OWN anti-windup engages at the real
+    rail. That one is directional -- it blocks the integrator growing into the limit while still
+    letting it decay back out -- whereas the only thing reaching a railed command today is
+    controlsd's steer_limited_by_safety, which freezes in both directions at once. Measured: it
+    holds 62-71% of low-speed frames, pinning the integrator through whole corners against a
+    standing 0.4 m/s^2 error it is never allowed to absorb or unwind.
+
+    Platforms with no rail schedule keep the full scale, so this is a no-op for them.
+    """
+    scale = getattr(self, '_rail_limit_scale', 1.0) * self.steer_max
+    self.pid.set_limits(self.lateral_accel_from_torque(scale, self.torque_params),
+                        self.lateral_accel_from_torque(-scale, self.torque_params))
+    # torque-space extension controllers need +-steer_max instead; re-assert on every reset
+    # path. hasattr: v0's __init__ calls this before the extension exists.
+    if hasattr(self, 'extension'):
+      self.extension.update_limits()
+
+  def _update_plan_curvature(self):
+    """Refresh the planned-curvature curve from the extension's modelV2 (populated by
+    controlsd every frame) when a new model frame arrives, and track staleness. The
+    ext-base model_valid keys on orientation.x and belongs to the override controllers,
+    so the fields this controller actually reads are length-checked here instead."""
+    model = self.extension.model_v2
+    if model is None:
+      self._plan_curvature = None
+      return
+    if model.frameId == self._prev_model_frame_id:
+      self._frames_since_model += 1
+      return
+    self._prev_model_frame_id = model.frameId
+    self._frames_since_model = 0
+    rate = np.asarray(model.orientationRate.z)
+    vel = np.asarray(model.velocity.x)
+    if len(rate) == len(ModelConstants.T_IDXS) and len(vel) == len(rate):
+      self._plan_curvature = rate / np.maximum(vel, MIN_SPEED)
+    else:
+      self._plan_curvature = None
+
   def update(self, active, CS, VM, params, steer_limited_by_safety, desired_curvature, calibrated_pose, curvature_limited, lat_delay):
+    # The deliverable rail moves with speed, so the PID limits have to be refreshed here:
+    # update_limits is otherwise only reached when the torque params themselves change.
+    rail_scale = 1.0
+    if self.steer_rail_schedule is not None:
+      rail_scale = float(np.interp(CS.vEgo, self.steer_rail_schedule[0], self.steer_rail_schedule[1]))
+    rail_changed = rail_scale != self._rail_limit_scale
+    self._rail_limit_scale = rail_scale
+
     # Override torque params from extension
-    if self.extension.update_override_torque_params(self.torque_params):
+    if self.extension.update_override_torque_params(self.torque_params) or rail_changed:
       self.update_limits()
 
     pid_log = log.ControlsState.LateralTorqueState.new_message()
@@ -113,11 +252,16 @@ class LatControlTorque(LatControlTorqueV0):
       self.measurement_rate_filter.x = 0.0
       self.jerk_filter.x = 0.0
       self.prev_setpoint = future_desired_lateral_accel
+      self.plan_jerk_weight = 0.0
+      self._release_error_ramp = 1.0
+      self._rail_lead_headroom = 1.0
     else:
       # One-shot integrator decay on steering-press release, so hand-back after an
       # override is neutral instead of a kick
       if self.prev_steering_pressed and not CS.steeringPressed:
         self.pid.i *= STEER_RELEASE_I_DECAY
+        self._release_error_ramp = 0.0
+      self._release_error_ramp = min(1.0, self._release_error_ramp + self.dt / RELEASE_ERROR_RAMP_T)
 
       roll_offset_fade = float(np.interp(CS.vEgo, FF_ROLL_OFFSET_FADE_BP, FF_ROLL_OFFSET_FADE_V))
       roll_compensation = params.roll * ACCELERATION_DUE_TO_GRAVITY * roll_offset_fade
@@ -129,7 +273,26 @@ class LatControlTorque(LatControlTorqueV0):
       self.curvature_request_buffer.append(desired_curvature)
       gravity_adjusted_future_lateral_accel = future_desired_lateral_accel - roll_compensation
 
-      raw_lateral_jerk = (future_desired_lateral_accel - expected_lateral_accel) / max(lat_delay, self.dt)
+      differencer_jerk = (future_desired_lateral_accel - expected_lateral_accel) / max(lat_delay, self.dt)
+      self._update_plan_curvature()
+      plan_weight = 0.0
+      plan_jerk = 0.0
+      # While the driver is pressing, every 20 Hz plan predicts the maneuver ending (peak
+      # now, unwind ahead) and the next plan revises it away — the secant then leads
+      # opposite to what is actually being commanded (route ab t=407: plan railed +1.0
+      # against v0's -1.0 mid-override). The differencer tracks the commanded path, so it
+      # owns pressed frames; the plan takes over at the release edge, which is exactly
+      # where the differencer's revision spike lives.
+      if (self._plan_curvature is not None and self._frames_since_model < MODEL_STALE_FRAMES and
+          not curvature_limited and not CS.steeringPressed):
+        plan_request_t = max(lat_delay + PLAN_ACTION_OFFSET, MIN_STABLE_DELAY)
+        # the secant start is plan_request_t - lat_delay >= PLAN_ACTION_OFFSET, never negative
+        plan_accel_request = float(np.interp(plan_request_t, ModelConstants.T_IDXS, self._plan_curvature)) * CS.vEgo ** 2
+        plan_accel_expected = float(np.interp(plan_request_t - lat_delay, ModelConstants.T_IDXS, self._plan_curvature)) * CS.vEgo ** 2
+        plan_jerk = (plan_accel_request - plan_accel_expected) / max(lat_delay, self.dt)
+        plan_weight = float(np.interp(abs(future_desired_lateral_accel - plan_accel_request), DIVERGENCE_BLEND_BP, DIVERGENCE_BLEND_V))
+      self.plan_jerk_weight = plan_weight
+      raw_lateral_jerk = plan_weight * plan_jerk + (1.0 - plan_weight) * differencer_jerk
       raw_lateral_jerk = min(max(raw_lateral_jerk, -MAX_SETPOINT_LATERAL_JERK), MAX_SETPOINT_LATERAL_JERK)
       # the filter is a convex combination of clipped inputs, so its output needs no second clip
       desired_lateral_jerk = self.jerk_filter.update(raw_lateral_jerk)
@@ -137,8 +300,15 @@ class LatControlTorque(LatControlTorqueV0):
       # first-order lead: delayed request plus one lat_delay of planned jerk, so turn-in
       # starts a steering delay early instead of chasing the request. The clip and low-pass
       # above keep a lagd mis-estimate from over-leading the setpoint. With the plan holding
-      # still the jerk term is zero and this collapses back to v0's setpoint algebra.
-      setpoint = expected_lateral_accel + desired_lateral_jerk * lat_delay
+      # still the jerk term is zero and this collapses back to v0's setpoint algebra. Below
+      # driving speed the lead fades back to v0's algebra entirely (see LEAD_SPEED_FADE_BP).
+      lead_weight = float(np.interp(CS.vEgo, LEAD_SPEED_FADE_BP, LEAD_SPEED_FADE_V))
+      setpoint_jerk = lead_weight * desired_lateral_jerk + (1.0 - lead_weight) * differencer_jerk
+      setpoint = expected_lateral_accel + setpoint_jerk * lat_delay
+      if self._rail_lead_headroom < 1.0:
+        setpoint = future_desired_lateral_accel + self._rail_lead_headroom * (setpoint - future_desired_lateral_accel)
+        if lat_delay > self.dt:
+          setpoint_jerk = (setpoint - expected_lateral_accel) / lat_delay
 
       measurement_rate = self.measurement_rate_filter.update((measurement - self.previous_measurement) / self.dt)
       self.previous_measurement = measurement
@@ -153,7 +323,7 @@ class LatControlTorque(LatControlTorqueV0):
       unwind_detected = unwind_rate < UNWIND_JERK_THRESHOLD and abs(setpoint) < UNWIND_LAT_ACCEL_NEAR_ZERO
       self.prev_setpoint = setpoint
 
-      error = setpoint - measurement
+      error = (setpoint - measurement) * self._release_error_ramp
 
       # do error correction in lateral acceleration space, convert at end to handle non-linear torque responses correctly
       pid_log.error = float(error)
@@ -202,7 +372,7 @@ class LatControlTorque(LatControlTorqueV0):
       pid_log.output = float(-output_torque)
       pid_log.actualLateralAccel = float(measurement)
       pid_log.desiredLateralAccel = float(setpoint)
-      pid_log.desiredLateralJerk = float(desired_lateral_jerk)
+      pid_log.desiredLateralJerk = float(setpoint_jerk)
       # The EPS delivers only rail(v) of the steer scale above the ceiling falloff, and the
       # carcontroller's honest clamp reports reaching it as steer_limited_by_safety — which
       # _check_saturation treats as not-saturated (its suppression is meant for driver-torque
@@ -210,10 +380,14 @@ class LatControlTorque(LatControlTorqueV0):
       # so a railed EPS in a curve still raises the steering-limit warning. Driver-torque
       # narrowing keeps its suppression: it shrinks the window below the rail, it does not
       # push the command onto it. Platforms without a rail schedule keep stock semantics.
+      # The PID limits sit on this same rail (see update_limits), so at_rail is now exactly
+      # "the PID is at its own limit" rather than "the carcontroller is about to clamp us".
       if self.steer_rail_schedule is not None:
-        steer_rail = float(np.interp(CS.vEgo, self.steer_rail_schedule[0], self.steer_rail_schedule[1]))
-        at_rail = steer_rail * self.steer_max - abs(output_torque) < 1e-3
+        rail_limit = rail_scale * self.steer_max
+        at_rail = rail_limit - abs(output_torque) < 1e-3
         alert_limited = steer_limited_by_safety and not at_rail
+        headroom = (rail_limit - abs(output_torque)) / (RAIL_LEAD_TAPER_MARGIN * self.steer_max)
+        self._rail_lead_headroom = float(np.clip(headroom, 0.0, 1.0))
       else:
         at_rail = self.steer_max - abs(output_torque) < 1e-3
         alert_limited = steer_limited_by_safety
