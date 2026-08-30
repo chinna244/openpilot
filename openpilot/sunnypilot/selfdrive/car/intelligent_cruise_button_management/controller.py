@@ -66,7 +66,14 @@ DECEL_OVERSHOOT_PARAMS = {
   # ~0.09 m/s^2 per mph of gap, dead below ~2 mph, saturating near -0.75 m/s^2 by ~9 mph
   'mazda': {
     'decel_bp': [0.02, 0.09, 0.26, 0.44, 0.73],  # desired decel magnitude, m/s^2
-    'gap_v': [1.5, 2.5, 4.0, 6.0, 8.5],  # required gap below vEgo, mph
+    # Required gap below vEgo, mph, carrying a lead over the steady-state inverse. The gap
+    # the ECU actually sees is not the one commanded here: the lever's rise is limited by
+    # the dash walk (~4 mph/s measured), not by DECEL_OVERSHOOT_RISE, so a maneuver spends
+    # its first seconds at a gap well short of the request -- route 135 measured 2.65 s
+    # median from a limiter taking the source to the car pulling -0.5 m/s^2. Commanding the
+    # deeper gap up front pays that walk back; the request falls as the car converges, so
+    # the lever still lets go on its own.
+    'gap_v': [2.0, 4.0, 6.0, 8.5, 10.0],
     'max_gap': 10.,  # mph; the response saturates, going deeper buys nothing
     'min_decel': 0.15,  # m/s^2; leave gentle coast-downs to the stock behavior
   },
