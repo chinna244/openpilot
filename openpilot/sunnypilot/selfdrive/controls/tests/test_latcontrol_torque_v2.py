@@ -12,6 +12,7 @@ from openpilot.selfdrive.modeld.constants import ModelConstants
 from openpilot.sunnypilot.selfdrive.controls.lib.latcontrol_torque_v2 import (
   LatControlTorque as LatControlTorqueV2,
   get_center_chatter_jerk_deadzone,
+  KP_LOW_SPEED,
   MODEL_STALE_FRAMES,
 )
 
@@ -322,9 +323,126 @@ class TestRailAwareSaturation:
     log = self._run(lac, lat_accel_demand=6.0, sls=False, frames=self.SAT_FRAMES)
     assert log.saturated
 
+class TestRailLimitedPid:
+  RAIL = 0.5
+
+  def _railed(self, rail=RAIL):
+    lac = make_lac(LatControlTorqueV2)
+    if rail is not None:
+      lac.steer_rail_schedule = ([0.0], [rail])
+    return lac
+
+  def test_limits_track_the_rail(self, params):
+    lac = self._railed()
+    step(lac, make_cs(15.0), 0.0)
+    assert lac.pid.pos_limit == pytest.approx(self.RAIL * LAF)
+    assert lac.pid.neg_limit == pytest.approx(-self.RAIL * LAF)
+
+  def test_no_schedule_keeps_full_scale_limits(self, params):
+    lac = self._railed(rail=None)
+    assert lac.steer_rail_schedule is None
+    step(lac, make_cs(15.0), 0.0)
+    assert lac.pid.pos_limit == pytest.approx(LAF)
+
+  def test_limits_follow_speed(self, params):
+    """A falling ceiling must tighten the limits as the car speeds up, not stay on whatever
+    the schedule read at construction."""
+    lac = make_lac(LatControlTorqueV2)
+    lac.steer_rail_schedule = ([5.0, 25.0], [1.0, 0.5])
+    step(lac, make_cs(5.0), 0.0)
+    assert lac.pid.pos_limit == pytest.approx(LAF)
+    step(lac, make_cs(25.0), 0.0)
+    assert lac.pid.pos_limit == pytest.approx(0.5 * LAF)
+
+  def test_output_never_exceeds_the_rail(self, params):
+    lac = self._railed()
+    v_ego = 15.0
+    demand = 3.0 / v_ego ** 2  # 3.0 m/s^2: well past the 1.25 m/s^2 the rail allows
+    for _ in range(DELAY_FRAMES + 10):
+      step(lac, make_cs(v_ego), demand, active=False)
+    for _ in range(50):
+      out, _, _ = lac.update(True, make_cs(v_ego, 0.0), VM, LP, False, demand, None, False, LAT_DELAY)
+      assert abs(out) <= self.RAIL + 1e-9
+
+  def _rail_then_reverse(self, sls, seed_i=0.4):
+    """Rail the output on a large demand, seed the integrator, then flip the measurement past
+    the request so the error reverses. Returns the integrator after the reversal."""
+    v_ego = 15.0
+    demand = 3.0 / v_ego ** 2
+    lac = self._railed()
+    for _ in range(DELAY_FRAMES + 10):
+      step(lac, make_cs(v_ego), demand, active=False)
+    for _ in range(100):
+      lac.update(True, make_cs(v_ego, 0.0), VM, LP, sls, demand, None, False, LAT_DELAY)
+    lac.pid.i = seed_i
+    for _ in range(100):
+      lac.update(True, make_cs(v_ego, 4.0), VM, LP, sls, demand, None, False, LAT_DELAY)
+    return lac.pid.i
+
+  def test_railed_integrator_decays_toward_a_reversing_error(self, params):
+    """The load-bearing property. steer_limited_by_safety -- the only mechanism that reached a
+    railed command before the limits moved -- freezes both directions at once, so the
+    integrator sits pinned through a whole corner. With the limits on the rail the PID's own
+    anti-windup takes over: still no growth INTO the rail, but the integrator tracks an error
+    that has reversed."""
+    frozen = self._rail_then_reverse(sls=True)
+    free = self._rail_then_reverse(sls=False)
+    assert frozen == pytest.approx(0.4)      # pinned at the seed, both directions
+    assert free < 0.4 - 0.05                 # decays back out of the rail
+
+  def test_railed_integrator_still_cannot_wind_into_the_rail(self, params):
+    """The other half: a standing error that pushes further into the rail must not wind up."""
+    v_ego = 15.0
+    demand = 3.0 / v_ego ** 2
+    lac = self._railed()
+    for _ in range(DELAY_FRAMES + 10):
+      step(lac, make_cs(v_ego), demand, active=False)
+    lac.pid.i = 0.0
+    for _ in range(200):  # measurement stuck at zero: error stays large and positive
+      lac.update(True, make_cs(v_ego, 0.0), VM, LP, False, demand, None, False, LAT_DELAY)
+    # unconstrained, ki * dt * error * 200 frames would be ~1.8
+    assert lac.pid.i < 0.05
+
+
+class TestLowSpeedGain:
+  """v0's inherited KP ramps to 65 at 2 m/s against an output the EPS caps near 2.67 m/s^2, so
+  a 0.04 m/s^2 error already commands full scale and the loop runs as a relay. v2 holds the
+  gain near what the healthy 7.5-9 m/s band runs and leaves the schedule alone above the knee."""
+
+  def test_retuned_below_the_knee_untouched_above(self, params):
+    v0, v2 = make_pair()
+    for v in sorted(KP_LOW_SPEED):
+      v0.pid.speed = v2.pid.speed = v
+      assert v2.pid.k_p == pytest.approx(KP_LOW_SPEED[v])
+      assert v2.pid.k_p < v0.pid.k_p, f"{v} m/s"
+    for v in (7.5, 10.0, 15.0, 30.0):
+      v0.pid.speed = v2.pid.speed = v
+      assert v2.pid.k_p == pytest.approx(v0.pid.k_p), f"{v} m/s"
+
+  def test_schedule_stays_monotone(self, params):
+    """Gain must not rise with speed anywhere across the splice at the knee."""
+    v2 = make_lac(LatControlTorqueV2)
+    gains = []
+    for i in range(400):
+      v2.pid.speed = i * 0.1
+      gains.append(float(v2.pid.k_p))
+    assert all(a >= b - 1e-9 for a, b in zip(gains, gains[1:], strict=False))
+
+  def test_median_low_speed_error_no_longer_rails_on_p_alone(self, params):
+    """0.30 m/s^2 is the measured median tracking error in a turn at this speed. Under v0's
+    gain it commands full scale by itself; under v2's it stays inside the linear region."""
+    v0, v2 = make_pair()
+    v_ego, err = 3.0, 0.30
+    for _ in range(DELAY_FRAMES + 10):
+      step(v0, make_cs(v_ego), 0.0, active=False)
+      step(v2, make_cs(v_ego), 0.0, active=False)
+    out0, _, _ = v0.update(True, make_cs(v_ego, -err), VM, LP, False, 0.0, None, False, LAT_DELAY)
+    out2, _, log2 = v2.update(True, make_cs(v_ego, -err), VM, LP, False, 0.0, None, False, LAT_DELAY)
+    assert abs(out0) == pytest.approx(v0.steer_max)
+    assert abs(out2) < 0.9 * v2.steer_max
+    assert log2.p == pytest.approx(err * KP_LOW_SPEED[3.0], rel=1e-6)
+
 def make_plan_model(frame_id, curvature, v_plan=15.0):
-  """Fake modelV2 carrying a curvature plan over T_IDXS (constant, or a callable of plan
-  time). orientationRate.z = curvature * velocity, matching the on-wire convention."""
   ks = [curvature(t) if callable(curvature) else curvature for t in ModelConstants.T_IDXS]
   return SimpleNamespace(
     frameId=frame_id,
