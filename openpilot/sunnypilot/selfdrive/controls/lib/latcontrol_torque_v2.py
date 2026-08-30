@@ -110,6 +110,12 @@ def get_center_chatter_jerk_deadzone(v_ego, setpoint):
 
 
 class LatControlTorque(LatControlTorqueV0):
+  # v0's __init__ calls update_limits() before this subclass's __init__ has run (and once
+  # before the extension exists), so everything the override reads needs a class-level
+  # default rather than a per-call guard.
+  _rail_limit_scale = 1.0
+  extension = None
+
   def __init__(self, CP, CP_SP, CI, dt):
     super().__init__(CP, CP_SP, CI, dt)
     # Stores CURVATURE, scaled by the current v^2 on read — buffered lateral accel keeps the
@@ -122,9 +128,9 @@ class LatControlTorque(LatControlTorqueV0):
     self.prev_setpoint = 0.0
     self._release_error_ramp = 1.0
     # Fraction of the steer scale the EPS actually delivers, by speed (None: full scale).
-    # Feeds both the saturation alert below and the PID's own limits (see update_limits).
+    # Feeds both the saturation alert below and the PID's own limits (see update_limits);
+    # _rail_limit_scale holds the current fraction, refreshed per frame in update().
     self.steer_rail_schedule = get_steer_rail_schedule(CP)
-    self._rail_limit_scale = 1.0  # last frame's rail fraction, refreshed per frame in update()
     # Planned-curvature cache for the setpoint jerk source (see the block comment above the
     # constants). Rebuilt only when a new modelV2 frame arrives (~20 Hz), not at 100 Hz.
     self._plan_curvature = None
@@ -153,12 +159,12 @@ class LatControlTorque(LatControlTorqueV0):
 
     Platforms with no rail schedule keep the full scale, so this is a no-op for them.
     """
-    scale = getattr(self, '_rail_limit_scale', 1.0) * self.steer_max
+    scale = self._rail_limit_scale * self.steer_max
     self.pid.set_limits(self.lateral_accel_from_torque(scale, self.torque_params),
                         self.lateral_accel_from_torque(-scale, self.torque_params))
     # torque-space extension controllers need +-steer_max instead; re-assert on every reset
-    # path. hasattr: v0's __init__ calls this before the extension exists.
-    if hasattr(self, 'extension'):
+    # path (None until v0's __init__ constructs it, see the class-level default)
+    if self.extension is not None:
       self.extension.update_limits()
 
   def _update_plan_curvature(self):
@@ -255,18 +261,22 @@ class LatControlTorque(LatControlTorqueV0):
         plan_jerk = (plan_accel_request - plan_accel_expected) / max(lat_delay, self.dt)
         plan_weight = float(np.interp(abs(future_desired_lateral_accel - plan_accel_request), DIVERGENCE_BLEND_BP, DIVERGENCE_BLEND_V))
       self.plan_jerk_weight = plan_weight
-      raw_lateral_jerk = plan_weight * plan_jerk + (1.0 - plan_weight) * differencer_jerk
+      # Both blends below are the same idiom: v0's differencer jerk plus a weighted delta
+      # toward the shaped source. The raw differencer times lat_delay reconstructs the live
+      # request from the delayed one exactly, so at zero weight each stage IS v0's setpoint
+      # algebra — the shaped path is strictly an additive lead on top of it.
+      raw_lateral_jerk = differencer_jerk + plan_weight * (plan_jerk - differencer_jerk)
       raw_lateral_jerk = min(max(raw_lateral_jerk, -MAX_SETPOINT_LATERAL_JERK), MAX_SETPOINT_LATERAL_JERK)
       # the filter is a convex combination of clipped inputs, so its output needs no second clip
-      desired_lateral_jerk = self.jerk_filter.update(raw_lateral_jerk)
+      shaped_lateral_jerk = self.jerk_filter.update(raw_lateral_jerk)
 
       # first-order lead: delayed request plus one lat_delay of planned jerk, so turn-in
       # starts a steering delay early instead of chasing the request. The clip and low-pass
       # above keep a lagd mis-estimate from over-leading the setpoint. With the plan holding
-      # still the jerk term is zero and this collapses back to v0's setpoint algebra. Below
-      # driving speed the lead fades back to v0's algebra entirely (see LEAD_SPEED_FADE_BP).
+      # still the shaped jerk equals the differencer and this collapses back to v0's setpoint;
+      # below driving speed the lead fades out entirely (see LEAD_SPEED_FADE_BP).
       lead_weight = float(np.interp(CS.vEgo, LEAD_SPEED_FADE_BP, LEAD_SPEED_FADE_V))
-      setpoint_jerk = lead_weight * desired_lateral_jerk + (1.0 - lead_weight) * differencer_jerk
+      setpoint_jerk = differencer_jerk + lead_weight * (shaped_lateral_jerk - differencer_jerk)
       setpoint = expected_lateral_accel + setpoint_jerk * lat_delay
 
       measurement_rate = self.measurement_rate_filter.update((measurement - self.previous_measurement) / self.dt)
@@ -294,7 +304,7 @@ class LatControlTorque(LatControlTorqueV0):
       # The friction term sees the deadzoned jerk in place of the raw jerk contribution, so
       # tiny planner wobble at lane center cannot sign-flip it; the PID error above is unchanged
       friction_jerk_deadzone = get_center_chatter_jerk_deadzone(CS.vEgo, setpoint)
-      friction_jerk = math.copysign(max(abs(desired_lateral_jerk) - friction_jerk_deadzone, 0.0), desired_lateral_jerk)
+      friction_jerk = math.copysign(max(abs(shaped_lateral_jerk) - friction_jerk_deadzone, 0.0), shaped_lateral_jerk)
       friction_error = expected_lateral_accel + friction_jerk * lat_delay - measurement
       ff += get_friction(friction_error, lateral_accel_deadzone, FRICTION_THRESHOLD, self.torque_params)
 
@@ -318,10 +328,21 @@ class LatControlTorque(LatControlTorqueV0):
         output_torque = self.torque_from_lateral_accel(output_lataccel, self.torque_params)
 
       # Lateral acceleration torque controller extension updates
-      # Overrides pid_log.error and output_torque
-      pid_log, output_torque = self.extension.update(CS, VM, self.pid, params, ff, pid_log, setpoint, measurement, calibrated_pose, roll_compensation,
-                                                     future_desired_lateral_accel, measurement, lateral_accel_deadzone, gravity_adjusted_future_lateral_accel,
-                                                     desired_curvature, measured_curvature, steer_limited_by_safety, output_torque)
+      # Overrides pid_log.error and output_torque. Keyword-bound: the signature is long and
+      # shared across controllers, and a positional call fails silently if a sync reorders it.
+      pid_log, output_torque = self.extension.update(CS, VM, self.pid, params, ff, pid_log,
+                                                     setpoint=setpoint,
+                                                     measurement=measurement,
+                                                     calibrated_pose=calibrated_pose,
+                                                     roll_compensation=roll_compensation,
+                                                     desired_lateral_accel=future_desired_lateral_accel,
+                                                     actual_lateral_accel=measurement,
+                                                     lateral_accel_deadzone=lateral_accel_deadzone,
+                                                     gravity_adjusted_lateral_accel=gravity_adjusted_future_lateral_accel,
+                                                     desired_curvature=desired_curvature,
+                                                     actual_curvature=measured_curvature,
+                                                     steer_limited_by_safety=steer_limited_by_safety,
+                                                     output_torque=output_torque)
 
       pid_log.active = True
       pid_log.p = float(self.pid.p)
