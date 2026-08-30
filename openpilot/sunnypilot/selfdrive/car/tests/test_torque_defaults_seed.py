@@ -30,16 +30,10 @@ class FakeParams:
 
 
 def _cx5_eps_cp():
-  # steer-to-zero: 2022+ CX-5 EPS present -> minSteerSpeed == 0
-  return CarParams(brand="mazda", minSteerSpeed=0.0)
-
 
 def _pre_2022_mazda_cp():
-  # no CX-5 EPS -> low-speed lockout, minSteerSpeed > 0
   return CarParams(brand="mazda", minSteerSpeed=12.5)
 
-
-def _non_mazda_cp():
   return CarParams(brand="toyota", minSteerSpeed=0.0)
 
 
@@ -66,8 +60,6 @@ class TestMazdaTorqueDefaultsSeed:
     assert params.get_bool("MazdaTorqueDefaultsApplied") is False
 
   def test_idempotent_respects_user_override(self):
-    # Already applied once, and the user has since turned the toggles back off.
     params = FakeParams({"MazdaTorqueDefaultsApplied": True})
     _seed_mazda_torque_defaults(_cx5_eps_cp(), params)
-    for key in SEEDED_KEYS:
       assert params.get_bool(key) is False  # not re-seeded

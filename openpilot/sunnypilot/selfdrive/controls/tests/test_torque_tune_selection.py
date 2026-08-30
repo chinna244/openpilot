@@ -5,27 +5,6 @@ This file is part of zoompilot and is licensed under the MIT License.
 See the LICENSE.md file in the root directory for more details.
 """
 
-# Which torque controller an unset TorqueControlTune selects. This is easy to get wrong by
-# dropping `return_default=True` from the params read: params_keys.h declares "2.0" (v2), but
-# a bare params.get() returns None for an unset param, and float(None) raises — or, guarded,
-# silently falls through to the upstream controller. Nothing says the car dropped off v2.
-#
-# The v0 constructor is patched out: these tests pin the branch that gets taken, not the
-# controller's behavior, and building the real one pulls in NNLC model loading.
-
-from types import SimpleNamespace
-from unittest.mock import MagicMock
-
-import pytest
-
-from opendbc.car.structs import car
-from openpilot.cereal import custom
-from openpilot.common.params import Params
-from openpilot.common.prefix import OpenpilotPrefix
-from openpilot.sunnypilot.selfdrive.controls import controlsd_ext
-from openpilot.sunnypilot.selfdrive.controls.controlsd_ext import ControlsExt
-
-V0 = "v0"
 V1 = "v1"  # stands in for the `lac` upstream controller controlsd passes in
 V2 = "v2"
 

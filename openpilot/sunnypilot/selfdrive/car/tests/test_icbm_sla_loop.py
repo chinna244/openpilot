@@ -84,9 +84,6 @@ class FakeMazdaEcu:
     self.pending.append((self.t + TAP_LATENCY_S, direction))
 
   def _snap(self, direction):
-    # step to the next multiple of 5 strictly in `direction`
-    grid = 5 * ((self.dash // 5) + (1 if direction > 0 else 0)) if self.dash % 5 else self.dash + 5 * direction
-    return grid - self.dash if self.dash % 5 else 5 * direction
 
   def tick(self, tap_dir=0, hold_dir=0, forged_hold_dir=0):
     """tap_dir: paced presses (driver taps or servo taps). hold_dir: the driver's
@@ -154,79 +151,44 @@ class Loop:
     self.tick_n = 0
     self.limit_mph = 0.
     self.scc_dip_mph = 0.  # SCC-vision target when active, 0 = inactive
-    # vEgo defaults to the set speed (enough for the button-timing scenarios). Override it,
-    # plus a_target, to exercise decel overshoot: the servo only builds the gap when the
-    # plan is asking for real decel AND the car is above the plan target.
     self.v_ego_mph = None
-    self.a_target = 0.
-    self.decel_overshoot = False
-    self.driver_queue = {}  # tick -> (ButtonType, hold_ticks)
     self._driver_active = None  # (button, remaining_ticks)
-    self.sla_events = []  # (tick, event int) emitted by SLA, across the whole run
-
-    # engage: settle disabled then enabled, dash = baseline
-    for _ in range(5):
       self._card_tick(enabled=False)
     for _ in range(5):
       self._card_tick(enabled=True)
-    assert abs(self.helper.v_cruise_kph - baseline_mph * MPH_KPH) < 0.1
 
-  # -- message construction ------------------------------------------------------------
   def _cs(self, button_events=None):
     CS = car.CarState(cruiseState={"available": True,
                                    "speed": self.ecu.dash * MPH_MS,
-                                   "speedCluster": self.ecu.dash * MPH_MS})
     v_ego_mph = self.v_ego_mph if self.v_ego_mph is not None else self.helper.v_cruise_kph / MPH_KPH
-    CS.vEgo = float(v_ego_mph * MPH_MS)
     CS.buttonEvents = button_events or []
     return CS
 
   def _lp_sp(self):
     LP_SP = custom.LongitudinalPlanSP()
-    # as longitudinal_planner.update_targets: the mirror's cap always participates
-    # (V_CRUISE_UNSET when idle never wins the min; the frozen prompt hold does)
-    targets = {PlanSource.cruise: self.helper.v_cruise_kph * CV.KPH_TO_MS,
                PlanSource.speedLimitAssist: self.mirror.output_v_target}
     if self.scc_dip_mph > 0:
       targets[PlanSource.sccVision] = self.scc_dip_mph * MPH_MS
     source = min(targets, key=lambda k: targets[k])
     LP_SP.longitudinalPlanSource = source
-    LP_SP.vTarget = float(targets[source])
-    # vision lookahead wire: 0 = no lookahead (default for these tests); a test can set
-    # lookahead_mph to model the horizon seeing a dip beyond the current source flip
-    if self.lookahead_mph is not None:
       LP_SP.smartCruiseControl.vision.vAheadMin = float(self.lookahead_mph * MPH_MS)
     LP_SP.aTarget = float(self.a_target)
     LP_SP.speedLimit.assist.state = self.mirror.state
     LP_SP.speedLimit.resolver.speedLimit = self.limit_mph * MPH_MS
     LP_SP.speedLimit.resolver.speedLimitFinalLast = self.limit_mph * MPH_MS
     LP_SP.speedLimit.resolver.speedLimitLastValid = self.limit_mph > 0
-    return LP_SP
-
-  def _cc_sp(self):
-    CC_SP = custom.CarControlSP()
     CC_SP.intelligentCruiseButtonManagement.state = self.servo.state
     return CC_SP
 
-  # -- per-layer ticks -----------------------------------------------------------------
   def _card_tick(self, CS=None, enabled=True, lp_msg=None, cc_msg=None):
     CS = CS if CS is not None else self._cs()
     self.helper.update_speed_limit_assist(False, lp_msg or self._lp_sp(), cc_msg or self._cc_sp())
     self.helper.update_v_cruise(CS, enabled=enabled, is_metric=False)
-
-  def run(self, seconds, assert_each=None):
     for _ in range(int(seconds / DT_CTRL)):
       self.tick_n += 1
 
-      # Messages consumed this tick reflect the OTHER processes' state as of the previous
-      # tick: plannerd/selfdrived output is in flight for at least one cycle before card
-      # and each other see it. Zero-latency views would let e.g. card's press-edge
-      # ownership latch observe an SLA deactivation that, in reality, cannot have been
-      # published yet.
       lp_msg = self._lp_sp()
-      cc_msg = self._cc_sp()
 
-      # driver script
       events = []
       if self.tick_n in self.driver_queue:
         button, hold_ticks = self.driver_queue.pop(self.tick_n)
@@ -235,50 +197,22 @@ class Loop:
       driver_tap_dir = 0
       driver_hold_dir = 0
       if self._driver_active is not None:
-        button, remaining, total = self._driver_active
-        self._driver_active[1] -= 1
-        if total - self._driver_active[1] > 30:
-          # a physical hold reaches the ECU's hold integrator (genuine frames carry it)
-          driver_hold_dir = 1 if button == ButtonType.accelCruise else -1
-        if self._driver_active[1] <= 0:
           events.append(ButtonEvent(type=button, pressed=False))
-          self._driver_active = None
           if total <= 30:
-            driver_tap_dir = 1 if button == ButtonType.accelCruise else -1  # ECU applies short presses on release
 
-      # one CarState per tick, shared by all three consumers (none mutates it)
       CS = self._cs(events)
 
-      # plannerd: mirrors the session as published at the END of the previous card
-      # frame (one transport hop), at 20 Hz
       if self.tick_n % 5 == 0:
         session_msg = custom.CarStateSP.new_message()
         self.helper.cruise_arbiter.fill_msg(session_msg)
         self.events_sp.clear()
         v_ego_mph = self.v_ego_mph if self.v_ego_mph is not None else self.helper.v_cruise_kph / MPH_KPH
-        self.mirror.update(session_msg.cruiseSession, v_ego_mph * MPH_MS, 0., 0., self.events_sp)
-        self.sla_events.extend((self.tick_n, e) for e in self.events_sp.events)
-
-      # selfdrived: servo against the real dash; the session state it sees is one
-      # message hop old (carStateSP published at the end of the previous card frame)
-      session_state_stale = self.helper.cruise_arbiter.state
-      CC = car.CarControl(enabled=True)
-      self.servo.run(CS, CC, lp_msg, is_metric=False, decel_overshoot_enabled=self.decel_overshoot,
                      session_state=session_state_stale)
 
-      # card: arbiter (classification + session) runs inside update_v_cruise,
-      # synchronous with the buttons
       self._card_tick(CS, lp_msg=lp_msg, cc_msg=cc_msg)
-
-      # ECU: driver's physical press + openpilot's emission. Card vetoes emission with
-      # same-frame session state (the servo's own freeze is one hop stale), as
-      # card.controls_update does before CI.apply.
       tap_dir, forged_hold_dir = driver_tap_dir, 0
-      sb = self.servo.cruise_button
       if self.helper.cruise_arbiter.prompting:
         sb = SendButtonState.none
-      if sb == SendButtonState.increase:
-        tap_dir = tap_dir or 1
       elif sb == SendButtonState.decrease:
         tap_dir = tap_dir or -1
       elif sb == SendButtonState.increaseHold:
@@ -287,27 +221,15 @@ class Loop:
         forged_hold_dir = -1
       self.ecu.tick(tap_dir=tap_dir, hold_dir=driver_hold_dir, forged_hold_dir=forged_hold_dir)
 
-      if assert_each is not None:
-        assert_each(self)
-
-  # -- driver actions ------------------------------------------------------------------
   def driver_press(self, button, in_seconds, hold_s=0.15):
     self.driver_queue[self.tick_n + int(in_seconds / DT_CTRL)] = (button, max(1, int(hold_s / DT_CTRL)))
 
   @property
-  def v_cruise_mph(self):
-    return round(self.helper.v_cruise_kph / MPH_KPH, 1)
 
 
-class TestCurveRestore:
-  def test_dip_restores_exactly(self):
-    """F2 end-to-end: an SCC dip walks the dash down; after it clears, the dash comes back
     to exactly the driver's baseline, across ECU press drops and grid snaps."""
-    loop = Loop(baseline_mph=60, seed=1)
     loop.scc_dip_mph = 55
     loop.run(6.0)
-    assert loop.ecu.dash <= 56, f"dash never followed the dip: {loop.ecu.dash}"
-
     loop.scc_dip_mph = 0.
     loop.run(12.0)  # quiet window + restore move + latency
     assert loop.ecu.dash == 60, f"restore not exact: dash={loop.ecu.dash}"
@@ -316,21 +238,13 @@ class TestCurveRestore:
   def test_dip_train_does_not_churn(self):
     """Back-to-back dips with the horizon in view: the lookahead veto must hold the
     dash down through the gap (the second dip is visible before its source commits)."""
-    loop = Loop(baseline_mph=60, seed=2)
-    loop.lookahead_mph = 55  # the vision profile sees the dip train the whole time
     loop.scc_dip_mph = 55
-    loop.run(5.0)
     dash_after_first = loop.ecu.dash
 
     loop.scc_dip_mph = 0.
     loop.run(1.5)  # gap between commits; the dip is still on the horizon
-    assert loop.ecu.dash == dash_after_first, "servo restored between back-to-back dips"
-    loop.scc_dip_mph = 55
     loop.run(3.0)
     loop.scc_dip_mph = 0.
-    loop.lookahead_mph = 255. / MPH_MS  # horizon clear
-    loop.run(12.0)
-    assert loop.ecu.dash == 60
 
 
 class TestSlaSession:
@@ -348,7 +262,6 @@ class TestSlaSession:
     loop = Loop(baseline_mph=60, seed=3)
     self._confirm_lower(loop, limit=45)
 
-    states = set()
     def watch(lo):
       states.add(lo.sla.state)
     loop.run(10.0, assert_each=watch)

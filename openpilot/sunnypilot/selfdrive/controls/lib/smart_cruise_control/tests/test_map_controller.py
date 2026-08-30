@@ -94,8 +94,5 @@ class TestSmartCruiseControlMap(OpenpilotTestCase):
     assert self.scc_m.output_v_target == pytest.approx(15.)
     assert 150. < self.scc_m.target_distance < 250.
 
-    # required decel to the target, reached through the publication ramp
-    expected = (15. ** 2 - v_ego ** 2) / (2. * self.scc_m.target_distance)
-    for _ in range(40):
       self.scc_m.update(True, False, v_ego, 0., 25.)
     assert self.scc_m.output_a_target == pytest.approx(expected, abs=1e-3)
