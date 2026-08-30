@@ -41,6 +41,18 @@ UNWIND_JERK_THRESHOLD = -1.0  # m/s^3, setpoint rate below this while near zero 
 UNWIND_LAT_ACCEL_NEAR_ZERO = 0.3  # m/s^2
 MIN_LATERAL_CONTROL_SPEED = 0.3  # m/s
 STEER_RELEASE_I_DECAY = 0.8  # one-shot integrator decay on steering-press release
+# At the release edge the tracking error is whatever the driver left (p90 0.67 m/s^2 on the
+# 2026-08-29 override drive) and the P term lands all of it within one frame (P swing p90
+# 2.24 within 100 ms) — the felt "abrupt at first" hand-back. Easing the error in over the
+# ramp turns the step into a slope; feedforward is untouched, so the curve hold the driver
+# expects on release is immediate.
+RELEASE_ERROR_RAMP_T = 0.3  # s
+# While the command sits on the measured EPS rail, setpoint lead beyond the live request
+# buys no torque — the EPS is already delivering its maximum — it only inflates the error
+# the P term swings from when the corner exits (90-degree corners ran 58-100% rail duty
+# with ~1 m/s^2 of exit ringing, integrator frozen throughout, on the same drive). Taper
+# the lead to the live request as headroom to the rail vanishes; v0's algebra at the rail.
+RAIL_LEAD_TAPER_MARGIN = 0.1  # fraction of the steer scale over which the lead fades out
 
 # Roll compensation and latAccelOffset are lateral-accel-domain corrections; below
 # walking pace the desired lateral accel is ~0, so an unfaded road-crown term dominates
@@ -114,6 +126,8 @@ class LatControlTorque(LatControlTorqueV0):
     self.low_speed_pid_threshold = max(CP.minSteerSpeed, MIN_LATERAL_CONTROL_SPEED)
     self.prev_steering_pressed = False
     self.prev_setpoint = 0.0
+    self._release_error_ramp = 1.0
+    self._rail_lead_headroom = 1.0  # last frame's headroom-to-rail factor for the lead taper
     # Fraction of the steer scale the EPS actually delivers, by speed (None: full scale).
     # See the saturation check below for why the alert needs it.
     self.steer_rail_schedule = get_steer_rail_schedule(CP)
@@ -181,11 +195,15 @@ class LatControlTorque(LatControlTorqueV0):
       self.jerk_filter.x = 0.0
       self.prev_setpoint = future_desired_lateral_accel
       self.plan_jerk_weight = 0.0
+      self._release_error_ramp = 1.0
+      self._rail_lead_headroom = 1.0
     else:
       # One-shot integrator decay on steering-press release, so hand-back after an
       # override is neutral instead of a kick
       if self.prev_steering_pressed and not CS.steeringPressed:
         self.pid.i *= STEER_RELEASE_I_DECAY
+        self._release_error_ramp = 0.0
+      self._release_error_ramp = min(1.0, self._release_error_ramp + self.dt / RELEASE_ERROR_RAMP_T)
 
       roll_offset_fade = float(np.interp(CS.vEgo, FF_ROLL_OFFSET_FADE_BP, FF_ROLL_OFFSET_FADE_V))
       roll_compensation = params.roll * ACCELERATION_DUE_TO_GRAVITY * roll_offset_fade
@@ -229,6 +247,10 @@ class LatControlTorque(LatControlTorqueV0):
       lead_weight = float(np.interp(CS.vEgo, LEAD_SPEED_FADE_BP, LEAD_SPEED_FADE_V))
       setpoint_jerk = lead_weight * desired_lateral_jerk + (1.0 - lead_weight) * differencer_jerk
       setpoint = expected_lateral_accel + setpoint_jerk * lat_delay
+      if self._rail_lead_headroom < 1.0:
+        setpoint = future_desired_lateral_accel + self._rail_lead_headroom * (setpoint - future_desired_lateral_accel)
+        if lat_delay > self.dt:
+          setpoint_jerk = (setpoint - expected_lateral_accel) / lat_delay
 
       measurement_rate = self.measurement_rate_filter.update((measurement - self.previous_measurement) / self.dt)
       self.previous_measurement = measurement
@@ -243,7 +265,7 @@ class LatControlTorque(LatControlTorqueV0):
       unwind_detected = unwind_rate < UNWIND_JERK_THRESHOLD and abs(setpoint) < UNWIND_LAT_ACCEL_NEAR_ZERO
       self.prev_setpoint = setpoint
 
-      error = setpoint - measurement
+      error = (setpoint - measurement) * self._release_error_ramp
 
       # do error correction in lateral acceleration space, convert at end to handle non-linear torque responses correctly
       pid_log.error = float(error)
@@ -304,6 +326,8 @@ class LatControlTorque(LatControlTorqueV0):
         steer_rail = float(np.interp(CS.vEgo, self.steer_rail_schedule[0], self.steer_rail_schedule[1]))
         at_rail = steer_rail * self.steer_max - abs(output_torque) < 1e-3
         alert_limited = steer_limited_by_safety and not at_rail
+        headroom = (steer_rail * self.steer_max - abs(output_torque)) / (RAIL_LEAD_TAPER_MARGIN * self.steer_max)
+        self._rail_lead_headroom = float(np.clip(headroom, 0.0, 1.0))
       else:
         at_rail = self.steer_max - abs(output_torque) < 1e-3
         alert_limited = steer_limited_by_safety

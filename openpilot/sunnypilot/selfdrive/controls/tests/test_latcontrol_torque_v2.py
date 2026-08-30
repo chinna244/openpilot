@@ -523,3 +523,104 @@ class TestPlanJerkSource:
       out0, _, log0 = v0.update(True, make_cs(v_ego), VM, LP, False, k_step, None, False, LAT_DELAY)
       out2, _, log2 = v2.update(True, make_cs(v_ego), VM, LP, False, k_step, None, False, LAT_DELAY)
       assert log2.desiredLateralAccel == pytest.approx(log0.desiredLateralAccel, abs=1e-6), f"frame {i}"
+
+
+class TestReleaseRampAndRailTaper:
+  """The two 2026-08-29 feel fixes: the release-edge error ramp (P-step p90 2.24 within
+  100 ms measured on the override drive) and the rail-proximity lead taper (90-degree
+  corners at 58-100% rail duty with the integrator frozen — the lead only inflates the
+  error the P term swings from at exit)."""
+
+  def _steady_error_run(self, v2, v_ego, lat_accel, press_frames):
+    """Standing measurement offset; pressed for press_frames, then released. Returns
+    (errors, ps, fs) for 40 frames after the release edge."""
+    for _ in range(DELAY_FRAMES + 10):
+      step(v2, make_cs(v_ego), 0.0, active=False)
+    for _ in range(press_frames):
+      step(v2, make_cs(v_ego, lat_accel, pressed=True), 0.0)
+    errors, ps, fs = [], [], []
+    for _ in range(40):
+      log = step(v2, make_cs(v_ego, lat_accel), 0.0)
+      errors.append(log.error)
+      ps.append(log.p)
+      fs.append(log.f)
+    return errors, ps, fs
+
+  def test_release_error_ramp_slopes_the_p_step(self, params):
+    v2 = make_lac(LatControlTorqueV2)
+    errors, ps, _ = self._steady_error_run(v2, v_ego=15.0, lat_accel=-0.5, press_frames=50)
+    full = errors[-1]
+    assert abs(full) > 0.4  # the standing error survives the run
+    # first post-release frame carries ~dt/RAMP_T of the error, not all of it
+    assert abs(errors[0]) < 0.1 * abs(full)
+    assert abs(ps[0]) < 0.1 * abs(ps[-1])
+    # monotone ramp-in, complete within RELEASE_ERROR_RAMP_T
+    assert abs(errors[9]) < abs(errors[19]) < abs(errors[29])
+    assert errors[35] == pytest.approx(full, rel=1e-6)
+
+  def test_release_ramp_leaves_feedforward_alone(self, params):
+    """The ramp eases the PID error only: feedforward (the curve hold the driver expects
+    back immediately) must not dip at the release edge."""
+    v2 = make_lac(LatControlTorqueV2)
+    # nonzero desired so the FF is meaningful; measurement matches desired (no error)
+    for _ in range(DELAY_FRAMES + 10):
+      step(v2, make_cs(15.0), 2e-3, active=False)
+    for _ in range(50):
+      step(v2, make_cs(15.0, 2e-3 * 15.0 ** 2, pressed=True), 2e-3)
+    logs = [step(v2, make_cs(15.0, 2e-3 * 15.0 ** 2), 2e-3) for _ in range(40)]
+    assert logs[0].f == pytest.approx(logs[-1].f, abs=1e-9)
+
+  def test_no_ramp_without_a_release_edge(self, params):
+    """A steady active run never engages the ramp: error is full-scale from the start."""
+    v2 = make_lac(LatControlTorqueV2)
+    for _ in range(DELAY_FRAMES + 10):
+      step(v2, make_cs(15.0), 0.0, active=False)
+    log = step(v2, make_cs(15.0, -0.5), 0.0)
+    assert abs(log.error) > 0.4
+
+  def _railed_run(self, v2, frames=120):
+    """Ramping demand large enough to pin the output past a 0.5 rail at 15 m/s."""
+    v_ego = 15.0
+    logs = []
+    desired = 0.0
+    for _ in range(DELAY_FRAMES + 10):
+      step(v2, make_cs(v_ego), desired, active=False)
+    for _ in range(frames):
+      desired = min(desired + 2e-4, 1.5e-2)  # ramps toward 3.4 m/s^2, output >> rail
+      logs.append((desired * v_ego ** 2, step(v2, make_cs(v_ego), desired)))
+    return logs
+
+  def test_rail_taper_collapses_lead_to_live_request(self, params):
+    v2 = make_lac(LatControlTorqueV2)
+    v2.steer_rail_schedule = ([0.0], [0.5])
+    logs = self._railed_run(v2)
+    # once the output has been on the rail for a few frames, the setpoint is the live request
+    railed = [(future, log) for future, log in logs[10:] if abs(log.output) >= 0.5]
+    assert len(railed) > 20
+    for future, log in railed[3:]:
+      assert log.desiredLateralAccel == pytest.approx(future, abs=1e-6)
+
+  def test_lead_survives_without_a_rail_schedule(self, params):
+    """Same railed demand on a scheduleless platform: the lead must still be present
+    (setpoint ahead of the live request while the demand ramps)."""
+    v2 = make_lac(LatControlTorqueV2)
+    assert v2.steer_rail_schedule is None
+    logs = self._railed_run(v2)
+    leads = [log.desiredLateralAccel - future for future, log in logs[40:80]]
+    assert max(abs(l) for l in leads) > 0.05
+
+  def test_rail_taper_inert_below_the_rail(self, params):
+    """With plenty of headroom the taper never engages: frame-for-frame identical to a
+    scheduleless controller on the same gentle run."""
+    v2a = make_lac(LatControlTorqueV2)
+    v2a.steer_rail_schedule = ([0.0], [0.5])
+    v2b = make_lac(LatControlTorqueV2)
+    v_ego = 15.0
+    for _ in range(DELAY_FRAMES + 10):
+      step(v2a, make_cs(v_ego), 0.0, active=False)
+      step(v2b, make_cs(v_ego), 0.0, active=False)
+    for i in range(200):
+      desired = 1e-3 * math.sin(i / 50)  # ~0.2 m/s^2, output well under the rail
+      la = step(v2a, make_cs(v_ego), desired)
+      lb = step(v2b, make_cs(v_ego), desired)
+      assert la.output == pytest.approx(lb.output, abs=1e-9), f"frame {i}"
