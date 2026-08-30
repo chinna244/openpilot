@@ -39,6 +39,28 @@ _A_LAT_REG_MAX = 2.  # m/s2; curves are taken at or below this lateral accelerat
 # that drops to 5% for 1.4% of speed given up.
 _PLAN_MARGIN = 0.95
 
+# The model reads path curvature low at range, so the profile binds late and no budget can
+# make the distance back up. Measured against the curvature the car actually pulled at 26
+# apexes (route 135), the ratio of predicted to realized kappa runs 1.00 inside 30 m, 0.79
+# at 80 m and 0.30 past 130 m. It is a DISTANCE effect, not a horizon-fraction one: the same
+# shape holds in the 18-31, 31-42 and 42+ mph bands, and on two unrelated routes, where it is
+# stronger still. Nothing better is available from the message -- geometric curvature off
+# position.x/y carries the same bias and is worse near the car -- because the far end of the
+# path is an 8-10 s prediction that regresses toward straight under its own uncertainty.
+# Undo it before the profile solve. The gain returns to 1.0 as the curve closes, so it moves
+# WHEN the car brakes, not how hard: an over-read at range is walked back by the same solver
+# a second later, and on a straight road it multiplies a kappa of zero and costs nothing.
+_KAPPA_BIAS_D = [0., 30., 50., 70., 90., 110.]  # m along the path
+# Reciprocal of the measured ratio, capped. Uncapped it reaches 2.07 past 130 m, but the
+# per-apex spread is wide there (IQR 0.50-0.82 at 80-120 m, and 3 of 26 apexes over-read),
+# and 1.5 is where the closed-loop replay stops buying apexes and starts adding straight-road
+# limiter activity.
+_KAPPA_BIAS_GAIN = [1.0, 1.06, 1.14, 1.22, 1.42, 1.5]
+# How much tighter than the near field the raw path ahead has to read before the near floor
+# lets go. A few percent of curvature noise must not look like a corner worth braking past
+# the near requirement for.
+_NEAR_FLOOR_FRAC = 0.98
+
 # Release well below COMMIT_FRAC so the gate does not chatter on noise.
 _RELEASE_FRAC = 0.3
 
@@ -77,6 +99,7 @@ class SmartCruiseControlVision:
     self.v_profile_now = float('inf')
     self.v_dip_ahead = float('inf')
     self.v_near_min = float('inf')
+    self.v_raw_min = float('inf')
 
     # published
     self.output_v_target = V_CRUISE_UNSET
@@ -92,6 +115,7 @@ class SmartCruiseControlVision:
     self.v_profile_now = float('inf')
     self.v_dip_ahead = float('inf')
     self.v_near_min = float('inf')
+    self.v_raw_min = float('inf')
     self.max_pred_lat_acc = 0.
 
   def _update_params(self) -> None:
@@ -121,6 +145,17 @@ class SmartCruiseControlVision:
     dist[1:] = np.cumsum(np.hypot(np.diff(x), np.diff(y)))
 
     lim = self.limits
+    # The near field is measured, not predicted, so it keeps raw geometry: it is the speed
+    # the road actually requires, and the bias correction is never allowed to outvote it.
+    near = dist <= max(self.v_ego, MIN_V) * _NEAR_T
+    v_raw = allowed_speed(kappa, _A_LAT_REG_MAX * _PLAN_MARGIN)
+    self.v_near_min = float(np.min(v_raw[near])) if np.any(near) else float('inf')
+    self.v_raw_min = float(np.min(v_raw))
+    # UI wire: the lateral acceleration the near path would produce at the current speed
+    self.max_pred_lat_acc = float(np.max(kappa[near]) * self.v_ego ** 2) if np.any(near) else 0.
+
+    # Everything that decides WHEN to brake plans on the bias-corrected curve.
+    kappa = kappa * np.interp(dist, _KAPPA_BIAS_D, _KAPPA_BIAS_GAIN)
     v_allowed = allowed_speed(kappa, _A_LAT_REG_MAX * _PLAN_MARGIN)
 
     # the stock path's lead includes walking the dash down to the deepest dip ahead
@@ -135,11 +170,6 @@ class SmartCruiseControlVision:
     v_max = backward_pass(v_allowed, dist, lim.a_budget)
     self.v_profile_now = float(v_max[0])
     self.v_dip_ahead = min_profile_speed(v_max, dist, float(dist[-1]))
-
-    near = dist <= max(self.v_ego, MIN_V) * _NEAR_T
-    self.v_near_min = float(np.min(v_allowed[near])) if np.any(near) else float('inf')
-    # UI wire: the lateral acceleration the near path would produce at the current speed
-    self.max_pred_lat_acc = float(np.max(kappa[near]) * self.v_ego ** 2) if np.any(near) else 0.
 
     # commit when the required decel approaches the budget; once braking, hold through the
     # curve (the near path stays below the setpoint) and release on real relaxation
@@ -209,6 +239,23 @@ class SmartCruiseControlVision:
     return self.is_active and self.solver_active
 
   @property
+  def _near_floor(self) -> float:
+    """Speed the road the car can already resolve requires, m/s; -inf when it does not bind.
+
+    The correction is a claim about what the model cannot resolve yet, so it must not be the
+    sole reason to command below what it can. Going under the near requirement is allowed
+    only when the raw path genuinely reports something tighter further out; the correction
+    then decides how early and how hard to brake for it, which is all it is for.
+
+    Without this, a constant-radius curve inflates its own far half while the car is inside
+    it and the car settles below the speed the road requires and stays there for the length
+    of the curve -- a sweeper or a long ramp, where nothing ever comes closer to disagree.
+    """
+    if np.isfinite(self.v_near_min) and self.v_raw_min >= self.v_near_min * _NEAR_FLOOR_FRAC:
+      return self.v_near_min
+    return -float('inf')
+
+  @property
   def v_ahead_min(self) -> float:
     """Lowest planned speed on the horizon for the ICBM restore gate, m/s.
 
@@ -233,6 +280,10 @@ class SmartCruiseControlVision:
     a_need = self.a_required
     if np.isfinite(self.v_dip_ahead):
       a_need = min(a_need, max(self.v_ego - self.v_dip_ahead, 0.))
+    # keep the two channels consistent: a decel request the target floor forbids would still
+    # reach the actuator, and on the stock path the overshoot lever would pull the dash down
+    # past the floor anyway
+    a_need = min(a_need, max(self.v_ego - self._near_floor, 0.))
     a_des = max(-a_need, _A_PUB_MIN)
     j = self.limits.jerk(self.v_ego) or _STOCK_RAMP_JERK
     self.a_out = float(np.clip(a_des, self.a_out - j * DT_MDL, self.a_out + j * DT_MDL))
@@ -257,7 +308,7 @@ class SmartCruiseControlVision:
         # a dash servo cannot track a continuous profile in 1 mph taps; pre-position it
         # at the deepest dip on the horizon and let the decel gap do the shaping
         v = min(v, self.v_dip_ahead)
-    return max(v, MIN_V)
+    return max(v, self._near_floor, MIN_V)
 
   def update(self, sm: messaging.SubMaster, long_enabled: bool, long_override: bool, v_ego: float, a_ego: float,
              v_cruise_setpoint: float) -> None:
