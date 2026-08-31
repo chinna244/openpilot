@@ -1,4 +1,4 @@
-# Panda remains a temporary chinna244 pin. OpenDBC uses chinna244/opendbc mazda-dev.
+# Panda remains a temporary chinna244 pin. OpenDBC uses chinna244/opendbc develop.
 # Touch this file to force `git submodule sync`.
 [submodule "panda"]
   path = panda
