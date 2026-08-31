@@ -363,6 +363,7 @@ struct OnroadEventSP @0xda96579883444c35 {
     laneChangeRoadEdge @24;
     longitudinalEnableChime @25;
     longitudinalDisableChime @26;
+    bigModelReady @27;
   }
 }
 

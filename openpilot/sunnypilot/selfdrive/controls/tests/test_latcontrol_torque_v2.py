@@ -508,6 +508,59 @@ class TestSharedGainSchedule:
       assert v2.pid.k_p == pytest.approx(v0.pid.k_p), f"{i * 0.1} m/s"
 
 
+class TestLowSpeedDamping:
+  """The 12e lateral maneuvers (9 m/s steps) showed 35-100% overshoot with the integrator
+  frozen near zero: the EPS slew (12 counts/frame) leaves ~1 s of stale torque behind a
+  railed command, and a pure P loop only unwinds after the crossing. kd = 0.3 s * KP(v),
+  capped below 7.5 m/s and faded out by 14.5 m/s, is the phase lead validated against that
+  route (closed-loop sim overshoot 1.63 -> 1.21; command off the rail a median 0.13 s
+  earlier, model-free). v0 keeps KD = 0 and the shared -measurement_rate argument dead."""
+
+  def test_kd_schedule_pins(self, params):
+    _, v2 = make_pair()
+    for v_ego, kd in [(2.0, 1.65), (7.5, 1.65), (9.0, 1.29), (10.0, 1.05), (14.5, 0.0), (25.0, 0.0)]:
+      v2.pid.speed = v_ego
+      assert v2.pid.k_d == pytest.approx(kd), f"{v_ego} m/s"
+
+  def test_v0_kd_stays_zero(self, params):
+    v0, _ = make_pair()
+    for v_ego in [2.0, 9.0, 25.0]:
+      v0.pid.speed = v_ego
+      assert v0.pid.k_d == 0.0
+
+  def test_damping_opposes_measurement_motion(self, params):
+    """With the setpoint held and the measurement swinging toward it, the D term opposes the
+    motion (positive rate -> negative d) and trims the command relative to a static run."""
+    _, moving = make_pair()
+    _, static = make_pair()
+    v_ego = 9.0
+    desired = 0.5 / v_ego ** 2
+    for _ in range(DELAY_FRAMES + 10):
+      step(moving, make_cs(v_ego), desired, active=False)
+      step(static, make_cs(v_ego), desired, active=False)
+    out_m = out_s = 0.0
+    for i in range(50):
+      lat = min(i * 0.02, 0.5)  # measurement sweeping up at 2 m/s^3
+      log_m = step(moving, make_cs(v_ego, lat), desired)
+      log_s = step(static, make_cs(v_ego, 0.0), desired)
+      out_m, out_s = log_m.output, log_s.output
+    assert moving.pid.d < -0.1
+    assert static.pid.d == pytest.approx(0.0, abs=1e-9)
+    # output is logged sign-inverted; the moving run commands less toward the turn
+    assert abs(out_m) < abs(out_s)
+
+  def test_no_damping_at_highway_speed(self, params):
+    """Above the fade the D term is exactly zero however fast the measurement moves."""
+    _, v2 = make_pair()
+    v_ego = 20.0
+    desired = 0.5 / v_ego ** 2
+    for _ in range(DELAY_FRAMES + 10):
+      step(v2, make_cs(v_ego), desired, active=False)
+    for i in range(50):
+      step(v2, make_cs(v_ego, min(i * 0.02, 0.5)), desired)
+    assert v2.pid.d == 0.0
+
+
 def make_plan_model(frame_id, curvature, v_plan=15.0):
   """Fake modelV2 carrying a curvature plan over T_IDXS (constant, or a callable of plan
   time). orientationRate.z = curvature * velocity, matching the on-wire convention."""

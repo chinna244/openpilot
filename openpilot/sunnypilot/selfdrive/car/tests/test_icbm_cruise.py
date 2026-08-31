@@ -358,10 +358,11 @@ class TestDecelOvershoot:
 
   def test_commands_below_target_when_decelerating(self):
     icbm = self.make_icbm()
-    # planner wants -0.45 m/s^2 at 45 mph toward a 40 mph target: needs a ~6 mph gap below vEgo
+    # planner wants -0.45 m/s^2 at 45 mph toward a 40 mph target: gap_v asks ~8.5 mph below
+    # vEgo, leading the steady-state inverse to pay back the dash walk
     self.run_frames(icbm, target_mph=40, v_ego_mph=45, a_target=-0.45, n=100)
-    assert icbm.v_target <= 39, icbm.v_target
-    assert icbm.v_target >= 37, icbm.v_target
+    assert icbm.v_target <= 37, icbm.v_target
+    assert icbm.v_target >= 35, icbm.v_target
 
   def test_deep_dip_is_a_no_op(self):
     """When the target is already far below vEgo the plant is saturated; never go deeper."""
