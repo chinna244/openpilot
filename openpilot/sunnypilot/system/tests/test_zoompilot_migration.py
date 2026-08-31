@@ -85,7 +85,7 @@ def test_never_moves_anyone_off_develop(monkeypatch, origin, branch):
 
 def test_published_channels_are_not_migration_sources():
   """Guard against anyone widening LEGACY_BRANCHES into a live install channel."""
-  for protected in ("develop", "main", "main-prebuilt", "develop-prebuilt"):
+  for protected in ("develop", "danger-unstable", "main", "main-prebuilt", "develop-prebuilt"):
     assert protected not in LEGACY_BRANCHES
 
 
