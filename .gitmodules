@@ -6,7 +6,7 @@
 [submodule "opendbc"]
   path = opendbc_repo
   url = https://github.com/chinna244/opendbc.git
-  branch = mazda-dev
+  branch = develop
 [submodule "msgq"]
   path = msgq_repo
   url = https://github.com/sunnypilot/msgq.git
