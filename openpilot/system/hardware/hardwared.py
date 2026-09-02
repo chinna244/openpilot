@@ -14,6 +14,7 @@ from openpilot.cereal import log
 from openpilot.cereal.services import SERVICE_LIST
 from openpilot.common.utils import strip_deprecated_keys
 from openpilot.common.filter_simple import FirstOrderFilter
+from openpilot.sunnypilot.common.ignition import get_ignition_state
 from openpilot.common.params import Params
 from openpilot.common.realtime import DT_HW
 from openpilot.selfdrive.modeld.helpers import MODELS_DIR, chestnut_compiled
@@ -26,6 +27,7 @@ from openpilot.system.loggerd.config import get_available_percent
 from openpilot.common.swaglog import cloudlog
 from openpilot.sunnypilot.system.statsd import statlog
 from openpilot.system.hardware.power_monitoring import PowerMonitoring
+from openpilot.sunnypilot.system.hardware.hardwared_ext import HardwaredExt
 from openpilot.system.hardware.fan_controller import FanController
 from openpilot.common.version import terms_version, training_version, get_build_metadata, terms_version_sp, CHESTNUT_BRANCHES
 
@@ -191,7 +193,7 @@ def hw_state_thread(end_event, hw_queue):
 def hardware_thread(end_event, hw_queue) -> None:
   system_stats = LinuxSystemStats()
   pm = messaging.PubMaster(['deviceState'])
-  sm = messaging.SubMaster(["peripheralState", "gpsLocationExternal", "selfdriveState", "pandaStates"], poll="pandaStates")
+  sm = messaging.SubMaster(["peripheralState", "gpsLocationExternal", "selfdriveState", "pandaStates", HardwaredExt.SERVICE], poll="pandaStates")
 
   count = 0
 
@@ -228,6 +230,7 @@ def hardware_thread(end_event, hw_queue) -> None:
   offroad_cycle_count = 0
 
   params = Params()
+  ext = HardwaredExt(params, SERVICE_LIST['pandaStates'].frequency)
   power_monitor = PowerMonitoring()
 
   uptime_offroad: float = params.get("UptimeOffroad", return_default=True)
@@ -250,13 +253,16 @@ def hardware_thread(end_event, hw_queue) -> None:
     # handle requests to cycle system started state
     if params.get_bool("OnroadCycleRequested"):
       params.put_bool("OnroadCycleRequested", False, block=True)
+      ext.on_onroad_cycle()
       offroad_cycle_count = sm.frame
     onroad_conditions["not_onroad_cycle"] = (sm.frame - offroad_cycle_count) >= ONROAD_CYCLE_TIME * SERVICE_LIST['pandaStates'].frequency
+
+    ext.update(sm, started_ts is not None, engaged_prev)
 
     if sm.updated['pandaStates'] and len(pandaStates) > 0:
 
       # Set ignition based on any panda connected
-      onroad_conditions["ignition"] = any(ps.ignitionLine or ps.ignitionCan for ps in pandaStates if ps.pandaType != log.PandaState.PandaType.unknown)
+      onroad_conditions["ignition"] = get_ignition_state(pandaStates)
 
       pandaState = pandaStates[0]
 
