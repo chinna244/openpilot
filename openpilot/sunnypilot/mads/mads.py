@@ -23,6 +23,12 @@ SafetyModel = structs.CarParams.SafetyModel
 SET_SPEED_BUTTONS = (ButtonType.accelCruise, ButtonType.resumeCruise, ButtonType.decelCruise, ButtonType.setCruise)
 IGNORED_SAFETY_MODES = (SafetyModel.silent, SafetyModel.noOutput)
 
+# Frames of MADS steering with the panda reporting lateral not allowed. pandaStates arrives at
+# 10 Hz on its own socket, so a fresh engagement can read stale for up to ~10 frames; the
+# warning waits twice that, the disable the same 200 frames as upstream's controlsMismatch.
+LATERAL_MISMATCH_WARN_FRAMES = 20
+LATERAL_MISMATCH_DISABLE_FRAMES = 200
+
 
 class ModularAssistiveDrivingSystem:
   def __init__(self, selfdrive):
@@ -182,7 +188,13 @@ class ModularAssistiveDrivingSystem:
 
     if not CS.cruiseState.available and not self.no_main_cruise:
       self.events.remove(EventName.buttonEnable)
-      if self.selfdrive.CS_prev.cruiseState.available:
+      # On these cars the ACC main state is the only MADS off-switch, so lateral must never
+      # outlive it. Watching the falling edge alone leaves a trap: anything that engages MADS
+      # while availability is already low (a car reporting cruise enabled without main on)
+      # never sees an edge and cannot be shut off short of ignition off. Checking the level
+      # too catches that state on the next frame. Brands that engage MADS on their own button
+      # with main cruise off keep the edge-only behavior.
+      if self.selfdrive.CS_prev.cruiseState.available or (self.enabled and not self.allow_always):
         self.events_sp.add(EventNameSP.lkasDisable)
 
     if self.steering_mode_on_brake == MadsSteeringModeOnBrake.DISENGAGE:
@@ -199,7 +211,11 @@ class ModularAssistiveDrivingSystem:
       if self.state_machine.state == State.paused:
         self.events_sp.add(EventNameSP.silentLkasEnable)
 
-    if self.lateral_mismatch_counter >= 200:
+    # every rejected frame is an unsteered frame (the camera's own steering is relay-blocked
+    # while we control), so the driver hears about it well before the disable
+    if self.lateral_mismatch_counter >= LATERAL_MISMATCH_WARN_FRAMES:
+      self.events_sp.add(EventNameSP.controlsMismatchLateralWarning)
+    if self.lateral_mismatch_counter >= LATERAL_MISMATCH_DISABLE_FRAMES:
       self.events_sp.add(EventNameSP.controlsMismatchLateral)
 
     self.events.remove(EventName.pcmDisable)
