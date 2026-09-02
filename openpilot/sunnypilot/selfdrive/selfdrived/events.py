@@ -99,6 +99,17 @@ EVENTS_SP: dict[int, dict[str, Alert | AlertCallbackType]] = {
     ET.USER_DISABLE: EngagementAlert(AudibleAlert.disengage),
   },
 
+  # Sound-only mirrors for longitudinal state transitions whose stock events are
+  # filtered to keep Mazda TJA_MADS independent. PERMANENT is presentation-only
+  # here and is intentionally ignored by the MADS state machine.
+  EventNameSP.longitudinalEnableChime: {
+    ET.PERMANENT: EngagementAlert(AudibleAlert.engage),
+  },
+
+  EventNameSP.longitudinalDisableChime: {
+    ET.PERMANENT: EngagementAlert(AudibleAlert.disengage),
+  },
+
   EventNameSP.manualSteeringRequired: {
     ET.USER_DISABLE: Alert(
       "Automatic Lane Centering is OFF",

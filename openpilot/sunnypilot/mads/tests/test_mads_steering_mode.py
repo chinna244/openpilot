@@ -12,8 +12,7 @@ from opendbc.car import structs
 from openpilot.selfdrive.selfdrived.events import Events
 from openpilot.sunnypilot.selfdrive.selfdrived.events import EventsSP
 from openpilot.sunnypilot.mads.helpers import MadsSteeringModeOnBrake, read_steering_mode_param
-from openpilot.sunnypilot.mads.mads import (LATERAL_MISMATCH_DISABLE_FRAMES, LATERAL_MISMATCH_WARN_FRAMES,
-                                            ModularAssistiveDrivingSystem)
+from openpilot.sunnypilot.mads.mads import ModularAssistiveDrivingSystem
 from opendbc.sunnypilot.car.tesla.values import MadsScreenButtonType, TeslaFlagsSP
 from openpilot.common.test import OpenpilotTestCase
 
@@ -21,6 +20,17 @@ State = custom.ModularAssistiveDrivingSystem.ModularAssistiveDrivingSystemState
 EventName = log.OnroadEvent.EventName
 EventNameSP = custom.OnroadEventSP.EventName
 SafetyModel = structs.CarParams.SafetyModel
+
+
+class FakeSubMaster(dict):
+  """dict-backed SubMaster stub with configurable pandaStates freshness/validity."""
+
+  def __init__(self, *args, checks_ok=True, **kwargs):
+    super().__init__(*args, **kwargs)
+    self.checks_ok = checks_ok
+
+  def all_checks(self, service_list=None) -> bool:
+    return self.checks_ok
 
 
 def make_car_state(brake_pressed=False, regen_braking=False, standstill=False, v_ego=0.0):
@@ -63,7 +73,7 @@ def make_mads(mocker, steering_mode):
   sd.enabled_prev = False
   sd.initialized = True
   sd.CS_prev = make_car_state()
-  sd.sm = {'pandaStates': [make_panda_state(mocker)]}
+  sd.sm = FakeSubMaster({'pandaStates': [make_panda_state(mocker)]})
   sd.state_machine = mocker.MagicMock()
 
   mads = ModularAssistiveDrivingSystem(sd)
@@ -211,40 +221,73 @@ class TestLateralMismatchCounter(OpenpilotTestCase):
       mads.data_sample()
     assert mads.lateral_mismatch_counter == 200
 
-  def test_warning_precedes_the_disable(self, mocker):
-    # Alert before the disable because steering is unavailable from the first rejected frame.
+  def test_empty_panda_counts_as_mismatch(self, mocker):
     mads, sd = make_mads(mocker, MadsSteeringModeOnBrake.PAUSE)
     mads.enabled = True
     mads.active = True
-    sd.sm['pandaStates'] = [make_panda_state(mocker, False)]
-    cs = make_car_state(v_ego=10.0)
+    sd.sm['pandaStates'] = []
 
-    def events_after(n):
-      mads.lateral_mismatch_counter = 0
-      sd.events_sp.clear()
-      for _ in range(n):
-        mads.data_sample()
-      mads.update_events(cs)
-      return sd.events_sp.has(EventNameSP.controlsMismatchLateralWarning), sd.events_sp.has(EventNameSP.controlsMismatchLateral)
-
-    # a fresh engagement can read stale for a pandaStates period: no alert yet
-    assert events_after(LATERAL_MISMATCH_WARN_FRAMES - 1) == (False, False)
-    assert events_after(LATERAL_MISMATCH_WARN_FRAMES) == (True, False)
-    assert events_after(LATERAL_MISMATCH_DISABLE_FRAMES - 1) == (True, False)
-    assert events_after(LATERAL_MISMATCH_DISABLE_FRAMES) == (True, True)
-
-  def test_no_warning_while_openpilot_itself_is_engaged(self, mocker):
-    # with longitudinal engaged the panda steers on controls_allowed; controls_allowed_lateral
-    # is not the gate, and upstream's controlsMismatch covers that half
-    mads, sd = make_mads(mocker, MadsSteeringModeOnBrake.PAUSE)
-    mads.enabled = True
-    mads.active = True
-    sd.enabled = True
-    sd.sm['pandaStates'] = [make_panda_state(mocker, False)]
-    for _ in range(LATERAL_MISMATCH_DISABLE_FRAMES):
+    for _ in range(200):
       mads.data_sample()
-    mads.update_events(make_car_state(v_ego=10.0))
-    assert not sd.events_sp.has(EventNameSP.controlsMismatchLateralWarning)
+    assert mads.lateral_mismatch_counter == 200
+
+  def test_all_ignored_pandas_count_as_mismatch(self, mocker):
+    mads, sd = make_mads(mocker, MadsSteeringModeOnBrake.PAUSE)
+    mads.enabled = True
+    mads.active = True
+    ps = make_panda_state(mocker, True)
+    ps.safetyModel = SafetyModel.elm327
+    sd.sm['pandaStates'] = [ps]
+
+    for _ in range(200):
+      mads.data_sample()
+    assert mads.lateral_mismatch_counter == 200
+
+  def test_counter_resets_when_panda_recovers(self, mocker):
+    mads, sd = make_mads(mocker, MadsSteeringModeOnBrake.PAUSE)
+    mads.enabled = True
+    mads.active = True
+    sd.sm['pandaStates'] = [make_panda_state(mocker, False)]
+
+    for _ in range(100):
+      mads.data_sample()
+    assert mads.lateral_mismatch_counter == 100
+
+    sd.sm['pandaStates'] = [make_panda_state(mocker, True)]
+    mads.data_sample()
+    assert mads.lateral_mismatch_counter == 0
+
+    sd.sm['pandaStates'] = [make_panda_state(mocker, False)]
+    for _ in range(100):
+      mads.data_sample()
+    assert mads.lateral_mismatch_counter == 100
+
+
+  def test_stale_panda_states_count_as_mismatch(self, mocker):
+    mads, sd = make_mads(mocker, MadsSteeringModeOnBrake.PAUSE)
+    mads.enabled = True
+    mads.active = True
+    # Cached auth must not keep the counter from advancing when the service is stale.
+    sd.sm = FakeSubMaster({'pandaStates': [make_panda_state(mocker, True)]}, checks_ok=False)
+
+    for _ in range(50):
+      mads.data_sample()
+    assert mads.lateral_mismatch_counter == 50
+
+  def test_fresh_recovery_resets_mismatch_counter(self, mocker):
+    mads, sd = make_mads(mocker, MadsSteeringModeOnBrake.PAUSE)
+    mads.enabled = True
+    mads.active = True
+    sd.sm = FakeSubMaster({'pandaStates': [make_panda_state(mocker, True)]}, checks_ok=False)
+
+    for _ in range(50):
+      mads.data_sample()
+    assert mads.lateral_mismatch_counter == 50
+
+    sd.sm.checks_ok = True
+    sd.sm['pandaStates'] = [make_panda_state(mocker, True)]
+    mads.data_sample()
+    assert mads.lateral_mismatch_counter == 0
 
 
 # brand restrictions

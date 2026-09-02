@@ -23,13 +23,18 @@ ALL_STATES = (State.schema.enumerants.values())
 # The event types checked in DISABLED section of state machine
 ENABLE_EVENT_TYPES = (ET.ENABLE, ET.OVERRIDE_LATERAL)
 
+# Dedicated synthetic event id. Do not overwrite EVENTS_SP[0] (lkasEnable); that
+# poisons later MADS tests in the same process so TJA no longer enables.
+_TEST_EVENT = max(EVENTS_SP.keys(), default=0) + 1
+_LKAS_ENABLE_MAPPING = EVENTS_SP[EventNameSP.lkasEnable]
+
 
 def make_event(event_types):
   event = {}
   for ev in event_types:
     event[ev] = NormalPermanentAlert("alert")
-  EVENTS_SP[0] = event  # type: ignore[assignment] # ty: ignore[invalid-assignment]
-  return 0
+  EVENTS_SP[_TEST_EVENT] = event  # type: ignore[assignment] # ty: ignore[invalid-assignment]
+  return _TEST_EVENT
 
 
 class MockMADS:
@@ -48,6 +53,10 @@ class TestMADSStateMachine(OpenpilotTestCase):
     self.events = self.mads.selfdrive.events
     self.events_sp = self.mads.selfdrive.events_sp
     self.mads.selfdrive.state_machine.soft_disable_timer = int(SOFT_DISABLE_TIME / DT_CTRL)
+
+  def teardown_method(self):
+    EVENTS_SP[EventNameSP.lkasEnable] = _LKAS_ENABLE_MAPPING
+    EVENTS_SP.pop(_TEST_EVENT, None)
 
   def clear_events(self):
     self.events.clear()
@@ -132,6 +141,27 @@ class TestMADSStateMachine(OpenpilotTestCase):
     self.state_machine.update()
     assert self.state_machine.state == State.enabled
     self.clear_events()
+
+  def test_explicit_lkas_enable_alert_while_selfdrive_enabled(self):
+    self.mads.selfdrive.enabled = True
+    self.mads.selfdrive.state_machine.current_alert_types = []
+    self.events_sp.add(EventNameSP.lkasEnable)
+
+    self.state_machine.update()
+
+    assert self.state_machine.state == State.enabled
+    assert ET.ENABLE in self.mads.selfdrive.state_machine.current_alert_types
+
+  def test_silent_lkas_enable_remains_silent_while_selfdrive_enabled(self):
+    self.mads.selfdrive.enabled = True
+    self.mads.selfdrive.state_machine.current_alert_types = []
+    self.events_sp.add(EventNameSP.lkasEnable)
+    self.events_sp.add(EventNameSP.silentLkasEnable)
+
+    self.state_machine.update()
+
+    assert self.state_machine.state == State.enabled
+    assert ET.ENABLE not in self.mads.selfdrive.state_machine.current_alert_types
 
   def test_maintain_states(self):
     for state in ALL_STATES:

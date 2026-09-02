@@ -9,6 +9,7 @@ from openpilot.cereal import log, custom
 
 from opendbc.car import structs
 from opendbc.car.hyundai.values import HyundaiFlags
+from opendbc.car.mazda.values import has_tja_mads
 from openpilot.common.params import Params
 from openpilot.sunnypilot.mads.helpers import MadsSteeringModeOnBrake, read_steering_mode_param, MADS_NO_ACC_MAIN_BUTTON
 from openpilot.sunnypilot.mads.state import StateMachine, GEARS_ALLOW_PAUSED_SILENT
@@ -21,13 +22,16 @@ GearShifter = structs.CarState.GearShifter
 SafetyModel = structs.CarParams.SafetyModel
 
 SET_SPEED_BUTTONS = (ButtonType.accelCruise, ButtonType.resumeCruise, ButtonType.decelCruise, ButtonType.setCruise)
-IGNORED_SAFETY_MODES = (SafetyModel.silent, SafetyModel.noOutput)
+IGNORED_SAFETY_MODES = (SafetyModel.silent, SafetyModel.noOutput, SafetyModel.elm327)
 
 # Frames of MADS steering with the panda reporting lateral not allowed. pandaStates arrives at
 # 10 Hz on its own socket, so a fresh engagement can read stale for up to ~10 frames; the
 # warning waits twice that, the disable the same 200 frames as upstream's controlsMismatch.
 LATERAL_MISMATCH_WARN_FRAMES = 20
 LATERAL_MISMATCH_DISABLE_FRAMES = 200
+# Mazda TJA_MADS: allow a brief panda-state delay before counting a lateral mismatch.
+# After this grace, the same 200-frame threshold as other brands raises controlsMismatchLateral.
+MAZDA_LATERAL_AUTH_GRACE = 50
 
 
 class ModularAssistiveDrivingSystem:
@@ -53,6 +57,12 @@ class ModularAssistiveDrivingSystem:
         self.allow_always = True
     if self.CP.brand == "tesla":
       self.allow_always = True
+    self.tja_mads = has_tja_mads(self.CP)
+    if self.tja_mads:
+      # Physical TJA (ButtonType.lkas) is the only MADS toggle. MRCC is OEM-only
+      # and must not enable/disable MADS via cruiseState.available.
+      self.allow_always = True
+      self.no_main_cruise = True
 
     if self.CP.brand in MADS_NO_ACC_MAIN_BUTTON:
       self.no_main_cruise = True
@@ -62,10 +72,17 @@ class ModularAssistiveDrivingSystem:
     self.main_enabled_toggle = self.params.get_bool("MadsMainCruiseAllowed")
     self.steering_mode_on_brake = read_steering_mode_param(self.CP, self.CP_SP, self.params)
     self.unified_engagement_mode = self.params.get_bool("MadsUnifiedEngagementMode")
+    if self.tja_mads:
+      # Physical TJA is the only MADS master. UEM would let pcmEnable/SET engage MADS.
+      self.main_enabled_toggle = False
+      self.unified_engagement_mode = False
 
   def read_params(self):
     self.main_enabled_toggle = self.params.get_bool("MadsMainCruiseAllowed")
     self.unified_engagement_mode = self.params.get_bool("MadsUnifiedEngagementMode")
+    if self.tja_mads:
+      self.main_enabled_toggle = False
+      self.unified_engagement_mode = False
 
   def pedal_pressed_non_gas_pressed(self, CS: structs.CarState) -> bool:
     # ignore `pedalPressed` events caused by gas presses
@@ -115,12 +132,24 @@ class ModularAssistiveDrivingSystem:
     # When the safety and selfdrived do not agree on controls_allowed_lateral
     # we want to disengage sunnypilot. However the status from the panda goes through
     # another socket other than the CAN messages and one can arrive earlier than the other.
-    # Therefore we allow a mismatch for two samples, then we trigger the disengagement.
     if not self.active or self.selfdrive.enabled:
       self.lateral_mismatch_counter = 0
-    elif any(not ps.controlsAllowedLateral for ps in self.selfdrive.sm['pandaStates']
-             if ps.safetyModel not in IGNORED_SAFETY_MODES):
+      return
+
+    # Stale/invalid pandaStates retain the last list; treat that as mismatch instead of
+    # trusting a cached controlsAllowedLateral=True sample.
+    sm = self.selfdrive.sm
+    if not sm.all_checks(['pandaStates']):
       self.lateral_mismatch_counter += 1
+      return
+
+    relevant = [ps for ps in sm['pandaStates']
+                if ps.safetyModel not in IGNORED_SAFETY_MODES]
+    mismatch = (not relevant) or any(not ps.controlsAllowedLateral for ps in relevant)
+    if mismatch:
+      self.lateral_mismatch_counter += 1
+    else:
+      self.lateral_mismatch_counter = 0
 
   def update_events(self, CS: structs.CarState):
     if not self.selfdrive.enabled and self.enabled:
@@ -157,6 +186,15 @@ class ModularAssistiveDrivingSystem:
 
     selfdrive_enable_events = self.events.has(EventName.pcmEnable) or self.events.has(EventName.buttonEnable)
     set_speed_btns_enable = any(be.type in SET_SPEED_BUTTONS for be in CS.buttonEvents)
+
+    # TJA_MADS filters the stock longitudinal transition events below so MRCC
+    # cannot toggle MADS. Preserve only their C4 chimes by mirroring the already
+    # computed selfdrive state transition as a presentation-only SP event.
+    if self.tja_mads:
+      if self.selfdrive.enabled and not self.selfdrive.enabled_prev:
+        self.events_sp.add(EventNameSP.longitudinalEnableChime)
+      elif not self.selfdrive.enabled and self.selfdrive.enabled_prev:
+        self.events_sp.add(EventNameSP.longitudinalDisableChime)
 
     # wrongCarMode alert only or actively block control
     self.get_wrong_car_mode(selfdrive_enable_events or set_speed_btns_enable)
@@ -209,9 +247,14 @@ class ModularAssistiveDrivingSystem:
 
     # every rejected frame is an unsteered frame (the camera's own steering is relay-blocked
     # while we control), so the driver hears about it well before the disable
-    if self.lateral_mismatch_counter >= LATERAL_MISMATCH_WARN_FRAMES:
+    warn_frames = LATERAL_MISMATCH_WARN_FRAMES
+    disable_frames = LATERAL_MISMATCH_DISABLE_FRAMES
+    if self.tja_mads:
+      warn_frames += MAZDA_LATERAL_AUTH_GRACE
+      disable_frames += MAZDA_LATERAL_AUTH_GRACE
+    if self.lateral_mismatch_counter >= warn_frames:
       self.events_sp.add(EventNameSP.controlsMismatchLateralWarning)
-    if self.lateral_mismatch_counter >= LATERAL_MISMATCH_DISABLE_FRAMES:
+    if self.lateral_mismatch_counter >= disable_frames:
       self.events_sp.add(EventNameSP.controlsMismatchLateral)
 
     self.events.remove(EventName.pcmDisable)
