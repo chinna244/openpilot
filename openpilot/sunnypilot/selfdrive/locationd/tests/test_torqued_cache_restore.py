@@ -17,7 +17,7 @@ from openpilot.selfdrive.locationd.torqued import TorqueEstimator, VERSION, MIN_
 from openpilot.sunnypilot.selfdrive.locationd.torqued_ext import LIVE_TORQUE_PARAMETERS_SP_KEY, LIVE_TORQUE_PARAMETERS_SP_SERVICE
 from openpilot.sunnypilot.selfdrive.locationd.tests.speed_dep_helpers import (
   SPEED_DEP_FINGERPRINT, NON_SPEED_DEP_FINGERPRINT, FakePubMaster, get_car_bins, make_cp, make_cache, make_cache_sp,
-  in_bounds_values, seed_values, assert_untouched,
+  in_bounds_values, seed_values, assert_untouched, seed_version_of,
 )
 
 pytestmark = pytest.mark.skipif(SPEED_DEP_FINGERPRINT is None, reason="No cars in speed_dependent.toml")
@@ -28,9 +28,10 @@ def _cache(**kwargs):
   return make_cache(**kwargs).lateralTorqueParameters
 
 
-def _sp(est, lafs, frictions, points=None, centers=None, version=VERSION):
+def _sp(est, lafs, frictions, points=None, centers=None, version=VERSION, seed_version=None):
   """The fork cache keyed to this estimator's config."""
-  msg = make_cache_sp(est.speed_bin_centers if centers is None else centers, lafs, frictions, points=points, version=version)
+  msg = make_cache_sp(est.speed_bin_centers if centers is None else centers, lafs, frictions, points=points, version=version,
+                      seed_version=est.speed_dep_seed_version if seed_version is None else seed_version)
   return getattr(msg, LIVE_TORQUE_PARAMETERS_SP_SERVICE)
 
 
@@ -233,6 +234,37 @@ class TestCacheRestore:
                            cache_sp=_sp(est, lafs, frictions, _one_point_per_bin(est), centers=other_centers))
     assert_untouched(est, seeds)
 
+  def test_seed_version_read_from_config(self, fake_params):
+    est = TorqueEstimator(make_cp())
+    assert est.speed_dep_seed_version == seed_version_of(est.CP.carFingerprint)
+
+  @pytest.mark.parametrize("delta", [1, -1], ids=["cache_behind", "cache_ahead"])
+  def test_other_seed_version_rejects_whole_cache(self, fake_params, delta):
+    """The TOML entry's seed_version keys the fork cache: a bump retires the bins and the
+    points learned under the old seeds, so the new seeds take over on the next boot. Any
+    mismatch counts, since neither side's values were learned under this config."""
+    est = TorqueEstimator(make_cp())
+    seeds = seed_values(est)
+    lafs, frictions = in_bounds_values(est)
+    est._restore_ext_cache(_cache(decay=200.0), cache_CP=est.CP,
+                           cache_sp=_sp(est, lafs, frictions, _one_point_per_bin(est),
+                                        seed_version=est.speed_dep_seed_version + delta))
+    assert_untouched(est, seeds)
+
+  def test_legacy_cache_without_seed_version_reads_zero(self, fake_params):
+    """A cache written before the field existed reads back 0, so the first seed_version on
+    an entry retires it exactly once, and an entry without one keeps restoring it."""
+    est = TorqueEstimator(make_cp())
+    seeds = seed_values(est)
+    lafs, frictions = in_bounds_values(est)
+    sp = _sp(est, lafs, frictions, seed_version=0)
+    assert sp.seedVersion == 0
+    est._restore_ext_cache(_cache(), cache_CP=est.CP, cache_sp=sp)
+    if est.speed_dep_seed_version == 0:
+      assert est.speed_bin_filtered[0]['latAccelFactor'].x == lafs[0]
+    else:
+      assert_untouched(est, seeds)
+
   def test_invalid_cache_keeps_seeds_but_restores_points_and_decay(self, fake_params):
     """Upstream takes filtered values only from a valid cache, and still reloads points and
     decay on a key match so the learner resumes with its data. Mirror both halves."""
@@ -280,11 +312,12 @@ class TestCacheRestoreGolden:
     n_bins = len(seed_est.speed_bin_bounds)
     lafs, frictions = in_bounds_values(seed_est)
     points = [[[0.11 + 0.01 * i, 0.3 + 0.02 * i]] * 3 for i in range(n_bins)]
+    seed_version = overrides.pop('seed_version', seed_est.speed_dep_seed_version)  # fork cache only
     kwargs = {'decay': decay, 'global_laf': CP.lateralTuning.torque.latAccelFactor,
               'global_friction': CP.lateralTuning.torque.friction, **overrides}
     cache = make_cache(**kwargs).to_bytes()
     cache_sp = make_cache_sp(seed_est.speed_bin_centers, lafs, frictions, points=points,
-                             version=overrides.get('version', VERSION)).to_bytes()
+                             version=overrides.get('version', VERSION), seed_version=seed_version).to_bytes()
     return cache, cache_sp, seed_est
 
   @staticmethod
@@ -328,6 +361,13 @@ class TestCacheRestoreGolden:
   def test_wrong_version_rejected(self, fake_params):
     CP = make_cp()
     cache, cache_sp, seed_est = self._healthy_cache(fake_params, CP, version=VERSION + 1)
+    est = self._restore_from(fake_params, CP, cache, cache_sp)
+    assert_untouched(est, seed_values(seed_est))
+
+  def test_seed_version_bump_rejected(self, fake_params):
+    """A release that bumps seed_version in the TOML finds every device's cache one behind."""
+    CP = make_cp()
+    cache, cache_sp, seed_est = self._healthy_cache(fake_params, CP, seed_version=TorqueEstimator(CP).speed_dep_seed_version - 1)
     est = self._restore_from(fake_params, CP, cache, cache_sp)
     assert_untouched(est, seed_values(seed_est))
 
@@ -395,6 +435,7 @@ class TestPointsCacheWrite:
     with log.Event.from_bytes(fake_params.store[LIVE_TORQUE_PARAMETERS_SP_KEY]) as evt:
       sp = getattr(evt, LIVE_TORQUE_PARAMETERS_SP_SERVICE)
       assert sp.version == VERSION
+      assert sp.seedVersion == est.speed_dep_seed_version == seed_version_of(est.CP.carFingerprint)
       assert list(sp.speedBinCenters) == pytest.approx(est.speed_bin_centers)
       assert len(sp.speedBinLatAccelFactors) == len(bounds)
       assert len(sp.speedBinPoints) == len(bounds)

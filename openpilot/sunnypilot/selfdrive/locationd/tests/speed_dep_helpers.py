@@ -107,13 +107,20 @@ def make_cache(decay=float(MIN_FILTER_DECAY), valid=True, version=VERSION, globa
   return msg
 
 
-def make_cache_sp(centers, lafs, frictions, points=None, version=VERSION):
+def seed_version_of(fingerprint):
+  """The TOML entry's seed_version, as the estimator reads it."""
+  return int(SPEED_DEP_CARS.get(fingerprint, {}).get('seed_version', 0))
+
+
+def make_cache_sp(centers, lafs, frictions, points=None, version=VERSION, seed_version=None):
   """The LiveTorqueParametersSP cache event (the liveTorqueParametersSP message with the
-  buckets filled): VERSION and centers keying it, the per-bin values, and the points."""
+  buckets filled): VERSION, the seed version and centers keying it, the per-bin values, and
+  the points. seed_version defaults to the test car's TOML entry."""
   msg = messaging.new_message(LIVE_TORQUE_PARAMETERS_SP_SERVICE)
   msg.valid = True
   sp = getattr(msg, LIVE_TORQUE_PARAMETERS_SP_SERVICE)
   sp.version = version
+  sp.seedVersion = seed_version_of(SPEED_DEP_FINGERPRINT) if seed_version is None else seed_version
   sp.speedBinCenters = list(centers)
   sp.speedBinLatAccelFactors = list(lafs)
   sp.speedBinFrictions = list(frictions)

@@ -525,6 +525,7 @@ struct CustomReserved19 @0xa4f1eb3323f5f582 {
   # cache-only: empty on the published message; the per-bin buckets are thousands of
   # points and only the restore path reads them (LiveTorqueParametersSP param)
   speedBinPoints @5 :List(List(List(Float32)));
+  seedVersion @6 :Int32;           # speed_dependent.toml seed_version the bins were learned under; 0 before the field existed
 }
 
 # ---- zoompilot -----------------------------------------------------------------------------

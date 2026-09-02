@@ -217,7 +217,7 @@ points.
 
 Restore (`_restore_ext_cache`, guards added 2026-09-02 in `fbabecf35c`): both caches
 must carry upstream's restore key (fingerprint, tuning type, offline seeds, VERSION, via
-`CarParamsPrevRoute`) and the fork cache this config's bin centers; filtered values are
+`CarParamsPrevRoute`) and the fork cache this config's `seed_version` and bin centers; filtered values are
 taken only when upstream's cache was written valid; anything non-finite or outside a bin's
 clip range rejects the whole cache, because the bins are one interpolated tune and a partial
 restore leaves a step between a cached bin and a re-seeded neighbour. The decay is restored
@@ -226,6 +226,14 @@ five times faster after every restart). The points are checked on their own (bin
 finiteness); when they fail, the values still restore and the buckets start empty. A fork
 cache that is absent restores nothing. A valid pair restores bit-identically
 (`test_torqued_cache_restore.py`).
+
+Replacing learned values on a release. The per-bin seeds are not in upstream's restore key,
+so editing `laf_bp` / `friction_bp` alone leaves every device on its learned values (only a
+value outside the new +-30% band rejects the cache, and the points refit it straight back).
+Each TOML entry carries a `seed_version` (0 when absent); the fork cache records the one it
+was learned under (`seedVersion`, 0 for a cache written before the field) and any mismatch
+restarts learning from the seeds, values and points both. Bump it with the seed refresh in
+the same commit; a device picks it up on the next boot after the update.
 
 ## Constants
 

@@ -130,6 +130,9 @@ class TorqueEstimatorExt:
     from opendbc.sunnypilot.car.interfaces import get_speed_dep_config_for_car
 
     cfg = get_speed_dep_config_for_car(self.CP)
+    # the TOML entry's seed_version, bumped with a seed refresh to retire every cache learned
+    # under the old seeds; 0 for an entry without one and for the defaults
+    self.speed_dep_seed_version = int(cfg.get('seed_version', 0))
 
     if 'speed_bp' in cfg:
       self.speed_bin_centers = list(cfg['speed_bp'])
@@ -200,9 +203,10 @@ class TorqueEstimatorExt:
   def _restore_ext_cache(self, cache_ltp=None, cache_CP=None, cache_sp=None):
     """Restores the per-bin filters, decay and point buckets from the two caches: upstream's
     LiveTorqueParameters supplies the restore key, decay and the valid flag; the fork's
-    LiveTorqueParametersSP supplies its own VERSION, the bin centers, the values and the
-    points. Both must carry this car's restore key (fingerprint, tuning type, offline seeds,
-    VERSION) and the fork cache this config's bin centers; the filtered values are taken only
+    LiveTorqueParametersSP supplies its own VERSION, the seed version, the bin centers, the
+    values and the points. Both must carry this car's restore key (fingerprint, tuning type,
+    offline seeds, VERSION) and the fork cache this config's seed_version and bin centers; the
+    filtered values are taken only
     when upstream's cache was written valid, and since the bins are one tune a single bad
     value rejects them whole. Points are restored on top when they pass their own checks, and
     are simply skipped when they fail them. Reads from Params for whichever argument is None."""
@@ -236,6 +240,9 @@ class TorqueEstimatorExt:
           cache_sp = getattr(evt, LIVE_TORQUE_PARAMETERS_SP_SERVICE)
       if TorqueEstimator.get_restore_key(cache_CP, cache_sp.version) != TorqueEstimator.get_restore_key(self.CP, VERSION):
         cloudlog.info("speed-dep: fork cache restore key mismatch, restarting learning")
+        return
+      if cache_sp.seedVersion != self.speed_dep_seed_version:
+        cloudlog.info(f"speed-dep: seed version {cache_sp.seedVersion} -> {self.speed_dep_seed_version}, restarting learning")
         return
       n_bins = len(self.speed_bin_bounds)
       if not self._centers_match(cache_sp.speedBinCenters):
@@ -296,14 +303,16 @@ class TorqueEstimatorExt:
       return None
 
   def _sp_msg(self, valid, values, with_points):
-    """A liveTorqueParametersSP event: VERSION, the bin centers and the per-bin values, plus
-    the point buckets for the cache copy. Empty bins on a car that is not speed-binned."""
+    """A liveTorqueParametersSP event: VERSION, the seed version, the bin centers and the
+    per-bin values, plus the point buckets for the cache copy. Empty bins on a car that is
+    not speed-binned."""
     from openpilot.selfdrive.locationd.torqued import VERSION
     msg = messaging.new_message(LIVE_TORQUE_PARAMETERS_SP_SERVICE)
     msg.valid = valid
     sp = getattr(msg, LIVE_TORQUE_PARAMETERS_SP_SERVICE)
     sp.version = VERSION
     if values is not None:
+      sp.seedVersion = self.speed_dep_seed_version
       lat_factors, frictions, valid_flags = values
       sp.speedBinCenters = self.speed_bin_centers
       sp.speedBinLatAccelFactors = lat_factors
