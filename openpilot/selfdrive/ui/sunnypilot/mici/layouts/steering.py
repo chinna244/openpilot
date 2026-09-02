@@ -19,11 +19,13 @@ from openpilot.system.ui.widgets.scroller import NavScroller
 from openpilot.selfdrive.ui.ui_state import ui_state
 from openpilot.sunnypilot.mads.helpers import MadsSteeringModeOnBrake, get_mads_limited_brands
 from openpilot.sunnypilot.selfdrive.controls.lib.auto_lane_change import AUTO_LANE_CHANGE_TIMER, AutoLaneChangeMode
-from openpilot.sunnypilot.selfdrive.controls.lib.lane_change_smoothing import PACE_MIN, PACE_MAX, pace_profile_time
+from openpilot.sunnypilot.selfdrive.controls.lib.lane_change_smoothing import LEVEL_OFF, read_level
 from openpilot.sunnypilot.selfdrive.controls.lib.torque_tune import load_versions, resolved_tune_version
 from openpilot.system.ui.lib.application import gui_app
 
 MADS_STEERING_MODE_LABELS = [tr("remain"), tr("pause"), tr("disengage")]
+# LaneChangeSmoothing stores the index into this list (lane_change_smoothing.LEVELS order, off first)
+LC_LEVEL_LABELS = [tr("off"), tr("fast"), tr("medium"), tr("slow"), tr("extra slow")]
 
 # AutoLaneChangeTimer stores the mode itself (OFF is -1), so the keys are the stored values, not
 # indices. Timed labels come from AUTO_LANE_CHANGE_TIMER so they can't drift from the controller.
@@ -100,17 +102,10 @@ class SteeringLayoutMici(NavScroller):
                                      depends_on=lambda: self._bsm_applies(self._alc_val) and self._car_has_bsm())
     # blocks lane changes toward a detected road edge — ungated, matching TICI lane_change_settings
     self._lc_road_edge = BigParamControl(tr("road edge block"), "RoadEdgeLaneChangeEnabled")
-    self._lc_smooth = BigParamControl(tr("smoothing"), "LaneChangeSmoothing")
-    # stored value is the 1-9 pace index; every label shows the sinusoidal profile time
-    # it selects, the physically meaningful quantity (higher pace = quicker)
-    self._lc_pace = BigParamOption(tr("smoothing") + "\n" + tr("duration"), "LaneChangeSmoothingPace",
-                                   min_value=PACE_MIN, max_value=PACE_MAX,
-                                   label_callback=lambda v: f"~{pace_profile_time(v):.1f}s",
-                                   picker_label_callback=lambda v: f"{pace_profile_time(v):.1f}",
-                                   picker_unit=tr("seconds"))
-    self._lc_pace.set_enabled(lambda: self._lc_smooth._checked)
+    # off = stock; every level is a slower lane change than stock
+    self._lc_level = BigMultiParamToggleSP(tr("lane change") + "\n" + tr("smoothing"), "LaneChangeSmoothing", LC_LEVEL_LABELS)
     self._lc_view = self._lane_change_btn.link_sub_panel([self._lc_timer, self._lc_bsm, self._lc_road_edge,
-                                                          self._lc_smooth, self._lc_pace])
+                                                          self._lc_level])
 
     # --- Blinker sub-panel ---
     self._blinker_toggle = BigParamControl(tr("enable blinker pause"), "BlinkerPauseLateralControl")
@@ -241,13 +236,13 @@ class SteeringLayoutMici(NavScroller):
     # already ignores it below Nudgeless, and the user's choice comes back when they re-enable
     lc_bsm = _on_off(ui_state.params.get_bool("AutoLaneChangeBsmDelay") and self._bsm_applies(alc_val))
     road_edge = _on_off(ui_state.params.get_bool("RoadEdgeLaneChangeEnabled"))
-    lc_smooth_on = ui_state.params.get_bool("LaneChangeSmoothing")
-    if alc_val <= AutoLaneChangeMode.OFF and lc_bsm == "off" and road_edge == "off" and not lc_smooth_on:
+    lc_level = read_level(ui_state.params)
+    if alc_val <= AutoLaneChangeMode.OFF and lc_bsm == "off" and road_edge == "off" and lc_level == LEVEL_OFF:
       self._lane_change_btn.set_disabled()
     else:
       auto_badge = _alc_label(alc_val) if alc_val > AutoLaneChangeMode.OFF else "off"
       self._lane_change_btn.set_badges([(tr("auto"), auto_badge), (tr("bsm-delay"), lc_bsm),
-                                        (tr("road-edge"), road_edge), (tr("smooth"), _on_off(lc_smooth_on))])
+                                        (tr("road-edge"), road_edge), (tr("smooth"), LC_LEVEL_LABELS[lc_level])])
 
     enforce_torque = self._enforce_torque = ui_state.params.get_bool("EnforceTorqueControl")
     self._v2_tune = resolved_tune_version(ui_state.params) == 2.0
