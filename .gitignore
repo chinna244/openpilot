@@ -104,3 +104,18 @@ SKILL.md
 !.idea/customTargets.xml
 !.idea/tools/*
 !.run/*
+
+# screenshot test output: *.png is LFS-tracked against a push-inaccessible remote,
+# so a committed screenshot bricks installs (see CLAUDE.md)
+openpilot/sunnypilot/selfdrive/ui/tests/screenshots/
+notes/
+
+# local-only trees that live in their own repos (zoompilot-research, zoompilot-site,
+# smart-can-filter) or are stale pre-restructure build output
+/site/
+/hardware/
+/scratchpad/
+/.wrangler/
+/mise.toml
+/tools/replay/
+/tools/jotpluggler/

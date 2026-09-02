@@ -1,74 +1,88 @@
-![](https://user-images.githubusercontent.com/47793918/233812617-beab2e71-57b9-479e-8bff-c3931347ca40.png)
+# zoompilot
 
-## 🌞 What is sunnypilot?
-[sunnypilot](https://github.com/sunnyhaibin/sunnypilot) is a fork of comma.ai's openpilot, an open source driver assistance system. sunnypilot offers the user a unique driving experience for over 300+ supported car makes and models with modified behaviors of driving assist engagements. sunnypilot complies with comma.ai's safety rules as accurately as possible.
+A Mazda-optimized fork of [sunnypilot](https://github.com/sunnypilot/sunnypilot) for the CX-5 and CX-9. My goal is to enable the best steering possible and support all sunnypilot features on the 2022-2025 CX-5, staying within openpilot's safety guidelines.
 
-## 💭 Join our Community Forum
-Join the official sunnypilot community forum to stay up to date with all the latest features and be a part of shaping the future of sunnypilot!
-* https://community.sunnypilot.ai/
+This is what I run on my own 2022 CX-5 every day. There's a nicer tour of all of this at [zoompilot.ai](https://zoompilot.ai).
 
-## Documentation
-https://docs.sunnypilot.ai/ is your one stop shop for everything from features to installation to FAQ about the sunnypilot
+## Install
 
-## 🚘 Running on a dedicated device in a car
-First, check out this list of items you'll need to [get started](https://community.sunnypilot.ai/t/getting-started-using-sunnypilot-in-your-supported-car/251).
+When your comma device asks for a custom software URL during setup, type:
 
-## Installation
-Next, refer to the sunnypilot community forum for [installation instructions](https://community.sunnypilot.ai/t/read-before-installing-sunnypilot/254), as well as a complete list of [Recommended Branch Installations](https://community.sunnypilot.ai/t/recommended-branch-installations/235).
+```
+zoompilot/main
+```
 
-## 🎆 Pull Requests
-We welcome both pull requests and issues on GitHub. Bug fixes are encouraged.
+`main` carries the releases, built ahead of time so the device doesn't have to compile on install. `develop` is where the day to day work lands if you want it earlier. Devices installed from my old personal fork move themselves to `main` on their next start.
 
-Pull requests should be against the most current `master` branch.
+**This is experimental software.** You drive the car, you follow the law where you live, and you carry the risk. It ships with no warranty and no liability for any damage or injury.
 
-## 📊 User Data
+## steering improvements
 
-By default, sunnypilot uploads the driving data to comma servers. You can also access your data through [comma connect](https://connect.comma.ai/).
+Using a data driven approach I reverse engineered the steering hardware and developed features to use the EPS to its full potential.
 
-sunnypilot is open source software. The user is free to disable data collection if they wish to do so.
+- **Speed-dependent torque.** The EPS caps the steering torque it will deliver, and that cap changes with speed. We encode the whole curve, so openpilot knows the extra torque it has at low speeds and the reduced torque at high speeds. More confident in the neighborhood, fewer wobbles on the highway.
+- **Speed-dependent tuning.** Stock openpilot learns ONE lateral acceleration factor and ONE friction value for every speed. We let it learn across seven speed ranges instead, matching the EPS's non-linear speed-dependent behaviour.
+- **Rate-matched commands.** The EPS accepts steering commands changing by up to 12 units a frame; stock asked for 10, leaving ~17% of that rate unused. We ask for the full 12, so torque ramps in faster.
+- **Factory-matched specs.** Steering ratio, mass, wheelbase, and steering lag, set to Mazda's real figures and refined against thousands of miles of learned data, so commands land where the planner intends.
 
-sunnypilot logs the road-facing camera, CAN, GPS, IMU, magnetometer, thermal sensors, crashes, and operating system logs.
-The driver-facing camera and microphone are only logged if you explicitly opt-in in settings.
+## fix annoyances
 
-By using this software, you understand that use of this software or its related services will generate certain types of user data, which may be logged and stored at the sole discretion of comma. By accepting this agreement, you grant an irrevocable, perpetual, worldwide right to comma for the use of this data.
+The stock port threw warnings that should have only applied to pre-2022 cars. I pulled the logs from many drivers and cut the false ones. The real ones still fire.
 
-## Licensing
+- **Place hands on wheel alert.** The Mazda port was built on pre-2022 cars, where an LKAS_BLOCK signal meant steering control was lost. Across thousands of logged miles from many drivers, we found 2022+ EPS keeps steering through LKAS_BLOCK. It mostly fires near a stop, or when stock LKAS loses the lane lines. Real faults still disengage; we just stopped alerting when the car is still steering.
+- **Steering override hysteresis.** The same override filter Hyundai, Ford, Tesla, and Rivian run. It weighs more frames before deciding you've taken the wheel, so a pothole or rough patch no longer trips a phantom takeover.
 
-sunnypilot is released under the [MIT License](LICENSE). This repository includes original work as well as significant portions of code derived from [openpilot by comma.ai](https://github.com/commaai/openpilot), which is also released under the MIT license with additional disclaimers.
+## wire up sensors
 
-The original openpilot license notice, including comma.ai’s indemnification and alpha software disclaimer, is reproduced below as required:
+Your CX-5 ships with sensors the stock port never reads. We wire them in.
 
-> openpilot is released under the MIT license. Some parts of the software are released under other licenses as specified.
->
-> Any user of this software shall indemnify and hold harmless Comma.ai, Inc. and its directors, officers, employees, agents, stockholders, affiliates, subcontractors and customers from and against all allegations, claims, actions, suits, demands, damages, liabilities, obligations, losses, settlements, judgments, costs and expenses (including without limitation attorneys’ fees and costs) which arise out of, relate to or result from any use of this software by user.
->
-> **THIS IS ALPHA QUALITY SOFTWARE FOR RESEARCH PURPOSES ONLY. THIS IS NOT A PRODUCT.
-> YOU ARE RESPONSIBLE FOR COMPLYING WITH LOCAL LAWS AND REGULATIONS.
-> NO WARRANTY EXPRESSED OR IMPLIED.**
+- **Forward radar.** A radar behind the front badge runs the factory cruise. We read it too: distance, angle, and closing speed for up to four cars ahead, fused with the camera. Braking and throttle stay factory.
+- **Blind-spot monitors.** The factory blind-spot sensors already watch the lanes beside you. We feed what they see into openpilot before every lane change.
+- **Speed-limit signs.** The camera already reads posted limits for your dash. We route those into speed-limit assist, which can set your cruise to match, so you're not re-dialing at every sign.
 
-For full license terms, please see the [`LICENSE`](LICENSE) file.
+## radar cruise enhancements
 
-## 💰 Support sunnypilot
-If you find any of the features useful, consider becoming a [sponsor on GitHub](https://github.com/sponsors/sunnyhaibin) to support future feature development and improvements.
+The CX-5 keeps its factory cruise; zoompilot can set the speed for you by 'pressing' your wheel buttons.
 
+- **Fixed ICBM.** sunnypilot's Intelligent-Cruise-Button-Management and Smart-Cruise are broken for Mazda. I rebuilt how zoompilot works your wheel buttons. The speed you dial is remembered exactly: curves and speed limits can borrow it for a while, but you get your number back, never one or two under it. If the car misses a press, it quietly catches up.
+- **Speed-limit assist that sticks.** When the car sees a new limit, the screen asks once. Tap minus to accept a lower one and zoompilot dials the car down for you. It used to forget your answer a moment later; now it holds until the road changes. Press plus while it has you at a limit and it steps aside until the next sign. Your buttons always win.
+- **Smart Cruise.** A sunnypilot feature that reduces your set speed before a curve in the road and sets it back after. You can use vision or downloaded maps to determine when to slow down. Enable it in the cruise settings menu.
+- **Deceleration overshoot (alpha).** The Mazda does not instantly react to adjustments in set cruise speed. This option reduces the set cruise speed MORE than what the model calls for, to get the deceleration the curve needs.
 
-By becoming a sponsor, you will gain access to exclusive content, early access to new features, and the opportunity to directly influence the project's development.
+## additional Mazdas covered
 
+Not just the CX-5.
 
-<h3>GitHub Sponsor</h3>
+- **EPS swaps.** Swapped a 2022+ CX-5 steering rack into an older Mazda? We fingerprint the rack by its firmware, not by the car openpilot thinks you're driving, and steer it all the way to a stop.
+- **CX-9.** Supported for all features, but speed-dependent torque will take longer to learn since I only supply seeds for the CX-5. The CX-9 specs are also updated to match Mazda's official figures.
 
-<a href="https://github.com/sponsors/sunnyhaibin">
-  <img src="https://user-images.githubusercontent.com/47793918/244135584-9800acbd-69fd-4b2b-bec9-e5fa2d85c817.png" alt="Become a Sponsor" width="300" style="max-width: 100%; height: auto;">
-</a>
-<br>
+## recommended setup
 
-<h3>PayPal</h3>
+1. Factory-reset the device before you install. A clean device carries no stale settings from a previous fork.
+2. Pick a driving model. I run Firehose. DTRv6 is a favourite and MacroStiff is great at high speed.
+3. Under steering: turn on torque control, then self-tune, then speed-dependent self-tune.
+4. Leave custom tune and manual real-time off. Let the car teach the software. That's the point.
 
-<a href="https://paypal.me/sunnyhaibin0850" target="_blank">
-<img src="https://www.paypalobjects.com/en_US/i/btn/btn_donateCC_LG.gif" alt="PayPal this" title="PayPal - The safer, easier way to pay online!" border="0" />
-</a>
-<br></br>
+Want to slow down for curves? Under cruise, turn on intelligent cruise button management, then pick smart cruise vision, maps, or both. Maps need a region downloaded through SunnyLink first.
 
-Your continuous love and support are greatly appreciated! Enjoy 🥰
+You can manage almost all of it from the device screen. No laptop, no cloud editor. SunnyLink still works if you like it.
 
-<span>-</span> Jason, Founder of sunnypilot
+## issues
+
+Something misbehaving on your Mazda? Open an issue on the [tracker](https://github.com/zoompilot/zoompilot/issues). A route ID or dashcam clip helps a lot.
+
+## credits
+
+zoompilot stands on [sunnypilot](https://github.com/sunnypilot/sunnypilot), which stands on [openpilot](https://github.com/commaai/openpilot) by comma.ai. Most of the code here is theirs. Remote access and dashboards come from [sunnylink](https://www.sunnylink.ai/), a free service paid for by the sunnypilot project. To support them: [sponsor sunnypilot](https://github.com/sponsors/sunnyhaibin), or [buy hardware from comma](https://comma.ai/shop).
+
+## license
+
+This project uses software from Haibin Wen and SUNNYPILOT LLC and is licensed under a custom license requiring permission for use. See [LICENSE.md](LICENSE.md) for sunnypilot's terms, [LICENSE](LICENSE) for openpilot's, and [NOTICE.md](NOTICE.md) for how they stack up and what zoompilot's own files are under.
+
+---
+
+These features would work on other vehicles and could be upstreamed into sunnypilot or openpilot. I'm slowly working on that, but it's easier to share my own fork in the meantime.
+
+Mazda, comma.ai, and the sunnypilot project neither endorse this nor have anything to do with it.
+
+zoom-zoom-zoom
