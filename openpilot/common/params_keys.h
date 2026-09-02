@@ -294,6 +294,6 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"TorqueParamsOverrideEnabled", {PERSISTENT | BACKUP, BOOL, "0"}},
     {"TorqueParamsOverrideFriction", {PERSISTENT | BACKUP, FLOAT, "0.1"}},
     {"TorqueParamsOverrideLatAccelFactor", {PERSISTENT | BACKUP, FLOAT, "2.5"}},
-    // mazda-dev: one-time marker so steer-to-zero Mazda torque-control defaults are seeded exactly once (see sunnypilot/selfdrive/car/interfaces.py)
+    // Ensures steer-to-zero Mazda torque defaults are seeded once.
     {"MazdaTorqueDefaultsApplied", {PERSISTENT | BACKUP, BOOL}},
 };
