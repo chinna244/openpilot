@@ -12,6 +12,7 @@ from openpilot.common.params import Params
 from openpilot.selfdrive.ui.sunnypilot.layouts.settings.display import OnroadBrightness
 from openpilot.sunnypilot.models.helpers import ACTIVE_BUNDLE_KEYS, get_active_source
 from openpilot.sunnypilot.sunnylink.sunnylink_state import SunnylinkState
+from openpilot.sunnypilot.selfdrive.ui.offroad_mode import request_offroad_mode
 from openpilot.system.ui.lib.application import gui_app
 from openpilot.system.ui.sunnypilot.widgets.screen_saver import ScreenSaverSP
 
@@ -215,11 +216,15 @@ class UIStateSP:
       if not CP.enableBsm:
         self.params.remove("AutoLaneChangeBsmDelay")
     else:
-      # No CarParams: clear all car-dependent params as safety default
-      self.params.remove("EnforceTorqueControl")
-      self.params.remove("NeuralNetworkLateralControl")
-      self.params.remove("LateralJerkTorqueController")
-      self.params.remove("AlphaLongitudinalEnabled")
+      # No CarParams: clear all car-dependent params as safety default. Never while
+      # onroad: on a fresh install's first drive, card seeds car-dependent defaults
+      # (e.g. the Mazda torque-control stack) during init, before CarParamsPersistent
+      # is written, and this wipe would race it and silently undo the seed.
+      if not self.started:
+        self.params.remove("EnforceTorqueControl")
+        self.params.remove("NeuralNetworkLateralControl")
+        self.params.remove("LateralJerkTorqueController")
+        self.params.remove("AlphaLongitudinalEnabled")
 
     # No longitudinal control: no experimental mode or DEC
     if not has_long:
@@ -240,6 +245,7 @@ class UIStateSP:
       self.params.remove("CustomAccIncrementsEnabled")
       self.params.remove("SmartCruiseControlVision")
       self.params.remove("SmartCruiseControlMap")
+      self.params.remove("SmartCruiseDecelOvershoot")
 
 
 class DeviceSP:
@@ -263,7 +269,7 @@ class DeviceSP:
 
     # blocked runs every frame, so write only when actually sleeping
     if _ui_state.boot_offroad_mode == 1 and not on and not self._blocked_by_screensaver:
-      _ui_state.params.put_bool("OffroadMode", True)
+      request_offroad_mode(_ui_state.params, True)
 
   def dismiss_screensaver(self, _ui_state) -> None:
     if gui_app.get_active_widget() == _ui_state.screensaver:
