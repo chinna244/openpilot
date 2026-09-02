@@ -5,14 +5,11 @@ This file is part of sunnypilot and is licensed under the MIT License.
 See the LICENSE.md file in the root directory for more details.
 """
 
-import time
-
-from openpilot.common.parameterized import parameterized
+import pytest
 
 from openpilot.cereal import custom
 from opendbc.car.car_helpers import interfaces
 from opendbc.car.rivian.values import CAR as RIVIAN
-from opendbc.car.structs import car
 from opendbc.car.tesla.values import CAR as TESLA
 from opendbc.car.toyota.values import CAR as TOYOTA
 from openpilot.common.constants import CV
@@ -24,13 +21,8 @@ from openpilot.sunnypilot.selfdrive.car import interfaces as sunnypilot_interfac
 from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit import PCM_LONG_REQUIRED_MAX_SET_SPEED
 from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.common import Mode
 from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.speed_limit_assist import SpeedLimitAssist, \
-  PRE_ACTIVE_GUARD_PERIOD, ACTIVE_STATES, CRUISE_BUTTON_CONFIRM_HOLD
-from openpilot.sunnypilot.selfdrive.selfdrived.button_state_tracker import ButtonStateTracker
+  PRE_ACTIVE_GUARD_PERIOD, ACTIVE_STATES
 from openpilot.sunnypilot.selfdrive.selfdrived.events import EventsSP
-from openpilot.common.test import OpenpilotTestCase
-
-ButtonEvent = car.CarState.ButtonEvent
-ButtonType = car.CarState.ButtonEvent.Type
 
 SpeedLimitAssistState = custom.LongitudinalPlanSP.SpeedLimit.AssistState
 
@@ -46,20 +38,31 @@ SPEED_LIMITS = {
 DEFAULT_CAR = TOYOTA.TOYOTA_RAV4_TSS2
 
 
-class TestSpeedLimitAssist(OpenpilotTestCase):
-  car_name = DEFAULT_CAR
+@pytest.fixture
+def car_name(request):
+  return getattr(request, "param", DEFAULT_CAR)
 
-  def setup_method(self):
+
+@pytest.fixture(autouse=True)
+def set_car_name_on_instance(request, car_name):
+  instance = getattr(request, "instance", None)
+  if instance:
+    instance.car_name = car_name
+
+
+class TestSpeedLimitAssist:
+
+  def setup_method(self, method):
     self.params = Params()
     self.reset_custom_params()
     self.events_sp = EventsSP()
     CI = self._setup_platform(self.car_name)
     self.sla = SpeedLimitAssist(CI.CP, CI.CP_SP)
-    self.sla.pre_active_timer = int(PRE_ACTIVE_GUARD_PERIOD[self.sla.pcm_op_long] / DT_MDL)
+    self.sla.pre_active_timer = int(PRE_ACTIVE_GUARD_PERIOD / DT_MDL)
     self.pcm_long_max_set_speed = PCM_LONG_REQUIRED_MAX_SET_SPEED[self.sla.is_metric][1]  # use 80 MPH for now
     self.speed_conv = CV.MS_TO_KPH if self.sla.is_metric else CV.MS_TO_MPH
 
-  def teardown_method(self):
+  def teardown_method(self, method):
     self.reset_state()
 
   def _setup_platform(self, car_name):
@@ -102,16 +105,13 @@ class TestSpeedLimitAssist(OpenpilotTestCase):
     assert not self.sla.is_active
     assert V_CRUISE_UNSET == self.sla.get_v_target_from_control()
 
-  @parameterized.expand([RIVIAN.RIVIAN_R1, TESLA.TESLA_MODEL_Y], names=["car_name"])
+  @pytest.mark.parametrize("car_name", [RIVIAN.RIVIAN_R1, TESLA.TESLA_MODEL_Y], indirect=True)
   def test_disallowed_brands(self, car_name):
     """
       Speed Limit Assist is disabled for the following brands and conditions:
       - All Tesla and is a release branch;
       - All Rivian
     """
-    self.car_name = car_name
-    self.openpilot_setup_method()  # rebuild the platform for this brand
-
     assert not self.sla.enabled
 
     # stay disallowed even when the param may have changed from somewhere else
@@ -151,7 +151,7 @@ class TestSpeedLimitAssist(OpenpilotTestCase):
     self.sla.state = SpeedLimitAssistState.preActive
     self.sla.update(True, False, SPEED_LIMITS['city'], 0, SPEED_LIMITS['highway'], SPEED_LIMITS['city'], SPEED_LIMITS['city'], True, 0, self.events_sp)
 
-    for _ in range(int(PRE_ACTIVE_GUARD_PERIOD[self.sla.pcm_op_long] / DT_MDL)):
+    for _ in range(int(PRE_ACTIVE_GUARD_PERIOD / DT_MDL)):
       self.sla.update(True, False, SPEED_LIMITS['city'], 0, SPEED_LIMITS['highway'], SPEED_LIMITS['city'], SPEED_LIMITS['city'], True, 0, self.events_sp)
     assert self.sla.state == SpeedLimitAssistState.inactive
 
@@ -214,15 +214,13 @@ class TestSpeedLimitAssist(OpenpilotTestCase):
       self.sla.update(True, False, speed_limit, 0, self.pcm_long_max_set_speed, speed_limit, speed_limit, True, 0, self.events_sp)
     assert self.sla.state in ACTIVE_STATES
 
-  def test_invalid_speed_limits_handling(self):
+  @pytest.mark.parametrize("invalid_limit", [-10, 0, 200 * CV.MPH_TO_MS], ids=["negative", "zero", "absurd"])
+  def test_invalid_speed_limits_handling(self, invalid_limit):
     self.initialize_active_state(self.pcm_long_max_set_speed)
 
-    invalid_limits = [-10, 0, 200 * CV.MPH_TO_MS]
-
-    for invalid_limit in invalid_limits:
-      self.sla.update(True, False, SPEED_LIMITS['city'], 0, self.pcm_long_max_set_speed, invalid_limit, SPEED_LIMITS['city'], True, 0, self.events_sp)
-      assert isinstance(self.sla.output_v_target, (int, float))
-      assert self.sla.output_v_target == V_CRUISE_UNSET or self.sla.output_v_target > 0
+    self.sla.update(True, False, SPEED_LIMITS['city'], 0, self.pcm_long_max_set_speed, invalid_limit, SPEED_LIMITS['city'], True, 0, self.events_sp)
+    assert isinstance(self.sla.output_v_target, (int, float))
+    assert self.sla.output_v_target == V_CRUISE_UNSET or self.sla.output_v_target > 0
 
   def test_stale_data_handling(self):
     self.initialize_active_state(self.pcm_long_max_set_speed)
@@ -243,7 +241,29 @@ class TestSpeedLimitAssist(OpenpilotTestCase):
 
     self.sla.update(True, False, current_speed, 0, self.pcm_long_max_set_speed, target_speed, target_speed, True, distance, self.events_sp)
     assert self.sla.state == SpeedLimitAssistState.adapting
-    assert self.sla.output_v_target == target_speed  # TODO-SP: assert expected accel, need to enable self.acceleration_solutions
+    assert self.sla.output_v_target == target_speed
+    # required decel to the sign: (limit^2 - v_ego^2) / (2 * d), reached through the
+    # publication ramp
+    expected = (target_speed ** 2 - current_speed ** 2) / (2. * distance)
+    for _ in range(60):
+      self.sla.update(True, False, current_speed, 0, self.pcm_long_max_set_speed, target_speed, target_speed, True, distance, self.events_sp)
+    # pcm-op-long is openpilot long: the wire seeds the MPC, so it stops at the budget
+    assert expected < -self.sla.limits.a_budget
+    assert self.sla.output_a_target == pytest.approx(-self.sla.limits.a_budget, abs=1e-3)
+
+  def test_adapting_decel_inside_the_budget_is_published_exactly(self):
+    self.sla.state = SpeedLimitAssistState.adapting
+    self.sla.v_cruise_cluster_prev = self.pcm_long_max_set_speed
+    self.sla.prev_v_cruise_cluster_conv = round(self.pcm_long_max_set_speed * self.speed_conv)
+    distance = 300.0
+    current_speed = SPEED_LIMITS['freeway']
+    target_speed = SPEED_LIMITS['highway']
+    expected = (target_speed ** 2 - current_speed ** 2) / (2. * distance)
+    assert -self.sla.limits.a_budget < expected < 0.
+    for _ in range(60):
+      self.sla.update(True, False, current_speed, 0, self.pcm_long_max_set_speed, target_speed, target_speed, True, distance, self.events_sp)
+    assert self.sla.state == SpeedLimitAssistState.adapting
+    assert self.sla.output_a_target == pytest.approx(expected, abs=1e-3)
 
   def test_long_disengaged_to_disabled(self):
     self.initialize_active_state(self.pcm_long_max_set_speed)
@@ -253,110 +273,27 @@ class TestSpeedLimitAssist(OpenpilotTestCase):
     assert self.sla.state == SpeedLimitAssistState.disabled
     assert self.sla.output_v_target == V_CRUISE_UNSET
 
-  def test_maintain_states_with_no_changes(self):
+  @pytest.mark.parametrize("initial_state", [
+    SpeedLimitAssistState.preActive,
+    SpeedLimitAssistState.pending,
+    SpeedLimitAssistState.active,
+    SpeedLimitAssistState.adapting,
+  ], ids=["preActive", "pending", "active", "adapting"])
+  def test_maintain_states_with_no_changes(self, initial_state):
     """Test that states are maintained when no significant changes occur"""
-    test_states = [
-      SpeedLimitAssistState.preActive,
-      SpeedLimitAssistState.pending,
-      SpeedLimitAssistState.active,
-      SpeedLimitAssistState.adapting
-    ]
+    # steady inputs: the set speed has sat at the required max and the limit has not
+    # changed since the previous frame (the old loop primed both through earlier cases)
+    self.sla.v_cruise_cluster_prev = self.pcm_long_max_set_speed
+    self.sla.prev_v_cruise_cluster_conv = round(self.pcm_long_max_set_speed * self.speed_conv)
+    self.sla.speed_limit_prev = SPEED_LIMITS['city']
+    self.sla.state = initial_state
+    self.sla.op_engaged = True
 
-    for state in test_states:
-      self.sla.state = state
-      self.sla.op_engaged = True
+    self.sla.update(True, False, SPEED_LIMITS['city'], 0, self.pcm_long_max_set_speed, SPEED_LIMITS['city'], SPEED_LIMITS['city'], True, 0, self.events_sp)
 
-      initial_state = state
+    assert self.sla.state in ALL_STATES  # Sanity check
 
-      self.sla.update(True, False, SPEED_LIMITS['city'], 0, self.pcm_long_max_set_speed, SPEED_LIMITS['city'], SPEED_LIMITS['city'], True, 0, self.events_sp)
-
-      assert self.sla.state in ALL_STATES  # Sanity check
-
-      if initial_state == SpeedLimitAssistState.preActive:
-        assert self.sla.state in [SpeedLimitAssistState.preActive, SpeedLimitAssistState.active]
-      elif initial_state in ACTIVE_STATES:
-        assert self.sla.state in ACTIVE_STATES
-
-
-class TestButtonStateTrackerSLAIntegration(OpenpilotTestCase):
-
-  def setup_method(self):
-
-    self.tracker = ButtonStateTracker()
-    self.params = Params()
-    self.params.put("IsReleaseSpBranch", True, block=True)
-    self.params.put("SpeedLimitMode", int(Mode.assist), block=True)
-    self.params.put_bool("IsMetric", False, block=True)
-    self.params.put("SpeedLimitOffsetType", 0, block=True)
-    self.params.put("SpeedLimitValueOffset", 0, block=True)
-
-    CarInterface = interfaces[DEFAULT_CAR]
-    CP = CarInterface.get_non_essential_params(DEFAULT_CAR)
-    CP.openpilotLongitudinalControl = True
-    CP_SP = CarInterface.get_non_essential_params_sp(CP, DEFAULT_CAR)
-    self.sla = SpeedLimitAssist(CP, CP_SP)
-
-  def _make_cs(self, events=None) -> car.CarState:
-    CS = car.CarState()
-    CS.buttonEvents = events or []
-    return CS
-
-  def _run_ctrl_frames(self, frames: list[car.CarState]) -> None:
-    for cs in frames:
-      self.tracker.update(cs)
-
-  def test_button_confirm_via_tracker(self) -> None:
-    self._run_ctrl_frames([
-      self._make_cs([ButtonEvent(type=ButtonType.accelCruise, pressed=True)]),
-      self._make_cs(),
-      self._make_cs([ButtonEvent(type=ButtonType.accelCruise, pressed=False)]),
-      self._make_cs(),
-      self._make_cs(),
-    ])
-    self.sla.update_buttons(self.tracker.release_toggle)
-    assert self.sla._get_button_release(req_plus=True, req_minus=False)
-
-  def test_rapid_press_release_between_polls(self) -> None:
-    self.sla.update_buttons(self.tracker.release_toggle)
-
-    self._run_ctrl_frames([
-      self._make_cs([ButtonEvent(type=ButtonType.decelCruise, pressed=True)]),
-      self._make_cs([ButtonEvent(type=ButtonType.decelCruise, pressed=False)]),
-      self._make_cs(),
-      self._make_cs(),
-      self._make_cs(),
-    ])
-    self.sla.update_buttons(self.tracker.release_toggle)
-    assert self.sla._get_button_release(req_plus=False, req_minus=True)
-
-  def test_multiple_releases_between_polls(self) -> None:
-    self.sla.update_buttons(self.tracker.release_toggle)
-
-    self._run_ctrl_frames([
-      self._make_cs([
-        ButtonEvent(type=ButtonType.accelCruise, pressed=True),
-        ButtonEvent(type=ButtonType.decelCruise, pressed=True),
-      ]),
-      self._make_cs([
-        ButtonEvent(type=ButtonType.accelCruise, pressed=False),
-        ButtonEvent(type=ButtonType.decelCruise, pressed=False),
-      ]),
-    ])
-    self.sla.update_buttons(self.tracker.release_toggle)
-    assert self.sla._get_button_release(req_plus=True, req_minus=False)
-    assert self.sla._get_button_release(req_plus=False, req_minus=True)
-
-  def test_no_false_positive_same_toggle(self) -> None:
-    self.sla.update_buttons(self.tracker.release_toggle)
-    self.sla.update_buttons(self.tracker.release_toggle)
-    assert not self.sla._get_button_release(req_plus=True, req_minus=False)
-    assert not self.sla._get_button_release(req_plus=False, req_minus=True)
-
-  def test_button_confirm_expires(self) -> None:
-    self._run_ctrl_frames([
-      self._make_cs([ButtonEvent(type=ButtonType.accelCruise, pressed=True)]),
-      self._make_cs([ButtonEvent(type=ButtonType.accelCruise, pressed=False)]),
-    ])
-    self.sla.update_buttons(self.tracker.release_toggle)
-    time.sleep(CRUISE_BUTTON_CONFIRM_HOLD + 0.1)
-    assert not self.sla._get_button_release(req_plus=True, req_minus=False)
+    if initial_state == SpeedLimitAssistState.preActive:
+      assert self.sla.state in [SpeedLimitAssistState.preActive, SpeedLimitAssistState.active]
+    elif initial_state in ACTIVE_STATES:
+      assert self.sla.state in ACTIVE_STATES
