@@ -8,6 +8,7 @@ from typing import Any
 
 from opendbc.car import structs
 from opendbc.car.interfaces import CarInterfaceBase
+from opendbc.car.mazda.values import MazdaFlags
 from openpilot.common.params import Params
 from openpilot.common.swaglog import cloudlog
 from openpilot.sunnypilot.selfdrive.controls.lib.nnlc.helpers import get_nn_model_path
@@ -23,6 +24,35 @@ def log_fingerprint(CP: structs.CarParams) -> None:
     sentry.capture_fingerprint_mock()
   else:
     sentry.capture_fingerprint(CP.carFingerprint, CP.brand)
+
+
+MAZDA_STEER_TO_ZERO_TORQUE_TUNE = 2.0  # FLOAT param; the tune fitted to the 2022+ EPS (latcontrol_torque_v2.py)
+
+
+def _seed_mazda_torque_defaults(CP: structs.CarParams, params: Params | None = None) -> None:
+  """One-time: default the torque-control stack ON for steer-to-zero Mazdas (the 2022+ CX-5 EPS).
+
+  Gated on the EPS flag, not the model, so the CX-9 sharing this EPS and EPS swaps are covered.
+  The three toggles are seeded once behind a marker so the user can turn them off later. The v2
+  tune is seeded whenever the param is unset, independent of the marker, so an explicit user
+  choice is kept and TorqueControlTune's declared default stays 0.0 for every other brand.
+  """
+  if params is None:
+    params = Params()
+
+  if CP.brand != "mazda" or not (CP.flags & MazdaFlags.STEER_TO_ZERO_EPS):
+    return
+  if params.get("TorqueControlTune") is None:
+    params.put("TorqueControlTune", MAZDA_STEER_TO_ZERO_TORQUE_TUNE, block=True)  # controlsd reads it at startup
+    cloudlog.warning("Seeded steer-to-zero Mazda TorqueControlTune=%s", MAZDA_STEER_TO_ZERO_TORQUE_TUNE)
+  if params.get_bool("MazdaTorqueDefaultsApplied"):
+    return
+
+  params.put_bool("EnforceTorqueControl", True)     # torque lateral control
+  params.put_bool("LiveTorqueParamsToggle", True)   # self-tune (live torque params)
+  params.put_bool("SpeedDependentTorqueToggle", True)  # per-speed-bin learning
+  params.put_bool("MazdaTorqueDefaultsApplied", True)
+  cloudlog.warning("Seeded steer-to-zero Mazda torque-control defaults (EnforceTorqueControl, self-tune, speed-dependent)")
 
 
 def _enforce_torque_lateral_control(CP: structs.CarParams, params: Params | None = None, enabled: bool = False) -> bool:
@@ -99,6 +129,7 @@ def _cleanup_unsupported_params(CP: structs.CarParams, CP_SP: structs.CarParamsS
 
 
 def setup_interfaces(CI: CarInterfaceBase, params: Params | None = None) -> None:
+  _seed_mazda_torque_defaults(CI.CP, params)
   enforce_torque = _enforce_torque_lateral_control(CI.CP, params)
   nnlc_enabled = _initialize_neural_network_lateral_control(CI.CP, CI.CP_SP, params)
   _initialize_intelligent_cruise_button_management(CI.CP, CI.CP_SP, params)
