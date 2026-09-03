@@ -5,6 +5,7 @@ import sys
 import signal
 import itertools
 import math
+import threading
 import time
 import datetime
 from typing import NoReturn
@@ -88,30 +89,144 @@ def try_setup_logs(diag, logs):
 AT_PORT = "/dev/modem_at0"
 AT_LOCK = "/dev/shm/modem.lock"  # shared with modem.py and LPA
 
-@retry(attempts=5, delay=1.0)
-def at_cmd(cmd: str) -> str:
+def _at_cmd_once(cmd: str) -> tuple[str, str]:
+  """Send one AT command. Returns (status, body) where status is OK, ERROR, or +CME ERROR:..."""
   with os.fdopen(os.open(AT_LOCK, os.O_CREAT | os.O_RDWR, 0o666), "r+") as lock:
     fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
     with Serial(AT_PORT, baudrate=115200, timeout=5) as ser:
       ser.reset_input_buffer()
       ser.write(f"{cmd}\r".encode())
       lines = []
+      status = ""
       while True:
         line = ser.readline()
         if not line:
           raise RuntimeError(f"AT command timeout: {cmd}")
         line = line.decode('utf-8', errors='replace').strip()
         if line in ("OK", "ERROR") or line.startswith("+CME ERROR"):
+          status = line
           break
         if line and line != cmd:
           lines.append(line)
-    return '\n'.join(lines)
+      return status, '\n'.join(lines)
+
+@retry(attempts=5, delay=1.0)
+def at_cmd(cmd: str) -> str:
+  _, body = _at_cmd_once(cmd)
+  return body
+
+def at_cmd_succeeded(cmd: str) -> bool:
+  """True only if the modem replied OK. ERROR / +CME ERROR / timeout are failure."""
+  try:
+    status, _ = _at_cmd_once(cmd)
+  except Exception:
+    return False
+  return status == "OK"
 
 def gps_enabled() -> bool:
   return "QGPS: 1" in at_cmd("AT+QGPS?")
 
+XTRA_TIME_MAX_ATTEMPTS = 5
+XTRA_TIME_RETRY_DELAY = 1.0
+# Matches timed.set_time() deadband: ignore small wall-clock vs monotonic offset noise.
+CLOCK_JUMP_THRESHOLD = 10.0
+# Cover modem attach + first NITZ/NTP correction after boot without an unbounded watcher.
+CLOCK_JUMP_MONITOR_S = 90.0
+CLOCK_JUMP_POLL_S = 1.0
+
+def send_xtra_time() -> bool:
+  """Inject current UTC system time into GNSS. Returns True only after an OK response."""
+  if not system_time_valid():
+    return False
+  time_str = datetime.datetime.now(datetime.UTC).replace(tzinfo=None).strftime("%Y/%m/%d,%H:%M:%S")
+  return at_cmd_succeeded(f"AT+QGPSXTRATIME=0,\"{time_str}\",1,1,1000")
+
+def maybe_send_xtra_time(already_sent: bool, send_fn=send_xtra_time) -> bool:
+  """Send assistance time at most once per GNSS session. Returns whether it has been sent."""
+  if already_sent:
+    return True
+  return send_fn()
+
+def wall_monotonic_offset() -> float:
+  return time.time() - time.monotonic()  # noqa: TID251
+
+def clock_offset_jumped(original: float, current: float, threshold: float = CLOCK_JUMP_THRESHOLD) -> bool:
+  return abs(current - original) >= threshold
+
+def inject_xtra_time_bounded(send_fn=send_xtra_time, sleep_fn=time.sleep,
+                             max_attempts: int = XTRA_TIME_MAX_ATTEMPTS,
+                             retry_delay: float = XTRA_TIME_RETRY_DELAY,
+                             success_msg: str = "injected GNSS assistance time after GNSS start") -> bool:
+  for attempt in range(1, max_attempts + 1):
+    try:
+      if send_fn():
+        cloudlog.warning(success_msg)
+        return True
+    except Exception:
+      cloudlog.exception("failed to inject GNSS assistance time")
+    if attempt < max_attempts:
+      sleep_fn(retry_delay)
+  cloudlog.error(f"gave up injecting GNSS assistance time after {max_attempts} attempts")
+  return False
+
+def wait_until_xtra_time_sent(send_fn=send_xtra_time, sleep_fn=time.sleep, interval: float = 1.0,
+                             time_valid_fn=system_time_valid,
+                             max_attempts: int = XTRA_TIME_MAX_ATTEMPTS,
+                             retry_delay: float = XTRA_TIME_RETRY_DELAY,
+                             offset_fn=wall_monotonic_offset) -> tuple[bool, float | None]:
+  """Wait until system time is valid, then attempt QGPSXTRATIME a bounded number of times.
+
+  Captures the wall-vs-monotonic offset immediately before each injection attempt so the
+  correction monitor is baseline'd on the clock actually sent to GNSS.
+  """
+  while not time_valid_fn():
+    sleep_fn(interval)
+  baseline: float | None = None
+
+  def send_with_baseline():
+    nonlocal baseline
+    baseline = offset_fn()
+    return send_fn()
+
+  sent = inject_xtra_time_bounded(send_fn=send_with_baseline, sleep_fn=sleep_fn,
+                                  max_attempts=max_attempts, retry_delay=retry_delay)
+  return sent, baseline if sent else None
+
+def monitor_clock_jump_and_reinject(send_fn=send_xtra_time, sleep_fn=time.sleep,
+                                    offset_fn=wall_monotonic_offset, monotonic_fn=time.monotonic,
+                                    original_offset: float | None = None,
+                                    window_s: float = CLOCK_JUMP_MONITOR_S,
+                                    poll_s: float = CLOCK_JUMP_POLL_S,
+                                    threshold: float = CLOCK_JUMP_THRESHOLD,
+                                    max_attempts: int = XTRA_TIME_MAX_ATTEMPTS,
+                                    retry_delay: float = XTRA_TIME_RETRY_DELAY) -> bool:
+  """After initial XTRATIME, watch for a material system-clock correction. At most one reinjection."""
+  original = offset_fn() if original_offset is None else original_offset
+  deadline = monotonic_fn() + window_s
+  while monotonic_fn() < deadline:
+    if clock_offset_jumped(original, offset_fn(), threshold):
+      cloudlog.warning("system clock jumped after GNSS assistance time; reinjecting")
+      return inject_xtra_time_bounded(
+        send_fn=send_fn, sleep_fn=sleep_fn, max_attempts=max_attempts, retry_delay=retry_delay,
+        success_msg="reinjected GNSS assistance time after system clock correction")
+    sleep_fn(poll_s)
+  return False
+
+def retry_xtra_time_after_start(already_sent: bool, original_offset: float | None = None,
+                               interval: float = 1.0) -> None:
+  """Ensure GNSS gets assistance time, then watch briefly for a later system-clock correction."""
+  def _run():
+    injected = already_sent
+    baseline = original_offset
+    if not injected:
+      injected, baseline = wait_until_xtra_time_sent(interval=interval)
+    if injected:
+      monitor_clock_jump_and_reinject(original_offset=baseline)
+
+  threading.Thread(target=_run, daemon=True, name="qcomgpsd-xtratime").start()
+
 @retry(attempts=5, delay=1.0)
-def setup_quectel(diag: ModemDiag):
+def setup_quectel(diag: ModemDiag) -> tuple[bool, float]:
   # enable OEMDRE in the NV
   # TODO: it has to reboot for this to take effect
   DIAG_NV_READ_F = 38
@@ -130,9 +245,8 @@ def setup_quectel(diag: ModemDiag):
   # don't automatically turn on GNSS on powerup
   at_cmd("AT+QGPSCFG=\"autogps\",0")
 
-  if system_time_valid():
-    time_str = datetime.datetime.now(datetime.UTC).replace(tzinfo=None).strftime("%Y/%m/%d,%H:%M:%S")
-    at_cmd(f"AT+QGPSXTRATIME=0,\"{time_str}\",1,1,1000")
+  baseline_offset = wall_monotonic_offset()
+  xtra_time_sent = send_xtra_time()
 
   at_cmd("AT+QGPSCFG=\"outport\",\"usbnmea\"")
   at_cmd("AT+QGPS=1")
@@ -155,6 +269,7 @@ def setup_quectel(diag: ModemDiag):
     GPSDIAG_OEM_DRE_ON,
     0,0
   ))
+  return xtra_time_sent, baseline_offset
 
 
 def teardown_quectel(diag):
@@ -212,7 +327,8 @@ def main() -> NoReturn:
 
   # connect to modem
   diag = ModemDiag()
-  setup_quectel(diag)
+  xtra_time_sent, baseline_offset = setup_quectel(diag)
+  retry_xtra_time_after_start(xtra_time_sent, original_offset=baseline_offset)
   cloudlog.warning("quectel setup done")
   gpio_init(GPIO.GNSS_PWR_EN, True)
   gpio_set(GPIO.GNSS_PWR_EN, True)

@@ -11,11 +11,23 @@ from openpilot.system.ui.widgets.icon_widget import IconWidget
 from openpilot.system.ui.widgets.label import UnifiedLabel, gui_label
 from openpilot.system.ui.lib.application import gui_app, FontWeight, MousePos, TextAlignment, TextAlignmentVertical
 from openpilot.selfdrive.ui.ui_state import ui_state, ChestnutState
+from openpilot.common.hardware import HARDWARE
+from openpilot.common.time_helpers import system_time_valid
 from openpilot.common.version import RELEASE_BRANCHES
+from openpilot.system.ui.lib.text_measure import measure_text_cached
 
 HEAD_BUTTON_FONT_SIZE = 40
 HOME_PADDING = 8
 ALERTS_ZONE_WIDTH = 180
+STATUS_BAR_SPACING = 18
+CLOCK_FONT_SIZE = 36
+CLOCK_POLL_S = 1.0
+NITZ_POLL_S = 5.0
+# 3GPP/Quectel NITZ offset is in quarters of an hour.
+TZ_OFFSET_QUARTERS_MIN = -48
+TZ_OFFSET_QUARTERS_MAX = 56
+CLOCK_SAMPLE_TEXT = "00/00 00:00"
+CLOCK_FALLBACK_WIDTH = 180
 
 NetworkType = log.DeviceState.NetworkType
 
@@ -126,6 +138,105 @@ class NetworkIcon(Widget):
     rl.draw_texture_ex(draw_net_txt, rl.Vector2(draw_x, draw_y), 0.0, 1.0, rl.Color(255, 255, 255, int(255 * 0.9)))
 
 
+def _coerce_offset_quarters(value) -> int | None:
+  if isinstance(value, bool) or value is None:
+    return None
+  try:
+    if isinstance(value, float):
+      if not value.is_integer():
+        return None
+      offset = int(value)
+    else:
+      offset = int(value)
+  except (TypeError, ValueError):
+    return None
+  if TZ_OFFSET_QUARTERS_MIN <= offset <= TZ_OFFSET_QUARTERS_MAX:
+    return offset
+  return None
+
+
+class LocalClock(Widget):
+  def __init__(self):
+    super().__init__()
+    self._params = ui_state.params
+    self._offset_quarters = self._read_persisted_offset()
+    self._persisted_offset = self._offset_quarters
+    self._text = ""
+    self._last_clock_mono = 0.0
+    self._last_nitz_mono = 0.0
+    self.set_enabled(False)
+    self.set_rect(rl.Rectangle(0, 0, self._measure_width(), 44))
+    self.set_visible(False)
+
+  def _measure_width(self) -> float:
+    try:
+      return float(measure_text_cached(gui_app.font(FontWeight.MEDIUM), CLOCK_SAMPLE_TEXT, CLOCK_FONT_SIZE).x)
+    except Exception:
+      return float(CLOCK_FALLBACK_WIDTH)
+
+  def _read_persisted_offset(self) -> int | None:
+    try:
+      return _coerce_offset_quarters(self._params.get("LastNetworkTimeZoneOffsetQuarters"))
+    except Exception:
+      return None
+
+  def _poll_nitz(self):
+    live = None
+    try:
+      get_modem_state = getattr(HARDWARE, "get_modem_state", None)
+      if callable(get_modem_state):
+        state = get_modem_state()
+        if isinstance(state, dict):
+          live = _coerce_offset_quarters(state.get("network_timezone_offset_quarters"))
+    except Exception:
+      live = None
+
+    if live is None:
+      return
+
+    self._offset_quarters = live
+    if live != self._persisted_offset:
+      try:
+        self._params.put("LastNetworkTimeZoneOffsetQuarters", live)
+        self._persisted_offset = live
+      except Exception:
+        pass
+
+  @property
+  def has_time(self) -> bool:
+    return bool(self._text)
+
+  def _refresh_text(self):
+    if self._offset_quarters is None or not system_time_valid():
+      self._text = ""
+      self.set_visible(False)
+      return
+    try:
+      utc_now = datetime.datetime.now(datetime.UTC)
+      local_now = utc_now + datetime.timedelta(minutes=self._offset_quarters * 15)
+      self._text = local_now.strftime("%m/%d %H:%M")
+    except Exception:
+      self._text = ""
+
+  def _update_state(self):
+    now = time.monotonic()
+    if self._last_nitz_mono == 0.0 or (now - self._last_nitz_mono) >= NITZ_POLL_S:
+      self._last_nitz_mono = now
+      self._poll_nitz()
+    if self._last_clock_mono == 0.0 or (now - self._last_clock_mono) >= CLOCK_POLL_S:
+      self._last_clock_mono = now
+      self._refresh_text()
+
+  def _render(self, _):
+    if not self._text:
+      return
+    gui_label(self._rect, self._text, font_size=CLOCK_FONT_SIZE, color=rl.WHITE,
+              font_weight=FontWeight.MEDIUM,
+              alignment=TextAlignment.LEFT,
+              alignment_vertical=TextAlignmentVertical.MIDDLE,
+              elide_right=False)
+
+
 class MiciHomeLayout(Widget):
   def __init__(self):
     super().__init__()
@@ -148,10 +259,12 @@ class MiciHomeLayout(Widget):
     self._body_icon = IconWidget("icons_mici/body.png", (54, 37))
 
     self._alerts_pill = AlertsPill()
+    self._local_clock = LocalClock()
 
     self._status_bar_layout = HBoxLayout([
       IconWidget("icons_mici/settings.png", (48, 48), opacity=0.9),
       NetworkIcon(),
+      self._local_clock,
       self._experimental_icon,
       self._usb_icon,
       self._chestnut_icon,
@@ -159,7 +272,7 @@ class MiciHomeLayout(Widget):
       self._chestnut_failed_icon,
       self._body_icon,
       self._mic_icon,
-    ], spacing=18)
+    ], spacing=STATUS_BAR_SPACING)
 
     self._openpilot_label = UnifiedLabel("zoompilot", font_size=96, font_weight=FontWeight.DISPLAY, max_width=480, wrap_text=False)
     self._version_label = UnifiedLabel("", font_size=36, font_weight=FontWeight.ROMAN, max_width=480, wrap_text=False)
@@ -222,6 +335,30 @@ class MiciHomeLayout(Widget):
 
     return version, branch, commit[:7], date_str
 
+  def _alerts_present(self) -> bool:
+    count = self._alert_count_callback() if self._alert_count_callback else 0
+    return bool(count)
+
+  def _footer_available_width(self) -> float:
+    if self._alerts_present():
+      return max(0.0, self.rect.width - self._alerts_pill.rect.width - 2 * HOME_PADDING)
+    return max(0.0, self.rect.width - HOME_PADDING)
+
+  def _status_bar_width_with_clock(self) -> float:
+    widths = [w.rect.width for w in self._status_bar_layout.widgets
+              if w is self._local_clock or w.is_visible]
+    if not widths:
+      return 0.0
+    return sum(widths) + STATUS_BAR_SPACING * (len(widths) - 1)
+
+  def _update_local_clock_visibility(self):
+    # HBoxLayout skips hidden children, so LocalClock never gets render()/_update_state()
+    # while hidden. Keep polling NITZ/time here, then show only if the current visible
+    # footer widgets plus the clock fit in the remaining footer/alerts-pill space.
+    self._local_clock._update_state()
+    self._local_clock.set_visible(
+      self._local_clock.has_time and self._status_bar_width_with_clock() <= self._footer_available_width())
+
   def _render(self, _):
     # TODO: why is there extra space here to get it to be flush?
     text_pos = rl.Vector2(self.rect.x - 2 + HOME_PADDING, self.rect.y - 16)
@@ -268,6 +405,7 @@ class MiciHomeLayout(Widget):
       self._chestnut_failed_icon.set_visible(not usb_unknown and chestnut_state in (ChestnutState.UNCOMPILED, ChestnutState.FAILED))
     self._mic_icon.set_visible(ui_state.recording_audio)
     self._body_icon.set_visible(bool(ui_state.is_body))
+    self._update_local_clock_visibility()
 
     footer_rect = rl.Rectangle(self.rect.x + HOME_PADDING, self.rect.y + self.rect.height - 48, self.rect.width - HOME_PADDING, 48)
     self._status_bar_layout.render(footer_rect)

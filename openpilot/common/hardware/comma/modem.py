@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
+import datetime
 import fcntl
 import json
 import logging
 import os
+import re
 import select
 import signal
-import string
 import struct
 import subprocess
 import tempfile
@@ -64,7 +65,59 @@ INITIAL_STATE: dict[str, object] = {
   "network_type": "unknown", "operator": "", "band": "", "channel": 0,
   "registration": "unknown", "temperatures": [], "extra": "",
   "tx_bytes": 0, "rx_bytes": 0,
+  "network_time_utc": "",
+  "network_time_monotonic": 0.0,
+  "network_timezone_offset_quarters": None,
+  "network_time_dst": None,
 }
+
+# NITZ is queried from CREG home/roaming, independent of CGREG/PPP.
+NETWORK_TIME_RETRY_INTERVAL = 2.0
+NETWORK_TIME_RETRY_WINDOW = 30.0
+NETWORK_TIME_REFRESH_INTERVAL = 45.0
+NETWORK_TIME_CLEARED = {
+  "network_time_utc": "",
+  "network_time_monotonic": 0.0,
+  "network_timezone_offset_quarters": None,
+  "network_time_dst": None,
+}
+
+# AT+QLTS=1: "YYYY/MM/DD,HH:MM:SS±TZ,DST" — timestamp is already UTC.
+# ±TZ is the effective local offset in quarters of an hour; do not apply it to UTC,
+# and do not add DST on top of ±TZ.
+_QLTS_RE = re.compile(r'^"?(\d+)/(\d+)/(\d+),(\d+):(\d+):(\d+)([+-]\d+),(\d+)"?$')
+_QLTS_TZ_QUARTERS_MIN = -48
+_QLTS_TZ_QUARTERS_MAX = 56
+
+
+def parse_qlts(value: str | None) -> tuple[str, int, int] | None:
+  """Parse AT+QLTS=1 into (utc_iso, offset_quarters, dst). None if missing or invalid."""
+  if not isinstance(value, str) or not value:
+    return None
+  m = _QLTS_RE.match(value.strip())
+  if not m:
+    return None
+  year, month, day, hour, minute, second = (int(x) for x in m.groups()[:6])
+  # Placeholder/unsynchronized modem values such as 255:255:255
+  if any(v == 255 for v in (year, month, day, hour, minute, second)):
+    return None
+  try:
+    offset_quarters = int(m.group(7))
+    dst = int(m.group(8))
+    dt = datetime.datetime(year, month, day, hour, minute, second)
+  except ValueError:
+    return None
+  if not (_QLTS_TZ_QUARTERS_MIN <= offset_quarters <= _QLTS_TZ_QUARTERS_MAX):
+    return None
+  if dst not in (0, 1, 2):
+    return None
+  return dt.strftime("%Y-%m-%dT%H:%M:%SZ"), offset_quarters, dst
+
+
+def parse_qlts_utc(value: str | None) -> str | None:
+  """Parse AT+QLTS=1 payload into ISO-8601 UTC. Returns None if missing or invalid."""
+  parsed = parse_qlts(value)
+  return None if parsed is None else parsed[0]
 
 
 @contextmanager
@@ -216,6 +269,8 @@ class Modem:
     self._roaming_allowed = True
     self.running = True
     self.S = INITIAL_STATE.copy()
+    self._last_qlts_mono = 0.0
+    self._qlts_registered_since = 0.0
 
   @staticmethod
   def _read_param(key):
@@ -355,7 +410,7 @@ class Modem:
       imei = ""
 
     iccid = (self._atv("AT+QCCID", "+QCCID:") or "").rstrip("F")
-    if not all(c in string.hexdigits for c in iccid):
+    if not iccid.isdigit():
       iccid = ""
 
     imsi = first_line("AT+CIMI")
@@ -380,16 +435,20 @@ class Modem:
     greg = self._parse_reg(self._atv("AT+CGREG?", "+CGREG:") or "")
     logging.debug(f"creg={reg} cgreg={greg} roaming_allowed={self._roaming_allowed}")
 
+    updates: dict = {}
+    if reg != self.S.get("registration"):
+      updates["registration"] = reg
+    updates.update(self._poll_network_time(reg))
+    if updates:
+      self._publish_state(**updates)
+
+    # Roaming restrictions apply to packet data only; NITZ still uses CREG.
     if reg == "roaming" and not self._roaming_allowed:
-      self._publish_state(registration=reg)
       return State.SEARCHING
 
     if reg in ("home", "roaming") and greg in ("home", "roaming"):
-      self._publish_state(registration=reg)
       return State.CONNECTING
 
-    if reg != self.S.get("registration"):
-      self._publish_state(registration=reg)
     return self._searching_idle()
 
   def _searching_idle(self):
@@ -450,6 +509,8 @@ class Modem:
 
   def _do_disconnecting(self):
     logging.warning("reconnecting")
+    self._last_qlts_mono = 0.0
+    self._qlts_registered_since = 0.0
     self._publish_state(**INITIAL_STATE)
     self._ppp.kill()
     self._ppp.cleanup_routes()
@@ -552,6 +613,44 @@ class Modem:
       logging.warning(f"no cellular DNS servers reported by modem: {v!r}; using fallback {dns_servers}")
     return dns_servers
 
+  def _qlts_interval(self, now: float) -> float:
+    if self.S.get("network_time_utc"):
+      return NETWORK_TIME_REFRESH_INTERVAL
+    if self._qlts_registered_since and (now - self._qlts_registered_since) >= NETWORK_TIME_RETRY_WINDOW:
+      return NETWORK_TIME_REFRESH_INTERVAL
+    return NETWORK_TIME_RETRY_INTERVAL
+
+  def _poll_network_time(self, registration: str | None = None, now: float | None = None) -> dict:
+    """Read cellular network UTC and NITZ timezone (AT+QLTS=1). Does not set the system clock."""
+    now = time.monotonic() if now is None else now
+    reg = self.S.get("registration") if registration is None else registration
+    if reg not in ("home", "roaming"):
+      self._last_qlts_mono = 0.0
+      self._qlts_registered_since = 0.0
+      if (self.S.get("network_time_utc") or self.S.get("network_time_monotonic") or
+          self.S.get("network_timezone_offset_quarters") is not None or
+          self.S.get("network_time_dst") is not None):
+        return dict(NETWORK_TIME_CLEARED)
+      return {}
+
+    if not self._qlts_registered_since:
+      self._qlts_registered_since = now
+
+    if self._last_qlts_mono and (now - self._last_qlts_mono) < self._qlts_interval(now):
+      return {}
+
+    self._last_qlts_mono = now
+    parsed = parse_qlts(self._atv("AT+QLTS=1", "+QLTS:"))
+    if parsed is None:
+      return {}
+    utc, offset_quarters, dst = parsed
+    return {
+      "network_time_utc": utc,
+      "network_time_monotonic": now,
+      "network_timezone_offset_quarters": offset_quarters,
+      "network_time_dst": dst,
+    }
+
   def _poll_byte_counters(self) -> dict:
     try:
       with open("/sys/class/net/ppp0/statistics/tx_bytes") as f:
@@ -566,7 +665,7 @@ class Modem:
     s: dict = {}
     for fn in (self._poll_signal, self._poll_operator, self._poll_band,
                self._poll_extra, self._poll_temps, self._poll_iface,
-               self._poll_byte_counters):
+               self._poll_byte_counters, self._poll_network_time):
       s.update(fn())
     if s:
       self._publish_state(**s)
