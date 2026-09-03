@@ -20,6 +20,7 @@ def _make_wm(mocker: Mocker, connections=None):
   wm._conn_monitor = mocker.MagicMock()
   wm._connections = dict(connections or {})
   wm._wifi_state = WifiState()
+  wm._wifi_enabled = True
   wm._user_epoch = 0
   wm._callback_queue = []
   wm._need_auth = []
@@ -291,6 +292,28 @@ class TestPassthroughStates(OpenpilotTestCase):
 
     assert wm._wifi_state.ssid == "Net"
     assert wm._wifi_state.status == ConnectStatus.CONNECTING
+    assert len(wm._callback_queue) == 0
+
+
+class TestWifiDisabled(OpenpilotTestCase):
+  @parameterized.expand([
+    NMDeviceState.PREPARE,
+    NMDeviceState.CONFIG,
+    NMDeviceState.ACTIVATED,
+    NMDeviceState.DISCONNECTED,
+  ], names=("state",))
+  def test_device_states_ignored_when_wifi_disabled(self, mocker, state):
+    """Queued StateChanged must not repopulate _wifi_state after WirelessEnabled=False."""
+    wm = _make_wm(mocker)
+    wm._wifi_enabled = False
+    wm._wifi_state = WifiState(ssid=None, status=ConnectStatus.DISCONNECTED)
+
+    fire(wm, state)
+
+    assert wm._wifi_state.ssid is None
+    assert wm._wifi_state.status == ConnectStatus.DISCONNECTED
+    wm._get_active_wifi_connection.assert_not_called()
+    wm._update_active_connection_info.assert_not_called()
     assert len(wm._callback_queue) == 0
 
 

@@ -64,6 +64,12 @@ class NetworkLayoutMici(NavScroller):
     self._wifi_button = WifiNetworkButton(self._wifi_manager)
     self._wifi_button.set_click_callback(lambda: gui_app.push_widget(self._wifi_ui))
 
+    def wifi_toggle_callback(checked: bool):
+      self._wifi_manager.set_wifi_enabled(checked)
+
+    self._wifi_toggle_btn = BigToggle("wi-fi", "", initial_state=self._wifi_manager.wifi_enabled,
+                                      toggle_callback=wifi_toggle_callback)
+
     # ******** Advanced settings ********
     # ******** Roaming toggle ********
     self._roaming_btn = BigParamControl("enable roaming", "GsmRoaming")
@@ -77,6 +83,7 @@ class NetworkLayoutMici(NavScroller):
 
     # Main scroller ----------------------------------
     self._scroller.add_widgets([
+      self._wifi_toggle_btn,
       self._wifi_button,
       self._network_metered_btn,
       self._tethering_toggle_btn,
@@ -90,6 +97,14 @@ class NetworkLayoutMici(NavScroller):
 
   def _update_state(self):
     super()._update_state()
+
+    wifi_enabled = self._wifi_manager.wifi_enabled
+    self._wifi_toggle_btn.set_checked(wifi_enabled)
+    self._wifi_button.set_enabled(wifi_enabled)
+    if not wifi_enabled:
+      self._tethering_toggle_btn.set_enabled(False)
+      self._tethering_password_btn.set_enabled(False)
+      self._network_metered_btn.set_enabled(False)
 
     # If not using prime SIM, show GSM settings and enable IPv4 forwarding
     show_cell_settings = ui_state.prime_state.get_type() in (PrimeType.NONE, PrimeType.LITE)
@@ -125,11 +140,12 @@ class NetworkLayoutMici(NavScroller):
 
   def _on_network_updated(self, networks: list[Network]):
     # Update tethering state
+    wifi_enabled = self._wifi_manager.wifi_enabled
     tethering_active = self._wifi_manager.is_tethering_active()
     # TODO: use real signals (like activated/settings changed, etc.) to speed up re-enabling buttons
-    self._tethering_toggle_btn.set_enabled(True)
-    self._tethering_password_btn.set_enabled(True)
-    self._network_metered_btn.set_enabled(lambda: not tethering_active and bool(self._wifi_manager.ipv4_address))
+    self._tethering_toggle_btn.set_enabled(wifi_enabled)
+    self._tethering_password_btn.set_enabled(wifi_enabled)
+    self._network_metered_btn.set_enabled(lambda: wifi_enabled and not tethering_active and bool(self._wifi_manager.ipv4_address))
     self._tethering_toggle_btn.set_checked(tethering_active)
 
     # Update network metered
