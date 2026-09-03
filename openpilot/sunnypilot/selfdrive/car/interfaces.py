@@ -8,7 +8,8 @@ from typing import Any
 
 from opendbc.car import structs
 from opendbc.car.interfaces import CarInterfaceBase
-from opendbc.car.mazda.values import MazdaFlags
+from opendbc.car.mazda.values import MazdaFlags, has_tja_mads
+from opendbc.sunnypilot.car.mazda.values import MazdaFlagsSP
 from openpilot.common.params import Params
 from openpilot.common.swaglog import cloudlog
 from openpilot.sunnypilot.selfdrive.controls.lib.nnlc.helpers import get_nn_model_path
@@ -128,12 +129,19 @@ def _cleanup_unsupported_params(CP: structs.CarParams, CP_SP: structs.CarParamsS
   set_speed_limit_assist_availability(CP, CP_SP, params)
 
 
+def _enable_mazda_experimental_mads_white_hud(CP: structs.CarParams, CP_SP: structs.CarParamsSP) -> None:
+  # Always-on for the same TJA_MADS Mazda platforms that previously gated the WHITE HUD trial param.
+  if CP.brand == "mazda" and has_tja_mads(CP):
+    CP_SP.flags |= MazdaFlagsSP.EXPERIMENTAL_MADS_WHITE_HUD.value
+
+
 def setup_interfaces(CI: CarInterfaceBase, params: Params | None = None) -> None:
   _seed_mazda_torque_defaults(CI.CP, params)
   enforce_torque = _enforce_torque_lateral_control(CI.CP, params)
   nnlc_enabled = _initialize_neural_network_lateral_control(CI.CP, CI.CP_SP, params)
   _initialize_intelligent_cruise_button_management(CI.CP, CI.CP_SP, params)
   _initialize_torque_lateral_control(CI, CI.CP, enforce_torque, nnlc_enabled)
+  _enable_mazda_experimental_mads_white_hud(CI.CP, CI.CP_SP)
   _cleanup_unsupported_params(CI.CP, CI.CP_SP)
 
   try:
@@ -161,11 +169,6 @@ def initialize_params(params) -> list[dict[str, Any]]:
   keys.extend([
     "TeslaCoopSteering",
     "TeslaMadsScreenButton",
-  ])
-
-  # mazda
-  keys.extend([
-    "MazdaExperimentalMadsWhiteHud",
   ])
 
   # toyota
