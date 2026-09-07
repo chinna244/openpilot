@@ -54,8 +54,8 @@ class TestMazdaTjaMadsChimes(OpenpilotTestCase):
     return mads, sd
 
   def test_event_ordinals(self):
-    assert int(EventNameSP.longitudinalEnableChime) == 27
-    assert int(EventNameSP.longitudinalDisableChime) == 28
+    assert int(EventNameSP.longitudinalEnableChime) == 28
+    assert int(EventNameSP.longitudinalDisableChime) == 29
 
   def test_mads_enable_chime_while_longitudinal_active(self):
     mads, sd = self._mads()
