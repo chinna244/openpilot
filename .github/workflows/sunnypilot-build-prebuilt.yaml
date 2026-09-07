@@ -37,10 +37,29 @@ jobs:
       is_stable_branch: ${{ steps.strategy.outputs.is_stable_branch }}
       build: ${{ steps.strategy.outputs.build }}
       include_big_model: ${{ steps.strategy.outputs.include_big_model }}
+      compile_ref: ${{ steps.compile_ref.outputs.compile_ref }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 1
+      - name: Resolve compile ref
+        id: compile_ref
+        run: |
+          set -o pipefail
+          # the commit being built: a fork PR's head branch name does not resolve in this repo
+          REF="${{ github.event.pull_request.head.sha || github.sha }}"
+          # the pkl schema follows these scripts as much as tinygrad: sync-20260902 changed
+          # compile_modeld.py with neither the ONNX nor tinygrad moving, and HF served the old pkl.
+          # blob shas at REF, hashed the way sunnypilot/models/compile_ref.py does from a checkout
+          COMPILE_REF=$(PYTHONPATH=. python3 openpilot/sunnypilot/models/compile_ref.py --list | while read -r f; do
+            SHA=$(gh api "repos/${{ github.repository }}/contents/${f}?ref=${REF}" --jq '.sha')
+            [ -n "$SHA" ] || { echo "::error::no blob sha for ${f} at ${REF}"; exit 1; }
+            echo "$SHA"
+          done | sha256sum | cut -d' ' -f1)
+          echo "compile ref: $COMPILE_REF"
+          echo "compile_ref=${COMPILE_REF}" >> $GITHUB_OUTPUT
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - name: Extract deploy strategy
         id: strategy
         run: |
@@ -239,19 +258,19 @@ jobs:
 
           TINYGRAD_REF=$(gh api "repos/${GH_REPO}/contents/tinygrad_repo?ref=${REF}" --jq '.sha')
           echo "tinygrad ref: $TINYGRAD_REF"
+          COMPILE_REF="${{ needs.prepare_strategy.outputs.compile_ref }}"
 
           JSON_URL="https://huggingface.co/datasets/${HF_REPO}/resolve/main/${HF_DEFAULTS_PATH}/default_models.json"
 
           check_defaults() {
             DEFAULTS=$(curl -fsSL "${JSON_URL}?t=$(date +%s)" 2>/dev/null) || return 1
-            TINYGRAD_MATCH=$(echo "$DEFAULTS" | jq -r --arg ref "$TINYGRAD_REF" '.tinygrad_ref == $ref' 2>/dev/null)
-            [ "$TINYGRAD_MATCH" = "true" ] || return 1
+            echo "$DEFAULTS" | jq -e --arg t "$TINYGRAD_REF" --arg c "$COMPILE_REF" '.tinygrad_ref == $t and .compile_ref == $c' >/dev/null 2>&1 || return 1
             BUNDLE=$(echo "$DEFAULTS" | jq --arg hash "$ONNX_HASH" '.bundles[] | select(.onnx_sha256 == $hash)' 2>/dev/null)
             [ -n "$BUNDLE" ] && [ "$BUNDLE" != "null" ]
           }
 
           if check_defaults; then
-            echo "HF defaults match repo ONNX hash and tinygrad ref"
+            echo "HF defaults match repo ONNX hash, tinygrad ref and compile ref"
             exit 0
           fi
 
@@ -322,19 +341,19 @@ jobs:
 
           TINYGRAD_REF=$(gh api "repos/${GH_REPO}/contents/tinygrad_repo?ref=${REF}" --jq '.sha')
           echo "tinygrad ref: $TINYGRAD_REF"
+          COMPILE_REF="${{ needs.prepare_strategy.outputs.compile_ref }}"
 
           JSON_URL="https://huggingface.co/datasets/${HF_REPO}/resolve/main/${HF_DEFAULTS_PATH}/default_models.json"
 
           check_defaults() {
             DEFAULTS=$(curl -fsSL "${JSON_URL}?t=$(date +%s)" 2>/dev/null) || return 1
-            TINYGRAD_MATCH=$(echo "$DEFAULTS" | jq -r --arg ref "$TINYGRAD_REF" '.tinygrad_ref == $ref' 2>/dev/null)
-            [ "$TINYGRAD_MATCH" = "true" ] || return 1
+            echo "$DEFAULTS" | jq -e --arg t "$TINYGRAD_REF" --arg c "$COMPILE_REF" '.tinygrad_ref == $t and .compile_ref == $c' >/dev/null 2>&1 || return 1
             DRIVING=$(echo "$DEFAULTS" | jq --arg hash "$DRIVING_HASH" '.bundles[] | select(.onnx_sha256 == $hash)' 2>/dev/null)
             [ -n "$DRIVING" ] && [ "$DRIVING" != "null" ] || return 1
           }
 
           if check_defaults; then
-            echo "HF defaults match repo ONNX hash and tinygrad ref"
+            echo "HF defaults match repo ONNX hash, tinygrad ref and compile ref"
             exit 0
           fi
 
@@ -405,19 +424,19 @@ jobs:
 
           TINYGRAD_REF=$(gh api "repos/${GH_REPO}/contents/tinygrad_repo?ref=${REF}" --jq '.sha')
           echo "tinygrad ref: $TINYGRAD_REF"
+          COMPILE_REF="${{ needs.prepare_strategy.outputs.compile_ref }}"
 
           JSON_URL="https://huggingface.co/datasets/${HF_REPO}/resolve/main/${HF_DEFAULTS_PATH}/default_models.json"
 
           check_defaults() {
             DEFAULTS=$(curl -fsSL "${JSON_URL}?t=$(date +%s)" 2>/dev/null) || return 1
-            TINYGRAD_MATCH=$(echo "$DEFAULTS" | jq -r --arg ref "$TINYGRAD_REF" '.tinygrad_ref == $ref' 2>/dev/null)
-            [ "$TINYGRAD_MATCH" = "true" ] || return 1
+            echo "$DEFAULTS" | jq -e --arg t "$TINYGRAD_REF" --arg c "$COMPILE_REF" '.tinygrad_ref == $t and .compile_ref == $c' >/dev/null 2>&1 || return 1
             DM=$(echo "$DEFAULTS" | jq --arg hash "$DM_HASH" '.bundles[] | select(.onnx_sha256 == $hash)' 2>/dev/null)
             [ -n "$DM" ] && [ "$DM" != "null" ] || return 1
           }
 
           if check_defaults; then
-            echo "HF defaults match DM ONNX hash and tinygrad ref"
+            echo "HF defaults match DM ONNX hash, tinygrad ref and compile ref"
             exit 0
           fi
 

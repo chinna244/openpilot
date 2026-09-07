@@ -224,6 +224,12 @@ class ModularAssistiveDrivingSystem:
             self.events_sp.remove(EventNameSP.lkasEnable)
             self.events_sp.add(EventNameSP.pedalPressedAlertOnly)
 
+    elif self.steering_mode_on_brake == MadsSteeringModeOnBrake.PAUSE:
+      # the panda holds a lateral request while the brake is down and arms on release; a brake
+      # already held at standstill raises no pedalPressed, so engage into paused on the brake level
+      if (CS.brakePressed or CS.regenBraking) and self.events_sp.has(EventNameSP.lkasEnable):
+        self.events_sp.add(EventNameSP.silentPedalPressed)
+
     if self.should_silent_lkas_enable(CS):
       if self.state_machine.state == State.paused:
         self.events_sp.add(EventNameSP.silentLkasEnable)

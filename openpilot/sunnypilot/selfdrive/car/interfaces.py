@@ -30,9 +30,10 @@ MAZDA_STEER_TO_ZERO_TORQUE_TUNE = 2.0  # FLOAT param; the tune fitted to the 202
 
 
 def _seed_mazda_torque_defaults(CP: structs.CarParams, params: Params | None = None) -> None:
-  """One-time: default the torque-control stack ON for steer-to-zero Mazdas (the 2022+ CX-5 EPS).
+  """One-time: default the torque-control stack ON for Mazdas on the measured EPS hardware.
 
-  Gated on the EPS flag, not the model, so the CX-9 sharing this EPS and EPS swaps are covered.
+  Gated on the EPS hardware mask, not the model, so the CX-9 sharing this EPS, EPS swaps and
+  legacy firmware on the same hardware are covered.
   Both seeds sit behind markers, because manager_init materializes every declared default at
   boot: TorqueControlTune is already 0.0 on disk by the time card runs, so "unset" never
   survives to here. The three toggles are seeded once behind MazdaTorqueDefaultsApplied. The
@@ -43,7 +44,7 @@ def _seed_mazda_torque_defaults(CP: structs.CarParams, params: Params | None = N
   if params is None:
     params = Params()
 
-  if CP.brand != "mazda" or not (CP.flags & MazdaFlags.STEER_TO_ZERO_EPS):
+  if CP.brand != "mazda" or not (CP.flags & MazdaFlags.EPS_HW):
     return
   if params.get("MazdaTorqueTuneSeeded") != MAZDA_STEER_TO_ZERO_TORQUE_TUNE:
     params.put("TorqueControlTune", MAZDA_STEER_TO_ZERO_TORQUE_TUNE, block=True)  # controlsd reads it at startup

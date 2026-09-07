@@ -49,6 +49,11 @@ def _pre_2022_mazda_cp():
   return CarParams(brand="mazda", minSteerSpeed=12.5)
 
 
+def _legacy_fw_cp():
+  # the same EPS hardware on firmware with the 45 kph floor: seeded like the steer-to-zero EPS
+  return CarParams(brand="mazda", flags=int(MazdaFlags.LEGACY_FW_EPS), minSteerSpeed=12.5)
+
+
 def _non_mazda_cp():
   # the flag bit alone must not seed another brand
   return CarParams(brand="toyota", flags=int(MazdaFlags.STEER_TO_ZERO_EPS))
@@ -68,6 +73,13 @@ class TestMazdaTorqueDefaultsSeed:
     for key in SEEDED_KEYS:
       assert params.get_bool(key) is False
     assert params.get_bool("MazdaTorqueDefaultsApplied") is False
+
+  def test_legacy_firmware_mazda_gets_defaults(self):
+    params = FakeParams()
+    _seed_mazda_torque_defaults(_legacy_fw_cp(), params)
+    for key in SEEDED_KEYS:
+      assert params.get_bool(key) is True
+    assert params.get("TorqueControlTune") == MAZDA_STEER_TO_ZERO_TORQUE_TUNE
 
   def test_non_mazda_not_seeded(self):
     params = FakeParams()

@@ -150,6 +150,58 @@ class TestPauseMode(OpenpilotTestCase):
     assert mads.state_machine.state == State.enabled
 
 
+def engage_on_main(mads, sd, cs, n=1):
+  # ACC main rising edge with MadsMainCruiseAllowed, the way MADS engages on cars without a button
+  mads.main_enabled_toggle = True
+  sd.CS_prev.cruiseState.available = False
+  run_frames(mads, sd, cs, n=n)
+
+
+# engaging with the brake already down (route 00000004--00dac0887c seg 12: main pressed at a
+# stop with the brake held, the panda kept its lateral request pending until release)
+
+class TestEngageWithBrakeHeld(OpenpilotTestCase):
+  @parameterized.expand([(True, False), (False, True)], names=["brake", "regen"])
+  def test_pause_enters_paused_and_never_counts_a_mismatch(self, mocker, brake, regen):
+    mads, sd = make_mads(mocker, MadsSteeringModeOnBrake.PAUSE)
+    sd.sm['pandaStates'] = [make_panda_state(mocker, False)]
+
+    cs = make_car_state(brake_pressed=brake, regen_braking=regen, standstill=True)
+    engage_on_main(mads, sd, cs, n=LATERAL_MISMATCH_DISABLE_FRAMES + 50)
+    assert mads.state_machine.state == State.paused
+    assert mads.enabled and not mads.active
+    assert mads.lateral_mismatch_counter == 0
+
+  def test_pause_resumes_on_release_when_the_panda_arms(self, mocker):
+    mads, sd = make_mads(mocker, MadsSteeringModeOnBrake.PAUSE)
+    sd.sm['pandaStates'] = [make_panda_state(mocker, False)]
+    engage_on_main(mads, sd, make_car_state(brake_pressed=True, standstill=True), n=250)
+    assert mads.state_machine.state == State.paused
+
+    sd.sm['pandaStates'] = [make_panda_state(mocker, True)]
+    run_frames(mads, sd, make_car_state(standstill=True))
+    assert mads.state_machine.state == State.enabled
+    assert mads.active
+
+  def test_pause_while_moving_goes_straight_to_paused(self, mocker):
+    mads, sd = make_mads(mocker, MadsSteeringModeOnBrake.PAUSE)
+    sd.events.add(EventName.pedalPressed)
+    engage_on_main(mads, sd, make_car_state(brake_pressed=True, v_ego=10.0))
+    assert mads.state_machine.state == State.paused
+
+  def test_pause_engages_normally_with_the_brake_up(self, mocker):
+    mads, sd = make_mads(mocker, MadsSteeringModeOnBrake.PAUSE)
+    engage_on_main(mads, sd, make_car_state(standstill=True))
+    assert mads.state_machine.state == State.enabled
+
+  @parameterized.expand([(MadsSteeringModeOnBrake.REMAIN_ACTIVE,), (MadsSteeringModeOnBrake.DISENGAGE,)], names=["mode"])
+  def test_other_modes_engage_with_the_brake_held(self, mocker, mode):
+    # the panda arms immediately in these modes, so the software may too
+    mads, sd = make_mads(mocker, mode)
+    engage_on_main(mads, sd, make_car_state(brake_pressed=True, standstill=True))
+    assert mads.state_machine.state == State.enabled
+
+
 # disengage
 
 class TestDisengageMode(OpenpilotTestCase):

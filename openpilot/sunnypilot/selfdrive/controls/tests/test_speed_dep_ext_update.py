@@ -194,13 +194,21 @@ class TestSeedValidityGate:
     assert get_speed_dep_config_for_car(make_cp('SWAP_CAR', 0.0)) == cfg
 
   def test_unflagged_entry_applies_regardless(self, set_speed_dep_config):
-    cfg = {'speed_bp': [10.0]}
+    cfg = {'speed_bp': [10.0, 20.0], 'laf_bp': [1.0, 2.0], 'friction_bp': [0.1, 0.2]}
     set_speed_dep_config({'PLAIN_CAR': cfg})
-    assert get_speed_dep_config_for_car(make_cp('PLAIN_CAR', 12.5)) == cfg
+    assert get_speed_dep_config_for_car(make_cp('PLAIN_CAR', 0.0)) == cfg
+    # a steering floor keeps the entry but drops the bins centered below it
+    assert get_speed_dep_config_for_car(make_cp('PLAIN_CAR', 12.5)) == {'speed_bp': [20.0], 'laf_bp': [2.0], 'friction_bp': [0.2]}
+
+  def test_entry_with_every_bin_below_the_floor_falls_back_to_defaults(self, set_speed_dep_config):
+    set_speed_dep_config({'PLAIN_CAR': {'speed_bp': [10.0], 'laf_bp': [1.0], 'seed_version': 3}})
+    assert get_speed_dep_config_for_car(make_cp('PLAIN_CAR', 12.5)) == {'seed_version': 3}
 
   def test_real_toml_flags_are_as_intended(self):
     """CX-9 2021 seeds were measured on an EPS-swapped car and must carry the flag;
     the CX-5 2022 seeds were measured on the stock (steer-to-zero) EPS and must not."""
     cars = get_speed_dep_config()
-    assert cars['MAZDA_CX9_2021'].get('requires_steer_to_zero') is True
+    # one EPS hardware across gen1 Mazdas: both entries serve their stock-EPS cars through the
+    # floor filter, so neither carries the flag any more
+    assert 'requires_steer_to_zero' not in cars['MAZDA_CX9_2021']
     assert 'requires_steer_to_zero' not in cars['MAZDA_CX5_2022']

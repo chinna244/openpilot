@@ -187,6 +187,16 @@ EVENTS_SP: dict[int, dict[str, Alert | AlertCallbackType]] = {
     ET.NO_ENTRY: NoEntryAlert("Parking Brake Engaged"),
   },
 
+  # pause-on-brake engagement with the brake already down: MADS enters paused and resumes on
+  # release, the same moment the panda arms its pending request
+  EventNameSP.silentPedalPressed: {
+    ET.NO_ENTRY: Alert(
+      "",
+      "",
+      AlertStatus.normal, AlertSize.none,
+      Priority.LOWEST, VisualAlert.none, AudibleAlert.none, 0.),
+  },
+
   EventNameSP.controlsMismatchLateral: {
     ET.IMMEDIATE_DISABLE: ImmediateDisableAlert("Controls Mismatch: Lateral"),
     ET.NO_ENTRY: NoEntryAlert("Controls Mismatch: Lateral"),

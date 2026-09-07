@@ -10,6 +10,7 @@ repo.
 - mazda-lateral.md: 2022 EPS detection and flag, 1200/12/12 envelope, speed-dependent
   STEER_MAX, LKAS_BLOCK and the non-delivery latch, camera ERR_BIT_1 history, TJA button
 - mazda-fingerprinting.md: VIN decode table and the EPS-swap fallback
+- mads.md: the two lateral machines, engaging with the brake held in pause mode
 - lateral-tune.md: v0/v1/v2 lineage, the v2 mechanisms and their attribution, the
   steer-limit classifier, the speed-bin learner and its cache
 - lateral-tune-roadmap.md: the empirical roadmap for the torque tune

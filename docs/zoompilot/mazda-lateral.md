@@ -176,8 +176,11 @@ In both captures the EPS was applying nothing because it had been starved of 0x2
 panda rejected every frame for 1.7 s (route 148, the rate-down mismatch and driver-torque
 staleness above) or lateral was never armed panda-side (routes 116/117, the radar-silent guard
 ordering in mazda-longitudinal.md). The controller, blind to that, ramped to the rail and held it
-into a dead EPS. The starvation is the cause; the latch only stops us feeding the camera while it
-happens. If a third fault ever shows up, look for a new starvation path first.
+into a dead EPS. The starvation is the cause, and as of 2026-09-06 it is known to be sufficient
+on its own: the EPS raises `LKAS_FAULT` about 0.6 s into the break and the camera faults 5.3 s
+later whatever is requested afterwards (see below). The latch does not prevent that; it bounds
+what the EPS is asked for while blocked. The stream itself is now kept alive by the echo check
+in the controller.
 
 ### Tried and rejected: a per-ignition cumulative budget
 
@@ -261,22 +264,33 @@ from. The speed is read once, when the alert arms, so a car accelerating out of 
 never lets go still gets told (route 00000148 crossed 5.9 to 7.6 m/s with zero delivery), while
 one hovering at the threshold does not flicker.
 
-## Camera ERR_BIT_1 history
+## LKAS_FAULT and the camera's ERR_BIT_1
 
-The camera's ERR_BIT_1 ("LKAS Fault: Restart the Car") has been captured three ways, all of them
-0x243 starvation of an EPS whose camera copy is relay-blocked:
+The camera's ERR_BIT_1 ("LKAS Fault: Restart the Car", the cluster's "Front Camera Sensor System
+Malfunction" once the HUD frame forwards ERR_BIT) follows a bit the EPS raises first:
+`STEER_RATE.LKAS_FAULT`, byte 6 bit 5, decoded since 2026-09-06. Over 64 h and 16 camera faults
+it is set before 15 of them, the camera follows 5.25 to 5.55 s after every known onset, and it
+never clears (57 runs). The camera is reacting to the EPS, not to our request: `000001bb` had
+commanded zero for 5.25 s when it faulted, and the March lateral-only drive_02 faulted at 16 m/s
+on zero requests. The bit is decoded for the log and tooling; the driver-facing fault stays the
+camera's own.
 
-1. Routes 00000116 and 00000117 (2026-08-27): MADS armed in software before the panda's
-   radar-silent guard completed, so the controller ramped torque while the panda rejected every
-   frame; when the panda's guard then completed its rate limiter rejected the 36 to 84 count
-   command until it fell back under one step. Fixed by ordering the software guard strictly after
-   the panda's (`STOCK_RADAR_GUARD_T`, mazda-longitudinal.md).
-2. Route 00000139 seg 14: highest non-delivery budget in the corpus (1755 count-seconds); the
-   non-delivery latch bounds this symptom.
-3. Route 00000148 seg 10: the panda's `max_rate_down` of 25 against the controller's 12 rejected
-   171 consecutive frames of a driver-override winddown (t+648.59 to t+650.31), compounded by
-   driver-torque sample staleness at a multiplier of 15. Fixed 2026-09-01 by 12/12 in the panda
-   and the 10-sample driver-torque window plus 2-count margin in the controller.
+What raises it, on the eleven onsets captured: a break in the 0x243 stream of about 0.6 s (ten,
+counting three comma restarts), and twice a ramping request into a zero-delivery standby at a
+crawl from a stop, which 406 near-identical stretches in the corpus did not reproduce and which
+stays open. The breaks were all panda rejection bursts (routes 00000116/00000117: MADS armed
+before the panda's radar-silent guard; 00000139 and 00000148: the 25-versus-12 rate-down and
+driver-torque staleness; drive_02 and 00000013 in March and July: commands past the 800-count
+limit of the time). Each cause was fixed in turn, but the mechanism behind all of them is the
+panda's own: a rejection resets its rate-limit reference to zero, so a controller that keeps
+ramping is rejected on every later frame. The controller now watches the EPS's echo of the last
+request it received (`LKAS_REQUEST` in STEER_RATE); when the echo matches none of the last
+`STEER_ECHO_HISTORY` commands for `STEER_ECHO_MISMATCH_FRAMES`, the ramp restarts from zero,
+which the panda accepts. Detection takes about 90 ms plus the echo lag; the closed-loop test in
+`opendbc/safety/tests/test_mazda.py` runs the real controller through the compiled safety model
+and bounds the outage at 20 frames against the EPS's 60, with the same scenario starving the
+EPS for the rest of the run without the echo. Measurements, the state table for byte 6 and the
+open items: [mazda-camera-fault-2026-09-06.md](mazda-camera-fault-2026-09-06.md).
 
 ## TJA button as the MADS switch
 
@@ -330,6 +344,8 @@ drive ambiguous and left the panda and software latches able to drift after a pr
 | `STEER_UNDELIVERED_FRAMES` | 20 (200 ms) | benign zero-delivery runs max 2 frames, blocked runs 183 | 96k unblocked frames |
 | `STEER_UNDELIVERED_ALERT_FRAMES` | 80 (0.8 s on top of the latch) | benign runs above 10 mph max 30 frames, faults 315 | corpus |
 | `STEER_UNDELIVERED_ALERT_MIN_SPEED` | 12 mph (5.36 m/s) | block release median 3.13, p90 4.97, max 5.39 m/s (38 episodes); fault began at 5.9 | 00000148 |
+| `STEER_ECHO_HISTORY` | 4 commands | STEER_RATE reports at 83 Hz against a 100 Hz command; a rejected command leaves the window in 4 frames | corpus |
+| `STEER_ECHO_MISMATCH_FRAMES` | 5 (50 ms) | 90 ms detection all-in against the EPS's 0.6 s stream timeout (10 onsets, last delivery 0.613 to 0.623 s before) | lkas_fault_scan.py |
 | `STEER_UNDELIVERED_ALERT_ORIGIN_SPEED` | 1.0 m/s | 1660 of 1915 blocks begin below 0.5 m/s; every latched block that began above and armed was a fault, slowest 4.6 | corpus, replay_undelivered_alert.py |
 | `steerActuatorDelay` | 0.14 s (2022 EPS) / 0.1 s | lagd 0.338 total on a CX-5 2022 | corpus |
 | `steerRatio` (CX-5 2022) | 18.1 | paramsd learner, 2.9M samples | corpus |
