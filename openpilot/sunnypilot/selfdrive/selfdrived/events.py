@@ -213,6 +213,17 @@ EVENTS_SP: dict[int, dict[str, Alert | AlertCallbackType]] = {
       Priority.LOW, VisualAlert.steerRequired, AudibleAlert.prompt, .5),
   },
 
+  # The stock camera's TJA/CTS stayed armed through openpilot's presses on the camera bus. The
+  # panda drops its 0x243 and the EPS follows ours, so the camera never sees its command
+  # executed. One press of the TJA button turns the stock system off; openpilot keeps steering.
+  EventNameSP.mazdaStockCtsActive: {
+    ET.WARNING: Alert(
+      "Stock CTS Is Still On",
+      "Press the TJA button to switch it off",
+      AlertStatus.userPrompt, AlertSize.mid,
+      Priority.LOW, VisualAlert.none, AudibleAlert.prompt, 4.),
+  },
+
   EventNameSP.experimentalModeSwitched: {
     ET.WARNING: NormalPermanentAlert("Experimental Mode Switched", duration=1.5)
   },
