@@ -343,15 +343,23 @@ one meaning, it alternates the two lane-centering systems:
 | Press from | Result |
 | --- | --- |
 | MADS off, camera off (or armed) | MADS on; the press arms the camera (and MRCC, stock); we press the camera off within 1 s |
-| MADS on, camera off | MADS off; the press arms the camera: stock TJA/CTS, live at once since the camera owns 0x243 when we do not steer |
+| MADS on, camera off | MADS off; the press arms the camera; we press it off within 1 s, so nobody steers until the driver presses again |
 | any, MRCC button (BIT1 low) | stock: MRCC and the camera both off; MADS untouched |
+
+The second row changed on 2026-09-09 after a user report on the first build: TJA press, MRCC
+button, TJA press left MADS off with the camera armed, and stock TJA engaged a few seconds later
+because the camera owns 0x243 when we do not steer. The camera is never needed with a panda
+fitted, so the press is no longer gated on lateral: any time 0x440 `TJA` reads nonzero the
+camera is pressed off, steering or not. The panda accepts the byte-exact bus-2 frame in every
+state (it only reaches the camera and can only toggle its lane centering). The stockLkas
+warning still fires only while openpilot steers.
 
 MRCC becoming armed on the first press is the button's stock behaviour and is left alone. It is
 armed, not engaged; SET still has to be pressed. No MRCC-off spoof on bus 0.
 
 **1. Camera press on bus 2** (`CarController.update_camera_tja`, opendbc b697d69be6). Carstate
 reads `stock_tja` live off the parsed 0x440 (0 when the camera is stale, never latched: the
-camera drops its own arm, seg 9 +470 ms). When `latActive` and `stock_tja != 0`, ONE CRZ_BTNS
+camera drops its own arm, seg 9 +470 ms). Whenever `stock_tja != 0`, ONE CRZ_BTNS
 on bus 2 with `TJA_BUTTON` set, `CTR = crz_btns_counter + 1`, every other byte the wheel's idle
 pattern (`00 09 ff Cx 00 00 00 00`), `create_button_cmd(bus=2, Buttons.TJA)`. The forwarded
 real stream supplies the release. `TJA_PRESS_INTERVAL_T` 1 s between presses (0x440 period

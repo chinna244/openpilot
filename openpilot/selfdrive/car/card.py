@@ -180,7 +180,7 @@ class Car:
     self.params.put("CarParamsSPPersistent", cp_sp_bytes)
 
     self.v_cruise_helper = VCruiseHelper(self.CP, self.CP_SP)
-    self.card_ext = CardExt(self.CP, self.CP_SP, self.params, self.sm, self.v_cruise_helper)
+    self.card_ext = CardExt(self.CP, self.CP_SP, self.params, self.sm, self.v_cruise_helper, self.CI)
 
     self.is_metric = self.params.get_bool("IsMetric")
     self.experimental_mode = self.params.get_bool("ExperimentalMode")

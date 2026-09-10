@@ -17,6 +17,7 @@ from openpilot.selfdrive.ui.sunnypilot.mici.layouts.sunnylink import SunnylinkLa
 from openpilot.selfdrive.ui.sunnypilot.mici.layouts.trips import TripsLayoutMici
 from openpilot.selfdrive.ui.sunnypilot.mici.layouts.visuals import VisualsLayoutMici
 from openpilot.selfdrive.ui.ui_state import ui_state
+from openpilot.selfdrive.ui.sunnypilot.ui_state import set_always_offroad
 from openpilot.system.ui.lib.application import gui_app, FontWeight
 from openpilot.system.ui.lib.multilang import tr
 
@@ -105,7 +106,7 @@ class SettingsLayoutSP(OP.SettingsLayout):
 
     def _set_offroad_status(status: bool):
       if not ui_state.engaged:
-        ui_state.params.put_bool("OffroadMode", status)
+        set_always_offroad(ui_state.params, status)
         ui_state.always_offroad = status
 
     if not enable:

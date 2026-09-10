@@ -181,7 +181,7 @@ class UIStateSP:
     self.true_v_ego_ui = self.params.get_bool("TrueVEgoUI")
     self.turn_signals = self.params.get_bool("ShowTurnSignals")
     self.boot_offroad_mode = self.params.get("DeviceBootMode", return_default=True)
-    self.always_offroad = self.params.get_bool("OffroadMode")
+    self.always_offroad = self.params.get_bool("OffroadMode") or self.params.get_bool("OffroadModeRequested")  # applied or pending
     self.screensaver_enabled = self.params.get_bool("ScreenSaverEnabled")
 
     if not self._sp_initialized:
@@ -243,6 +243,16 @@ class UIStateSP:
       self.params.remove("SmartCruiseControlVision")
       self.params.remove("SmartCruiseControlMap")
       self.params.remove("SmartCruiseDecelOvershoot")
+
+
+def set_always_offroad(params: Params, enable: bool) -> None:
+  """Entering is brokered by hardwared (OffroadModeRequested) so a silenced stock ECU is handed
+  back before pandad sees OffroadMode; exiting clears both."""
+  if enable:
+    params.put_bool("OffroadModeRequested", True)
+  else:
+    params.put_bool("OffroadMode", False)
+    params.put_bool("OffroadModeRequested", False)
 
 
 class DeviceSP:

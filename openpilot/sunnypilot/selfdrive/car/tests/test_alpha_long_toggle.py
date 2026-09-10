@@ -5,21 +5,21 @@ This file is part of zoompilot and is licensed under the MIT License.
 See the LICENSE.md file in the root directory for more details.
 """
 from opendbc.car import structs
-from openpilot.sunnypilot.selfdrive.car.alpha_long_toggle import AlphaLongToggleMonitor, HANDBACK_TIMEOUT_FRAMES, \
+from openpilot.sunnypilot.selfdrive.car.alpha_long_toggle import AlphaLongToggleMonitor, \
   STANDSTILL_V, STANDSTILL_T, StandstillGate
+
+from opendbc.car.mazda.radar_session import RADAR_SESSION_LIMIT_FRAMES
+from openpilot.sunnypilot.selfdrive.car.tests.fakes import FakeParams
 
 MOVING_V = 12.0
 
 
-class FakeParams:
-  def __init__(self, **bools):
-    self.bools = dict(bools)
+class FakeSession:
+  """The interface's radar session manager as the monitor sees it."""
 
-  def get_bool(self, key):
-    return self.bools.get(key, False)
-
-  def put_bool(self, key, value, **kwargs):
-    self.bools[key] = value
+  def __init__(self):
+    self.handback_completed = False
+    self.handback_failed = False
 
 
 def _monitor(toggle: bool, brand="mazda", op_long=True, alpha_avail=True, cycle_attempted=False, parked=True):
@@ -28,7 +28,9 @@ def _monitor(toggle: bool, brand="mazda", op_long=True, alpha_avail=True, cycle_
   cp.openpilotLongitudinalControl = op_long
   cp.alphaLongitudinalAvailable = alpha_avail
   params = FakeParams(AlphaLongitudinalEnabled=toggle, AlphaLongCycleAttempted=cycle_attempted)
-  m = AlphaLongToggleMonitor(cp, params)
+  # card_ext hands the session over only on a platform that silences a stock ECU under op long
+  session = FakeSession() if brand == "mazda" and op_long else None
+  m = AlphaLongToggleMonitor(cp, params, session)
   m.update_params()
   if parked:
     # the car has been sitting still since card started; the standstill debounce is already satisfied
@@ -36,8 +38,12 @@ def _monitor(toggle: bool, brand="mazda", op_long=True, alpha_avail=True, cycle_
   return m, params
 
 
-def _step(monitor, acc_faulted=False, enabled=False, v_ego=0.0):
+def _step(monitor, restored=False, restore_failed=False, acc_faulted=False, enabled=False, v_ego=0.0, can_valid=True):
+  if monitor.session is not None:
+    monitor.session.handback_completed = restored
+    monitor.session.handback_failed = restore_failed
   cs = structs.CarState()
+  cs.canValid = can_valid
   cs.accFaulted = acc_faulted
   cs.vEgo = v_ego
   cc = structs.CarControl()
@@ -68,15 +74,15 @@ class TestAlphaLongToggleMonitor:
       assert cc_sp.stockEcuHandBack
       assert not params.get_bool("OnroadCycleRequested")
     # stock radar heard again: cycle requested
-    cc_sp = _step(m, acc_faulted=True)
+    cc_sp = _step(m, restored=True)
     assert cc_sp.stockEcuHandBack
     assert params.get_bool("OnroadCycleRequested")
 
-  def test_disable_times_out_to_cycle(self):
+  def test_timeout_does_not_authorize_a_cycle(self):
     m, params = _monitor(toggle=False, op_long=True)
-    for _ in range(HANDBACK_TIMEOUT_FRAMES):
-      _step(m, acc_faulted=False)
-    assert params.get_bool("OnroadCycleRequested")
+    for _ in range(RADAR_SESSION_LIMIT_FRAMES):
+      _step(m, restore_failed=True)
+    assert not params.get_bool("OnroadCycleRequested")
 
   def test_waits_for_disengagement(self):
     m, params = _monitor(toggle=False, op_long=True)
@@ -93,10 +99,10 @@ class TestAlphaLongToggleMonitor:
     # before shutdown
     m, params = _monitor(toggle=False, op_long=True)
     _step(m)
-    _step(m, acc_faulted=True)
+    _step(m, restored=True)
     assert params.get_bool("OnroadCycleRequested")
     for _ in range(10):
-      cc_sp = _step(m, acc_faulted=True)
+      cc_sp = _step(m, restored=True)
       assert cc_sp.stockEcuHandBack
 
   def test_no_assert_after_done_when_nothing_was_handed_back(self):
@@ -150,21 +156,21 @@ class TestEngagedDefersFinish:
     _step(m)  # hand-back starts disengaged
     # engaged when the radar comes back: keep asserting, do not cycle yet
     for _ in range(50):
-      cc_sp = _step(m, acc_faulted=True, enabled=True)
+      cc_sp = _step(m, restored=True, enabled=True)
       assert cc_sp.stockEcuHandBack
       assert not params.get_bool("OnroadCycleRequested")
-    cc_sp = _step(m, acc_faulted=True, enabled=False)
+    cc_sp = _step(m, restored=True, enabled=False)
     assert cc_sp.stockEcuHandBack
     assert params.get_bool("OnroadCycleRequested")
 
   def test_mazda_timeout_while_engaged_holds_cycle(self):
     m, params = _monitor(toggle=False, op_long=True)
     _step(m)
-    for _ in range(HANDBACK_TIMEOUT_FRAMES + 10):
+    for _ in range(RADAR_SESSION_LIMIT_FRAMES + 10):
       cc_sp = _step(m, enabled=True)
       assert cc_sp.stockEcuHandBack
     assert not params.get_bool("OnroadCycleRequested")
-    _step(m, enabled=False)
+    _step(m, enabled=False, restored=True)
     assert params.get_bool("OnroadCycleRequested")
 
 
@@ -184,7 +190,7 @@ class TestOneCyclePerIgnition:
 
   def test_persisting_mismatch_mazda_disable_does_not_hand_back(self):
     m, params = _monitor(toggle=False, op_long=True, cycle_attempted=True)
-    cc_sp = _step(m, acc_faulted=True)
+    cc_sp = _step(m, restored=True)
     assert not cc_sp.stockEcuHandBack
     assert not params.get_bool("OnroadCycleRequested")
 
@@ -194,7 +200,7 @@ class TestOneCyclePerIgnition:
     assert not params.get_bool("AlphaLongCycleAttempted")
     params.put_bool("AlphaLongitudinalEnabled", False)
     m.update_params()
-    _step(m, acc_faulted=True)
+    _step(m, restored=True)
     assert params.get_bool("OnroadCycleRequested")
 
 
@@ -210,21 +216,22 @@ class TestStandstillGate:
 
   def test_toggle_cycle_waits_for_standstill(self):
     m, params = _monitor(toggle=False, op_long=True, parked=False)
-    # the hand-back itself runs at speed and the radar answers; only the cycle is held
+    # Neither restoration nor the cycle may begin while moving.
     for _ in range(100):
-      cc_sp = _step(m, acc_faulted=True, v_ego=MOVING_V)
-      assert cc_sp.stockEcuHandBack
+      cc_sp = _step(m, restored=True, v_ego=MOVING_V)
+      assert not cc_sp.stockEcuHandBack
       assert not params.get_bool("OnroadCycleRequested")
-    self._stop(m, acc_faulted=True)
+    self._stop(m, restored=True)
     assert params.get_bool("OnroadCycleRequested")
 
   def test_handback_timeout_still_waits_for_standstill(self):
-    m, params = _monitor(toggle=False, op_long=True, parked=False)
-    for _ in range(HANDBACK_TIMEOUT_FRAMES + 100):
+    m, params = _monitor(toggle=False, op_long=True)
+    assert _step(m).stockEcuHandBack  # restoration already started while parked
+    for _ in range(RADAR_SESSION_LIMIT_FRAMES + 100):
       cc_sp = _step(m, v_ego=MOVING_V)
       assert cc_sp.stockEcuHandBack
     assert not params.get_bool("OnroadCycleRequested")
-    self._stop(m)
+    self._stop(m, restored=True)
     assert params.get_bool("OnroadCycleRequested")
 
   def test_enable_direction_waits_for_standstill(self):
@@ -255,10 +262,86 @@ class TestStandstillGate:
     m, params = _monitor(toggle=False, op_long=True, parked=False)
     _step(m, v_ego=MOVING_V)
     for _ in range(m.standstill.frames_needed + 10):
-      _step(m, acc_faulted=True, enabled=True, v_ego=0.0)
+      _step(m, restored=True, enabled=True, v_ego=0.0)
     assert not params.get_bool("OnroadCycleRequested")
-    _step(m, acc_faulted=True, enabled=False, v_ego=0.0)
+    _step(m, restored=True, enabled=False, v_ego=0.0)
     assert params.get_bool("OnroadCycleRequested")
 
   def test_gate_needs_at_least_one_frame(self):
     assert StandstillGate(1 / (2 * STANDSTILL_T)).frames_needed == 1
+
+
+class TestExternalStop:
+  """A reboot, shutdown, forced offroad or calibration reset asks card for the hand-back
+  through StockEcuHandBackRequested and waits on StockEcuHandBackDone."""
+
+  @staticmethod
+  def _request(m, params):
+    params.put_bool("StockEcuHandBackRequested", True)
+    m.update_params()
+
+  def test_no_takeover_brand_answers_at_once(self):
+    for brand, op_long in (("toyota", True), ("mazda", False)):
+      m, params = _monitor(toggle=True, brand=brand, op_long=op_long, alpha_avail=False)
+      self._request(m, params)
+      cc_sp = _step(m)
+      assert not cc_sp.stockEcuHandBack
+      assert params.get_bool("StockEcuHandBackDone")
+      assert not params.get_bool("OnroadCycleRequested")
+
+  def test_mazda_hands_back_then_answers_without_cycling(self):
+    m, params = _monitor(toggle=True, op_long=True, parked=False)
+    self._request(m, params)
+    # moving is fine: the stop is happening either way
+    for _ in range(50):
+      cc_sp = _step(m, v_ego=MOVING_V)
+      assert cc_sp.stockEcuHandBack
+      assert not params.get_bool("StockEcuHandBackDone")
+    cc_sp = _step(m, v_ego=MOVING_V, restored=True)
+    assert cc_sp.stockEcuHandBack
+    assert params.get_bool("StockEcuHandBackDone")
+    # the toggle is satisfied, so no onroad cycle rides along with the stop
+    assert not params.get_bool("OnroadCycleRequested")
+    # the assert holds until the process dies
+    for _ in range(10):
+      cc_sp = _step(m, restored=True)
+      assert cc_sp.stockEcuHandBack
+
+  def test_failure_still_answers(self):
+    m, params = _monitor(toggle=True, op_long=True)
+    self._request(m, params)
+    _step(m)
+    _step(m, restore_failed=True)
+    assert params.get_bool("StockEcuHandBackDone")
+
+  def test_waits_for_disengagement_to_start(self):
+    m, params = _monitor(toggle=True, op_long=True)
+    self._request(m, params)
+    for _ in range(20):
+      cc_sp = _step(m, enabled=True)
+      assert not cc_sp.stockEcuHandBack
+    cc_sp = _step(m, enabled=False)
+    assert cc_sp.stockEcuHandBack
+    # once started, a re-engagement no longer pauses it
+    cc_sp = _step(m, enabled=True, restored=True)
+    assert cc_sp.stockEcuHandBack
+    assert params.get_bool("StockEcuHandBackDone")
+
+  def test_joins_a_toggle_handback_already_running(self):
+    m, params = _monitor(toggle=False, op_long=True)
+    _step(m)
+    self._request(m, params)
+    cc_sp = _step(m, enabled=True)  # engaged would block a fresh start, not a running one
+    assert cc_sp.stockEcuHandBack
+    _step(m, restored=True)
+    assert params.get_bool("StockEcuHandBackDone")
+    assert params.get_bool("OnroadCycleRequested")  # the toggle path still owns its cycle
+
+  def test_answered_once(self):
+    m, params = _monitor(toggle=True, op_long=True)
+    self._request(m, params)
+    _step(m)
+    _step(m, restored=True)
+    params.put_bool("StockEcuHandBackDone", False)
+    _step(m, restored=True)
+    assert not params.get_bool("StockEcuHandBackDone")

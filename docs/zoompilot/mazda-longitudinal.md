@@ -94,8 +94,21 @@ takeover, in 10 of 25 alpha-long routes, was the ordered hand-back's own answer,
 The hand-back to stock has to complete while the openpilot processes are still running: pandad
 blocks TX within about 100 ms of an onroad cycle starting. So the hand-back is driven from the
 control loop off `CC_SP.stockEcuHandBack`, and the process restart is requested only once the
-stock radar is heard again. A hand-back the radar never answers stops waiting after
-`RADAR_SESSION_LIMIT_T` so the restart can proceed.
+session manager (`radar_session.py`) has seen sustained stock traffic after its default-session
+request (`handback_completed`). A hand-back the radar never answers is a failure
+(`handback_failed`) after `RADAR_SESSION_LIMIT_T`: diagnostics stop, the alpha-long toggle does
+not cycle on it, and a late recovery can still complete it. The toggle monitor reads the
+manager's result through card; it no longer infers "stock radar heard" from accFaulted.
+
+Every other software stop goes through the same hand-back, brokered by
+`stock_ecu_handback.py`. hardwared holds `OnroadCycleRequested` (calibration reset,
+restart-needed toggles) and the UI's `OffroadModeRequested` (forced offroad), and manager holds
+`DoReboot` / `DoShutdown` / `DoUninstall`, each by setting `StockEcuHandBackRequested` and waiting
+for card's `StockEcuHandBackDone` (15 s bound, then the stop goes ahead). Forced offroad needs
+the request param because pandad reads `OffroadMode` itself and drops the panda's ignition
+within 100 ms of the write, before any hand-back could run; sunnylink's remote `OffroadMode`
+write still bypasses this. These stops are served moving or not, since they happen either way.
+Ignition off and power loss cannot be held: the radar recovers through S3 on its own.
 
 Once a hand-back has run to completion the radar stays stock for the rest of the process
 (`handback_completed`). The producer's contract is to hold the assert until the process exits;
@@ -162,9 +175,14 @@ Before the first teardown of the drive the block is the expected boot phase (FSC
 handover, 10 to 15 s), not a fault. Holding availability low keeps engagement out with at most a
 wrongCarMode no-entry toast. Raising accFaulted here showed a permanent "Cruise Fault: Restart
 the Car" on every start for a condition that clears by itself. After the radar has been silenced
-once, hearing it again is a real two-master conflict (dropped tester present, S3 recovery, or the
-ordered hand-back) and is a real accFaulted. The alpha-long toggle monitor relies on exactly this
-edge as its "stock radar heard" acknowledgment.
+once, hearing it again is a real two-master conflict (dropped tester present, S3 recovery) and
+is a real accFaulted. The ordered hand-back is masked out of it (`radar_handback_active`), and a
+hand-back that timed out raises it on its own (`radar_restore_failed`).
+
+Ownership is established by the silence guard and then held on the controller's claim: the bus
+witnesses (PEDALS, ENGINE_DATA at the CANParser's own ten-period validity) decide whether radar
+silence is evidence at all, a dead or blipping bus is never adopted as a silenced radar, and a
+blip while owned neither revokes availability nor re-runs the guard on recovery.
 
 ### Tried and rejected: gating availability alone
 
