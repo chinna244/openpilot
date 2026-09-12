@@ -170,6 +170,15 @@ class ModularAssistiveDrivingSystem:
     selfdrive_enable_events = self.events.has(EventName.pcmEnable) or self.events.has(EventName.buttonEnable)
     set_speed_btns_enable = any(be.type in SET_SPEED_BUTTONS for be in CS.buttonEvents)
 
+    # When a declared MADS button owns lateral, stock longitudinal transition events are
+    # filtered below so cruise cannot toggle MADS. Preserve only their C4 chimes by
+    # mirroring the already computed selfdrive state transition as a presentation-only SP event.
+    if self.button_owns_lateral:
+      if self.selfdrive.enabled and not self.selfdrive.enabled_prev:
+        self.events_sp.add(EventNameSP.longitudinalEnableChime)
+      elif not self.selfdrive.enabled and self.selfdrive.enabled_prev:
+        self.events_sp.add(EventNameSP.longitudinalDisableChime)
+
     # wrongCarMode alert only or actively block control
     self.get_wrong_car_mode(selfdrive_enable_events or set_speed_btns_enable)
 

@@ -129,6 +129,16 @@ EVENTS_SP: dict[int, dict[str, Alert | AlertCallbackType]] = {
     ET.USER_DISABLE: EngagementAlert(AudibleAlert.disengage),
   },
 
+  # Sound-only mirrors for longitudinal state transitions when a declared MADS button
+  # owns lateral. PERMANENT is presentation-only and is ignored by the MADS state machine.
+  EventNameSP.longitudinalEnableChime: {
+    ET.PERMANENT: EngagementAlert(AudibleAlert.engage),
+  },
+
+  EventNameSP.longitudinalDisableChime: {
+    ET.PERMANENT: EngagementAlert(AudibleAlert.disengage),
+  },
+
   EventNameSP.manualSteeringRequired: {
     ET.USER_DISABLE: Alert(
       "Automatic Lane Centering is OFF",
