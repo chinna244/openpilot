@@ -4,6 +4,20 @@ DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null && pwd )"
 
 source "$DIR/launch_env.sh"
 
+# Identity of the current source tree: HEAD commit + uncommitted diffs
+# (including submodule commits/diffs). Used to skip rebuilds when nothing changed.
+function source_fingerprint {
+  (
+    set -o pipefail
+    {
+      git -C "$DIR" rev-parse HEAD &&
+      git -C "$DIR" diff HEAD &&
+      git -C "$DIR" submodule foreach --recursive --quiet \
+        'echo "$displaypath $(git rev-parse HEAD)"; git diff HEAD'
+    } | sha256sum
+  ) 2>/dev/null
+}
+
 function agnos_init {
   # TODO: move this to agnos
   sudo rm -f /data/etc/NetworkManager/system-connections/*.nmmeta
@@ -94,7 +108,19 @@ function launch {
   # start manager
   cd openpilot/system/manager
   if [ ! -f $DIR/prebuilt ]; then
-    ./build.py
+    # Skip build.py when this exact source tree was already built successfully.
+    # Do not use the `prebuilt` file for this: that marker would skip builds
+    # after later pulls/commits and leave stale binaries.
+    BUILT_SOURCE="$DIR/.built_source"
+    if ! CURRENT_SOURCE="$(source_fingerprint)"; then
+      CURRENT_SOURCE=""
+    fi
+    if [ -z "$CURRENT_SOURCE" ] || [ ! -f "$BUILT_SOURCE" ] || [ "$(cat "$BUILT_SOURCE" 2>/dev/null)" != "$CURRENT_SOURCE" ]; then
+      ./build.py
+      if [ $? -eq 0 ] && [ -n "$CURRENT_SOURCE" ]; then
+        echo "$CURRENT_SOURCE" > "$BUILT_SOURCE"
+      fi
+    fi
   fi
   ./manager.py
 
