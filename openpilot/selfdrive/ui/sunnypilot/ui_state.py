@@ -246,13 +246,10 @@ class UIStateSP:
 
 
 def set_always_offroad(params: Params, enable: bool) -> None:
-  """Entering is brokered by hardwared (OffroadModeRequested) so a silenced stock ECU is handed
-  back before pandad sees OffroadMode; exiting clears both."""
-  if enable:
-    params.put_bool("OffroadModeRequested", True)
-  else:
-    params.put_bool("OffroadMode", False)
-    params.put_bool("OffroadModeRequested", False)
+  """The UI writes the forced-offroad preference only. hardwared applies it: entering waits for
+  a silenced stock ECU to be handed back before pandad sees OffroadMode, exiting clears the old
+  session's CarParams first so the fresh session sequences like a boot."""
+  params.put_bool("OffroadModeRequested", enable)
 
 
 class DeviceSP:
@@ -274,9 +271,10 @@ class DeviceSP:
     else:
       self.dismiss_screensaver(_ui_state)
 
-    # blocked runs every frame, so write only when actually sleeping
+    # blocked runs every frame, so write only when actually sleeping; ignition is off here,
+    # so hardwared applies the preference at once
     if _ui_state.boot_offroad_mode == 1 and not on and not self._blocked_by_screensaver:
-      _ui_state.params.put_bool("OffroadMode", True)
+      _ui_state.params.put_bool("OffroadModeRequested", True)
 
   def dismiss_screensaver(self, _ui_state) -> None:
     if gui_app.get_active_widget() == _ui_state.screensaver:

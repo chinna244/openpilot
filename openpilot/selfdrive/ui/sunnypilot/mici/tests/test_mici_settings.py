@@ -423,6 +423,7 @@ LAYOUT_TARGETS = [
   ("display", "DisplayLayoutMici"),
   ("models", "ModelsLayoutMici"),
   ("settings", "SettingsLayoutSP"),
+  ("software", "SoftwareLayoutSP"),
   ("steering", "SteeringLayoutMici"),
   ("sunnylink", "SunnylinkLayoutMici"),
   ("trips", "TripsLayoutMici"),
@@ -462,6 +463,97 @@ class TestSubtitleAreaRenders:
     render(btn)
 
 
+class TestReleaseNotes:
+  """The notes only exist as params updated writes, so the button has to read the right pair."""
+
+  def _button(self, params, current=b"<h1>old</h1>", new=b"<h1>new</h1>", available=False):
+    from openpilot.selfdrive.ui.sunnypilot.mici.layouts.software import ReleaseNotesButton
+
+    params.put("UpdaterCurrentDescription", "0.1 / develop / abc / 2026-01-01", block=True)
+    params.put("UpdaterNewDescription", "0.2 / develop / def / 2026-01-02", block=True)
+    params.put("UpdaterCurrentReleaseNotes", current, block=True)
+    params.put("UpdaterNewReleaseNotes", new, block=True)
+    params.put_bool("UpdateAvailable", available, block=True)
+    return ReleaseNotesButton()
+
+  def test_shows_installed_version(self, params):
+    btn = self._button(params)
+    render(btn)
+    assert btn.get_value() == "0.1"
+    btn._click_callback()
+    assert "old" in [e.content for e in btn._page._content.elements]
+
+  def test_shows_pending_version(self, params):
+    btn = self._button(params, available=True)
+    render(btn)
+    assert btn.get_value() == "0.2"
+    btn._click_callback()
+    assert "new" in [e.content for e in btn._page._content.elements]
+
+  def test_page_renders_without_notes(self, params):
+    btn = self._button(params, current=b"")
+    btn._click_callback()
+    render(btn._page)
+
+  def test_page_renders_changelog(self, params):
+    # the real thing: the first CHANGELOG.md block, parsed the way updated does it
+    from openpilot.common.basedir import BASEDIR
+    from openpilot.system.updated.updated import parse_release_notes
+
+    btn = self._button(params, current=parse_release_notes(BASEDIR))
+    btn._click_callback()
+    render(btn._page)
+    assert len(btn._page._content.elements) > 1
+
+
+class TestUpdateAlert:
+  """The alert is the only place a staged update announces itself, so it owns the notes flow."""
+
+  def _alerts(self, params, available=True):
+    from openpilot.selfdrive.ui.sunnypilot.mici.layouts.offroad_alerts import UPDATE_KEY, MiciOffroadAlertsSP
+
+    params.put("UpdaterNewDescription", "2026.09.07-13 / develop / 259190d / Sep 07", block=True)
+    params.put("UpdaterNewReleaseNotes", b"<h1>zoompilot v2026.09.07-13</h1>", block=True)
+    params.put_bool(UPDATE_KEY, available, block=True)
+
+    layout = MiciOffroadAlertsSP()
+    pending = {alert.key: params.get(alert.key) for alert in layout.sorted_alerts}
+    pending["UpdaterNewDescription"] = params.get("UpdaterNewDescription")
+    layout._refresh(pending)
+    return layout
+
+  def test_alert_points_at_the_notes(self, params):
+    item = self._alerts(params)._update_item
+    assert item.alert_data.visible
+    assert "zoompilot 2026.09.07-13, Sep 07" in item.alert_data.text
+    assert "blog.comma.ai" not in item.alert_data.text
+    # the item re-split the new text, so the card knows how tall it has to be
+    assert item._body_text == "Tap to read what's new."
+
+  def test_no_alert_without_an_update(self, params):
+    item = self._alerts(params, available=False)._update_item
+    assert not item.alert_data.visible
+    assert item.alert_data.text == ""
+
+  def test_click_opens_the_new_notes(self, params):
+    layout = self._alerts(params)
+    layout._update_item._click_callback()
+    assert "zoompilot v2026.09.07-13" in [e.content for e in layout._notes_page._content.elements]
+
+  def test_install_slider_follows_the_staged_update(self, params):
+    from openpilot.selfdrive.ui.sunnypilot.mici.layouts.software import ReleaseNotesPage
+
+    page = ReleaseNotesPage()
+    params.put_bool("UpdateAvailable", True, block=True)
+    assert page._install.is_visible
+    render(page)  # the slider only has a rect once the page lays it out under the notes
+    assert page._install.rect.height > 0
+
+    params.put_bool("UpdateAvailable", False, block=True)
+    assert not page._install.is_visible
+    render(page)
+
+
 class TestLayoutsSurviveRender:
   """Post-sync guard. A layout that imports and updates cleanly can still crash on draw."""
 
@@ -494,3 +586,30 @@ class TestLayoutsSurviveRender:
     from openpilot.selfdrive.ui.sunnypilot.mici.layouts.home import MiciHomeLayoutSP
 
     render(MiciHomeLayoutSP())
+
+
+
+class TestAlphaLongSwitchMici:
+  """The alpha switch is the saved preference, editable offroad only (forced offroad included)."""
+
+  def test_switch_is_offroad_only(self, params, monkeypatch):
+    from openpilot.selfdrive.ui.mici.layouts.settings.developer import DeveloperLayoutMici
+    from openpilot.selfdrive.ui.ui_state import ui_state
+    layout = DeveloperLayoutMici()
+    monkeypatch.setattr(ui_state, "started", True)
+    render(layout)
+    assert not layout._alpha_long_toggle.enabled
+    monkeypatch.setattr(ui_state, "started", False)  # naturally offroad or forced offroad
+    render(layout)
+    assert layout._alpha_long_toggle.enabled
+
+  def test_force_offroad_writes_the_preference_only(self, params, monkeypatch):
+    from openpilot.selfdrive.ui.sunnypilot.mici.layouts.settings import SettingsLayoutSP
+    from openpilot.system.ui.lib.application import gui_app
+    layout = SettingsLayoutSP()
+    pushed = []
+    monkeypatch.setattr(gui_app, "push_widget", lambda w: pushed.append(w))
+    layout._handle_always_offroad(True)
+    pushed[-1]._confirm_callback()
+    assert wait_for_param(params, "OffroadModeRequested") is True
+    assert not params.get_bool("OffroadMode")  # applied by hardwared, never the UI

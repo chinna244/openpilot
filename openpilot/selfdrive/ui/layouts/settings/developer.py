@@ -83,7 +83,7 @@ class DeveloperLayout(Widget):
       description=lambda: tr(DESCRIPTIONS["alpha_longitudinal"]),
       initial_state=self._params.get_bool("AlphaLongitudinalEnabled"),
       callback=self._on_alpha_long_enabled,
-      enabled=lambda: not ui_state.engaged,
+      enabled=ui_state.is_offroad,
     )
 
     self._ui_debug_toggle = toggle_item(

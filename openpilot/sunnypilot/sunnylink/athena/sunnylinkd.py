@@ -55,6 +55,7 @@ BLOCKED_PARAMS = {
   "HasAcceptedTermsSP",
   "OnroadCycleRequested",      # Prevent remote cycle trigger
   "AlphaLongitudinalEnabled",  # Flips longitudinal mode via an onroad cycle; local UI only
+  "OffroadMode",               # Applied by hardwared alone; remote writes go through OffroadModeRequested
   "ParamsVersion",         # Device-managed version counter
 }
 

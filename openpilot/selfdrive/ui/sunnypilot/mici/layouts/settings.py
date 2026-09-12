@@ -12,6 +12,7 @@ from openpilot.selfdrive.ui.mici.widgets.dialog import BigConfirmationDialog, Bi
 from openpilot.selfdrive.ui.sunnypilot.mici.layouts.cruise import CruiseLayoutMici
 from openpilot.selfdrive.ui.sunnypilot.mici.layouts.display import DisplayLayoutMici
 from openpilot.selfdrive.ui.sunnypilot.mici.layouts.models import ModelsLayoutMici
+from openpilot.selfdrive.ui.sunnypilot.mici.layouts.software import SoftwareLayoutSP
 from openpilot.selfdrive.ui.sunnypilot.mici.layouts.steering import SteeringLayoutMici
 from openpilot.selfdrive.ui.sunnypilot.mici.layouts.sunnylink import SunnylinkLayoutMici
 from openpilot.selfdrive.ui.sunnypilot.mici.layouts.trips import TripsLayoutMici
@@ -41,6 +42,9 @@ class SettingsLayoutSP(OP.SettingsLayout):
 
     device_panel = DeviceLayoutMici()
     self._scroller._items[2].set_click_callback(lambda: gui_app.push_widget(device_panel))
+
+    # by label: an index mis-wires silently if the base list is ever reordered
+    self._replace_panel("software", SoftwareLayoutSP())
 
     self.icon_offroad_enable = gui_app.texture("../../sunnypilot/selfdrive/assets/icons_mici/always_offroad.png", BIG_ICON_SIZE,
                                                BIG_ICON_SIZE)
@@ -98,6 +102,10 @@ class SettingsLayoutSP(OP.SettingsLayout):
     self._scroller._items.clear()
     for item in items:
       self._scroller.add_widget(item)
+
+  def _replace_panel(self, label: str, panel) -> None:
+    btn = next(btn for btn in self._scroller.items if btn.get_text() == label)
+    btn.set_click_callback(lambda: gui_app.push_widget(panel))
 
   def _update_state(self):
     super()._update_state()

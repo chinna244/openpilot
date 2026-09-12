@@ -11,11 +11,15 @@ from opendbc.car import structs
 from opendbc.car.chrysler.values import RAM_DT
 from opendbc.car.mazda.values import MazdaFlags
 from openpilot.selfdrive.selfdrived.events import Events
+from openpilot.sunnypilot.mads.mads import SET_SPEED_BUTTONS
+from opendbc.sunnypilot.car.stock_ecu import ENGAGES_NORMALLY
 from openpilot.sunnypilot.selfdrive.selfdrived.events import EventsSP
 
 EventName = log.OnroadEvent.EventName
 EventNameSP = custom.OnroadEventSP.EventName
 GearShifter = structs.CarState.GearShifter
+StockEcuState = custom.CarStateZP.StockEcuState
+
 
 
 class CarSpecificEventsSP:
@@ -24,8 +28,9 @@ class CarSpecificEventsSP:
     self.CP_SP = CP_SP
 
     self.low_speed_alert = False
+    self.stock_ecu_prev = StockEcuState.notNeeded
 
-  def update(self, CS: structs.CarState, events: Events):
+  def update(self, CS: structs.CarState, events: Events, CS_SP):
     events_sp = EventsSP()
 
     if self.CP.brand == 'chrysler':
@@ -64,5 +69,20 @@ class CarSpecificEventsSP:
         # steering (the panda blocks the camera's command).
         events.remove(EventName.stockLkas)
         events_sp.add(EventNameSP.mazdaStockCtsActive)
+
+    # A SET/RES press before the stock ECU openpilot stands in for is owned lands on a body
+    # that will not engage (Mazda route 0000020d: six presses, nothing shown): name what the
+    # driver has to do. Alert-only; the press itself does nothing.
+    stock_ecu = CS_SP.zoompilot.stockEcu
+    if str(stock_ecu) not in ENGAGES_NORMALLY and any(be.pressed and be.type in SET_SPEED_BUTTONS for be in CS.buttonEvents):
+      events_sp.add(EventNameSP.stockEcuNotReady)
+    # Unprompted only where waiting changes the outcome: parked with the takeover still
+    # starting (route 0000021b pulled away 5 s short of it). Rolling, the press alert carries
+    # "park to engage"; a standing banner would nag a whole drive. One line on the ready edge.
+    if stock_ecu == StockEcuState.starting and CS.standstill:
+      events_sp.add(EventNameSP.stockEcuInitializing)
+    if stock_ecu == StockEcuState.ready and self.stock_ecu_prev != StockEcuState.ready:
+      events_sp.add(EventNameSP.stockEcuReady)
+    self.stock_ecu_prev = stock_ecu
 
     return events_sp

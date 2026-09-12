@@ -50,11 +50,10 @@ of accFaulted. The refactor makes their contracts explicit rather than adding mo
    hardwared holds `OnroadCycleRequested` (calibration reset, restart-needed toggles) and
    `OffroadModeRequested` (forced offroad; pandad reads `OffroadMode` directly and drops the
    panda's ignition within 100 ms, so the UI writes the request instead), manager holds
-   `DoReboot` / `DoShutdown` / `DoUninstall`. Each sets `StockEcuHandBackRequested`, card
-   answers `StockEcuHandBackDone` on completion, failure, or at once when nothing was taken
-   over; the consumer proceeds on the answer or after 15 s. Served moving or not. Not
-   holdable: ignition off, power loss, thermal-critical offroad, sunnylink's remote
-   `OffroadMode` write.
+   `DoReboot` / `DoShutdown` / `DoUninstall`. Superseded 2026-09-10 by the correlated
+   request/result records and the moving-takeover contract in
+   `force-offroad-alpha-transition.md`; remote `OffroadMode` writes are blocked there. Not
+   holdable: ignition off, power loss, thermal-critical offroad.
 8. Bus witnesses at the CANParser's own ten-period validity (PEDALS 200 ms, ENGINE_DATA
    100 ms), not a tighter window the parser would still accept. Once owned, ownership is
    held on the controller's claim through a blip; only stock traffic ends it.

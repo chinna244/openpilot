@@ -5,8 +5,9 @@ This file is part of zoompilot and is licensed under the MIT License.
 See the LICENSE.md file in the root directory for more details.
 """
 from opendbc.car import structs
+from opendbc.sunnypilot.car.stock_ecu import StockEcuState
 from openpilot.common.params import Params
-from openpilot.sunnypilot.selfdrive.car.alpha_long_toggle import AlphaLongToggleMonitor
+from openpilot.sunnypilot.selfdrive.car.stock_ecu_handback import StockEcuHandBackServer
 
 
 class CardExt:
@@ -20,10 +21,11 @@ class CardExt:
   def __init__(self, CP: structs.CarParams, CP_SP: structs.CarParamsSP, params: Params, sm, v_cruise_helper, CI) -> None:
     self.sm = sm
     self.v_cruise_helper = v_cruise_helper
-    # onroad AlphaLongitudinalEnabled changes: sequence any ECU hand-back, then cycle. The
-    # session manager's own result is the acknowledgment, not a driver-facing fault bit.
-    stock_ecu_session = CI.CC.radar_session if CP.brand == "mazda" and CP.openpilotLongitudinalControl else None
-    self.alpha_long_monitor = AlphaLongToggleMonitor(CP, params, stock_ecu_session)
+    # The stock ECU transition contract (opendbc/sunnypilot/car/stock_ecu.py): a controller that
+    # silences a stock ECU under openpilot longitudinal exposes `stock_ecu_state`; nothing
+    # brand-specific is read here. The hand-back server answers the lifecycle's requests off it.
+    self.controller = CI.CC
+    self.handback = StockEcuHandBackServer(params)
 
   def update_v_cruise_post(self, CS, CS_SP) -> None:
     helper = self.v_cruise_helper
@@ -32,13 +34,19 @@ class CardExt:
     helper.reconcile_setpoint_with_dash(CS)
     # publish the arbiter's session (plannerd mirrors it; the ICBM servo freezes on a prompt)
     helper.cruise_arbiter.fill_msg(CS_SP)
+    # the driver's view of the stock ECU, for the engage-press alert (stockEcuNotReady)
+    CS_SP.zoompilot.stockEcu = str(self.stock_ecu_state)
+
+  @property
+  def stock_ecu_state(self) -> StockEcuState:
+    return getattr(self.controller, "stock_ecu_state", StockEcuState.NOT_NEEDED)
 
   def controls_update(self, CS, CC, CC_SP: structs.CarControlSP) -> structs.CarControlSP:
     """Runs just before CI.apply on the converted CarControlSP struct, which it may edit."""
     self.v_cruise_helper.cruise_arbiter.gate_send_button(CC_SP)
-    self.alpha_long_monitor.update(CS, CC, CC_SP)
+    self.handback.update(CC.enabled, self.stock_ecu_state, CC_SP)
     return CC_SP
 
   def update_params(self) -> None:
     # rides card's params thread, keeping param reads off the 100 Hz path
-    self.alpha_long_monitor.update_params()
+    self.handback.update_params()

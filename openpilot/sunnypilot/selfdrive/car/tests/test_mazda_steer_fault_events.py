@@ -5,7 +5,7 @@ This file is part of zoompilot and is licensed under the MIT License.
 See the LICENSE.md file in the root directory for more details.
 """
 
-from openpilot.cereal import custom, log
+from openpilot.cereal import custom, log, messaging
 from opendbc.car import structs
 from opendbc.car.mazda.values import MazdaFlags
 from openpilot.selfdrive.selfdrived.events import Events
@@ -23,6 +23,10 @@ def _car_events(brand: str, flags: int = 0) -> CarSpecificEventsSP:
   return CarSpecificEventsSP(CP, structs.CarParamsSP())
 
 
+def _car_state_sp():
+  return messaging.new_message('carStateSP').carStateSP
+
+
 def _events(*names: int) -> Events:
   events = Events()
   for name in names:
@@ -37,7 +41,7 @@ class TestMazdaSteerFaultEvents:
   def test_steer_to_zero_eps_downgrades_to_the_silent_warning(self):
     car_events = _car_events('mazda', MazdaFlags.GEN1 | MazdaFlags.STEER_TO_ZERO_EPS)
     events = _events(EventName.steerTempUnavailable)
-    car_events.update(structs.CarState(), events)
+    car_events.update(structs.CarState(), events, _car_state_sp())
     assert not events.has(EventName.steerTempUnavailable)
     assert events.has(EventName.steerTempUnavailableSilent)
     assert events.contains(ET.WARNING)
@@ -47,7 +51,7 @@ class TestMazdaSteerFaultEvents:
   def test_older_eps_keeps_upstream_escalation(self):
     car_events = _car_events('mazda', MazdaFlags.GEN1)
     events = _events(EventName.steerTempUnavailable)
-    car_events.update(structs.CarState(), events)
+    car_events.update(structs.CarState(), events, _car_state_sp())
     assert events.has(EventName.steerTempUnavailable)
     assert not events.has(EventName.steerTempUnavailableSilent)
     assert events.contains(ET.SOFT_DISABLE)
@@ -55,14 +59,14 @@ class TestMazdaSteerFaultEvents:
   def test_other_brands_are_untouched(self):
     car_events = _car_events('honda', MazdaFlags.STEER_TO_ZERO_EPS)
     events = _events(EventName.steerTempUnavailable)
-    car_events.update(structs.CarState(), events)
+    car_events.update(structs.CarState(), events, _car_state_sp())
     assert events.has(EventName.steerTempUnavailable)
     assert not events.has(EventName.steerTempUnavailableSilent)
 
   def test_other_events_survive_the_swap(self):
     car_events = _car_events('mazda', MazdaFlags.GEN1 | MazdaFlags.STEER_TO_ZERO_EPS)
     events = _events(EventName.steerTempUnavailable, EventName.steerUnavailable, EventName.steerSaturated)
-    car_events.update(structs.CarState(), events)
+    car_events.update(structs.CarState(), events, _car_state_sp())
     assert events.has(EventName.steerUnavailable)
     assert events.has(EventName.steerSaturated)
     assert events.has(EventName.steerTempUnavailableSilent)
@@ -71,7 +75,7 @@ class TestMazdaSteerFaultEvents:
   def test_nothing_to_downgrade_is_a_no_op(self):
     car_events = _car_events('mazda', MazdaFlags.GEN1 | MazdaFlags.STEER_TO_ZERO_EPS)
     events = _events(EventName.steerUnavailable)
-    car_events.update(structs.CarState(), events)
+    car_events.update(structs.CarState(), events, _car_state_sp())
     assert events.names == [EventName.steerUnavailable]
 
 
@@ -89,7 +93,7 @@ class TestMazdaStockCtsEvents:
   def test_stock_cts_becomes_a_warning_not_a_no_entry(self):
     car_events = _car_events('mazda', MazdaFlags.GEN1 | MazdaFlags.STEER_TO_ZERO_EPS)
     events = _events(EventName.stockLkas)
-    events_sp = car_events.update(self._cs(True), events)
+    events_sp = car_events.update(self._cs(True), events, _car_state_sp())
     assert not events.has(EventName.stockLkas)
     assert events_sp.has(EventNameSP.mazdaStockCtsActive)
     assert events_sp.contains(ET.WARNING)
@@ -99,19 +103,19 @@ class TestMazdaStockCtsEvents:
   def test_every_mazda_eps_gets_it(self):
     car_events = _car_events('mazda', MazdaFlags.GEN1)
     events = _events(EventName.stockLkas)
-    events_sp = car_events.update(self._cs(True), events)
+    events_sp = car_events.update(self._cs(True), events, _car_state_sp())
     assert events_sp.has(EventNameSP.mazdaStockCtsActive)
 
   def test_no_pulse_adds_nothing(self):
     car_events = _car_events('mazda', MazdaFlags.GEN1)
     events = _events()
-    events_sp = car_events.update(self._cs(False), events)
+    events_sp = car_events.update(self._cs(False), events, _car_state_sp())
     assert not events_sp.has(EventNameSP.mazdaStockCtsActive)
     assert events.names == []
 
   def test_other_brands_keep_upstreams_alert(self):
     car_events = _car_events('tesla')
     events = _events(EventName.stockLkas)
-    events_sp = car_events.update(self._cs(True), events)
+    events_sp = car_events.update(self._cs(True), events, _car_state_sp())
     assert events.has(EventName.stockLkas)
     assert not events_sp.has(EventNameSP.mazdaStockCtsActive)

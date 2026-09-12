@@ -365,8 +365,11 @@ struct OnroadEventSP @0xda96579883444c35 {
     controlsMismatchLateralWarning @26;
     silentPedalPressed @27;
     mazdaStockCtsActive @28;
-    longitudinalEnableChime @29;
-    longitudinalDisableChime @30;
+    stockEcuNotReady @29;
+    stockEcuInitializing @30;
+    stockEcuReady @31;
+    longitudinalEnableChime @32;
+    longitudinalDisableChime @33;
   }
 }
 
@@ -539,6 +542,21 @@ struct CustomReserved19 @0xa4f1eb3323f5f582 {
 
 struct CarStateZP @0xc879af11c43cb400 {
   cruiseSession @0 :CruiseSession;
+  # The stock ECU transition contract (opendbc/sunnypilot/car/stock_ecu.py), written by card
+  # at carState rate: the driver's view of the ECU openpilot stands in for. ready is the
+  # vehicle's own silence guard, never a session acknowledgement.
+  stockEcu @1 :StockEcuState;
+
+  enum StockEcuState {
+    notNeeded @0;
+    starting @1;
+    parkToTakeOver @2;
+    stockCruiseOn @3;
+    ready @4;
+    restoring @5;
+    restored @6;
+    failed @7;
+  }
 
   # The card-side cruise arbiter's session, published at carState rate. On non-pcm
   # cars this is the authoritative SLA session: plannerd mirrors it into
