@@ -1,3 +1,16 @@
+zoompilot v2026.09.12-14
+========================
+* adjustments to address LKAS errors.
+* On cars with TJA/CTS, zoompilot now switches off TJA fully so it doesn't take over when you disengage zoompilot. This also addresses related "Front Camera System Malfunction" errors.
+* Added 2023 CX-8 support and 2012-16 CX-5 alpha longitudinal support with a compatible steering rack swap. Older Mazdas now appear in the car picker.
+* You can now change the "TJA button" setting through sunnylink.
+* Alpha longitudinal only
+  * Fixes for not being able to engage after a restart or force offroad.
+  * Change the alpha longitudinal toggle to offroad only to avoid cruise lockouts and dash errors.
+  * A new startup alert tells you when alpha longitudinal is ready.
+  * If you pull away before setup finishes, it will try to enable again at the next stop.
+  * Added support for older G46L radars with a compatible steering rack swap. Lead detection uses the camera.
+
 zoompilot v2026.09.07-13
 ========================
 * Fixes bugs
