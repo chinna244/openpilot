@@ -2,6 +2,7 @@ import math
 import pyray as rl
 from dataclasses import dataclass
 from openpilot.common.constants import CV
+from openpilot.selfdrive.ui.mici.onroad import aeb_off_icon
 from openpilot.selfdrive.ui.mici.onroad.torque_bar import TorqueBar
 from openpilot.selfdrive.ui.ui_state import ui_state, UIStatus, ChestnutState
 from openpilot.system.ui.lib.application import gui_app, FontWeight
@@ -127,6 +128,8 @@ class HudRenderer(Widget):
     self._txt_chestnut_green: rl.Texture = gui_app.texture('icons_mici/chestnut_green.png', 60, 44)
     self._txt_chestnut_orange: rl.Texture = gui_app.texture('icons_mici/chestnut_orange.png', 75, 44)
     self._chestnut_icon: rl.Texture | None = None
+    self._txt_aeb_off: rl.Texture = aeb_off_icon.load_texture()
+    self._model_source_width = 0  # the model icon's width in the bottom-right corner this frame, 0 if none
     self._wheel_alpha_filter = FirstOrderFilter(0, 0.05, 1 / gui_app.target_fps)
     self._wheel_y_filter = FirstOrderFilter(0, 0.1, 1 / gui_app.target_fps)
 
@@ -189,7 +192,10 @@ class HudRenderer(Widget):
 
     self._draw_steering_wheel(rect)
 
+    self._draw_aeb_off(rect)
+
   def _draw_model_source(self, rect: rl.Rectangle) -> None:
+    self._model_source_width = 0
     if ui_state.sm.recv_frame['selfdriveState'] < ui_state.started_frame:
       return
 
@@ -217,6 +223,20 @@ class HudRenderer(Widget):
     pos = rl.Vector2(rect.x + rect.width - 10 - icon.width,
                      rect.y + rect.height - 14 - (self._txt_wheel.height + icon.height) / 2)
     rl.draw_texture_ex(icon, pos, 0.0, 1.0, rl.Color(255, 255, 255, int(255 * opacity * alpha)))
+    self._model_source_width = (icon.width + 10) * alpha  # slides with the fade, no jump at its end
+
+  def _draw_aeb_off(self, rect: rl.Rectangle) -> None:
+    """Amber AEB-off marker for as long as AEB is off or not yet counted as back, or the driver's
+    own setting has it off. Bottom right, mirroring the wheel: clear of the torque arc, the turn
+    intent and MAX; left of the model icon while that shows in the same corner."""
+    zp = ui_state.sm['carStateSP'].zoompilot
+    if not (zp.stockEcuOff or zp.aebSettingOff):
+      return
+    w, h = aeb_off_icon.SIZE
+    x = rect.x + rect.width - 10 - w - self._model_source_width
+    y = rect.y + rect.height - 14 - h
+    rl.draw_texture_pro(self._txt_aeb_off, rl.Rectangle(0, 0, self._txt_aeb_off.width, self._txt_aeb_off.height),
+                        rl.Rectangle(x, y, w, h), rl.Vector2(0, 0), 0.0, rl.WHITE)
 
   def _draw_steering_wheel(self, rect: rl.Rectangle) -> None:
     wheel_txt = self._txt_wheel_critical if self._show_wheel_critical else self._txt_wheel

@@ -16,10 +16,29 @@ ButtonEvent = structs.CarState.ButtonEvent
 ButtonType = structs.CarState.ButtonEvent.Type
 
 
-def cs_sp(farther: bool):
+def cs_sp(farther: bool, stock_ecu: str = "notNeeded"):
   msg = messaging.new_message('carStateSP').carStateSP
   msg.zoompilot.distanceFarther = farther
+  msg.zoompilot.stockEcu = stock_ecu
   return msg
+
+
+class TestCarCruiseOwnsDistance:
+  """While the car's own cruise drives (Mazda stockCruiseOn), its distance button is the car's:
+  selfdrived leaves openpilot's personality and experimental toggle alone."""
+
+  def test_only_the_car_cruise_counts(self):
+    helper = CruiseHelper(structs.CarParams())
+    assert helper.car_cruise_on(cs_sp(False, "stockCruiseOn"))
+    for state in ("notNeeded", "parkToTakeOver", "starting", "ready", "restoring", "restored", "failed"):
+      assert not helper.car_cruise_on(cs_sp(False, state))
+
+  def test_a_held_press_is_dropped(self):
+    helper = CruiseHelper(structs.CarParams())
+    helper.button_frame_counts[ButtonType.gapAdjustCruise] = 30  # held, short of the long press
+    helper.experimental_mode_switched = True
+    helper.car_cruise_on(cs_sp(False, "stockCruiseOn"))
+    assert helper.button_frame_counts[ButtonType.gapAdjustCruise] == 0 and not helper.experimental_mode_switched
 
 
 class TestDistanceFarther:

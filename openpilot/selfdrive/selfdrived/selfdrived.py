@@ -523,7 +523,8 @@ class SelfdriveD(CruiseHelper):
     CruiseHelper.update(self, CS, self.events_sp, self.experimental_mode)
 
     # decrement personality on distance button press
-    if self.CP.openpilotLongitudinalControl:
+    # (not while the car's own cruise drives: its distance button is the car's)
+    if self.CP.openpilotLongitudinalControl and not self.car_cruise:
       if any(not be.pressed and be.type == ButtonType.gapAdjustCruise for be in CS.buttonEvents):
         if not self.experimental_mode_switched:
           self.personality = (self.personality - 1) % 3

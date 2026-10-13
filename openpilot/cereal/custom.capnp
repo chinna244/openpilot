@@ -587,6 +587,8 @@ struct OnroadEventZP @0xeff60a9f4d5cb12f {
     longitudinalEnableChime @8;
     longitudinalDisableChime @9;
     stockLkasArming @10;
+    stockEcuHandedBack @11;
+    alphaLongNextStop @12;
   }
 }
 
@@ -612,6 +614,14 @@ struct CarStateZP @0xc879af11c43cb400 {
     passive @1;
     active @2;
   }
+  # The stock ECU's own functions (Mazda: AEB) are off or not yet counted as back: its default
+  # session left (requested away, silenced, mid hand-back) or restarting after a hand-back.
+  stockEcuOff @5 :Bool;
+  # The driver's own setting has the car's AEB off (Mazda: Smart Brake Support off).
+  aebSettingOff @6 :Bool;
+  # The driver asked for alpha long (Mazda: RES before the car's own cruise ran); the radar is
+  # taken at the next stop.
+  alphaLongRequested @7 :Bool;
 
   enum StockEcuState {
     notNeeded @0;
