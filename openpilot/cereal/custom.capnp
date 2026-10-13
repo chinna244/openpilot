@@ -378,6 +378,8 @@ struct OnroadEventSP @0xda96579883444c35 {
     longitudinalEnableChime @35;
     longitudinalDisableChime @36;
     stockLkasArming @37;
+    stockEcuHandedBack @38;
+    alphaLongNextStop @39;
   }
 }
 
@@ -576,6 +578,14 @@ struct CarStateZP @0xc879af11c43cb400 {
   # The car's own lane keep is back on after the driver switched it off, and the EPS has not
   # applied torque since. MADS keeps the driver told lateral is disabled until it does.
   lkasArming @3 :Bool;
+  # The stock ECU's own functions (Mazda: AEB) are off or not yet counted as back: its default
+  # session left (requested away, silenced, mid hand-back) or restarting after a hand-back.
+  stockEcuOff @4 :Bool;
+  # The driver's own setting has the car's AEB off (Mazda: Smart Brake Support off).
+  aebSettingOff @5 :Bool;
+  # The driver asked for alpha long (Mazda: RES before the car's own cruise ran); the radar is
+  # taken at the next stop.
+  alphaLongRequested @6 :Bool;
 
   enum StockEcuState {
     notNeeded @0;

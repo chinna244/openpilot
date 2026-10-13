@@ -41,6 +41,12 @@ class CardExt:
     CS_SP.zoompilot.distanceFarther = bool(getattr(self.car_state, "distance_more_button", 0))
     # the EPS re-arming after the car's lane keep came back on, on the brands that track it
     CS_SP.zoompilot.lkasArming = bool(getattr(self.car_state, "lkas_arming", False))
+    # the stock ECU's own functions off or not yet back (Mazda: AEB), for the UI's marker and "AEB on"
+    CS_SP.zoompilot.stockEcuOff = bool(getattr(self.controller, "stock_ecu_off", False))
+    # the driver's own setting has AEB off (Mazda: Smart Brake Support), for the same marker
+    CS_SP.zoompilot.aebSettingOff = bool(getattr(self.car_state, "aeb_setting_off", False))
+    # alpha long asked for and not yet taken over, for the "next stop" line
+    CS_SP.zoompilot.alphaLongRequested = bool(getattr(self.controller, "alpha_long_requested", False))
 
   @property
   def stock_ecu_state(self) -> StockEcuState:

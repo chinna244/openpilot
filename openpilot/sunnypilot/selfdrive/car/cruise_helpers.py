@@ -12,6 +12,7 @@ from openpilot.common.params import Params
 
 ButtonType = car.CarState.ButtonEvent.Type
 EventNameSP = custom.OnroadEventSP.EventName
+StockEcuState = custom.CarStateZP.StockEcuState
 
 DISTANCE_LONG_PRESS = 50
 
@@ -33,6 +34,16 @@ class CruiseHelper:
 
         # toggle experimental mode once on distance button hold
         self.update_experimental_mode(events, experimental_mode)
+
+  def car_cruise_on(self, CS_SP) -> bool:
+    """The car's own cruise engaged on its own radar (Mazda stockCruiseOn): the distance button
+    sets that cruise's gap, so openpilot's personality and the long-press experimental toggle
+    leave it alone and show nothing. A press held into it is dropped, not counted on after."""
+    on = CS_SP.zoompilot.stockEcu == StockEcuState.stockCruiseOn
+    if on:
+      self.button_frame_counts[ButtonType.gapAdjustCruise] = 0
+      self.experimental_mode_switched = False
+    return on
 
   def distance_farther_released(self, CS_SP) -> bool:
     """The release edge of the wheel's "farther" distance button (carStateSP.zoompilot), the
