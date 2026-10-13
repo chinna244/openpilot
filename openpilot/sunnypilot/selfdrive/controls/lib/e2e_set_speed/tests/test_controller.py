@@ -17,7 +17,7 @@ from openpilot.sunnypilot.selfdrive.controls.lib.e2e_set_speed.controller import
 from openpilot.sunnypilot.selfdrive.controls.lib.e2e_set_speed.tests.helpers import ENGAGED, T_IDXS, MockParams, build_sm
 
 V_EGO = 20.
-V_CRUISE = 24.  # floor (24 - 20) / 8 = 0.5
+V_CRUISE = 22.  # floor (22 - 20) / 4 = 0.5, under FLOOR_MAX as the tests assume
 HOLD_FRAMES = round(c.HOLD_TIME / DT)
 SOFT_HOLD_FRAMES = round(c.SOFT_HOLD_TIME / DT)
 RISE_FRAMES = round(1. / (c.AUTHORITY_RISE * DT))

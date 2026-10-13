@@ -229,13 +229,18 @@ class SpeedLimitAssist:
         elif self.state == SpeedLimitAssistState.preActive:
           if self.target_set_speed_confirmed:
             self._update_confirmed_state()
+          elif self.speed_limit_changed:
+            self.pre_active_timer = int(PRE_ACTIVE_GUARD_PERIOD / DT_MDL)
           elif self.pre_active_timer <= 0:
             # Timeout - session ended
             self.state = SpeedLimitAssistState.inactive
 
         # INACTIVE
         elif self.state == SpeedLimitAssistState.inactive:
-          pass
+          # a new limit asks again, so one ignored prompt does not end the session
+          if self.speed_limit_changed:
+            self.state = SpeedLimitAssistState.preActive
+            self.pre_active_timer = int(PRE_ACTIVE_GUARD_PERIOD / DT_MDL)
 
     # DISABLED
     elif self.state == SpeedLimitAssistState.disabled:

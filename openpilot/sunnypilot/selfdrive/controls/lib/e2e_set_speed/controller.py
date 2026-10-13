@@ -40,7 +40,7 @@ PARAM = "ExperimentalModeSetSpeed"
 
 # Floor: close the gap the way stock MRCC does after a set-speed step (~7.7 s, peaking at a
 # median 0.57 m/s^2), faded in above walking pace.
-TAU = 8.0  # s
+TAU = 4.0  # s
 FLOOR_MAX = 0.6  # m/s^2
 MIN_SPEED = 5.0  # m/s
 FULL_SPEED = 8.0  # m/s
@@ -49,7 +49,7 @@ FULL_SPEED = 8.0  # m/s
 # are not filtered; the hold keeps a flickering trip from re-arming mid-slowdown.
 AUTHORITY_RISE = 1.0  # 1/s
 AUTHORITY_FALL = 4.0  # 1/s
-HOLD_TIME = 3.0  # s
+HOLD_TIME = 1.5  # s
 # The model's own slowdown signals re-arm sooner, which is most of what the driver feels as lag
 # after a bend or an easing. Hysteresis does the hold's job for them: while re-arming they trip
 # again from the wider *_CLEAR band until authority is back to full, so a signal hovering at its
