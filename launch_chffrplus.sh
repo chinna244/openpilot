@@ -4,6 +4,21 @@ DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null && pwd )"
 
 source "$DIR/launch_env.sh"
 
+# Identity of the current source tree: HEAD commit + uncommitted diffs
+# (including submodule commits/diffs). Used to skip rebuilds when nothing changed.
+# --no-optional-locks: reading must not write to .git.
+function source_fingerprint {
+  (
+    set -o pipefail
+    {
+      git --no-optional-locks -C "$DIR" rev-parse HEAD &&
+      git --no-optional-locks -C "$DIR" diff HEAD &&
+      git --no-optional-locks -C "$DIR" submodule foreach --recursive --quiet \
+        'echo "$displaypath $(git rev-parse HEAD)"; git --no-optional-locks diff HEAD'
+    } | sha256sum
+  ) 2>/dev/null
+}
+
 function agnos_init {
   # TODO: move this to agnos
   sudo rm -f /data/etc/NetworkManager/system-connections/*.nmmeta
@@ -91,8 +106,25 @@ function launch {
 
   # start manager
   cd openpilot/system/manager
-  if [ ! -f $DIR/prebuilt ]; then
+  # Skip build.py when this exact source tree was already built here. The `prebuilt` file
+  # alone skips it only where no build was ever recorded (or git cannot be read): once a
+  # build is recorded, a pull or an edit rebuilds even with `prebuilt` present, so quick
+  # boot cannot leave stale binaries or panda firmware.
+  BUILT_SOURCE="$DIR/.built_source"
+  if ! CURRENT_SOURCE="$(source_fingerprint)"; then
+    CURRENT_SOURCE=""
+  fi
+  SKIP_BUILD=""
+  if [ -n "$CURRENT_SOURCE" ] && [ "$(cat "$BUILT_SOURCE" 2>/dev/null)" == "$CURRENT_SOURCE" ]; then
+    SKIP_BUILD=1
+  elif [ -f $DIR/prebuilt ] && { [ -z "$CURRENT_SOURCE" ] || [ ! -f "$BUILT_SOURCE" ]; }; then
+    SKIP_BUILD=1
+  fi
+  if [ -z "$SKIP_BUILD" ]; then
     ./build.py
+    if [ $? -eq 0 ] && [ -n "$CURRENT_SOURCE" ]; then
+      echo "$CURRENT_SOURCE" > "$BUILT_SOURCE"
+    fi
   fi
   ./manager.py
 
