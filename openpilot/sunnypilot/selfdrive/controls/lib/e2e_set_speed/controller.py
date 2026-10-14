@@ -49,8 +49,9 @@ LaneChangeState = log.LaneChangeState
 PARAM = "ExperimentalModeSetSpeed"
 
 # Floor: close the gap a little firmer than stock MRCC after a set-speed step (~7.7 s, peaking at
-# a median 0.57 m/s^2, p90 0.72), faded in above walking pace.
-TAU = 6.0  # s
+# a median 0.57 m/s^2, p90 0.72), faded in above walking pace. Local tuning: 4.0 s (zoompilot 6.0)
+# for a quicker pickup back to the set speed.
+TAU = 4.0  # s
 FLOOR_MAX = 0.8  # m/s^2
 MIN_SPEED = 5.0  # m/s
 FULL_SPEED = 8.0  # m/s
@@ -88,7 +89,7 @@ GIVE_MAX = 0.6  # m/s^2
 
 BOOST_RATE = 0.5  # m/s^3, both ways
 HAZARD_FALL = 2.4  # m/s^3, cutting a boost for a hazard
-HOLD_TIME = 3.0  # s after the last hazard
+HOLD_TIME = 1.5  # s after the last hazard (local tuning, zoompilot 3.0: re-arms sooner)
 
 LAT_HORIZON = 10.0  # s, for the friction circle
 
