@@ -84,6 +84,16 @@ _NEAR_T_BIG = 4.0  # s
 
 _V_FLOOR = 0.5  # m/s; model velocity floor when converting yaw rate to curvature
 
+# Floor turns. Pulling away from a signal on openpilot long, the car crosses MIN_V mid-turn in a
+# corner tighter than the floor allows, and a cycle started there can only hold MIN_V: the pull-away
+# pauses at the exit (routes 0000014b, 00000151-153). A corner the car is already turning through
+# near the floor is left to the plan until the solver releases it, unless the car would reach
+# _FLOOR_TURN_LAT_CAP on the curvature past the actuation lead _FLOOR_TURN_PROJ_T on (the turn goes
+# on: loops, hairpins, a tightening corner), or gets more than the in-curve margin over the curve.
+_FLOOR_TURN_LAT_ACC = 1.6  # m/s2, already turning
+_FLOOR_TURN_LAT_CAP = 2.8  # m/s2; at this cap synthetic R15/R20 loops from a stop peak as before
+_FLOOR_TURN_PROJ_T = 1.0  # s
+
 # UI state thresholds do not affect control output.
 _TURNING_LAT_ACC_TH = 1.6  # current lat acc above this displays as turning
 _LEAVING_LAT_ACC_TH = 1.3  # turning displays as leaving below this
@@ -114,6 +124,8 @@ class SmartCruiseControlVision(UpstreamVision):
     self.d_held = 0.  # and its remaining distance
     self.seen_frames = 0  # consecutive frames a bend has bound
     self.max_pred_lat_acc = 0.
+    self.lat_ahead = 0.  # lateral acceleration past the actuation lead, _FLOOR_TURN_PROJ_T on
+    self.floor_turn = False  # the curve is a floor turn left to the plan
 
   def _update_calculations(self, sm: messaging.SubMaster) -> None:
     if not self.long_enabled or not self.enabled:
@@ -160,6 +172,10 @@ class SmartCruiseControlVision(UpstreamVision):
       if np.isfinite(v_dip):
         t_lead += lim.dash_traversal_time(max(self.v_ego - max(v_dip, MIN_V), 0.))
     d_lead = lead_distance(self.v_ego, t_lead, lim.a_budget, lim.jerk(self.v_ego))
+    # kappa is a magnitude, so left and right turns read alike
+    past_lead = near & (dist >= d_lead)
+    v_soon = self.v_ego + max(self.a_ego, 0.) * _FLOOR_TURN_PROJ_T
+    self.lat_ahead = v_soon ** 2 * float(np.max(kappa[past_lead])) if np.any(past_lead) else 0.
 
     self.a_required = required_decel(self.v_ego, v_allowed, dist, d_lead)
     # What the car must still shed from here. The commit gate budgets the stock dash walk in
@@ -206,7 +222,17 @@ class SmartCruiseControlVision(UpstreamVision):
       self.v_dip_held = float(v_max[i_dip])
       self.d_held = float(dist[i_dip])
 
+  def _update_floor_turn(self) -> None:
+    band = MIN_V + _IN_CURVE_MARGIN
+    escape = self.v_ego > max(self.v_near_min, MIN_V) + _IN_CURVE_MARGIN or self.lat_ahead >= _FLOOR_TURN_LAT_CAP
+    if not self.solver_active or escape:
+      self.floor_turn = False
+    elif (self.limits.op_long and self.v_dip_ahead <= band and self.v_ego <= band and
+          self.current_lat_acc >= _FLOOR_TURN_LAT_ACC):
+      self.floor_turn = True
+
   def _update_state_machine(self) -> tuple[bool, bool]:
+    self._update_floor_turn()
     if self.state != VisionState.disabled:
       # Longitudinal and feature disable take priority over active states.
       if not self.long_enabled or not self.enabled:
@@ -219,7 +245,7 @@ class SmartCruiseControlVision(UpstreamVision):
           # Do not start a turn-control cycle below the operating speed.
           if self.v_ego <= MIN_V:
             pass
-          elif self.solver_active:
+          elif self.solver_active and not self.floor_turn:
             self.state = VisionState.entering
 
         elif self.state == VisionState.overriding:
