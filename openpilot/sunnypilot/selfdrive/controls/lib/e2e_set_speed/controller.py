@@ -266,9 +266,11 @@ class E2ESetSpeedController:
 
     target = self.gain * max(0., min(floor, self.bound) - a_model) if self.authority else 0.
     # over the envelope, hand back what we added; behind a lead the MPC and the gap assist own the
-    # speed, so nothing new is handed back there and what was is let go at the normal rate
+    # speed, so nothing new is handed back there and what was is let go at the normal rate. Only
+    # where the plan drops TAPER_DROP does the model mean to slow; a smaller wobble just stops the
+    # boost (routes 00000150/00000152: a ~1 mph dip handed back GIVE_MAX on a clear road)
     give = min(self.added / GIVE_T, GIVE_MAX)
-    if self.bound < a_model and give > 0. and hazard != Inhibit.lead:
+    if self.bound < a_model and give > 0. and hazard != Inhibit.lead and vel[0] - vel.min() >= TAPER_DROP:
       target = -min(give, a_model - self.bound)
     # a hazard cuts a boost fast; handing speed back is never urgent
     fall = HAZARD_FALL if not self.authority and self.boost > 0. else BOOST_RATE

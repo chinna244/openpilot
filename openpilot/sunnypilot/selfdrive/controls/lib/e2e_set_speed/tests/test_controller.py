@@ -307,3 +307,42 @@ def test_a_lead_lets_a_give_back_go_at_the_rate_limit():
     boosts.append(ctl.boost)
   assert np.abs(np.diff(boosts)).max() <= c.BOOST_RATE * DT + 1e-9
   assert boosts[-1] == 0.
+
+
+def _dip(depth):
+  """A plan that dips depth m/s between 2 and 6 s and comes back: the model wavering, not slowing."""
+  return _plan(lambda t: V_EGO - depth if 2. <= t <= 6. else V_EGO)
+
+
+def _with_speed_added():
+  ctl = settled(deliver=True)
+  run(ctl, 100, build_sm(V_EGO), deliver=True)
+  assert ctl.added > 0.5
+  return ctl
+
+
+def test_a_dip_under_taper_drop_gives_nothing_back():
+  # routes 00000150/00000152: a ~1 mph wobble in the plan handed back up to GIVE_MAX on a clear road
+  ctl = _with_speed_added()
+  boosts = []
+  for _ in range(60):
+    run(ctl, 1, build_sm(V_EGO, plan_v=_dip(c.TAPER_DROP - 0.3)), deliver=True)
+    boosts.append(ctl.boost)
+  assert min(boosts) >= 0.
+
+
+def test_a_dip_under_taper_drop_still_stops_adding():
+  ctl = _with_speed_added()
+  boost = ctl.boost
+  run(ctl, 60, build_sm(V_EGO, plan_v=_dip(c.TAPER_DROP - 0.3)), deliver=True)
+  assert ctl.boost < boost
+
+
+def test_a_dip_the_model_means_still_gives_back():
+  ctl = _with_speed_added()
+  boosts = []
+  for _ in range(60):
+    run(ctl, 1, build_sm(V_EGO, plan_v=_dip(c.TAPER_DROP + 1.)), deliver=True)
+    boosts.append(ctl.boost)
+  assert min(boosts) < 0.
+  assert min(boosts) >= -c.GIVE_MAX - 1e-9
