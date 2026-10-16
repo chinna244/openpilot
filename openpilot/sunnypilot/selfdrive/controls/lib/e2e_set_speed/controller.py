@@ -91,6 +91,14 @@ BOOST_RATE = 0.5  # m/s^3, both ways
 HAZARD_FALL = 2.4  # m/s^3, cutting a boost for a hazard
 HOLD_TIME = 1.5  # s after the last hazard (local tuning, zoompilot 3.0: re-arms sooner)
 
+# Highway: the floor's ceiling and the boost's rise ease from the city values above to these across
+# FLOOR_SPEED_BP. A full floor re-entering at BOOST_RATE after a hold or an uphill sag surged the car to
+# the Mazda ceiling and on top of the model's own pull (route 00000159). The boost falls at BOOST_RATE
+# everywhere.
+FLOOR_SPEED_BP = [15., 25.]  # m/s
+FLOOR_MAX_HIGHWAY = 0.5  # m/s^2
+BOOST_RISE_HIGHWAY = 0.25  # m/s^3
+
 LAT_HORIZON = 10.0  # s, for the friction circle
 
 # Upstream's ACC friction circle (selfdrive/controls/lib/longitudinal_planner.py), mirrored
@@ -101,6 +109,14 @@ A_TOTAL_MAX_V = [1.7, 3.2]
 T_IDXS = np.asarray(ModelConstants.T_IDXS)
 LAT_MASK = T_IDXS <= LAT_HORIZON
 SLOWING_MASK = (T_IDXS >= SLOWING_T[0]) & (T_IDXS <= SLOWING_T[1])
+
+
+def floor_max(v_ego: float) -> float:
+  return float(np.interp(v_ego, FLOOR_SPEED_BP, [FLOOR_MAX, FLOOR_MAX_HIGHWAY]))
+
+
+def boost_rise(v_ego: float) -> float:
+  return float(np.interp(v_ego, FLOOR_SPEED_BP, [BOOST_RATE, BOOST_RISE_HIGHWAY]))
 
 
 def envelope_bound(vel: np.ndarray, yaw_rate: np.ndarray, pos: np.ndarray, v_target: float, added: float) -> float:
@@ -235,7 +251,7 @@ class E2ESetSpeedController:
     lat_now = max(abs(curvature) * v_ego ** 2, abs(steer_lat_accel))
     lat_accel = max(lat_now, float(np.max(np.abs(yaw_rate * vel)[LAT_MASK])))
 
-    floor = float(np.clip((v_cruise - v_ego) / TAU, 0., FLOOR_MAX)) * float(np.interp(v_ego, [MIN_SPEED, FULL_SPEED], [0., 1.]))
+    floor = float(np.clip((v_cruise - v_ego) / TAU, 0., floor_max(v_ego))) * float(np.interp(v_ego, [MIN_SPEED, FULL_SPEED], [0., 1.]))
     a_total_max = float(np.interp(v_ego, A_TOTAL_MAX_BP, A_TOTAL_MAX_V))
     floor = min(floor, math.sqrt(max(a_total_max ** 2 - lat_accel ** 2, 0.)))
     if not allow_throttle:
@@ -274,5 +290,5 @@ class E2ESetSpeedController:
       target = -min(give, a_model - self.bound)
     # a hazard cuts a boost fast; handing speed back is never urgent
     fall = HAZARD_FALL if not self.authority and self.boost > 0. else BOOST_RATE
-    self.boost = max(-give, float(np.clip(target, self.boost - fall * self.dt, self.boost + BOOST_RATE * self.dt)))
+    self.boost = max(-give, float(np.clip(target, self.boost - fall * self.dt, self.boost + boost_rise(v_ego) * self.dt)))
     return a_model + self.boost

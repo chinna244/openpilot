@@ -84,14 +84,14 @@ def test_idle_resets_at_once(kwargs, reason):
 def test_boosts_from_the_first_frame_at_the_rate_limit():
   ctl = new_controller()
   boosts = [run(ctl, 1, build_sm(V_EGO), v_cruise=V_EGO + 10.) for _ in range(SETTLE_FRAMES)]
-  assert boosts[0] == pytest.approx(c.BOOST_RATE * DT)
-  assert max(np.diff([0.] + boosts)) <= c.BOOST_RATE * DT + 1e-9
-  assert boosts[-1] == pytest.approx(c.FLOOR_MAX)
+  assert boosts[0] == pytest.approx(c.boost_rise(V_EGO) * DT)
+  assert max(np.diff([0.] + boosts)) <= c.boost_rise(V_EGO) * DT + 1e-9
+  assert boosts[-1] == pytest.approx(c.floor_max(V_EGO))
   assert ctl.inhibit == Inhibit.none
 
 
 def test_floor_closes_the_gap():
-  assert settled().boost == pytest.approx((V_CRUISE - V_EGO) / c.TAU)
+  assert settled().boost == pytest.approx(min((V_CRUISE - V_EGO) / c.TAU, c.floor_max(V_EGO)))
 
 
 @pytest.mark.parametrize("v, floor", [
@@ -106,7 +106,7 @@ def test_floor_fades_in_above_walking_pace(v, floor):
 
 def test_gain_fades_the_boost_as_the_model_slows():
   ctl = new_controller()
-  floor = (V_CRUISE - V_EGO) / c.TAU
+  floor = min((V_CRUISE - V_EGO) / c.TAU, c.floor_max(V_EGO))
   a_model = -0.1
   gain = (a_model - c.GAIN_BP[0]) / (c.GAIN_BP[1] - c.GAIN_BP[0])
   run(ctl, SETTLE_FRAMES, build_sm(V_EGO), a_model=a_model)
@@ -346,3 +346,62 @@ def test_a_dip_the_model_means_still_gives_back():
     boosts.append(ctl.boost)
   assert min(boosts) < 0.
   assert min(boosts) >= -c.GIVE_MAX - 1e-9
+
+
+# Highway: the floor's ceiling and its rise ease from the city values over FLOOR_SPEED_BP (route 00000159)
+@pytest.mark.parametrize("v", [c.FULL_SPEED, 12., c.FLOOR_SPEED_BP[0]])
+def test_city_floor_and_rise_are_unchanged(v):
+  ctl = new_controller()
+  assert run(ctl, 1, build_sm(v), v_cruise=v + 10.) == pytest.approx(c.BOOST_RATE * DT)
+  assert ctl.floor == pytest.approx(c.FLOOR_MAX)
+
+
+@pytest.mark.parametrize("v", [c.FLOOR_SPEED_BP[1], 30.])
+def test_highway_floor_and_rise(v):
+  ctl = new_controller()
+  boosts = [run(ctl, 1, build_sm(v), v_cruise=v + 10.) for _ in range(200)]
+  assert boosts[0] == pytest.approx(c.BOOST_RISE_HIGHWAY * DT)
+  assert max(np.diff([0.] + boosts)) <= c.BOOST_RISE_HIGHWAY * DT + 1e-9
+  assert ctl.floor == pytest.approx(c.FLOOR_MAX_HIGHWAY)
+  assert boosts[-1] == pytest.approx(c.FLOOR_MAX_HIGHWAY)
+
+
+def test_floor_and_rise_interpolate_across_the_band():
+  v = sum(c.FLOOR_SPEED_BP) / 2
+  ctl = new_controller()
+  assert run(ctl, 1, build_sm(v), v_cruise=v + 10.) == pytest.approx((c.BOOST_RATE + c.BOOST_RISE_HIGHWAY) / 2 * DT)
+  assert ctl.floor == pytest.approx((c.FLOOR_MAX + c.FLOOR_MAX_HIGHWAY) / 2)
+
+
+def _settled_on_highway():
+  ctl = new_controller()
+  v = c.FLOOR_SPEED_BP[1]
+  run(ctl, 200, build_sm(v), v_cruise=v + 10., deliver=True)
+  assert ctl.boost == pytest.approx(c.FLOOR_MAX_HIGHWAY)
+  return ctl, v
+
+
+def test_highway_boost_still_falls_at_boost_rate():
+  ctl, v = _settled_on_highway()
+  before = ctl.boost
+  run(ctl, 1, build_sm(v), a_model=c.GAIN_BP[0], v_cruise=v + 10.)  # the model braking: gain 0, target 0
+  assert before - ctl.boost == pytest.approx(c.BOOST_RATE * DT)
+
+
+def test_highway_hazard_still_cuts_at_hazard_fall():
+  ctl, v = _settled_on_highway()
+  before = ctl.boost
+  run(ctl, 1, build_sm(v, lead=True), v_cruise=v + 10.)
+  assert before - ctl.boost == pytest.approx(c.HAZARD_FALL * DT)
+
+
+def test_highway_give_back_keeps_its_rate():
+  ctl, v = _settled_on_highway()
+  run(ctl, 100, build_sm(v), v_cruise=v + 10., deliver=True)
+  stopping = _plan(lambda t: max(v - 2. * t, 0.))
+  boosts = [ctl.boost]
+  for _ in range(200):
+    run(ctl, 1, build_sm(v, plan_v=stopping), v_cruise=v + 10., deliver=True)
+    boosts.append(ctl.boost)
+  assert min(boosts) < 0.
+  assert np.abs(np.diff(boosts)).max() == pytest.approx(c.BOOST_RATE * DT)

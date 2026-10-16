@@ -15,7 +15,7 @@ from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import T_IDX
 from openpilot.selfdrive.controls.lib.longitudinal_planner import LongitudinalPlanner, LongitudinalPlanSource
 from openpilot.sunnypilot.selfdrive.car.tests.fakes import FakeParams
 from openpilot.sunnypilot.selfdrive.controls.lib.dec.tests.test_dec_planner_gate import build_planner, build_sm
-from openpilot.sunnypilot.selfdrive.controls.lib.e2e_set_speed.controller import FLOOR_MAX, E2ESetSpeedController, Inhibit
+from openpilot.sunnypilot.selfdrive.controls.lib.e2e_set_speed.controller import E2ESetSpeedController, Inhibit, floor_max
 
 MODEL_ACCEL = 0.
 
@@ -61,7 +61,7 @@ def test_on_raises_the_e2e_candidate():
   planner = run_planner(True)
   assert planner.e2e_set_speed.inhibit == Inhibit.none
   assert planner.mpc.source == LongitudinalPlanSource.e2e
-  assert planner.output_a_target == pytest.approx(FLOOR_MAX)
+  assert planner.output_a_target == pytest.approx(floor_max(20.))  # the fixture's 20 m/s
 
 
 def test_plan_reports_the_floor():
