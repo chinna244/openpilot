@@ -405,3 +405,164 @@ def test_highway_give_back_keeps_its_rate():
     boosts.append(ctl.boost)
   assert min(boosts) < 0.
   assert np.abs(np.diff(boosts)).max() == pytest.approx(c.BOOST_RATE * DT)
+
+
+# A lead far enough ahead and not closing leaves the floor alone: the MPC candidate already holds the
+# lead's gap and the planner takes the min of the candidates, so the floor can only ask for what the
+# MPC allows. The lead stands the floor down only when it is near, closing or braking.
+FAR = {"lead": True, "lead_d": (c.FAR_LEAD_T + 1.) * V_EGO, "lead_vrel": 1.}  # 6 s ahead, pulling away
+
+
+def test_a_far_lead_pulling_away_leaves_the_floor_on():
+  ctl = new_controller()
+  boosts = [run(ctl, 1, build_sm(V_EGO, **FAR)) for _ in range(SETTLE_FRAMES)]
+  assert ctl.inhibit == Inhibit.none and ctl.authority == 1.
+  assert boosts[0] == pytest.approx(c.boost_rise(V_EGO) * DT)
+  assert boosts[-1] == pytest.approx(min((V_CRUISE - V_EGO) / c.TAU, c.floor_max(V_EGO)))
+
+
+def test_a_steady_far_lead_leaves_the_floor_on():
+  ctl = new_controller()
+  run(ctl, SETTLE_FRAMES, build_sm(V_EGO, **{**FAR, "lead_vrel": c.FAR_LEAD_CLOSING}))
+  assert ctl.inhibit == Inhibit.none and ctl.boost > 0.
+
+
+@pytest.mark.parametrize("v, sm_kwargs", [
+  (V_EGO, {**FAR, "lead_d": (c.FAR_LEAD_T - 0.5) * V_EGO}),  # inside the headway
+  (V_EGO, {**FAR, "lead_vrel": c.FAR_LEAD_CLOSING - 0.1}),  # closing
+  (V_EGO, {**FAR, "lead_a": c.FAR_LEAD_BRAKING - 0.1, "lead_vrel": c.FAR_LEAD_CLOSING - 0.1}),  # braking and closing
+  (V_EGO, {**FAR, "lead_d": float('nan')}),  # a lead that is not a number is not clearly far
+  (V_EGO, {"lead": True}),  # on the bumper
+  (V_EGO, {**FAR, "lead2": (c.FAR_LEAD_T * V_EGO - 10., 1., 0.)}),  # a second lead that is near
+  (V_EGO, {**FAR, "lead2": (FAR["lead_d"] + 20., c.FAR_LEAD_CLOSING - 0.1, 0.)}),  # a second lead that is closing
+  (6., {"lead": True, "lead_d": c.FAR_LEAD_MIN - 5., "lead_vrel": 1.}),  # slow: 5 s is under the minimum distance
+])
+def test_a_near_or_closing_lead_still_stands_the_floor_down_at_once(v, sm_kwargs):
+  ctl = new_controller()
+  run(ctl, SETTLE_FRAMES, build_sm(v), v_cruise=v + 3.)
+  start = ctl.boost
+  assert start > 0.
+  run(ctl, 1, build_sm(v, **sm_kwargs), v_cruise=v + 3.)
+  assert (ctl.inhibit, ctl.authority) == (Inhibit.lead, 0.)
+  assert ctl.boost == pytest.approx(start - c.HAZARD_FALL * DT)
+
+
+def test_a_far_lead_that_closes_cuts_the_boost_and_holds():
+  ctl = new_controller()
+  run(ctl, SETTLE_FRAMES, build_sm(V_EGO, **FAR))
+  start = ctl.boost
+  assert start > 0.
+  # a cut-in or a braking lead: closing now
+  run(ctl, math.ceil(start / (c.HAZARD_FALL * DT)), build_sm(V_EGO, **{**FAR, "lead_vrel": -3.}))
+  assert ctl.boost == 0. and ctl.inhibit == Inhibit.lead
+  # far again: the hold runs out first, as after any other hazard
+  assert run(ctl, HOLD_FRAMES, build_sm(V_EGO, **FAR)) == 0.
+  assert ctl.inhibit == Inhibit.hold
+  assert run(ctl, 1, build_sm(V_EGO, **FAR)) > 0.
+
+
+def test_a_far_lead_does_not_end_the_hold_after_a_driver_press():
+  ctl = settled()
+  run(ctl, 1, build_sm(V_EGO, gas=True))
+  assert ctl.inhibit == Inhibit.driver
+  assert run(ctl, HOLD_FRAMES, build_sm(V_EGO, **FAR)) == 0.
+  assert run(ctl, 1, build_sm(V_EGO, **FAR)) > 0.
+
+
+# A far lead that brakes without closing: the MPC candidate is not binding, so a hazard-rate cut would only be a jerk.
+SOFT = {**FAR, "lead_a": c.FAR_LEAD_BRAKING - 0.5}
+
+
+def _boosted_behind_a_far_lead():
+  ctl = new_controller()
+  run(ctl, SETTLE_FRAMES, build_sm(V_EGO, **FAR))
+  assert ctl.boost > 0.
+  return ctl
+
+
+def test_a_braking_far_lead_winds_the_boost_down_at_the_normal_rate():
+  ctl = _boosted_behind_a_far_lead()
+  start = ctl.boost
+  run(ctl, 1, build_sm(V_EGO, **SOFT))
+  assert (ctl.inhibit, ctl.authority) == (Inhibit.lead, 0.)
+  assert ctl.boost == pytest.approx(start - c.BOOST_RATE * DT)
+  run(ctl, math.ceil(start / (c.BOOST_RATE * DT)), build_sm(V_EGO, **SOFT))
+  assert ctl.boost == 0.
+  assert run(ctl, 20, build_sm(V_EGO, **SOFT)) == 0.  # and it does not grow back while the lead brakes
+
+
+def test_a_braking_far_lead_that_starts_closing_cuts_at_the_hazard_rate():
+  ctl = _boosted_behind_a_far_lead()
+  run(ctl, 1, build_sm(V_EGO, **SOFT))
+  before = ctl.boost
+  run(ctl, 1, build_sm(V_EGO, **{**SOFT, "lead_vrel": c.FAR_LEAD_CLOSING - 0.5}))
+  assert ctl.boost == pytest.approx(before - c.HAZARD_FALL * DT)
+
+
+def test_the_hold_follows_a_soft_cut_like_any_other():
+  ctl = _boosted_behind_a_far_lead()
+  run(ctl, math.ceil(ctl.boost / (c.BOOST_RATE * DT)) + 1, build_sm(V_EGO, **SOFT))
+  assert run(ctl, HOLD_FRAMES, build_sm(V_EGO, **FAR)) == 0.
+  assert ctl.inhibit == Inhibit.hold
+  assert run(ctl, 1, build_sm(V_EGO, **FAR)) > 0.
+
+
+@pytest.mark.parametrize("sm_kwargs", [
+  {"lead_d": (c.FAR_LEAD_T - 0.5) * V_EGO},
+  {"lead_vrel": c.FAR_LEAD_CLOSING - 0.1},
+])
+def test_a_soft_lead_never_softens_a_near_or_closing_one(sm_kwargs):
+  ctl = _boosted_behind_a_far_lead()
+  start = ctl.boost
+  run(ctl, 1, build_sm(V_EGO, **{**SOFT, **sm_kwargs}))
+  assert ctl.boost == pytest.approx(start - c.HAZARD_FALL * DT)
+
+
+# Coming back to far from near asks for a little more than staying far does.
+EDGE = {**FAR, "lead_d": (c.FAR_LEAD_T + 0.5) * V_EGO}  # far enough to stay far, not to become far again
+NEAR = {**FAR, "lead_d": (c.FAR_LEAD_T - 0.5) * V_EGO}
+
+
+def test_a_lead_at_the_edge_of_far_is_far_until_it_has_been_near():
+  ctl = new_controller()
+  run(ctl, SETTLE_FRAMES, build_sm(V_EGO, **EDGE))
+  assert ctl.inhibit == Inhibit.none and ctl.boost > 0.
+
+
+def test_a_lead_has_to_be_a_little_further_to_count_as_far_again():
+  ctl = new_controller()
+  run(ctl, SETTLE_FRAMES, build_sm(V_EGO, **EDGE))
+  run(ctl, 1, build_sm(V_EGO, **NEAR))
+  assert ctl.inhibit == Inhibit.lead
+  run(ctl, HOLD_FRAMES + SETTLE_FRAMES, build_sm(V_EGO, **EDGE))
+  assert (ctl.inhibit, ctl.boost) == (Inhibit.lead, 0.)  # still near at the edge
+  run(ctl, 1, build_sm(V_EGO, **FAR))  # a full re-arm margin ahead
+  assert ctl.inhibit == Inhibit.hold
+  run(ctl, HOLD_FRAMES, build_sm(V_EGO, **EDGE))  # and far again at the edge, since it has been far since
+  assert run(ctl, 1, build_sm(V_EGO, **EDGE)) > 0.
+
+
+@pytest.mark.parametrize("clear", ["no_lead", "idle"])
+def test_the_edge_rule_is_forgotten_when_the_lead_is_gone(clear):
+  ctl = new_controller()
+  run(ctl, 1, build_sm(V_EGO, **NEAR))
+  assert ctl.inhibit == Inhibit.lead
+  if clear == "no_lead":
+    run(ctl, 1, build_sm(V_EGO))
+  else:
+    run(ctl, 1, build_sm(V_EGO), is_e2e=False)
+  run(ctl, HOLD_FRAMES + SETTLE_FRAMES, build_sm(V_EGO, **EDGE))
+  assert ctl.inhibit == Inhibit.none and ctl.boost > 0.
+
+
+def test_the_edge_rule_never_delays_a_hazard():
+  ctl = new_controller()
+  run(ctl, 1, build_sm(V_EGO, **NEAR))
+  run(ctl, HOLD_FRAMES, build_sm(V_EGO, **FAR))
+  run(ctl, SETTLE_FRAMES, build_sm(V_EGO, **FAR))
+  start = ctl.boost
+  assert start > 0.
+  run(ctl, 1, build_sm(V_EGO, **{**FAR, "lead_vrel": c.FAR_LEAD_CLOSING - 0.1}))
+  assert (ctl.inhibit, ctl.authority) == (Inhibit.lead, 0.)
+  assert ctl.boost == pytest.approx(start - c.HAZARD_FALL * DT)
+

@@ -25,7 +25,7 @@ still meets every ceiling further on, and the boost may only accelerate toward i
 
 Because the model will not shed speed we added before a bend or a stop, the boost goes negative
 when the car is over the envelope: it gives back the speed it put on, never more, so the car
-reaches each slowdown at the model's own speed. Hazards (FCW, a lead, the driver, a lane change)
+reaches each slowdown at the model's own speed. Hazards (FCW, a near lead, the driver, a lane change)
 cut the boost and hold it off for a few seconds.
 
 Without a lead nothing above the e2e candidate bounds it (the MPC's synthetic lead and the e2e
@@ -91,6 +91,23 @@ BOOST_RATE = 0.5  # m/s^3, both ways
 HAZARD_FALL = 2.4  # m/s^3, cutting a boost for a hazard
 HOLD_TIME = 1.5  # s after the last hazard (local tuning, zoompilot 3.0: re-arms sooner)
 
+# A lead is a hazard only when it is near, closing or braking. Further ahead and steady, the MPC candidate
+# already holds its gap and the planner takes the lowest candidate, so the floor can ask only for what the
+# MPC allows, while the gap assist stays out for seconds after a new or uncertain lead (routes 0000015b
+# 96-115 s and 0000015c 82-85 s: a lead 55-116 m ahead pulling away at 6-9 s, the model asking 0.2-0.4 m/s^2
+# under a 0.8 floor).
+FAR_LEAD_T = 5.0  # s of headway
+FAR_LEAD_MIN = 40.  # m, at any speed
+FAR_LEAD_CLOSING = -0.5  # m/s, vRel below this is closing
+FAR_LEAD_BRAKING = -0.5  # m/s^2, the gap assist's own bar for a braking lead
+# A far lead that is braking but not closing winds the boost down at BOOST_RATE instead of cutting it: the MPC
+# candidate is not binding yet, so a hazard-rate cut would only be a jerk. Near or closing still cuts at once.
+# Coming back to far from near asks for a little more than staying far does, so a lead hovering at the edge does not
+# cut and re-grow the boost. Only the way back is slower, never the way into a hazard.
+FAR_LEAD_REARM_T = 1.0  # s of extra headway
+FAR_LEAD_REARM_CLOSING = 0.3  # m/s
+FAR_LEAD_REARM_BRAKING = 0.2  # m/s^2
+
 # Highway: the floor's ceiling and the boost's rise ease from the city values above to these across
 # FLOOR_SPEED_BP. A full floor re-entering at BOOST_RATE after a hold or an uphill sag surged the car to
 # the Mazda ceiling and on top of the model's own pull (route 00000159). The boost falls at BOOST_RATE
@@ -154,9 +171,11 @@ class E2ESetSpeedController:
     self.bound_k = dt / (BOUND_TAU + dt)
     self.frame = -1
     self.enabled = False
+    self.lead_near = False  # a lead was near and has not been far since
     self._reset(Inhibit.disabled)
 
   def _reset(self, reason) -> None:
+    self.lead_near = False
     self.gain = 0.
     self.floor = 0.
     self.bound = math.nan  # unset: the next bound is taken as is
@@ -197,16 +216,35 @@ class E2ESetSpeedController:
     msg.bound = float(self.bound) if math.isfinite(self.bound) else 0.
     msg.added = float(self.added)
 
-  @staticmethod
-  def _hazard(sm: messaging.SubMaster, fcw: bool):
-    CS, md, rs, cs = sm['carState'], sm['modelV2'], sm['radarState'], sm['controlsState']
+  def _lead_class(self, lead, v_ego: float) -> int:
+    """0 far and steady, 1 far and not closing but braking, 2 near or closing; anything not clearly far is 2."""
+    if not lead.present:
+      return 0
+    back = self.lead_near  # after a near lead, far takes a little more
+    headway = (FAR_LEAD_T + (FAR_LEAD_REARM_T if back else 0.)) * v_ego
+    if not (lead.dRel >= max(headway, FAR_LEAD_MIN) and lead.vRel >= FAR_LEAD_CLOSING + (FAR_LEAD_REARM_CLOSING if back else 0.)):
+      return 2
+    return 0 if lead.aLeadK >= FAR_LEAD_BRAKING + (FAR_LEAD_REARM_BRAKING if back else 0.) else 1
+
+  def _lead_level(self, sm: messaging.SubMaster) -> int:
+    """The worst of the leads: 0 far and steady (or none), 1 far but braking, 2 near or closing."""
+    rs, v_ego = sm['radarState'], sm['carState'].vEgo
+    level = max(self._lead_class(rs.leadOne, v_ego), self._lead_class(rs.leadTwo, v_ego))
+    if level == 2:
+      self.lead_near = True
+    elif level == 0:
+      self.lead_near = False
+    return level
+
+  def _hazard(self, sm: messaging.SubMaster, fcw: bool):
+    CS, md, cs = sm['carState'], sm['modelV2'], sm['controlsState']
     if fcw:
       return Inhibit.fcw
     if md.meta.hardBrakePredicted:
       return Inhibit.hardBrake
     if cs.forceDecel:
       return Inhibit.forceDecel
-    if rs.leadOne.present or rs.leadTwo.present:
+    if self._lead_level(sm) == 2:
       return Inhibit.lead
     if CS.gasPressed or CS.brakePressed:
       return Inhibit.driver
@@ -267,6 +305,9 @@ class E2ESetSpeedController:
     self.gain = float(np.interp(a_model, GAIN_BP, [0., 1.]))
 
     hazard = self._hazard(sm, fcw)
+    soft = False
+    if hazard is None and self._lead_level(sm) == 1:
+      hazard, soft = Inhibit.lead, True  # no new boost; the old one winds down
     if hazard is not None:
       self.hold_left = self.hold_frames
       self.inhibit = hazard
@@ -289,6 +330,6 @@ class E2ESetSpeedController:
     if self.bound < a_model and give > 0. and hazard != Inhibit.lead and vel[0] - vel.min() >= TAPER_DROP:
       target = -min(give, a_model - self.bound)
     # a hazard cuts a boost fast; handing speed back is never urgent
-    fall = HAZARD_FALL if not self.authority and self.boost > 0. else BOOST_RATE
+    fall = HAZARD_FALL if not self.authority and self.boost > 0. and not soft else BOOST_RATE
     self.boost = max(-give, float(np.clip(target, self.boost - fall * self.dt, self.boost + boost_rise(v_ego) * self.dt)))
     return a_model + self.boost

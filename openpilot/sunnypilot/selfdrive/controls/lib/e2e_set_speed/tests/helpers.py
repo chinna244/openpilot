@@ -20,9 +20,11 @@ def plan_pos(vel: np.ndarray) -> np.ndarray:
 
 
 def build_sm(v_ego: float, plan_v=None, yaw_rate=0., curvature=0., lead=False, gas=False, brake=False,
-             should_stop=False, hard_brake=False, force_decel=False, lane_change=False) -> dict:
+             should_stop=False, hard_brake=False, force_decel=False, lane_change=False,
+             lead_d=0., lead_vrel=0., lead_a=0., lead2=None) -> dict:
   """Readers for the four services the controller reads. plan_v and yaw_rate take a scalar or a
-  33-point trajectory on the model's T_IDXS."""
+  33-point trajectory on the model's T_IDXS. A lead is where lead_d, lead_vrel and lead_a put it: left
+  at zero it is on the bumper, a hazard at any speed."""
   cs = messaging.new_message('carState')
   cs.carState.vEgo = v_ego
   cs.carState.gasPressed = gas
@@ -40,6 +42,12 @@ def build_sm(v_ego: float, plan_v=None, yaw_rate=0., curvature=0., lead=False, g
 
   rs = messaging.new_message('radarState')
   rs.radarState.leadOne.present = lead
+  rs.radarState.leadOne.dRel = lead_d
+  rs.radarState.leadOne.vRel = lead_vrel
+  rs.radarState.leadOne.aLeadK = lead_a
+  if lead2 is not None:  # (dRel, vRel, aLeadK)
+    rs.radarState.leadTwo.present = True
+    rs.radarState.leadTwo.dRel, rs.radarState.leadTwo.vRel, rs.radarState.leadTwo.aLeadK = lead2
 
   ctrl = messaging.new_message('controlsState')
   ctrl.controlsState.forceDecel = force_decel
