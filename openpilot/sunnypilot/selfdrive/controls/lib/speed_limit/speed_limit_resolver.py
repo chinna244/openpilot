@@ -21,6 +21,9 @@ SpeedLimitSource = custom.LongitudinalPlanSP.SpeedLimit.Source
 
 ALL_SOURCES = tuple(SpeedLimitSource.schema.enumerants.values())
 
+# A GPS message logged further ahead of now than this is not trusted either.
+MAP_FIX_FUTURE_TOLERANCE = 1.  # s
+
 
 class SpeedLimitResolver:
   limit_solutions: dict[custom.LongitudinalPlanSP.SpeedLimit.Source, float]
@@ -123,24 +126,43 @@ class SpeedLimitResolver:
     self._reset_limit_sources(SpeedLimitSource.map)
     self._process_map_data(sm)
 
+  @staticmethod
+  def _message_age(sm: messaging.SubMaster, service: str) -> float | None:
+    """Seconds since the last message of a service, on the monotonic clock it was logged on; None if too old (or
+    logged in the future). unixTimestampMillis is wall-clock time and cannot be aged against monotonic."""
+    age = time.monotonic() - sm.logMonoTime[service] * 1e-9
+    if not -MAP_FIX_FUTURE_TOLERANCE <= age <= LIMIT_MAX_MAP_DATA_AGE:
+      return None
+    return age
+
+  def _gps_fix_age(self, sm: messaging.SubMaster) -> float | None:
+    """Age of the last GPS message, which must carry a fix; None without a current fix. Without one mapd keeps
+    the last road it matched, and its limit must not reach the planner (routes 00000152-159)."""
+    if not sm[self._gps_location_service].hasFix:
+      return None
+    return self._message_age(sm, self._gps_location_service)
+
   def _process_map_data(self, sm: messaging.SubMaster) -> None:
-    gps_data = sm[self._gps_location_service]
     map_data = sm['liveMapDataSP']
 
-    gps_fix_age = time.monotonic() - gps_data.unixTimestampMillis * 1e-3
-    if gps_fix_age > LIMIT_MAX_MAP_DATA_AGE:
+    gps_fix_age = self._gps_fix_age(sm)
+    if gps_fix_age is None:
+      return
+
+    # plannerd ignores liveMapDataSP liveness: a mapd that stopped publishing leaves its last limit in the SubMaster
+    if self._message_age(sm, 'liveMapDataSP') is None:
       return
 
     speed_limit = map_data.speedLimit if map_data.speedLimitValid else 0.
     next_speed_limit = map_data.speedLimitAhead if map_data.speedLimitAheadValid else 0.
 
-    self._calculate_map_data_limits(sm, speed_limit, next_speed_limit)
+    self._calculate_map_data_limits(sm, speed_limit, next_speed_limit, gps_fix_age)
 
-  def _calculate_map_data_limits(self, sm: messaging.SubMaster, speed_limit: float, next_speed_limit: float) -> None:
-    gps_data = sm[self._gps_location_service]
+  def _calculate_map_data_limits(self, sm: messaging.SubMaster, speed_limit: float, next_speed_limit: float,
+                                 gps_fix_age: float) -> None:
     map_data = sm['liveMapDataSP']
 
-    distance_since_fix = self.v_ego * (time.monotonic() - gps_data.unixTimestampMillis * 1e-3)
+    distance_since_fix = self.v_ego * max(gps_fix_age, 0.)
     distance_to_speed_limit_ahead = max(0., map_data.speedLimitAheadDistance - distance_since_fix)
 
     self.limit_solutions[SpeedLimitSource.map] = speed_limit
