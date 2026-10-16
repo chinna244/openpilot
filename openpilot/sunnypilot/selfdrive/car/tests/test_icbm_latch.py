@@ -220,6 +220,7 @@ class TestCardHandover:
 class TestPlannerHandover:
   def _targets(self, planner, activation):
     cc = messaging.new_message('carControl').carControl
+    planner.scc.update = MagicMock()
     sm = {'carState': messaging.new_message('carState').carState, 'carControl': cc, 'carStateSP': _cs_sp(activation)}
     planner.update_targets(sm, 20., 0., 25.)
 

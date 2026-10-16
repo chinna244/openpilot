@@ -7,14 +7,17 @@ See the LICENSE.md file in the root directory for more details.
 import json
 import math
 import platform
-
+from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 from openpilot.cereal import custom
 from openpilot.common.params import Params
 from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.car.cruise import V_CRUISE_UNSET
 from openpilot.sunnypilot.selfdrive.controls.lib.smart_cruise_control.map_controller import R, SmartCruiseControlMap
+from openpilot.common.parameterized import parameterized
 from openpilot.common.test import OpenpilotTestCase
+from openpilot.sunnypilot.selfdrive.controls.lib.smart_cruise_control.smart_cruise_control import SmartCruiseControl
 
 MapState = VisionState = custom.LongitudinalPlanSP.SmartCruiseControl.MapState
 
@@ -73,3 +76,52 @@ class TestSmartCruiseControlMap(OpenpilotTestCase):
     self.assertAlmostEqual(self.scc_m.v_target, 24.0, delta=24.0 * 1e-6)
 
   # TODO-SP: mock data from modelV2 to test other states
+
+  def _curve_ahead(self):
+    # v_ego=25, a_ego=0, tv=24 at a 40 m waypoint: a target with a valid position (test_moderate_curve)
+    waypoint_lon_deg = (40.0 / R) * (180.0 / math.pi)
+    self.mem_params.put("LastGPSPosition", json.dumps({"latitude": 0.0, "longitude": 0.0}), block=True)
+    self.mem_params.put("MapTargetVelocities",
+                        json.dumps([{"latitude": 0.0, "longitude": waypoint_lon_deg, "velocity": 24.0}]), block=True)
+
+  def test_invalid_position_ignores_the_targets(self):
+    self._curve_ahead()
+    for _ in range(3):
+      self.scc_m.update(True, False, 25.0, 0.0, 30.0, False)
+    assert self.scc_m.state == MapState.enabled and not self.scc_m.is_active
+    assert self.scc_m.v_target != 24.0
+    assert self.scc_m.output_v_target == V_CRUISE_UNSET
+
+  def test_position_lost_while_turning_releases_the_target(self):
+    self._curve_ahead()
+    for _ in range(3):
+      self.scc_m.update(True, False, 25.0, 0.0, 30.0)
+    assert self.scc_m.state == MapState.turning
+
+    self.scc_m.update(True, False, 25.0, 0.0, 30.0, False)
+    assert self.scc_m.state == MapState.enabled and not self.scc_m.is_active
+    assert self.scc_m.output_v_target == V_CRUISE_UNSET
+
+    self.scc_m.update(True, False, 25.0, 0.0, 30.0)
+    self.scc_m.update(True, False, 25.0, 0.0, 30.0)
+    assert self.scc_m.state == MapState.turning
+    self.assertAlmostEqual(self.scc_m.v_target, 24.0, delta=24.0 * 1e-6)
+
+
+class TestSmartCruiseControlMapPositionValid(OpenpilotTestCase):
+  """The planner passes the map controller whether the position mapd holds is current: liveMapDataSP valid
+  (published with the localizer) and alive (mapd still publishing)."""
+
+  @parameterized.expand([
+    ("valid_and_alive", True, True, True),
+    ("localizer_invalid", False, True, False),
+    ("mapd_not_publishing", True, False, False),
+    ("neither", False, False, False),
+  ], names=["case", "valid", "alive", "expected"])
+  def test_position_valid_reaches_the_map_controller(self, case, valid, alive, expected):
+    scc = SmartCruiseControl()
+    scc.map.update = MagicMock()
+    scc.vision.update = MagicMock()
+    sm = SimpleNamespace(valid={'liveMapDataSP': valid}, alive={'liveMapDataSP': alive})
+    scc.update(sm, True, False, 25., 0., 30.)
+    assert scc.map.update.call_args.args[-1] is expected

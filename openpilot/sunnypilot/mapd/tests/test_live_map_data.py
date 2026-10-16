@@ -42,13 +42,13 @@ def make_map_data(mocker, map_limit=30 * MPH, next_limit=0., next_latitude=None)
   return OsmMapData()
 
 
-def tick(map_data, status, position_valid):
+def tick(map_data, status, position_valid, gps_ok=None):
   location = map_data.sm.__getitem__.return_value
   location.status = status
   location.positionGeodetic.valid = position_valid
   location.positionGeodetic.value = [43.0, -87.9, 180.]
   location.calibratedOrientationNED.value = [0., 0., 0.]
-  location.gpsOK = status == Status.valid and position_valid
+  location.gpsOK = (status == Status.valid and position_valid) if gps_ok is None else gps_ok
   map_data.tick()
   return map_data.pm.send.call_args.args[1].liveMapDataSP
 
@@ -87,3 +87,15 @@ class TestLiveMapDataPublisher(OpenpilotTestCase):
     map_data = make_map_data(mocker)
     assert tick(map_data, Status.valid, True).speedLimitValid
     assert not tick(map_data, Status.uncalibrated, True).speedLimitValid
+
+  @parameterized.expand([
+    ("localizer_valid_gps_not_ok", Status.valid, True, False, True),   # a short GPS dropout: the localizer still dead-reckons
+    ("localizer_warming_up_gps_ok", Status.uninitialized, True, True, False),
+    ("localizer_valid_gps_ok", Status.valid, True, True, True),
+    ("localizer_lost_gps_not_ok", Status.uninitialized, False, False, False),
+  ], names=["case", "status", "position_valid", "gps_ok", "expected"])
+  def test_the_message_is_valid_while_the_localizer_is(self, case, status, position_valid, gps_ok, expected, mocker):
+    # SCC-Map drops its targets on this flag: it follows the position mapd was given, not gpsOK
+    map_data = make_map_data(mocker)
+    tick(map_data, status, position_valid, gps_ok)
+    assert map_data.pm.send.call_args.args[1].valid is expected

@@ -16,6 +16,7 @@ from openpilot.cereal import custom
 from opendbc.car import structs
 from openpilot.common.params import Params
 from openpilot.common.realtime import DT_MDL
+from openpilot.selfdrive.car.cruise import V_CRUISE_UNSET
 from openpilot.sunnypilot.selfdrive.controls.lib.smart_cruise_control.limits import COMMIT_FRAC
 from openpilot.sunnypilot.selfdrive.controls.lib.smart_cruise_control.zoompilot.map_controller import _CONFIRM_T, _CONFIRM_V_BP, R, SmartCruiseControlMap
 from openpilot.sunnypilot.selfdrive.controls.lib.smart_cruise_control.speed_profile import lead_distance, required_decel
@@ -233,3 +234,54 @@ class TestSmartCruiseControlMap(OpenpilotTestCase):
     self.scc_m.update(True, False, 25., 0., 25.)
     assert self.scc_m.v_target == pytest.approx(15.)
     assert self.scc_m.target_distance == pytest.approx(d0, abs=1.)
+
+  def drive(self, scc, v_ego, frames, position_valid=True):
+    for _ in range(frames):
+      scc.update(True, False, v_ego, 0., v_ego, position_valid)
+
+  def test_invalid_position_before_a_curve_does_not_bind(self):
+    # the same 15 m/s target binds at 25 m/s with a valid position (test_active_target_publishes_required_decel)
+    self._targets(15.)
+    self.drive(self.scc_m, 25., self.confirm_frames(25.) + 60, position_valid=False)
+    assert self.scc_m.state == MapState.enabled and not self.scc_m.is_active
+    assert self.scc_m.v_target == 0.
+    assert self.scc_m.output_v_target == V_CRUISE_UNSET
+
+  def test_position_lost_while_turning_releases_the_target(self):
+    self._targets(15.)
+    self.drive(self.scc_m, 25., self.confirm_frames(25.) + 2)
+    assert self.scc_m.state == MapState.turning and self.scc_m.output_v_target == pytest.approx(15.)
+
+    self.drive(self.scc_m, 25., 1, position_valid=False)
+    assert self.scc_m.state == MapState.enabled and not self.scc_m.is_active
+    assert self.scc_m.v_target == 0. and self.scc_m.target_distance == 0.
+    assert self.scc_m.output_v_target == V_CRUISE_UNSET
+    assert self.scc_m.output_a_target == 0.  # a_ego, no decel request left behind
+
+  def test_a_frozen_target_cannot_hold_a_speed_cap(self):
+    # routes 155/156: the position stays where it was while the car drives on at speed. A valid position
+    # holds the cap as long as the target is listed (control); an invalid one never lets it bind or hold.
+    self._targets(15.)
+    cp = structs.CarParams(brand="mazda", openpilotLongitudinalControl=True, longitudinalActuatorDelay=0.36)
+    held = SmartCruiseControlMap(cp)
+    self.drive(held, 25., int(60. / DT_MDL))
+    assert held.state == MapState.turning and held.output_v_target == pytest.approx(15.)
+
+    self.drive(self.scc_m, 25., self.confirm_frames(25.) + 2)
+    assert self.scc_m.is_active
+    for _ in range(int(60. / DT_MDL)):
+      self.drive(self.scc_m, 25., 1, position_valid=False)
+      assert not self.scc_m.is_active and self.scc_m.output_v_target == V_CRUISE_UNSET
+
+  def test_valid_position_restores_curve_behavior(self):
+    self._targets(15.)
+    self.drive(self.scc_m, 25., self.confirm_frames(25.) + 2)
+    self.drive(self.scc_m, 25., 5, position_valid=False)
+    assert not self.scc_m.is_active
+
+    # back to a valid position: the target is confirmed again before it binds, as for any new target
+    self.drive(self.scc_m, 25., 1)
+    assert not self.scc_m.is_active
+    self.drive(self.scc_m, 25., self.confirm_frames(25.) + 2)
+    assert self.scc_m.state == MapState.turning
+    assert self.scc_m.output_v_target == pytest.approx(15.)

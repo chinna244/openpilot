@@ -69,6 +69,7 @@ class SmartCruiseControlMap:
   a_ego: float = 0.
   output_v_target: float = V_CRUISE_UNSET
   output_a_target: float = 0.
+  position_valid: bool = True
 
   def __init__(self):
     self.params = Params()
@@ -105,7 +106,8 @@ class SmartCruiseControlMap:
     lat = self.last_position.latitude
     lon = self.last_position.longitude
 
-    self.target_velocities = velocities_from_param("MapTargetVelocities", self.mem_params) or []
+    # targets belong to the position mapd was given; without a valid one they are stale
+    self.target_velocities = (velocities_from_param("MapTargetVelocities", self.mem_params) or []) if self.position_valid else []
 
     if self.last_position is None or self.target_velocities is None:
       return
@@ -243,12 +245,13 @@ class SmartCruiseControlMap:
 
     return enabled, active
 
-  def update(self, long_enabled: bool, long_override: bool, v_ego, a_ego, v_cruise) -> None:
+  def update(self, long_enabled: bool, long_override: bool, v_ego, a_ego, v_cruise, position_valid: bool = True) -> None:
     self.long_enabled = long_enabled
     self.long_override = long_override
     self.v_ego = v_ego
     self.a_ego = a_ego
     self.v_cruise = v_cruise
+    self.position_valid = position_valid
 
     self.update_params()
     self.update_calculations()

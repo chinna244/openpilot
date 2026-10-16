@@ -64,7 +64,8 @@ class SmartCruiseControlMap(UpstreamMap):
 
   def update_calculations(self) -> None:
     self.last_position = coordinate_from_param("LastGPSPosition", self.mem_params) or Coordinate(0.0, 0.0)
-    self.target_velocities = velocities_from_param("MapTargetVelocities", self.mem_params) or []
+    # targets belong to the position mapd was given; without a valid one they are stale
+    self.target_velocities = (velocities_from_param("MapTargetVelocities", self.mem_params) or []) if self.position_valid else []
     lat, lon = self.last_position.latitude * TO_RADIANS, self.last_position.longitude * TO_RADIANS
     distances = [distance_to_point(lat, lon, p["latitude"] * TO_RADIANS, p["longitude"] * TO_RADIANS) for p in self.target_velocities]
 
