@@ -50,9 +50,10 @@ class BaseMapData(ABC):
     mapd_sp_send.valid = self.sm['liveLocationKalman'].gpsOK
     live_map_data = mapd_sp_send.liveMapDataSP
 
-    live_map_data.speedLimitValid = bool(MAX_SPEED_LIMIT > speed_limit > 0)
+    # mapd matches the last position it was given, and without a valid localizer that stays the last one stored
+    live_map_data.speedLimitValid = bool(self.localizer_valid and MAX_SPEED_LIMIT > speed_limit > 0)
     live_map_data.speedLimit = speed_limit
-    live_map_data.speedLimitAheadValid = bool(MAX_SPEED_LIMIT > next_speed_limit > 0)
+    live_map_data.speedLimitAheadValid = bool(self.localizer_valid and MAX_SPEED_LIMIT > next_speed_limit > 0)
     live_map_data.speedLimitAhead = next_speed_limit
     live_map_data.speedLimitAheadDistance = next_speed_limit_distance
     live_map_data.roadName = self.get_current_road_name()
