@@ -17,6 +17,7 @@ window); speedLimitActive fires on announce-counter deltas, which card bumps at 
 and never un-bumps, so a 20 Hz reader cannot miss one.
 """
 from openpilot.cereal import custom
+from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.controls.lib.drive_helpers import CONTROL_N
 from openpilot.selfdrive.modeld.constants import ModelConstants
 from openpilot.sunnypilot.selfdrive.controls.lib.smart_cruise_control.limits import get_planning_limits, publish_cap_decel
@@ -29,6 +30,11 @@ SessionState = custom.LongitudinalPlanSP.SpeedLimit.AssistState
 # past the sign (distance 0) the decel degrades to a pull over the control horizon,
 # matching SpeedLimitAssist's active-state form
 _T_ACTIVE = float(ModelConstants.T_IDXS[CONTROL_N])
+
+# A lower cap reaches the plan as a ramp, not a step: the cruise MPC answers a step of a few mph with up to its
+# full -1.2 m/s^2 within 1.5 s (route 00000163 776.3 s: 55 -> 50 mph, 63 -> 58 mph target). The ramp starts from
+# the current speed, so a cap far below it still brakes at once and a cap above the car's speed is unchanged.
+CAP_FALL_RATE = 0.6  # m/s^2
 
 
 class SpeedLimitAssistMirror:
@@ -44,6 +50,7 @@ class SpeedLimitAssistMirror:
     self.output_v_target = V_CRUISE_UNSET
     self.output_a_target = 0.
     self._a_out = 0.
+    self._v_ramp: float | None = None  # the plan cap last published, walking down toward a lower cap
     self._announce_seen: int | None = None  # sync on first update (plannerd restarts)
 
   @property
@@ -68,7 +75,15 @@ class SpeedLimitAssistMirror:
     # the arbiter publishes vCap as a target, a frozen hold, or V_CRUISE_UNSET, never 0; a 0
     # is capnp's default from a not-yet-received carStateSP and would win the plan min()
     v_cap = float(session.vCap)
-    self.output_v_target = v_cap if v_cap > 0.0 else V_CRUISE_UNSET
+    if v_cap > 0.0:
+      v_out = v_cap
+      if self._v_ramp is not None and v_cap < self._v_ramp:
+        v_out = max(v_cap, min(self._v_ramp, max(v_ego, v_cap)) - CAP_FALL_RATE * DT_MDL)
+      self._v_ramp = v_out
+      self.output_v_target = v_out
+    else:
+      self._v_ramp = None
+      self.output_v_target = V_CRUISE_UNSET
 
     # the decel actually required to arrive at the cap (it keys ICBM's overshoot gap on
     # stock ACC); computed here because the resolver's distance lives in plannerd
