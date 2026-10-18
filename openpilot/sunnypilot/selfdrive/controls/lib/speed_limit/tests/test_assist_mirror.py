@@ -80,7 +80,7 @@ class TestAssistMirrorDefaultMessage:
 
 
 class TestCapRamp:
-  """A lower cap walks down at CAP_FALL_RATE from the car's speed; it never delays a cap the car is already under."""
+  """For the plan a lower cap walks down at CAP_FALL_RATE from the car's speed; it never delays a cap the car is already under."""
 
   def _mirror(self):
     CP = car_struct.CarParams(brand="mazda", pcmCruise=False, openpilotLongitudinalControl=True)
@@ -95,32 +95,33 @@ class TestCapRamp:
     mirror = self._mirror()
     _update(mirror, self._session(28.0), v_ego=28.0, distance=0., a_ego=0.)
     _update(mirror, self._session(26.0), v_ego=28.0, distance=0., a_ego=0.)
-    assert mirror.output_v_target == pytest.approx(28.0 - CAP_FALL_RATE * DT_MDL)
+    assert mirror.plan_v_target == pytest.approx(28.0 - CAP_FALL_RATE * DT_MDL)
+    assert mirror.output_v_target == pytest.approx(26.0)  # the published cap (ICBM, alerts) is the session's own
     for _ in range(int(2.0 / 0.05)):
       _update(mirror, self._session(26.0), v_ego=28.0, distance=0., a_ego=0.)
-    assert mirror.output_v_target > 26.0  # 2 m/s at 0.6 m/s^2 takes 3.3 s; not there after 2.0 s
+    assert mirror.plan_v_target > 26.0  # 2 m/s at 0.6 m/s^2 takes 3.3 s; not there after 2.0 s
     for _ in range(int(2.0 / 0.05)):
       _update(mirror, self._session(26.0), v_ego=28.0, distance=0., a_ego=0.)
-    assert mirror.output_v_target == pytest.approx(26.0)
+    assert mirror.plan_v_target == pytest.approx(26.0)
 
   def test_ramp_starts_from_the_cars_speed_not_the_old_cap(self):
     mirror = self._mirror()
     _update(mirror, self._session(36.0), v_ego=27.0, distance=0., a_ego=0.)
     _update(mirror, self._session(25.0), v_ego=27.0, distance=0., a_ego=0.)
-    assert mirror.output_v_target == pytest.approx(27.0 - CAP_FALL_RATE * DT_MDL)
+    assert mirror.plan_v_target == pytest.approx(27.0 - CAP_FALL_RATE * DT_MDL)
 
   def test_rise_and_unset_pass_through(self):
     mirror = self._mirror()
     _update(mirror, self._session(25.0), v_ego=20.0, distance=0., a_ego=0.)
     _update(mirror, self._session(30.0), v_ego=20.0, distance=0., a_ego=0.)
-    assert mirror.output_v_target == pytest.approx(30.0)
+    assert mirror.plan_v_target == pytest.approx(30.0)
     _update(mirror, self._session(0.0), v_ego=20.0, distance=0., a_ego=0.)
-    assert mirror.output_v_target == V_CRUISE_UNSET
+    assert mirror.plan_v_target == V_CRUISE_UNSET
     _update(mirror, self._session(18.0), v_ego=20.0, distance=0., a_ego=0.)
-    assert mirror.output_v_target == pytest.approx(18.0)  # unset forgot the ramp
+    assert mirror.plan_v_target == pytest.approx(18.0)  # unset forgot the ramp
 
   def test_a_cap_above_the_cars_speed_is_not_delayed(self):
     mirror = self._mirror()
     _update(mirror, self._session(30.0), v_ego=20.0, distance=0., a_ego=0.)
     _update(mirror, self._session(25.0), v_ego=20.0, distance=0., a_ego=0.)
-    assert mirror.output_v_target == pytest.approx(25.0)
+    assert mirror.plan_v_target == pytest.approx(25.0)
