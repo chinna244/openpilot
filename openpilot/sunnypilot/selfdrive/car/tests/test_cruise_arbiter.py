@@ -17,7 +17,7 @@ from openpilot.common.constants import CV
 from openpilot.common.params import Params
 from openpilot.common.realtime import DT_CTRL
 from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.helpers import pcm_machine_owns_sla
-from openpilot.sunnypilot.selfdrive.car.cruise_arbiter import CruiseArbiter, \
+from openpilot.sunnypilot.selfdrive.car.cruise_arbiter import CruiseArbiter, REPROMPT_COOLDOWN, REPROMPT_HOLD, REPROMPT_MAX, \
   PRE_ACTIVE_GUARD_PERIOD as ARBITER_PROMPT_PERIOD, DISABLED_GUARD_PERIOD as ARBITER_GUARD_PERIOD
 from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.common import Mode
 
@@ -61,10 +61,13 @@ class TestCruiseArbiterNonPcm:
     lp.speedLimit.resolver.speedLimitLastValid = has_limit
     return lp
 
-  def frame(self, cluster_mph, limit_mph, has_limit=True, events=None):
+  def frame(self, cluster_mph, limit_mph, has_limit=True, events=None, v_mph=0., gas=False):
     self.arb.update_limit(self._lp(limit_mph, has_limit))
     CS = car_struct.CarState()
     CS.buttonEvents = events or []
+    CS.vEgo = v_mph * self.MPH
+    CS.gasPressed = gas
+    CS.standstill = v_mph < 0.1
     self.v_cruise_kph = self.arb.step(CS, True, self.v_cruise_kph, cluster_mph * CV.MPH_TO_KPH)
 
   def press(self, button_type, cluster_mph, limit_mph, has_limit=True):
@@ -336,3 +339,65 @@ class TestCruiseArbiterNonPcm:
     self.active_at(40, 35)
     assert self.announces(40, 40)
     assert self.arb.state == SpeedLimitAssistState.active
+
+  # a prompt nobody answered asks again while the set speed and the car are still over the limit's target
+
+  def run(self, seconds, cluster_mph, limit_mph, v_mph, gas=False):
+    for _ in range(int(seconds / DT_CTRL)):
+      self.frame(cluster_mph, limit_mph, v_mph=v_mph, gas=gas)
+
+  def ignored_prompt(self, cluster_mph=63, limit_mph=30, v_mph=30.):
+    self.go_pre_active(cluster_mph, limit_mph)
+    self.run(ARBITER_PROMPT_PERIOD + 0.1, cluster_mph, limit_mph, v_mph)
+    assert self.arb.state == SpeedLimitAssistState.inactive
+
+  def test_an_unanswered_prompt_asks_again(self):
+    self.ignored_prompt()
+    self.run(REPROMPT_COOLDOWN - 1., 63, 30, 30.)
+    assert self.arb.state == SpeedLimitAssistState.inactive  # not yet: the cooldown
+    self.run(1. + REPROMPT_HOLD + 0.1, 63, 30, 30.)
+    assert self.arb.state == SpeedLimitAssistState.preActive
+
+  def test_the_second_prompt_resolves_like_the_first(self):
+    self.ignored_prompt()
+    self.run(REPROMPT_COOLDOWN + REPROMPT_HOLD + 0.1, 63, 30, 30.)
+    assert self.arb.state == SpeedLimitAssistState.preActive
+    self.press(ButtonType.decelCruise, 63, 30)
+    assert self.arb.state == SpeedLimitAssistState.active
+
+  def test_any_press_is_an_answer(self):
+    self.ignored_prompt()
+    self.press(ButtonType.decelCruise, 63, 30)  # the driver steps the set speed down by hand
+    self.run(REPROMPT_COOLDOWN + 2 * REPROMPT_HOLD, 62, 30, 30.)
+    assert self.arb.state == SpeedLimitAssistState.inactive
+
+  def test_asks_at_most_twice_then_waits_for_the_next_limit(self):
+    self.ignored_prompt()
+    for _ in range(REPROMPT_MAX):
+      self.run(REPROMPT_COOLDOWN + REPROMPT_HOLD + 0.1, 63, 30, 30.)
+      assert self.arb.state == SpeedLimitAssistState.preActive
+      self.run(ARBITER_PROMPT_PERIOD + 0.1, 63, 30, 30.)
+      assert self.arb.state == SpeedLimitAssistState.inactive
+    self.run(2 * REPROMPT_COOLDOWN, 63, 30, 30.)
+    assert self.arb.state == SpeedLimitAssistState.inactive
+    self.frame(63, 35, v_mph=30.)  # a new limit prompts and re-arms
+    assert self.arb.state == SpeedLimitAssistState.preActive
+
+  @pytest.mark.parametrize("cluster_mph, v_mph, gas", [
+    (33, 30., False),   # the set speed is within the margin of the 30 mph target
+    (63, 10., False),   # the car is far below the limit: the set speed is not yet a problem
+    (63, 30., True),    # the driver is on the throttle
+    (63, 0., False),    # stopped
+  ])
+  def test_no_reprompt_when_there_is_nothing_to_ask(self, cluster_mph, v_mph, gas):
+    self.ignored_prompt(cluster_mph=max(cluster_mph, 63))
+    self.run(REPROMPT_COOLDOWN + 2 * REPROMPT_HOLD, cluster_mph, 30, v_mph, gas=gas)
+    assert self.arb.state == SpeedLimitAssistState.inactive
+
+  def test_a_short_overshoot_does_not_ask(self):
+    self.ignored_prompt()
+    self.run(REPROMPT_COOLDOWN, 63, 30, 10.)  # well under the limit through the cooldown
+    for _ in range(3):  # then over for less than the hold, dropping back below the near band each time
+      self.run(REPROMPT_HOLD - 0.5, 63, 30, 30.)
+      self.run(0.1, 63, 30, 10.)
+    assert self.arb.state == SpeedLimitAssistState.inactive

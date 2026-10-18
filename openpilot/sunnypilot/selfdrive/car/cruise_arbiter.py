@@ -29,6 +29,14 @@ CruiseIntent = custom.CarStateZP.CruiseSession.CruiseIntent
 # Timers use 100 Hz control frames.
 DISABLED_GUARD_PERIOD = 0.5   # s after engagement before the session may form
 PRE_ACTIVE_GUARD_PERIOD = 5.  # s a confirm prompt stays open
+# A prompt nobody answered asks again while the set speed and the car are still over the limit: routes 00000160 (476 s,
+# 28 s at 61-63 mph in a 58 mph target) and 00000163 (987 s, set speed 63 in a 35 mph target, 29 minus taps) went quiet
+# after the one prompt. Only an unanswered prompt re-asks (any press is the driver's answer), twice at most per limit.
+REPROMPT_MARGIN = 3     # display units the set speed must stand above the limit's target
+REPROMPT_NEAR = 5       # display units: the car must be above target minus this, or the set speed is not yet a problem
+REPROMPT_HOLD = 2.      # s the condition must hold
+REPROMPT_COOLDOWN = 25.  # s after a prompt closes unanswered, about 30 s from one prompt to the next
+REPROMPT_MAX = 2
 DRIVER_DIAL_PERIOD = 1.  # s after a wheel press edge in which a cluster match counts as the driver's dial
 # Resolve a held prompt before cruise.py emits its first long-press repeat tick.
 LONG_PRESS_FRAMES = 50 - 1
@@ -79,6 +87,10 @@ class CruiseArbiter:
     self.long_engaged_timer = 0
     self.pre_active_timer = 0
     self._driver_dismissed = False
+    self._ignored_prompt = False  # the last prompt closed unanswered; any press clears it
+    self._reprompts_left = 0
+    self._reprompt_cooldown = 0
+    self._reprompt_hold = 0
     self._cluster_conv = 0
     self._cluster_conv_prev = 0
     self._driver_dial_timer = 0  # frames since a wheel press edge: a cluster match is the driver's
@@ -148,7 +160,10 @@ class CruiseArbiter:
     if announce:
       self.announce_counter += 1
 
-  def _enter_prompt(self):
+  def _enter_prompt(self, rearm: bool = True):
+    if rearm:
+      self._reprompts_left = REPROMPT_MAX
+      self._ignored_prompt = False
     if self._target_conv() == self._cluster_conv:
       self._activate(from_prompt=False)  # the dash already shows the limit: nothing to confirm
       return
@@ -184,6 +199,8 @@ class CruiseArbiter:
         continue
       btn = b.type.raw
       self._driver_dial_timer = int(DRIVER_DIAL_PERIOD / DT_CTRL)
+      if b.pressed:
+        self._ignored_prompt = False  # a press is an answer, even a no
 
       if b.pressed:
         if self.state_prev_frame in ACTIVE_STATES:
@@ -259,6 +276,15 @@ class CruiseArbiter:
       return True
     return press.cls == _PRESS_PROMPT and press.resolved
 
+  def _reprompt_due(self, CS) -> bool:
+    """An unanswered prompt, the set speed still over the limit's target, and the car at or near it."""
+    target = self._target_conv()
+    over = (self._ignored_prompt and self._reprompts_left > 0 and self._has_limit and target > 0
+            and self._cluster_conv > target + REPROMPT_MARGIN and round(CS.vEgo * self._conv) > target - REPROMPT_NEAR
+            and not CS.gasPressed and not CS.standstill)
+    self._reprompt_hold = self._reprompt_hold + 1 if over else 0
+    return self._reprompt_cooldown <= 0 and self._reprompt_hold >= int(REPROMPT_HOLD / DT_CTRL)
+
   def step(self, CS, long_enabled: bool, v_cruise_kph: float, v_cruise_cluster_kph: float) -> float:
     """Classify presses, advance the session, and publish its cap in a fixed order."""
     if not self.applicable:
@@ -275,11 +301,13 @@ class CruiseArbiter:
     self.long_engaged_timer = max(0, self.long_engaged_timer - 1)
     self.pre_active_timer = max(0, self.pre_active_timer - 1)
     self._driver_dial_timer = max(0, self._driver_dial_timer - 1)
+    self._reprompt_cooldown = max(0, self._reprompt_cooldown - 1)
 
     if self.state != SessionState.disabled:
       if not long_enabled or not self.enabled:
         self._set_state(SessionState.disabled)
         self._driver_dismissed = False
+        self._ignored_prompt = False
 
       elif self.state in ACTIVE_STATES:
         if self._limit_changed and confirm_needed_for_change(self._cluster_conv, self._target_conv(), self.is_metric):
@@ -294,6 +322,9 @@ class CruiseArbiter:
         # limit for a curve meanwhile, which confirms nothing
         if self.pre_active_timer <= 0:
           self._set_state(SessionState.inactive)
+          self._ignored_prompt = True
+          self._reprompt_cooldown = int(REPROMPT_COOLDOWN / DT_CTRL)
+          self._reprompt_hold = 0
 
       elif self.state == SessionState.inactive:
         if self._limit_changed:
@@ -304,6 +335,10 @@ class CruiseArbiter:
           # The driver dialed onto the limit: wait for release so they can continue through
           # it. A dash the servo walked onto it is not a dial.
           self._activate(from_prompt=False)
+        elif self._reprompt_due(CS):
+          self._reprompts_left -= 1
+          self._reprompt_hold = 0
+          self._enter_prompt(rearm=False)
 
     else:
       if long_enabled and self.enabled:
