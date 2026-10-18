@@ -86,6 +86,11 @@ _NEAR_T = 3.0  # s
 _NEAR_T_BIG = 4.0  # s
 
 _V_FLOOR = 0.5  # m/s; model velocity floor when converting yaw rate to curvature
+# Where the plan has all but stopped and the car has not, yaw-rate noise over that speed reads as a sharp bend
+# (route 00000163 909 s: 0.023 rad/s at a planned 8 mph, a 156 m "curve" on a straight approach to a stop). Those
+# points carry no curvature; a plan that slow is already under any bend that matters.
+_KAPPA_V_MIN = 4.5  # m/s
+_KAPPA_V_FRAC = 0.5  # of vEgo
 
 # Floor turns. Pulling away from a signal on openpilot long, the car crosses MIN_V mid-turn in a
 # corner tighter than the floor allows, and a cycle started there can only hold MIN_V: the pull-away
@@ -148,6 +153,7 @@ class SmartCruiseControlVision(UpstreamVision):
 
     # Derive speed-independent curvature from model geometry.
     kappa = rate_z / np.maximum(vel, _V_FLOOR)
+    kappa = np.where((vel < _KAPPA_V_MIN) & (vel < _KAPPA_V_FRAC * self.v_ego), 0., kappa)
     dist = np.empty_like(x)
     dist[0] = 0.
     dist[1:] = np.cumsum(np.hypot(np.diff(x), np.diff(y)))

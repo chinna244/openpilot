@@ -273,3 +273,19 @@ class TestCurveRecovery(VisionCase):
     assert scc.output_v_target == V_CRUISE_UNSET
     # the restore is still capped at the curve by the lookahead
     assert scc.v_ahead_min < SETPOINT
+
+
+class TestPlannedStop(VisionCase):
+  """Yaw-rate noise over a plan that has all but stopped is no bend (route 00000163 909 s)."""
+
+  def test_noise_at_a_planned_stop_is_not_a_curve(self):
+    # 45 mph, the plan slowing to 3 m/s, a steady 0.023 rad/s: rate / speed would read a 130 m bend
+    self.run_road(20., lambda s: 0.023 / 3., v_model=3.)
+    assert self.scc_v.state == VisionState.enabled
+    assert not self.scc_v.solver_active
+    assert self.scc_v.output_v_target == V_CRUISE_UNSET
+
+  def test_a_turn_planned_slowly_from_a_slow_car_keeps_its_curvature(self):
+    # pulling into a corner: the car is as slow as the plan, so the curvature stands
+    self.run_road(4., lambda s: CURVE_KAPPA, v_model=3.)
+    assert np.isfinite(self.scc_v.v_near_min)
