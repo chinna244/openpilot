@@ -60,7 +60,7 @@ class TestHoldSetSpeed(VisionCase):
   def test_distant_curve_holds_set_speed(self):
     # a curve 185 m out, as the model actually reports one at that range: even with the
     # under-read corrected it asks well under the 0.7 * 1.2 commit, so the car holds
-    self.run_road(V_EGO, curve_at(185., kappa=0.012), attenuate=True)
+    self.run_road(V_EGO, curve_at(185., kappa=0.013), attenuate=True)  # 0.012 under the 2.2 ceiling, scaled to 2.4
     assert self.scc_v.state == VisionState.enabled
     assert self.scc_v.output_v_target == V_CRUISE_UNSET
     assert 0. < self.scc_v.a_required < 0.84
@@ -257,7 +257,7 @@ class TestCurveRecovery(VisionCase):
 
   def test_stock_target_rises_to_the_profile_below_the_allowed_speed(self):
     scc = self.commit(self.stock())
-    v = 14.  # just under the curve's allowed speed
+    v = float(vision_controller.curve_speed(self.KAPPA)) - 0.4  # just under the curve's allowed speed
     self.in_curve(scc, v)
     assert scc.solver_active and scc.a_required == 0.
     assert v < scc.v_near_min < v + 1.

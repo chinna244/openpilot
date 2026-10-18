@@ -30,7 +30,10 @@ __all__ = ['ACTIVE_STATES', 'ENABLED_STATES', 'SmartCruiseControlVision', 'Visio
 # curve's own speed, not the set speed. Tolerance falls with speed, but banked highway curves
 # (2.5-4 deg) hide 0.4-0.65 m/s2, so the ceiling dips mid-range and recovers (doc).
 _A_LAT_CURVE_BP = [15.6, 24.6, 31.3]  # m/s curve speed; 35, 55, 70 mph
-_A_LAT_CURVE = [2.2, 2.1, 2.2]
+# Local tuning (zoompilot 2.2, 2.1, 2.2): this driver's own turns peak at a median 2.4 m/s2 at 15-24 mph (31 turns,
+# routes 0000014e-00000163), and the model's own plan took a 210 m bend at about 2.6 (route 00000160 830 s) where
+# 2.0 held the car 7 mph under it.
+_A_LAT_CURVE = [2.4, 2.3, 2.3]
 # Reserve margin for actuation delay at the apex.
 _PLAN_MARGIN = 0.95
 # The same table by curvature (ascending), so each point's ceiling needs no speed solve.
