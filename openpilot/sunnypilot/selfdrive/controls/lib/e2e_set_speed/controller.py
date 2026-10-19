@@ -119,6 +119,21 @@ FLOOR_SPEED_BP = [15., 25.]  # m/s
 FLOOR_MAX_HIGHWAY = 0.5  # m/s^2
 BOOST_RISE_HIGHWAY = 0.25  # m/s^3
 
+# Plan-lead braking. Before a stop the model's action lags its own plan: route 0000016a t=153-158 the plan slowed
+# to 5 mph within 100-130 m (a constant -0.7 to -1.0 m/s^2) while the action stayed at -0.04 to -0.26, then it
+# braked at -2.3 and the driver took over. Without a lead, once the plan has needed PLB_ON or more for PLB_ARM,
+# the e2e candidate brakes at PLB_GAIN of what the plan needs until it needs less than PLB_OFF. Replayed on routes
+# 00000166-0000016a: 27 episodes, 22 ahead of a real slowdown, 5 ahead of a partial one (15-40% of the speed),
+# none on a clear road; at 0016a t=157 it starts 5 s before the model and adds up to 0.75 m/s^2.
+PLB_ON = -0.6  # m/s^2
+PLB_OFF = -0.3  # m/s^2
+PLB_ARM = 0.5  # s
+PLB_GAIN = 0.8
+PLB_MIN = -1.5  # m/s^2, past this the model's own braking leads
+PLB_DROP = 0.5  # m/s, plan speeds this far under the start count as slowing
+PLB_JERK = 1.0  # m/s^3, into the brake
+PLB_RELEASE = 1.0  # m/s^3, out of it
+
 LAT_HORIZON = 10.0  # s, for the friction circle
 
 # Upstream's ACC friction circle (selfdrive/controls/lib/longitudinal_planner.py), mirrored
@@ -165,11 +180,21 @@ def envelope_bound(vel: np.ndarray, yaw_rate: np.ndarray, pos: np.ndarray, v_tar
   return bound
 
 
+def plan_decel(vel: np.ndarray, pos: np.ndarray) -> float:
+  """Constant acceleration (<= 0) that meets the slowest-to-reach point of the model's plan."""
+  v0 = float(vel[0])
+  slow = vel < v0 - PLB_DROP
+  if not slow.any():
+    return 0.
+  return float(np.min((vel[slow] ** 2 - v0 ** 2) / (2. * np.maximum(pos[slow] - pos[0], 1.))))
+
+
 class E2ESetSpeedController:
   def __init__(self, params=None, dt: float = DT_MDL):
     self.params = params or Params()
     self.dt = dt
     self.hold_frames = int(round(HOLD_TIME / dt))
+    self.plb_arm_frames = int(round(PLB_ARM / dt))
     self.params_frames = int(PARAMS_UPDATE_PERIOD / dt)
     self.bound_k = dt / (BOUND_TAU + dt)
     self.frame = -1
@@ -185,6 +210,9 @@ class E2ESetSpeedController:
     self.boost = 0.
     self.added = 0.
     self.a_model = 0.
+    self.plb = 0.
+    self.plb_count = 0
+    self.plb_armed = False
     # DEC here means FCW, standstill or a predicted stop, and invalid means no model to trust: both
     # hazards. Engaging or leaving experimental mode is not.
     self.hold_left = self.hold_frames if reason in (Inhibit.decActive, Inhibit.invalid) else 0
@@ -335,4 +363,13 @@ class E2ESetSpeedController:
     # a hazard cuts a boost fast; handing speed back is never urgent
     fall = HAZARD_FALL if not self.authority and self.boost > 0. and not soft else BOOST_RATE
     self.boost = max(-give, float(np.clip(target, self.boost - fall * self.dt, self.boost + boost_rise(v_ego) * self.dt)))
-    return a_model + self.boost
+
+    req = plan_decel(vel, pos)
+    if sm['radarState'].leadOne.present or v_ego < MIN_SPEED or req > PLB_OFF:
+      self.plb_count, self.plb_armed = 0, False
+    elif req <= PLB_ON:
+      self.plb_count += 1
+      self.plb_armed = self.plb_armed or self.plb_count >= self.plb_arm_frames
+    want = max(PLB_GAIN * req, PLB_MIN) if self.plb_armed else 0.
+    self.plb = float(np.clip(want, self.plb - PLB_JERK * self.dt, self.plb + PLB_RELEASE * self.dt))
+    return min(a_model + self.boost, self.plb) if self.plb < 0. else a_model + self.boost

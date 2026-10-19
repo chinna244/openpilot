@@ -236,7 +236,8 @@ def test_added_speed_is_shed_like_the_model_sheds_it():
   assert before < added + 1.
 
 
-def test_gives_back_what_it_added_before_a_stop():
+def test_gives_back_what_it_added_before_a_stop(monkeypatch):
+  monkeypatch.setattr(c, "PLB_ON", -math.inf)  # the give-back alone; plan-lead braking sheds it too
   ctl = settled(deliver=True)
   run(ctl, 100, build_sm(V_EGO), deliver=True)
   added = ctl.added
@@ -296,7 +297,8 @@ def test_no_give_back_behind_a_lead():
   assert ctl.boost == 0.
 
 
-def test_a_lead_lets_a_give_back_go_at_the_rate_limit():
+def test_a_lead_lets_a_give_back_go_at_the_rate_limit(monkeypatch):
+  monkeypatch.setattr(c, "PLB_ON", -math.inf)  # the give-back alone; plan-lead braking sheds it too
   ctl = settled(deliver=True)
   run(ctl, 100, build_sm(V_EGO), deliver=True)
   run(ctl, 60, build_sm(V_EGO, plan_v=STOPPING), deliver=True)
@@ -396,7 +398,8 @@ def test_highway_hazard_still_cuts_at_hazard_fall():
   assert before - ctl.boost == pytest.approx(c.HAZARD_FALL * DT)
 
 
-def test_highway_give_back_keeps_its_rate():
+def test_highway_give_back_keeps_its_rate(monkeypatch):
+  monkeypatch.setattr(c, "PLB_ON", -math.inf)  # the give-back alone; plan-lead braking sheds it too
   ctl, v = _settled_on_highway()
   run(ctl, 100, build_sm(v), v_cruise=v + 10., deliver=True)
   stopping = _plan(lambda t: max(v - 2. * t, 0.))
@@ -567,3 +570,54 @@ def test_the_edge_rule_never_delays_a_hazard():
   assert (ctl.inhibit, ctl.authority) == (Inhibit.lead, 0.)
   assert ctl.boost == pytest.approx(start - c.HAZARD_FALL * DT)
 
+
+
+# Plan-lead braking: the model's action lags its own plan before a stop (route 0000016a t=153-158).
+SLOWING_TO_5MPH = _plan(lambda t: max(V_EGO - 1.0 * t, 2.2))  # a constant -1.0 m/s^2 down to 5 mph
+REQ = c.plan_decel(SLOWING_TO_5MPH, plan_pos(SLOWING_TO_5MPH))
+ARM = round(c.PLB_ARM / DT)
+
+
+def test_plan_decel_reads_the_plan():
+  assert REQ == pytest.approx(-1.0, abs=0.05)
+  assert c.plan_decel(np.full(len(T_IDXS), V_EGO), plan_pos(np.full(len(T_IDXS), V_EGO))) == 0.
+
+
+def test_brakes_ahead_of_the_model_once_the_plan_holds():
+  ctl = new_controller()
+  sm = build_sm(V_EGO, plan_v=SLOWING_TO_5MPH)
+  assert run(ctl, ARM - 1, sm, a_model=-0.1) == pytest.approx(-0.1)  # not before PLB_ARM
+  outs = [run(ctl, 1, sm, a_model=-0.1) for _ in range(100)]
+  assert np.diff(outs).min() >= -c.PLB_JERK * DT - 1e-9  # eased in
+  assert outs[-1] == pytest.approx(c.PLB_GAIN * REQ, abs=1e-6)
+
+
+def test_never_brakes_less_than_the_model():
+  ctl = new_controller()
+  assert run(ctl, ARM + 100, build_sm(V_EGO, plan_v=SLOWING_TO_5MPH), a_model=-2.0) == pytest.approx(-2.0)
+
+
+@pytest.mark.parametrize("sm_kwargs, v_ego", [({"lead": True, "lead_d": 50., "lead_vrel": 0.}, V_EGO), ({}, c.MIN_SPEED - 0.5)])
+def test_a_lead_or_walking_pace_leaves_the_stop_to_the_model(sm_kwargs, v_ego):
+  ctl = new_controller()
+  plan = _plan(lambda t: max(v_ego - 1.0 * t, 0.))
+  assert run(ctl, ARM + 100, build_sm(v_ego, plan_v=plan, **sm_kwargs), a_model=-0.1) >= -0.1
+
+
+def test_a_short_dip_does_not_brake():
+  ctl = new_controller()
+  run(ctl, ARM - 1, build_sm(V_EGO, plan_v=SLOWING_TO_5MPH), a_model=0.)
+  assert run(ctl, 1, build_sm(V_EGO), a_model=0.) >= 0.
+  assert run(ctl, ARM - 1, build_sm(V_EGO, plan_v=SLOWING_TO_5MPH), a_model=0.) >= 0.
+
+
+def test_lets_go_at_the_release_rate_when_the_plan_clears():
+  ctl = new_controller()
+  run(ctl, ARM + 100, build_sm(V_EGO, plan_v=SLOWING_TO_5MPH), a_model=-0.1)
+  plb = [ctl.plb]
+  for _ in range(100):
+    run(ctl, 1, build_sm(V_EGO), a_model=-0.1)
+    plb.append(ctl.plb)
+  assert plb[0] < -0.5
+  assert np.diff(plb).max() <= c.PLB_RELEASE * DT + 1e-9
+  assert plb[-1] == 0.
