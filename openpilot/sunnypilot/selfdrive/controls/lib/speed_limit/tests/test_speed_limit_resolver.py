@@ -12,7 +12,7 @@ from openpilot.common.parameterized import parameterized
 from openpilot.cereal import custom
 from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit import LIMIT_MAX_MAP_DATA_AGE
 
-from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.speed_limit_resolver import SpeedLimitResolver, ALL_SOURCES
+from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.speed_limit_resolver import SpeedLimitResolver, ALL_SOURCES, CAR_LIMIT_MIN
 from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.common import Policy
 from openpilot.common.test import OpenpilotTestCase
 
@@ -27,7 +27,7 @@ def create_mock(properties, mocker):
 
 
 def setup_sm_mock(mocker):
-  cruise_speed_limit = random.uniform(0, 120)
+  cruise_speed_limit = random.uniform(CAR_LIMIT_MIN, 120)
   live_map_data_limit = random.uniform(0, 120)
 
   car_state = create_mock({
@@ -226,6 +226,27 @@ class TestSpeedLimitResolverGpsFix(OpenpilotTestCase):
     resolver.update(26.8, gps_sm(mocker, 55 * MPH, 30 * MPH, has_fix=False))
     assert resolver.source == SpeedLimitSource.car
     assert resolver.speed_limit == 55 * MPH
+
+  @parameterized.expand([(p,) for p in Policy], names=["policy"])
+  def test_a_misread_low_car_limit_is_ignored(self, resolver_class, policy, mocker):
+    # route 00000169 t207: the camera read 5 mph, the map had no limit; the assist braked toward 6 mph
+    resolver = resolver_class()
+    resolver.policy = policy
+    resolver.update(6.8, gps_sm(mocker, 5 * MPH, 0.))
+    assert resolver.limit_solutions[SpeedLimitSource.car] == 0.
+    assert resolver.source == SpeedLimitSource.none
+    assert resolver.speed_limit == 0.
+
+  @parameterized.expand([(p,) for p in Policy], names=["policy"])
+  def test_a_10_mph_car_limit_still_counts(self, resolver_class, policy, mocker):
+    resolver = resolver_class()
+    resolver.policy = policy
+    resolver.update(6.8, gps_sm(mocker, 10 * MPH, 0.))
+    if policy == Policy.map_data_only:
+      assert resolver.source == SpeedLimitSource.none
+    else:
+      assert resolver.source == SpeedLimitSource.car
+      assert resolver.speed_limit == 10 * MPH
 
   def test_car_state_only_ignores_the_map(self, resolver_class, mocker):
     resolver = resolver_class()

@@ -24,6 +24,10 @@ ALL_SOURCES = tuple(SpeedLimitSource.schema.enumerants.values())
 # A GPS message logged further ahead of now than this is not trusted either.
 MAP_FIX_FUTURE_TOLERANCE = 1.  # s
 
+# A car (camera) limit below this is a misread sign, not a road limit: route 00000169 t207 and t234 read 5 mph
+# with no map limit, and the assist braked at -1.2 m/s2 toward 6 mph. 9 mph keeps 10 mph and 15 km/h signs.
+CAR_LIMIT_MIN = 9 * CV.MPH_TO_MS  # m/s
+
 
 class SpeedLimitResolver:
   limit_solutions: dict[custom.LongitudinalPlanSP.SpeedLimit.Source, float]
@@ -119,7 +123,8 @@ class SpeedLimitResolver:
 
   def _get_from_car_state(self, sm: messaging.SubMaster) -> None:
     self._reset_limit_sources(SpeedLimitSource.car)
-    self.limit_solutions[SpeedLimitSource.car] = sm['carStateSP'].speedLimit
+    speed_limit = sm['carStateSP'].speedLimit
+    self.limit_solutions[SpeedLimitSource.car] = speed_limit if speed_limit >= CAR_LIMIT_MIN else 0.
     self.distance_solutions[SpeedLimitSource.car] = 0.
 
   def _get_from_map_data(self, sm: messaging.SubMaster) -> None:
