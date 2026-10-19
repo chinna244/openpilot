@@ -17,6 +17,7 @@ from openpilot.common.constants import CV
 from openpilot.common.params import Params
 from openpilot.common.realtime import DT_CTRL
 from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.helpers import pcm_machine_owns_sla
+from openpilot.sunnypilot.selfdrive.car import cruise_arbiter
 from openpilot.sunnypilot.selfdrive.car.cruise_arbiter import CruiseArbiter, REPROMPT_COOLDOWN, REPROMPT_HOLD, REPROMPT_MAX, \
   PRE_ACTIVE_GUARD_PERIOD as ARBITER_PROMPT_PERIOD, DISABLED_GUARD_PERIOD as ARBITER_GUARD_PERIOD
 from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.common import Mode
@@ -339,6 +340,30 @@ class TestCruiseArbiterNonPcm:
     self.active_at(40, 35)
     assert self.announces(40, 40)
     assert self.arb.state == SpeedLimitAssistState.active
+
+  # a new limit counts only once the resolver has held it for LIMIT_SETTLE
+
+  def test_a_limit_flicker_inside_a_confirmed_session_asks_nothing(self, monkeypatch):
+    """Route 00000167 t=120: confirmed at 25, the map came back on the road just left (30 for 1.0 s), then 25 again."""
+    self.active_at(33, 25)
+    monkeypatch.setattr(cruise_arbiter, "LIMIT_SETTLE", 2.)
+    before = self.arb.announce_counter
+    for limit, seconds in ((30, 1.0), (25, 3.0)):
+      for _ in range(int(seconds / DT_CTRL)):
+        self.frame(33, limit)
+        assert self.arb.state == SpeedLimitAssistState.active
+        assert round(self.arb.v_cap / self.MPH) == 25
+    assert self.arb.announce_counter == before
+
+  def test_a_held_limit_change_lands_after_the_settle_period(self, monkeypatch):
+    self.active_at(70, 65)
+    monkeypatch.setattr(cruise_arbiter, "LIMIT_SETTLE", 2.)
+    before = self.arb.announce_counter
+    for _ in range(int(2. / DT_CTRL) - 1):
+      self.frame(70, 55)
+    assert round(self.arb.v_cap / self.MPH) == 65 and self.arb.announce_counter == before
+    self.frame(70, 55)
+    assert round(self.arb.v_cap / self.MPH) == 55 and self.arb.announce_counter == before + 1
 
   # a prompt nobody answered asks again while the set speed and the car are still over the limit's target
 

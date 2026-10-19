@@ -37,6 +37,10 @@ REPROMPT_NEAR = 5       # display units: the car must be above target minus this
 REPROMPT_HOLD = 2.      # s the condition must hold
 REPROMPT_COOLDOWN = 25.  # s after a prompt closes unanswered, about 30 s from one prompt to the next
 REPROMPT_MAX = 2
+# A new limit counts only once the resolver has held it this long: in route 00000167 the map came back on the road
+# just left (30 for 1.0 s inside a 25 the driver had confirmed) and flicked 30-25-30 for 0.9 s, the camera read 25 for
+# 1.8 s in a map gap, and each asked the driver again; in route 00000166 the camera flipped 5-35 in under 0.5 s.
+LIMIT_SETTLE = 2.  # s
 DRIVER_DIAL_PERIOD = 1.  # s after a wheel press edge in which a cluster match counts as the driver's dial
 # Resolve a held prompt before cruise.py emits its first long-press repeat tick.
 LONG_PRESS_FRAMES = 50 - 1
@@ -82,6 +86,8 @@ class CruiseArbiter:
     self._speed_limit_prev = 0.
     self._slf = 0.  # speedLimitFinalLast, m/s
     self._has_limit = False
+    self._limit_seen = (0., 0., False)  # the resolver's latest (speedLimit, speedLimitFinalLast, valid)
+    self._limit_seen_frames = 0
 
     self.long_enabled_prev = False
     self.long_engaged_timer = 0
@@ -122,9 +128,13 @@ class CruiseArbiter:
     if not self.applicable:
       return
     resolver = LP_SP.speedLimit.resolver
-    self._speed_limit = float(resolver.speedLimit)
-    self._slf = float(resolver.speedLimitFinalLast)
-    self._has_limit = bool(resolver.speedLimitValid or resolver.speedLimitLastValid)
+    seen = (float(resolver.speedLimit), float(resolver.speedLimitFinalLast), bool(resolver.speedLimitValid or resolver.speedLimitLastValid))
+    if seen != self._limit_seen:
+      self._limit_seen = seen
+      self._limit_seen_frames = 0
+    self._limit_seen_frames += 1
+    if self._limit_seen_frames >= int(LIMIT_SETTLE / DT_CTRL):
+      self._speed_limit, self._slf, self._has_limit = seen
 
   @property
   def _conv(self) -> float:
