@@ -175,7 +175,8 @@ def test_a_planned_slowdown_is_met_at_the_models_speed():
 
 
 def test_a_bend_the_model_takes_slower_than_allowed_limits_the_boost():
-  assert bound(np.full(len(T_IDXS), V_EGO), BEND_AHEAD) < c.FLOOR_MAX
+  straight = bound(np.full(len(T_IDXS), V_EGO))
+  assert bound(np.full(len(T_IDXS), V_EGO), BEND_AHEAD) < straight - 0.75
   # a gentle one leaves the floor alone
   assert bound(np.full(len(T_IDXS), V_EGO), BEND_AHEAD * 0.4 / 1.5) > c.FLOOR_MAX
 

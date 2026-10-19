@@ -52,7 +52,10 @@ PARAM = "ExperimentalModeSetSpeed"
 # a median 0.57 m/s^2, p90 0.72), faded in above walking pace. Local tuning: 4.0 s (zoompilot 6.0)
 # for a quicker pickup back to the set speed.
 TAU = 4.0  # s
-FLOOR_MAX = 0.8  # m/s^2
+# Held to stock's median peak: at 15-30 mph without a lead this driver's own push is 0.48 (p50) to 0.71
+# (p75) against 0.62 to 0.81 engaged at 0.8 (routes 00000160-00000168), every kickdown came at 0.75 or
+# more, and the more boost there is the harder a plan dip cuts it (route 00000168 t=81: 0.8 to 0 in 1.3 s).
+FLOOR_MAX = 0.6  # m/s^2
 MIN_SPEED = 5.0  # m/s
 FULL_SPEED = 8.0  # m/s
 
