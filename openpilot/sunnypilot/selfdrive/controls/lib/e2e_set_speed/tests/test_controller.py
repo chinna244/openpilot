@@ -376,6 +376,26 @@ def test_floor_and_rise_interpolate_across_the_band():
   assert ctl.floor == pytest.approx((c.FLOOR_MAX + c.FLOOR_MAX_HIGHWAY) / 2)
 
 
+# Town: the boost over a hesitant model is held to TOWN_BOOST_MAX (routes 0000016a, 0000016b)
+@pytest.mark.parametrize("v, boost", [
+  (c.FULL_SPEED, c.TOWN_BOOST_MAX),
+  (c.TOWN_BOOST_BP[0], c.TOWN_BOOST_MAX),
+  (sum(c.TOWN_BOOST_BP) / 2, (c.TOWN_BOOST_MAX + c.FLOOR_MAX) / 2),
+])
+def test_town_boost_is_held_over_a_hesitant_model(v, boost):
+  ctl = new_controller()
+  out = run(ctl, SETTLE_FRAMES, build_sm(v), a_model=0.1, v_cruise=v + 10.)
+  assert ctl.floor == pytest.approx(c.FLOOR_MAX)
+  assert ctl.boost == pytest.approx(boost)
+  assert out == pytest.approx(0.1 + boost)
+
+
+def test_town_boost_cap_leaves_a_small_gap_alone():
+  ctl = new_controller()
+  run(ctl, SETTLE_FRAMES, build_sm(c.FULL_SPEED), a_model=0.4, v_cruise=c.FULL_SPEED + 10.)
+  assert ctl.boost == pytest.approx(c.FLOOR_MAX - 0.4)
+
+
 def _settled_on_highway():
   ctl = new_controller()
   v = c.FLOOR_SPEED_BP[1]
