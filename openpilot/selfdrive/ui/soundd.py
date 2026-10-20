@@ -13,6 +13,7 @@ from openpilot.common.swaglog import cloudlog
 
 from openpilot.system import micd
 from openpilot.common.hardware import HARDWARE
+from opendbc.car.structs import CarParams
 
 from openpilot.sunnypilot.selfdrive.ui.quiet_mode import QuietMode
 
@@ -34,6 +35,14 @@ if HARDWARE.get_device_type() == "tizi":
 
 AudibleAlert = log.SelfdriveState.AudibleAlert
 AudibleAlertSP = custom.SelfdriveStateSP.AudibleAlert
+SafetyModel = CarParams.SafetyModel
+
+# The panda's sound DMA interrupt busy-waits while a sound plays. A sound started across the switch out of the
+# startup safety mode starves the panda's SPI and CAN, the EPS faults and the car reports LKAS off (routes
+# 0000014d, 00000156, 00000170, 00000171: sound 0.2-1.8 s before the switch, SPI errors +133..+155). A new sound
+# waits until the switch has settled; warnings never wait.
+SAFETY_SWITCH_HOLD = 2.0  # seconds after the panda leaves the startup safety mode
+HOLD_EXEMPT = (AudibleAlert.warningSoft, AudibleAlert.warningImmediate)
 
 
 sound_list_sp: dict[int, tuple[str, int | None, float]] = {
@@ -85,6 +94,7 @@ class Soundd(QuietMode):
 
     self.selfdrive_timeout_alert = False
     self.pending_stop = False
+    self.startup_safety_time: float | None = None  # last time a panda was in the startup safety mode
 
     self.spl_filter_weighted = FirstOrderFilter(0, 2.5, FILTER_DT, initialized=False)
 
@@ -153,9 +163,17 @@ class Soundd(QuietMode):
       self.current_alert = new_alert
       self.current_sound_frame = 0
 
+  def safety_switch_hold(self, sm) -> bool:
+    if sm.seen['pandaStates'] and any(ps.safetyModel == SafetyModel.elm327 for ps in sm['pandaStates']):
+      self.startup_safety_time = time.monotonic()
+    return self.startup_safety_time is not None and time.monotonic() - self.startup_safety_time < SAFETY_SWITCH_HOLD
+
   def get_audible_alert(self, sm):
+    hold = self.safety_switch_hold(sm)
     if sm.updated['selfdriveState']:
       new_alert = sm['selfdriveState'].alertSound.raw
+      if hold and new_alert not in (AudibleAlert.none, self.current_alert, *HOLD_EXEMPT):
+        return
       self.update_alert(new_alert)
     elif check_selfdrive_timeout_alert(sm):
       self.update_alert(AudibleAlert.warningImmediate)
@@ -180,7 +198,7 @@ class Soundd(QuietMode):
     import sounddevice as sd
     micd.patch_sounddevice(sd)
 
-    sm = messaging.SubMaster(['selfdriveState', 'selfdriveStateSP', 'soundPressure'])
+    sm = messaging.SubMaster(['selfdriveState', 'selfdriveStateSP', 'soundPressure', 'pandaStates'])
 
     with self.get_stream(sd) as stream:
       rk = Ratekeeper(20)
