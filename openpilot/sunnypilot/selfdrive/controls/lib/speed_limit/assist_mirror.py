@@ -36,7 +36,9 @@ _T_ACTIVE = float(ModelConstants.T_IDXS[CONTROL_N])
 # the current speed, so a cap far below it still brakes at once and a cap above the car's speed is unchanged.
 # Only the plan sees the ramp (plan_v_target): the published cap (output_v_target) stays the session's own, which ICBM
 # walks the dash to and the alerts announce.
-CAP_FALL_RATE = 0.6  # m/s^2
+# Local tuning (zoompilot 0.6): this driver lifting off at 15-25 mph slows at a median 0.26 m/s^2 (routes 00000097-0000016e),
+# and pressed the gas in 10 of 12 lower-zone slowdowns at 0.6. Model, lead and curve braking still win the plan min().
+CAP_FALL_RATE = 0.35  # m/s^2
 
 
 class SpeedLimitAssistMirror:

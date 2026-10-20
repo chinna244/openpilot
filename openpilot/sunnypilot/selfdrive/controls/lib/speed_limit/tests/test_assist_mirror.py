@@ -99,8 +99,8 @@ class TestCapRamp:
     assert mirror.output_v_target == pytest.approx(26.0)  # the published cap (ICBM, alerts) is the session's own
     for _ in range(int(2.0 / 0.05)):
       _update(mirror, self._session(26.0), v_ego=28.0, distance=0., a_ego=0.)
-    assert mirror.plan_v_target > 26.0  # 2 m/s at 0.6 m/s^2 takes 3.3 s; not there after 2.0 s
-    for _ in range(int(2.0 / 0.05)):
+    assert mirror.plan_v_target > 26.0  # 2 m/s at CAP_FALL_RATE takes 5.7 s; not there after 2.0 s
+    for _ in range(int((2.0 / CAP_FALL_RATE - 2.0 + 0.1) / 0.05) + 1):
       _update(mirror, self._session(26.0), v_ego=28.0, distance=0., a_ego=0.)
     assert mirror.plan_v_target == pytest.approx(26.0)
 
