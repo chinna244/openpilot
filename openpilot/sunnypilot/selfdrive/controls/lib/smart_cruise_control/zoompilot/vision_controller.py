@@ -102,6 +102,17 @@ _FLOOR_TURN_LAT_ACC = 1.6  # m/s2, already turning
 _FLOOR_TURN_LAT_CAP = 2.8  # m/s2; at this cap synthetic R15/R20 loops from a stop peak as before
 _FLOOR_TURN_PROJ_T = 1.0  # s
 
+# In-turn braking (openpilot long, town speed). Through an intersection corner the near field still reads the bend
+# the car is in, and the solver held -1.2 until the exit, where this driver was already back on the gas (13 of 22
+# episodes, routes 00000166-0000016e). Once the car is turning, braking stops at _IN_TURN_A_MIN unless the turn past
+# the actuation lead would put the car over _IN_TURN_ESCAPE_LAT. Closed-loop replay over 34 episodes (35 drives): town
+# in-turn braking under -0.5 10.6 s -> 0.9 s, +0.1 mph mean, worst corner 3.75 m/s2 (route 00000167 318 s; the
+# driver's own p75 at 15-20 mph is 3.76, 205 turns).
+_IN_TURN_V_MAX = 15.6  # m/s, 35 mph
+_IN_TURN_LAT_ACC = 1.6  # m/s2, current lateral acceleration that counts as turning
+_IN_TURN_A_MIN = -0.5  # m/s2
+_IN_TURN_ESCAPE_LAT = 3.5  # m/s2, lateral acceleration past the actuation lead that restores full braking
+
 # UI state thresholds do not affect control output.
 _TURNING_LAT_ACC_TH = 1.6  # current lat acc above this displays as turning
 _LEAVING_LAT_ACC_TH = 1.3  # turning displays as leaving below this
@@ -316,7 +327,14 @@ class SmartCruiseControlVision(UpstreamVision):
       a_need = min(a_need, max(self.v_ego - self.v_dip_ahead, 0.))
     # Measured geometry may use the ECU's range past the budget; jerk-limit the published command.
     self.a_out = publish_ramp(-a_need, self.a_out, self.limits, self.v_ego, a_floor=A_PUB_MIN)
+    if self._in_turn_capped:
+      self.a_out = max(self.a_out, _IN_TURN_A_MIN)
     return self.a_out
+
+  @property
+  def _in_turn_capped(self) -> bool:
+    return (self.limits.op_long and self.v_ego < _IN_TURN_V_MAX and self.current_lat_acc >= _IN_TURN_LAT_ACC and
+            self.lat_ahead < _IN_TURN_ESCAPE_LAT)
 
   def get_v_target_from_control(self) -> float:
     if not self._controlling:
