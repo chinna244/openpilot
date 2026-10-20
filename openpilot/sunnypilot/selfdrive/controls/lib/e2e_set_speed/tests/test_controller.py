@@ -351,6 +351,33 @@ def test_a_dip_the_model_means_still_gives_back():
   assert min(boosts) >= -c.GIVE_MAX - 1e-9
 
 
+# the plan settles 2 m/s lower 8 s out: past TAPER_DROP, but it needs only about -0.25 to meet
+GENTLE_DROP = _plan(lambda t: V_EGO - 2. if t >= 8. else V_EGO)
+
+
+def test_a_gentle_plan_drop_gives_nothing_back():
+  # route 0000016e t=92: a let-off of -0.60 on a clear road, and the driver pressed the gas
+  assert c.GIVE_PLAN < c.plan_decel(GENTLE_DROP, plan_pos(GENTLE_DROP)) < 0.
+  ctl = _with_speed_added()
+  boost = ctl.boost
+  boosts = []
+  for _ in range(60):
+    run(ctl, 1, build_sm(V_EGO, plan_v=GENTLE_DROP), deliver=True)
+    boosts.append(ctl.boost)
+  assert min(boosts) >= 0.
+  assert boosts[-1] < boost  # it still stops adding
+
+
+def test_a_plan_that_needs_give_plan_still_gives_back():
+  ctl = _with_speed_added()
+  boosts = []
+  for _ in range(60):
+    run(ctl, 1, build_sm(V_EGO, plan_v=STOPPING), deliver=True)
+    boosts.append(ctl.boost)
+  assert c.plan_decel(STOPPING, plan_pos(STOPPING)) <= c.GIVE_PLAN
+  assert min(boosts) < 0.
+
+
 # Highway: the floor's ceiling and its rise ease from the city values over FLOOR_SPEED_BP (route 00000159)
 @pytest.mark.parametrize("v", [c.FULL_SPEED, 12., c.FLOOR_SPEED_BP[0]])
 def test_city_floor_and_rise_are_unchanged(v):

@@ -89,6 +89,10 @@ SHED_RATE = 0.038  # 1/s
 CONVERGE_T = 2.0  # s
 GIVE_T = 2.0  # s
 GIVE_MAX = 0.6  # m/s^2
+# Only a plan that needs this much braking hands speed back; a gentler drop just stops the boost.
+# Replayed on routes 00000166-0000016e: 7 of 8 let-offs on a clear road went (0000016e t=92 gave
+# -0.60 for nothing), all 10 before a real slowdown still gave back, +0.6 mph mean into them.
+GIVE_PLAN = -0.6  # m/s^2
 
 BOOST_RATE = 0.5  # m/s^3, both ways
 HAZARD_FALL = 2.4  # m/s^3, cutting a boost for a hazard
@@ -373,7 +377,8 @@ class E2ESetSpeedController:
     # where the plan drops TAPER_DROP does the model mean to slow; a smaller wobble just stops the
     # boost (routes 00000150/00000152: a ~1 mph dip handed back GIVE_MAX on a clear road)
     give = min(self.added / GIVE_T, GIVE_MAX)
-    if self.bound < a_model and give > 0. and hazard != Inhibit.lead and vel[0] - vel.min() >= TAPER_DROP:
+    req = plan_decel(vel, pos)
+    if self.bound < a_model and give > 0. and hazard != Inhibit.lead and vel[0] - vel.min() >= TAPER_DROP and req <= GIVE_PLAN:
       target = -min(give, a_model - self.bound)
     # a hazard cuts a boost fast; handing speed back is never urgent
     fall = HAZARD_FALL if not self.authority and self.boost > 0. and not soft else BOOST_RATE
@@ -381,7 +386,6 @@ class E2ESetSpeedController:
 
     # Arms on PLB_ARM of consecutive need, only at speed; once armed it stays through the final approach under
     # MIN_SPEED, where the model's lag would otherwise leave it the hardest braking.
-    req = plan_decel(vel, pos)
     if sm['radarState'].leadOne.present or req > PLB_OFF:
       self.plb_count, self.plb_armed = 0, False
     elif not self.plb_armed:
