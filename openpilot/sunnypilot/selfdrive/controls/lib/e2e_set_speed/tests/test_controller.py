@@ -613,11 +613,47 @@ def test_a_short_dip_does_not_brake():
 
 def test_lets_go_at_the_release_rate_when_the_plan_clears():
   ctl = new_controller()
+  run(ctl, ARM + 100, build_sm(V_EGO, plan_v=SLOWING_TO_5MPH), a_model=0.3)
+  assert ctl.plb_active
+  outs = [run(ctl, 1, build_sm(V_EGO), a_model=0.3) for _ in range(100)]
+  assert outs[0] < -0.5
+  assert np.diff(outs).max() <= c.PLB_RELEASE * DT + 1e-9  # back up to the candidate without a step
+  assert not ctl.plb_active
+
+
+def test_starts_from_the_candidate_without_a_step():
+  # review: a ramp from 0 stepped a still-pushing candidate (+0.3) to -0.05 in one frame
+  ctl = new_controller()
+  sm = build_sm(V_EGO, plan_v=SLOWING_TO_5MPH)
+  outs = [run(ctl, 1, sm, a_model=0.3, v_cruise=V_EGO) for _ in range(ARM + 100)]
+  assert np.diff(outs).min() >= -c.PLB_JERK * DT - 1e-9
+  assert outs[-1] == pytest.approx(c.PLB_GAIN * REQ, abs=1e-6)
+
+
+def test_arming_needs_a_consecutive_half_second():
+  ctl = new_controller()
+  for _ in range(4 * ARM):  # the need flickers in and out of PLB_ON
+    run(ctl, 1, build_sm(V_EGO, plan_v=SLOWING_TO_5MPH), a_model=0.)
+    run(ctl, 1, build_sm(V_EGO, plan_v=_plan(lambda t: max(V_EGO - 0.4 * t, 2.2))), a_model=0.)
+  assert not ctl.plb_armed
+
+
+def test_stays_armed_through_the_final_approach():
+  ctl = new_controller()
   run(ctl, ARM + 100, build_sm(V_EGO, plan_v=SLOWING_TO_5MPH), a_model=-0.1)
-  plb = [ctl.plb]
-  for _ in range(100):
-    run(ctl, 1, build_sm(V_EGO), a_model=-0.1)
-    plb.append(ctl.plb)
-  assert plb[0] < -0.5
-  assert np.diff(plb).max() <= c.PLB_RELEASE * DT + 1e-9
-  assert plb[-1] == 0.
+  v = c.MIN_SPEED - 1.
+  out = run(ctl, 1, build_sm(v, plan_v=_plan(lambda t: max(v - 1.0 * t, 0.))), a_model=-0.1)
+  assert ctl.plb_armed and out < -0.5
+  # but never arms there
+  ctl = new_controller()
+  run(ctl, ARM + 100, build_sm(v, plan_v=_plan(lambda t: max(v - 1.0 * t, 0.))), a_model=-0.1)
+  assert not ctl.plb_armed
+
+
+def test_an_invalid_model_frame_eases_out_instead_of_dropping():
+  ctl = new_controller()
+  run(ctl, ARM + 100, build_sm(V_EGO, plan_v=SLOWING_TO_5MPH), a_model=-0.1)
+  before = run(ctl, 1, build_sm(V_EGO, plan_v=SLOWING_TO_5MPH), a_model=-0.1)
+  out = run(ctl, 1, build_sm(V_EGO, plan_v=np.nan), a_model=-0.1)
+  assert ctl.inhibit == Inhibit.invalid
+  assert out == pytest.approx(before + c.PLB_RELEASE * DT, abs=1e-6)

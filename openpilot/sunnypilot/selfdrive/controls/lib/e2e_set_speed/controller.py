@@ -210,9 +210,12 @@ class E2ESetSpeedController:
     self.boost = 0.
     self.added = 0.
     self.a_model = 0.
-    self.plb = 0.
     self.plb_count = 0
     self.plb_armed = False
+    # an invalid model frame or DEC lets an active plan-lead brake ease out instead of dropping it
+    if reason not in (Inhibit.invalid, Inhibit.decActive):
+      self.plb = 0.
+      self.plb_active = False
     # DEC here means FCW, standstill or a predicted stop, and invalid means no model to trust: both
     # hazards. Engaging or leaving experimental mode is not.
     self.hold_left = self.hold_frames if reason in (Inhibit.decActive, Inhibit.invalid) else 0
@@ -300,7 +303,7 @@ class E2ESetSpeedController:
     # DEC on a radarless car only blends to slow down (FCW, standstill, a predicted stop)
     if dec_active:
       self._reset(Inhibit.decActive)
-      return a_model
+      return self._plan_lead(a_model, None)
 
     md = sm['modelV2']
     v_ego = sm['carState'].vEgo
@@ -312,7 +315,7 @@ class E2ESetSpeedController:
     if (any(len(x) != ModelConstants.IDX_N for x in plan) or not all(np.isfinite(x).all() for x in plan) or
         not all(math.isfinite(x) for x in (v_ego, a_model, v_cruise, accel_coast, curvature))):
       self._reset(Inhibit.invalid)
-      return a_model
+      return self._plan_lead(a_model, None) if math.isfinite(a_model) else a_model
 
     self.a_model = a_model
     self.added *= 1. - SHED_RATE * self.dt
@@ -364,12 +367,26 @@ class E2ESetSpeedController:
     fall = HAZARD_FALL if not self.authority and self.boost > 0. and not soft else BOOST_RATE
     self.boost = max(-give, float(np.clip(target, self.boost - fall * self.dt, self.boost + boost_rise(v_ego) * self.dt)))
 
+    # Arms on PLB_ARM of consecutive need, only at speed; once armed it stays through the final approach under
+    # MIN_SPEED, where the model's lag would otherwise leave it the hardest braking.
     req = plan_decel(vel, pos)
-    if sm['radarState'].leadOne.present or v_ego < MIN_SPEED or req > PLB_OFF:
+    if sm['radarState'].leadOne.present or req > PLB_OFF:
       self.plb_count, self.plb_armed = 0, False
-    elif req <= PLB_ON:
-      self.plb_count += 1
-      self.plb_armed = self.plb_armed or self.plb_count >= self.plb_arm_frames
-    want = max(PLB_GAIN * req, PLB_MIN) if self.plb_armed else 0.
-    self.plb = float(np.clip(want, self.plb - PLB_JERK * self.dt, self.plb + PLB_RELEASE * self.dt))
-    return min(a_model + self.boost, self.plb) if self.plb < 0. else a_model + self.boost
+    elif not self.plb_armed:
+      self.plb_count = self.plb_count + 1 if req <= PLB_ON and v_ego >= MIN_SPEED else 0
+      self.plb_armed = self.plb_count >= self.plb_arm_frames
+    return self._plan_lead(a_model + self.boost, max(PLB_GAIN * req, PLB_MIN) if self.plb_armed else None)
+
+  def _plan_lead(self, candidate: float, want: float | None) -> float:
+    """The e2e candidate under plan-lead braking. want: the brake it asks for, None when disarmed. It eases from
+    the candidate down to want at PLB_JERK and back up to the candidate at PLB_RELEASE, so neither end steps."""
+    if not self.plb_active:
+      if want is None:
+        return candidate
+      self.plb_active, self.plb = True, candidate
+    target = candidate if want is None else min(candidate, want)
+    self.plb = float(np.clip(target, self.plb - PLB_JERK * self.dt, self.plb + PLB_RELEASE * self.dt))
+    if want is None and self.plb >= candidate:
+      self.plb_active = False
+      return candidate
+    return min(candidate, self.plb)
