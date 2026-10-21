@@ -42,7 +42,9 @@ def make_map_data(mocker, map_limit=30 * MPH, next_limit=0., next_latitude=None)
   return OsmMapData()
 
 
-def tick(map_data, status, position_valid, gps_ok=None):
+def tick(map_data, status, position_valid, gps_ok=None, alive=True, msg_valid=True):
+  map_data.sm.alive = {'liveLocationKalman': alive}
+  map_data.sm.valid = {'liveLocationKalman': msg_valid}
   location = map_data.sm.__getitem__.return_value
   location.status = status
   location.positionGeodetic.valid = position_valid
@@ -99,3 +101,16 @@ class TestLiveMapDataPublisher(OpenpilotTestCase):
     map_data = make_map_data(mocker)
     tick(map_data, status, position_valid, gps_ok)
     assert map_data.pm.send.call_args.args[1].valid is expected
+
+  @parameterized.expand([("localizer_stopped", False, True), ("message_not_valid", True, False)],
+                        names=["case", "alive", "msg_valid"])
+  def test_a_stopped_localizer_publishes_no_valid_limit(self, case, alive, msg_valid, mocker):
+    # review: the SubMaster keeps the last valid sample after liveLocationKalman stops, and each tick republished
+    # its old position as fresh valid map data
+    map_data = make_map_data(mocker, next_limit=20 * MPH, next_latitude=43.001)
+    assert tick(map_data, Status.valid, True).speedLimitValid
+    msg = tick(map_data, Status.valid, True, alive=alive, msg_valid=msg_valid)
+    assert not msg.speedLimitValid and not msg.speedLimitAheadValid
+    assert map_data.pm.send.call_args.args[1].valid is False
+    # and it comes back with the localizer
+    assert tick(map_data, Status.valid, True).speedLimitValid
