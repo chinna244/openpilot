@@ -278,3 +278,19 @@ class TestSpeedLimitResolverGpsFix(OpenpilotTestCase):
     resolver.policy = Policy.map_data_only
     resolver.update(20., gps_sm(mocker, 0., 15., fix_age=9., ahead_limit=10., ahead_distance=200.))
     assert resolver.speed_limit == 15.
+
+  @parameterized.expand([(35.,), (29.,)], names=["v_ego"])
+  def test_a_higher_limit_ahead_waits_for_its_sign(self, resolver_class, v_ego, mocker):
+    # review: at 35 m/s in a 25 m/s zone with 30 m/s 100 m ahead, the higher limit replaced the current one
+    # before the sign, and dropping under it brought 25 back: the limit followed the car's speed
+    resolver = resolver_class()
+    resolver.policy = Policy.map_data_only
+    resolver.update(v_ego, gps_sm(mocker, 0., 25., ahead_limit=30., ahead_distance=100.))
+    assert resolver.speed_limit == 25.
+    assert resolver.distance == 0.
+
+  def test_a_lower_limit_ahead_with_no_current_limit_still_applies(self, resolver_class, mocker):
+    resolver = resolver_class()
+    resolver.policy = Policy.map_data_only
+    resolver.update(20., gps_sm(mocker, 0., 0., ahead_limit=10., ahead_distance=100.))
+    assert resolver.speed_limit == 10.

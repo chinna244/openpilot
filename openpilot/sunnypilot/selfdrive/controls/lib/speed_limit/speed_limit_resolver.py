@@ -176,7 +176,8 @@ class SpeedLimitResolver:
     self.distance_solutions[SpeedLimitSource.map] = 0.
 
     # FIXME-SP: this is not working as expected
-    if 0. < next_speed_limit < self.v_ego:
+    # only a lower limit ahead is braked for early: above both, a higher one would lift the current limit before its sign
+    if 0. < next_speed_limit < self.v_ego and (speed_limit <= 0. or next_speed_limit < speed_limit):
       adapt_time = (next_speed_limit - self.v_ego) / self._adapt_acc
       adapt_distance = self.v_ego * adapt_time + 0.5 * self._adapt_acc * adapt_time ** 2
 
