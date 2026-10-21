@@ -128,8 +128,11 @@ BOOST_RISE_HIGHWAY = 0.25  # m/s^3
 # (routes 0000016a t=312-318 and 0000016b t=387-394: 20 to 29 mph, driver braked), and every plan dip cut 0.4-0.6 of
 # boost at once and re-grew it (0000016b t=182-188, t=292-297). Replayed on 00000166-0000016b: the run-ups end
 # 1.4-2.0 mph slower, the cut-and-regrow swings halve, the 15-30 mph push p50 is 0.44-0.60 against this driver's 0.48.
+# At 0.3 town recoveries ran ~10 mph under the set speed with the boost on the cap (route 00000173: 19 -> 32 mph took
+# 22 s). 0.45 over 11 town drives (00000166-00000173): +27.9 mph on 30 recoveries with no stop after, +16.3 mph on 19
+# pushes before a real slowdown (worst +3.5, 00000173 t=368); plan-lead braking and the give-back gate own those stops.
 TOWN_BOOST_BP = [12.5, 15.6]  # m/s, 28 to 35 mph
-TOWN_BOOST_MAX = 0.3  # m/s^2
+TOWN_BOOST_MAX = 0.45  # m/s^2
 
 # Plan-lead braking. Before a stop the model's action lags its own plan: route 0000016a t=153-158 the plan slowed
 # to 5 mph within 100-130 m (a constant -0.7 to -1.0 m/s^2) while the action stayed at -0.04 to -0.26, then it

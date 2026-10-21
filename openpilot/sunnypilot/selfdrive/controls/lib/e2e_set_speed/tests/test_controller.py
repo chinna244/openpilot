@@ -407,7 +407,8 @@ def test_floor_and_rise_interpolate_across_the_band():
 @pytest.mark.parametrize("v, boost", [
   (c.FULL_SPEED, c.TOWN_BOOST_MAX),
   (c.TOWN_BOOST_BP[0], c.TOWN_BOOST_MAX),
-  (sum(c.TOWN_BOOST_BP) / 2, (c.TOWN_BOOST_MAX + c.FLOOR_MAX) / 2),
+  # past the cap the floor's own gap over the 0.1 model binds
+  (sum(c.TOWN_BOOST_BP) / 2, min((c.TOWN_BOOST_MAX + c.FLOOR_MAX) / 2, c.FLOOR_MAX - 0.1)),
 ])
 def test_town_boost_is_held_over_a_hesitant_model(v, boost):
   ctl = new_controller()
