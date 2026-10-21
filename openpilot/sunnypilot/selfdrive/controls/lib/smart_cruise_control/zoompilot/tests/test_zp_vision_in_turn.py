@@ -8,12 +8,17 @@ from unittest import mock
 
 import pytest
 
+from opendbc.car import structs
+from openpilot.common.realtime import DT_MDL
+from openpilot.selfdrive.controls.lib.longitudinal_planner import get_cruise_accel
+
 from openpilot.sunnypilot.selfdrive.controls.lib.smart_cruise_control.zoompilot import vision_controller
 from openpilot.sunnypilot.selfdrive.controls.lib.smart_cruise_control.zoompilot.vision_controller import SmartCruiseControlVision
 from openpilot.sunnypilot.selfdrive.controls.lib.smart_cruise_control.zoompilot.tests.vision_harness import VisionCase, make_cp
 
 A_MIN = vision_controller._IN_TURN_A_MIN
 SIDES = pytest.mark.parametrize("side", [1., -1.], ids=["left", "right"])
+HOST_CP = structs.CarParams(steerRatio=15.5, wheelbase=2.7)
 
 
 def corner(k_near: float, k_after: float, side: float, d_split: float = 4.0):
@@ -29,13 +34,15 @@ def uncapped():
 class TestInTurnBraking(VisionCase):
 
   def drive(self, v, kappa_fn, cur_curvature, op_long=True):
-    """Hardest command over 2 s on a fresh controller."""
+    """Hardest braking over 2 s on a fresh controller: its acceleration seed, or the host's cruise
+    candidate built from its speed target, whichever is lower (the planner takes the minimum)."""
     scc = SmartCruiseControlVision(make_cp(op_long))
     sm = self.make_sm(v, kappa_fn, cur_curvature)
-    a_min = 0.
+    a_min = a_cruise = 0.
     for _ in range(40):
       scc.update(sm, True, False, v, 0., 20.)
-      a_min = min(a_min, scc.output_a_target)
+      a_cruise = get_cruise_accel(True, scc.output_v_target, v, a_cruise, 0., HOST_CP, DT_MDL, 0., True)
+      a_min = min(a_min, scc.output_a_target, a_cruise)
     return a_min
 
   def same_as_before(self, *args, **kwargs):

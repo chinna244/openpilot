@@ -347,6 +347,9 @@ class SmartCruiseControlVision(UpstreamVision):
       v = min(self.v_profile_now, v_lead)
       if np.isfinite(self.v_dip_ahead):
         v = max(v, self.v_dip_ahead)
+      if self._in_turn_capped:
+        # the unit-gain cruise candidate brakes no harder than the in-turn cap either
+        v = max(v, self.v_ego + _IN_TURN_A_MIN)
     else:
       # Pre-position the discrete stock-ACC setpoint at the horizon minimum, and lead vEgo down
       # only while braking: with nothing to brake for the dash follows the profile up.
