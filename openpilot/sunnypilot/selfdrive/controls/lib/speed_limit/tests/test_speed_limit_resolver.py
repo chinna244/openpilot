@@ -262,11 +262,19 @@ class TestSpeedLimitResolverGpsFix(OpenpilotTestCase):
     assert resolver.source == SpeedLimitSource.map
     assert resolver.speed_limit == 45 * MPH
 
-  def test_distance_to_the_next_limit_counts_from_the_fix(self, resolver_class, mocker):
-    # 20 m/s, a 10 m/s limit 100 m ahead of where the fix was taken 2 s ago: 60 m ahead now, inside the
+  def test_distance_to_the_next_limit_counts_from_the_map_message(self, resolver_class, mocker):
+    # 20 m/s, a 10 m/s limit 100 m ahead where mapd published 2 s ago: 60 m ahead now, inside the
     # 150 m it takes to slow at LIMIT_ADAPT_ACC, so the next limit applies
     resolver = resolver_class()
     resolver.policy = Policy.map_data_only
-    resolver.update(20., gps_sm(mocker, 0., 15., fix_age=2., ahead_limit=10., ahead_distance=100.))
+    resolver.update(20., gps_sm(mocker, 0., 15., ahead_limit=10., ahead_distance=100., map_age=2.))
     assert resolver.speed_limit == 10.
     assert abs(resolver.distance - 60.) < 0.5
+
+  def test_an_older_fix_does_not_advance_a_current_distance(self, resolver_class, mocker):
+    # review: mapd's 200 m is from the localizer's position now; a 9 s old fix (still accepted) took 180 m off
+    # and slowed for the 10 m/s limit 50 m before its 150 m braking distance
+    resolver = resolver_class()
+    resolver.policy = Policy.map_data_only
+    resolver.update(20., gps_sm(mocker, 0., 15., fix_age=9., ahead_limit=10., ahead_distance=200.))
+    assert resolver.speed_limit == 15.
