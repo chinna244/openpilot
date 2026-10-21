@@ -105,9 +105,9 @@ _FLOOR_TURN_PROJ_T = 1.0  # s
 # In-turn braking (openpilot long, town speed). Through an intersection corner the near field still reads the bend
 # the car is in, and the solver held -1.2 until the exit, where this driver was already back on the gas (13 of 22
 # episodes, routes 00000166-0000016e). Once the car is turning, braking stops at _IN_TURN_A_MIN unless the turn past
-# the actuation lead would put the car over _IN_TURN_ESCAPE_LAT. Closed-loop replay over 34 episodes (35 drives): town
-# in-turn braking under -0.5 10.6 s -> 0.9 s, +0.1 mph mean, worst corner 3.75 m/s2 (route 00000167 318 s; the
-# driver's own p75 at 15-20 mph is 3.76, 205 turns).
+# the actuation lead would put the car over _IN_TURN_ESCAPE_LAT. Closed-loop replay through the host's speed filter,
+# cruise candidate and actuator lag over 35 episodes (28 drives): town in-turn braking under -0.55 12.7 s -> 4.3 s,
+# +0.1 mph mean, worst corner 4.26 m/s2 as without the cap (route 00000167 318 s, a turn the escape hands back).
 _IN_TURN_V_MAX = 15.6  # m/s, 35 mph
 _IN_TURN_LAT_ACC = 1.6  # m/s2, current lateral acceleration that counts as turning
 _IN_TURN_A_MIN = -0.5  # m/s2
@@ -130,6 +130,7 @@ class SmartCruiseControlVision(UpstreamVision):
     self.limits = get_planning_limits(CP)
     self._reset_solver()
     self.a_out = 0.
+    self.v_ego_car = 0.
 
   def _reset_solver(self) -> None:
     self.solver_valid = False
@@ -161,6 +162,8 @@ class SmartCruiseControlVision(UpstreamVision):
       return
 
     self.current_lat_acc = self.v_ego ** 2 * abs(sm['controlsState'].curvature)
+    # the planner hands this controller its filtered speed but builds the cruise candidate on carState.vEgo
+    self.v_ego_car = sm['carState'].vEgo
 
     # Derive speed-independent curvature from model geometry.
     kappa = rate_z / np.maximum(vel, _V_FLOOR)
@@ -348,8 +351,9 @@ class SmartCruiseControlVision(UpstreamVision):
       if np.isfinite(self.v_dip_ahead):
         v = max(v, self.v_dip_ahead)
       if self._in_turn_capped:
-        # the unit-gain cruise candidate brakes no harder than the in-turn cap either
-        v = max(v, self.v_ego + _IN_TURN_A_MIN)
+        # the unit-gain cruise candidate brakes no harder than the in-turn cap either, on the measured speed it
+        # is built from as well as the filtered speed the MPC starts from
+        v = max(v, max(self.v_ego, self.v_ego_car) + _IN_TURN_A_MIN)
     else:
       # Pre-position the discrete stock-ACC setpoint at the horizon minimum, and lead vEgo down
       # only while braking: with nothing to brake for the dash follows the profile up.

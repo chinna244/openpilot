@@ -33,15 +33,18 @@ def uncapped():
 
 class TestInTurnBraking(VisionCase):
 
-  def drive(self, v, kappa_fn, cur_curvature, op_long=True):
+  def drive(self, v, kappa_fn, cur_curvature, op_long=True, v_car=None):
     """Hardest braking over 2 s on a fresh controller: its acceleration seed, or the host's cruise
-    candidate built from its speed target, whichever is lower (the planner takes the minimum)."""
+    candidate built from its speed target, whichever is lower (the planner takes the minimum).
+    v is the planner's filtered speed the controller gets, v_car the carState.vEgo the host's cruise
+    candidate is built on."""
+    v_car = v if v_car is None else v_car
     scc = SmartCruiseControlVision(make_cp(op_long))
-    sm = self.make_sm(v, kappa_fn, cur_curvature)
+    sm = self.make_sm(v, kappa_fn, cur_curvature, v_car=v_car)
     a_min = a_cruise = 0.
     for _ in range(40):
       scc.update(sm, True, False, v, 0., 20.)
-      a_cruise = get_cruise_accel(True, scc.output_v_target, v, a_cruise, 0., HOST_CP, DT_MDL, 0., True)
+      a_cruise = get_cruise_accel(True, scc.output_v_target, v_car, a_cruise, 0., HOST_CP, DT_MDL, 0., True)
       a_min = min(a_min, scc.output_a_target, a_cruise)
     return a_min
 
@@ -54,6 +57,12 @@ class TestInTurnBraking(VisionCase):
   def test_turning_through_a_town_corner_brakes_gently(self, side):
     # 8 m/s (18 mph) in a 20 m corner: 3.2 m/s2 now and past the lead, over the 2.3 ceiling
     assert self.drive(8., corner(0.05, 0.05, side), side * 0.05) == pytest.approx(A_MIN)
+
+  @SIDES
+  @pytest.mark.parametrize("v_car", [7.7, 8.3], ids=["filter_ahead", "filter_behind"])
+  def test_cap_holds_when_the_filtered_speed_lags_the_car(self, side, v_car):
+    # the planner's speed filter trails carState.vEgo by 0.3 m/s through a corner (route-like actuator lag)
+    assert self.drive(8., corner(0.05, 0.05, side), side * 0.05, v_car=v_car) >= A_MIN - 1e-6
 
   @SIDES
   def test_same_corner_braked_hard_before_the_cap(self, side):
@@ -79,3 +88,52 @@ class TestInTurnBraking(VisionCase):
 
   def test_stock_acc_brakes_as_before(self):
     assert self.same_as_before(8., corner(0.05, 0.05, 1.), 0.05, op_long=False)
+
+
+def test_planner_cruise_candidate_holds_the_cap_with_actuator_lag():
+  """The full planner in a 20 m corner at 18 mph, the car lagging the request by its 0.36 s delay and a
+  0.5 s response: the filtered speed handed to the controller falls behind carState.vEgo, and the cruise
+  candidate built on vEgo used to reach -0.81."""
+  from collections import deque
+  from openpilot.selfdrive.controls.lib.longcontrol import LongCtrlState
+  from openpilot.sunnypilot.selfdrive.car.tests.fakes import FakeParams
+  from openpilot.sunnypilot.selfdrive.controls.lib.dec.tests.test_dec_planner_gate import build_planner, build_sm
+  from openpilot.sunnypilot.selfdrive.controls.lib.smart_cruise_control.zoompilot import make_smart_cruise_control
+  from openpilot.sunnypilot.selfdrive.controls.lib.smart_cruise_control.zoompilot.tests.vision_harness import model_for_road
+
+  kappa = 0.05
+  p = build_planner(False, 'acc')
+  p.CP.brand = 'mazda'
+  p.CP.openpilotLongitudinalControl = True
+  p.CP.longitudinalActuatorDelay = 0.36
+  p.scc = make_smart_cruise_control(p.CP)
+  p.scc.vision.params = FakeParams(SmartCruiseControlVision=True)
+  p.scc.map.params = FakeParams(SmartCruiseControlMap=False)
+  p.sla_machine = None
+  p.e2e_set_speed.params = FakeParams(ExperimentalModeSetSpeed=False)
+  p.e2e_lead_gap.params = FakeParams(ExperimentalModeLeadGap=False)
+  p.v_desired_filter.x = 8.
+  sm = build_sm(True)
+  sm['controlsState'].longControlState = LongCtrlState.pid
+  sm['controlsState'].curvature = kappa
+
+  v, a, delayed = 8., 0., deque([0.] * 7)
+  lagged = capped = 0
+  for _ in range(120):
+    cs = sm['carState'].as_builder()
+    cs.vEgo, cs.aEgo, cs.vCruise, cs.vCruiseCluster = v, a, 72., 72.
+    sm['carState'] = cs.as_reader()
+    model = model_for_road(v, lambda s: kappa).modelV2
+    model.action.desiredAcceleration = 0.
+    sm['modelV2'] = model
+    p.update(sm)
+    vc = p.scc.vision
+    if vc._in_turn_capped and vc.is_active:
+      capped += 1
+      lagged += vc.v_ego < v - 0.2
+      assert p.a_cruise >= A_MIN - 1e-6
+      assert p.output_a_target >= A_MIN - 1e-6
+    delayed.append(float(p.output_a_target))
+    a += DT_MDL / 0.5 * (delayed.popleft() - a)
+    v += a * DT_MDL
+  assert capped > 100 and lagged > 0
