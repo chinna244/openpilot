@@ -107,7 +107,17 @@ HOLD_TIME = 1.5  # s after the last hazard (local tuning, zoompilot 3.0: re-arms
 # under a 0.8 floor).
 FAR_LEAD_T = 5.0  # s of headway
 FAR_LEAD_MIN = 40.  # m, at any speed
-FAR_LEAD_CLOSING = -0.5  # m/s, vRel below this is closing
+# A far lead becomes closing only if its gap would close within FAR_LEAD_CLOSE_T (any lead, radar or camera); once a lead
+# has been near or closing it is clear again only above the original closing bar too, so a closer that the camera then
+# under-reads stays a hazard until a lead is seen clear or the controller goes idle (not on frames without a lead or
+# with an invalid model).
+# A camera-only lead 85-110 m ahead read -2.3..+2.4 m/s from frame to frame while the gap grew 87 -> 99 m, and under the
+# bar alone its dips held the boost off 14.5 of 23 s (route 00000178 t=83). Replayed on 45 drives, every window ending
+# at the driver's first input: far-lead holds 466 -> 323 s; where it cut later than the bar, no lead came within 3 s of
+# headway or 6 s TTC in the next 10 s; lead-braking onsets at most +0.47 mph faster. The one far lead closing before a
+# hard stop (0000014b t=166-171, 120 -> 94 m at 2-5 m/s) read 20-55 s: cut on its 20 s readings, later than the bar did.
+FAR_LEAD_CLOSE_T = 25.  # s
+FAR_LEAD_CLOSING = -0.5  # m/s, the original closing bar; with FAR_LEAD_REARM_CLOSING what a latched lead must clear
 FAR_LEAD_BRAKING = -0.5  # m/s^2, the gap assist's own bar for a braking lead
 # A far lead that is braking but not closing winds the boost down at BOOST_RATE instead of cutting it: the MPC
 # candidate is not binding yet, so a hazard-rate cut would only be a jerk. Near or closing still cuts at once.
@@ -225,7 +235,8 @@ class E2ESetSpeedController:
     self._reset(Inhibit.disabled)
 
   def _reset(self, reason) -> None:
-    self.lead_near = False
+    if reason != Inhibit.invalid:  # invalid model frames keep what the leads have shown
+      self.lead_near = False
     self.gain = 0.
     self.floor = 0.
     self.bound = math.nan  # unset: the next bound is taken as is
@@ -273,14 +284,19 @@ class E2ESetSpeedController:
     msg.added = float(self.added)
 
   def _lead_class(self, lead, v_ego: float) -> int:
-    """0 far and steady, 1 far and not closing but braking, 2 near or closing; anything not clearly far is 2."""
+    """0 far and steady, 1 far and not closing but braking, 2 near or closing; anything not clearly far is 2. A distance or
+    closing speed that is not finite is not clearly far; an acceleration that is not finite is not clearly steady."""
     if not lead.present:
       return 0
+    if not (math.isfinite(lead.dRel) and math.isfinite(lead.vRel)):
+      return 2
     back = self.lead_near  # after a near lead, far takes a little more
     headway = (FAR_LEAD_T + (FAR_LEAD_REARM_T if back else 0.)) * v_ego
-    if not (lead.dRel >= max(headway, FAR_LEAD_MIN) and lead.vRel >= FAR_LEAD_CLOSING + (FAR_LEAD_REARM_CLOSING if back else 0.)):
+    closing = lead.dRel < FAR_LEAD_CLOSE_T * -lead.vRel or (back and lead.vRel < FAR_LEAD_CLOSING + FAR_LEAD_REARM_CLOSING)
+    if lead.dRel < max(headway, FAR_LEAD_MIN) or closing:
       return 2
-    return 0 if lead.aLeadK >= FAR_LEAD_BRAKING + (FAR_LEAD_REARM_BRAKING if back else 0.) else 1
+    steady = math.isfinite(lead.aLeadK) and lead.aLeadK >= FAR_LEAD_BRAKING + (FAR_LEAD_REARM_BRAKING if back else 0.)
+    return 0 if steady else 1
 
   def _lead_level(self, sm: messaging.SubMaster) -> int:
     """The worst of the leads: 0 far and steady (or none), 1 far but braking, 2 near or closing."""
@@ -288,7 +304,8 @@ class E2ESetSpeedController:
     level = max(self._lead_class(rs.leadOne, v_ego), self._lead_class(rs.leadTwo, v_ego))
     if level == 2:
       self.lead_near = True
-    elif level == 0:
+    elif level == 0 and (rs.leadOne.present or rs.leadTwo.present):
+      # only a lead seen clear clears it: a camera lead dropping out for a frame does not
       self.lead_near = False
     return level
 
