@@ -424,6 +424,14 @@ def test_town_boost_cap_leaves_a_small_gap_alone():
   assert ctl.boost == pytest.approx(c.FLOOR_MAX - 0.4)
 
 
+# Town pickup far under the set speed (gear study, routes 00000147-00000177): a 0.2 model is lifted to the 0.8 floor,
+# a 0.1 model to 0.1 plus the 0.6 town cap
+@pytest.mark.parametrize("a_model, out", [(0.2, 0.8), (0.1, 0.7)])
+def test_town_pickup_reaches_the_raised_floor(a_model, out):
+  ctl = new_controller()
+  assert run(ctl, SETTLE_FRAMES, build_sm(c.FULL_SPEED), a_model=a_model, v_cruise=c.FULL_SPEED + 10.) == pytest.approx(out)
+
+
 def _settled_on_highway():
   ctl = new_controller()
   v = c.FLOOR_SPEED_BP[1]

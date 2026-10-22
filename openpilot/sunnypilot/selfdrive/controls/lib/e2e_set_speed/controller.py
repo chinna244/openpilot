@@ -55,7 +55,9 @@ TAU = 4.0  # s
 # Held to stock's median peak: at 15-30 mph without a lead this driver's own push is 0.48 (p50) to 0.71
 # (p75) against 0.62 to 0.81 engaged at 0.8 (routes 00000160-00000168), every kickdown came at 0.75 or
 # more, and the more boost there is the harder a plan dip cuts it (route 00000168 t=81: 0.8 to 0 in 1.3 s).
-FLOOR_MAX = 0.6  # m/s^2
+# Back to 0.8 with the Mazda 4th-gear and upshift ceilings at 0.75: at 0.6 town pickups ran 20-28 mph in 6.2 s
+# (00000168-00000177) against 5.1 s at 0.8 and this driver's own 5.3 s.
+FLOOR_MAX = 0.8  # m/s^2
 MIN_SPEED = 5.0  # m/s
 FULL_SPEED = 8.0  # m/s
 
@@ -131,8 +133,9 @@ BOOST_RISE_HIGHWAY = 0.25  # m/s^3
 # At 0.3 town recoveries ran ~10 mph under the set speed with the boost on the cap (route 00000173: 19 -> 32 mph took
 # 22 s). 0.45 over 11 town drives (00000166-00000173): +27.9 mph on 30 recoveries with no stop after, +16.3 mph on 19
 # pushes before a real slowdown (worst +3.5, 00000173 t=368); plan-lead braking and the give-back gate own those stops.
+# 0.6 with FLOOR_MAX 0.8: in replay the same pickup gain as 0.8 (median 0.40 s on 20 pickups, 00000174-00000177).
 TOWN_BOOST_BP = [12.5, 15.6]  # m/s, 28 to 35 mph
-TOWN_BOOST_MAX = 0.45  # m/s^2
+TOWN_BOOST_MAX = 0.6  # m/s^2
 
 # Plan-lead braking. Before a stop the model's action lags its own plan: route 0000016a t=153-158 the plan slowed
 # to 5 mph within 100-130 m (a constant -0.7 to -1.0 m/s^2) while the action stayed at -0.04 to -0.26, then it
