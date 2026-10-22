@@ -66,6 +66,10 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
 
     self.v_desired_filter = FirstOrderFilter(init_v, 2.0, self.dt)
     self.a_cruise = init_a
+    self.gas_override = False  # the last reset was the driver's gas while engaged, no brake
+    self.gas_return = False  # since that handover, until the cruise state is back at its target's ask
+    self.a_target_published = init_a  # the plan sent: the internal one, lifted while a gas override is held
+    self.source_published = LongitudinalPlanSource.cruise
     self.output_a_target = init_a
     self.output_should_stop = False
 
@@ -115,6 +119,21 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
     # Get new v_cruise and a_target from Smart Cruise Control and Speed Limit Assist
     v_cruise, self.output_a_target = LongitudinalPlannerSP.update_targets(self, sm, self.v_desired_filter.x, self.output_a_target, v_cruise)
 
+    # A gas override resets the cruise state to the measured accel, which in a turn or over a bump reads as braking nobody
+    # asked for, and after the release it is the lowest candidate until it climbs back (route 00000177 t=183: -0.41 sent
+    # while the model asked +0.24). The state keeps its own path; the cruise candidate is held at what its target asks this
+    # cycle in the plan published while the gas is held (the first cycle after the release still uses it) and from the
+    # handover until the state is back there: a target that turns restrictive at any point gets at least what it asks.
+    # longControlState can trail the pedal by a cycle, so the gas is latched for the whole override.
+    if reset_state:
+      if not sm['selfdriveState'].enabled or sm['carState'].brakePressed:
+        self.gas_override = False
+      elif sm['carState'].gasPressed:
+        self.gas_override = True
+      self.gas_return = False
+    elif self.gas_override:
+      self.gas_override, self.gas_return = False, True
+
     self.mpc.set_weights(prev_accel_constraint, personality=sm['selfdriveState'].personality)
     self.mpc.set_cur_state(self.v_desired_filter.x, self.output_a_target)
     self.mpc.update(sm['radarState'], personality=sm['selfdriveState'].personality)
@@ -144,16 +163,32 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
     self.a_cruise = get_cruise_accel(is_e2e, v_cruise, v_ego,
                                      self.a_cruise, steer_angle_without_offset, self.CP, self.dt,
                                      accel_coast, self.allow_throttle)
+    a_cruise = self.a_cruise
+    if self.gas_override or self.gas_return:
+      # what the target asks this cycle: the cruise accel without its jerk limit (coast cap included), never above 0
+      cruise_ask = min(get_cruise_accel(is_e2e, v_cruise, v_ego, 0., steer_angle_without_offset, self.CP, 1e3,
+                                        accel_coast, self.allow_throttle), 0.)
+      if self.gas_return and self.a_cruise >= cruise_ask:
+        self.gas_return = False
+      else:
+        a_cruise = max(self.a_cruise, cruise_ask)
     cruise_should_stop = should_stop(v_ego, self.a_cruise)
 
+    # while the gas is held only the published plan is lifted: the MPC and the filter restart from the plain one
+    lift_published = reset_state and a_cruise > self.a_cruise
     candidates = [(output_a_target_mpc, self.mpc.source, output_should_stop_mpc),
-                  (self.a_cruise, LongitudinalPlanSource.cruise, cruise_should_stop)]
+                  (self.a_cruise if lift_published else a_cruise, LongitudinalPlanSource.cruise, cruise_should_stop)]
     if is_e2e:
       candidates.append((output_a_target_e2e, LongitudinalPlanSource.e2e, output_should_stop_e2e))
 
     output_a_target, self.mpc.source, _ = min(candidates, key=lambda c: c[0])
     self.output_should_stop = any(should_stop for _, _, should_stop in candidates)
     self.output_a_target = np.clip(output_a_target, ACCEL_MIN, ACCEL_MAX)
+    self.a_target_published, self.source_published = float(self.output_a_target), self.mpc.source
+    if lift_published:
+      published = [candidates[0], (a_cruise, LongitudinalPlanSource.cruise, cruise_should_stop)] + candidates[2:]
+      a_published, self.source_published, _ = min(published, key=lambda c: c[0])
+      self.a_target_published = float(np.clip(a_published, ACCEL_MIN, ACCEL_MAX))
 
     self.v_desired_filter.x = self.v_desired_filter.x + self.dt * (self.output_a_target + a_prev) / 2.0
 
@@ -172,10 +207,10 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
     longitudinalPlan.jerks = self.j_desired_trajectory.tolist()
 
     longitudinalPlan.hasLead = sm['radarState'].leadOne.present
-    longitudinalPlan.longitudinalPlanSource = self.mpc.source
+    longitudinalPlan.longitudinalPlanSource = self.source_published
     longitudinalPlan.fcw = self.fcw
 
-    longitudinalPlan.aTarget = float(self.output_a_target)
+    longitudinalPlan.aTarget = float(self.a_target_published)
     longitudinalPlan.shouldStop = bool(self.output_should_stop)
     longitudinalPlan.allowBrake = True
     longitudinalPlan.allowThrottle = bool(self.allow_throttle)

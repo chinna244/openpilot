@@ -164,7 +164,7 @@ class LongitudinalPlannerSP:
 
   def publish_longitudinal_plan_sp(self, sm: messaging.SubMaster, pm: messaging.PubMaster) -> None:
     # the host has chosen: tell the set-speed floor how much of the lift reached the car
-    self.e2e_set_speed.delivered(float(self.output_a_target), float(self.a_e2e))
+    self.e2e_set_speed.delivered(float(getattr(self, 'a_target_published', self.output_a_target)), float(self.a_e2e))
 
     plan_sp_send = messaging.new_message('longitudinalPlanSP')
 
@@ -173,7 +173,7 @@ class LongitudinalPlannerSP:
     longitudinalPlanSP = plan_sp_send.longitudinalPlanSP
     longitudinalPlanSP.longitudinalPlanSource = self.source
     longitudinalPlanSP.vTarget = float(self.output_v_target)
-    longitudinalPlanSP.aTarget = float(self.output_a_target)
+    longitudinalPlanSP.aTarget = float(getattr(self, 'a_target_published', self.output_a_target))
     longitudinalPlanSP.events = self.events_sp.to_msg()
 
     # Dynamic Experimental Control
