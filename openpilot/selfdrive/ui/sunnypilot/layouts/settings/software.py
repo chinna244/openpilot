@@ -33,7 +33,7 @@ class SoftwareLayoutSP(SoftwareLayout):
   def __init__(self):
     super().__init__()
     self.konik_toggle = toggle_item_sp(
-      "Konik backups", "Back up drives on parked Wi-Fi; comma stays active. Pending drives may be deleted if storage fills.",
+      "Konik backups", "Enable Konik online status and parked live view; back up drives on parked Wi-Fi. comma stays connected.",
       initial_state=ui_state.params.get_bool("KonikUploadsEnabled"), callback=self._on_konik_toggled,
       enabled=ui_state.is_offroad,
     )

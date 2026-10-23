@@ -56,6 +56,7 @@ def test_c4_pairing_appears_after_registration_and_refreshes(monkeypatch):
   page._qr = None
   page._last_refresh = float('-inf')
   page._status = SimpleNamespace(set_value=lambda _: None)
+  page._online = SimpleNamespace(set_value=lambda _: None)
   page._scroller = SimpleNamespace(add_widget=items.append)
   page._refresh()
   assert len(items) == 1
@@ -81,3 +82,27 @@ def test_standard_pairing_discards_stale_qr_when_identity_unavailable(monkeypatc
   panel._generate_qr_code()
   assert panel.qr_texture is None
   assert unloaded == [texture]
+
+
+@pytest.mark.parametrize('started, enabled, identity, expected', [
+  (False, True, 'konik-id', True), (True, True, 'konik-id', True),
+  (False, False, 'konik-id', False), (False, True, None, False),
+  (False, True, 'UnregisteredDevice', False),
+])
+def test_online_process_requires_separate_registered_identity(started, enabled, identity, expected):
+  from openpilot.system.manager.process_config import konik_connect_ready
+  params = SimpleNamespace(get_bool=lambda _: enabled, get=lambda _: identity)
+  assert konik_connect_ready(started, params, None) is expected
+
+
+def test_c4_account_displays_independent_online_status():
+  from openpilot.selfdrive.ui.mici.widgets import konik as c4
+  values = []
+  page = object.__new__(c4.KonikBackupPage)
+  page._params = SimpleNamespace(get=lambda key: 'connected' if key == 'KonikConnectionStatus' else 'uploading')
+  page._status = SimpleNamespace(set_value=lambda _: None)
+  page._online = SimpleNamespace(set_value=values.append)
+  page._qr = None
+  page._last_refresh = float('inf')
+  page._refresh()
+  assert values == ['connected']

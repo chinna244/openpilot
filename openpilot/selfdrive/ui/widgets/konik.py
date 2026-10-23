@@ -37,5 +37,7 @@ class KonikPairingDialog(PairingDialog):
     rl.draw_text_ex(font, text, rl.Vector2(rect.x + 40, rect.y + 160), 35, 0, rl.BLACK)
     status = self.params.get('KonikUploadStatus') or 'waiting for registration'
     rl.draw_text_ex(font, status, rl.Vector2(rect.x + 40, rect.y + 350), 30, 0, rl.BLACK)
+    online = self.params.get('KonikConnectionStatus') or 'waiting for connection'
+    rl.draw_text_ex(font, 'Konik connection: ' + online, rl.Vector2(rect.x + 40, rect.y + 400), 30, 0, rl.BLACK)
     self._render_qr_code(rl.Rectangle(rect.x + rect.width * 0.55, rect.y + 130, rect.height - 170, rect.height - 170))
     return -1

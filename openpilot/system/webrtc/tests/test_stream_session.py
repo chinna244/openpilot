@@ -1,4 +1,6 @@
 import asyncio
+import contextlib
+import pytest
 import json
 import time
 
@@ -85,3 +87,62 @@ class TestStreamSession(OpenpilotTestCase):
     response = self.loop.run_until_complete(handle_get_stream(ServerState(), b"{}", "text/plain"))
 
     assert response == (415, b'{"error": "unsupported media type"}', "application/json; charset=utf-8")
+
+
+class TestCameraSwitchPolicy:
+  def test_restricted_session_rejects_camera_switch(self, mocker):
+    from openpilot.system.webrtc.webrtcd import StreamSession
+    session = object.__new__(StreamSession)
+    session.konik = True
+    track = mocker.Mock()
+    session.video_tracks = [track]
+    session.message_handler(json.dumps({'type': 'livestreamCameraSwitch', 'data': {'camera': 'driver'}}).encode())
+    track.switch_camera.assert_not_called()
+
+  def test_existing_sessions_keep_camera_switch(self, mocker):
+    from openpilot.system.webrtc.webrtcd import StreamSession
+    session = object.__new__(StreamSession)
+    session.konik = False
+    track = mocker.Mock()
+    session.video_tracks = [track]
+    session.message_handler(json.dumps({'type': 'livestreamCameraSwitch', 'data': {'camera': 'road'}}).encode())
+    track.switch_camera.assert_called_once_with('road')
+
+
+  @pytest.mark.parametrize("key", ["KonikUploadsEnabled", "IsOffroad"])
+  @pytest.mark.parametrize("phase", ["negotiating", "streaming"])
+  def test_revoking_konik_stops_only_its_session(self, mocker, key, phase):
+    from openpilot.system.webrtc.webrtcd import StreamSession
+    async def check():
+      flags = {"KonikUploadsEnabled": True, "IsOffroad": True}
+      entered = asyncio.Event()
+      session = object.__new__(StreamSession)
+      session.konik = True
+      session.identifier = 'konik-test'
+      session.is_body = False
+      session.bitrate_controller = None
+      session.params = mocker.Mock()
+      session.params.get_bool.side_effect = lambda k: flags[k]
+      session.stream = mocker.Mock()
+      session.stream.has_messaging_channel.return_value = False
+      async def block():
+        entered.set()
+        await asyncio.Event().wait()
+      session.stream.wait_for_connection = block if phase == "negotiating" else mocker.AsyncMock()
+      session.run_normal_session = block
+      session.post_run_cleanup = mocker.AsyncMock()
+      session.logger = mocker.Mock()
+      unrelated_comma_viewer = asyncio.create_task(asyncio.Event().wait())
+      task = asyncio.create_task(session.run())
+      try:
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        flags[key] = False
+        with pytest.raises(asyncio.CancelledError):
+          await asyncio.wait_for(task, timeout=1)
+        session.post_run_cleanup.assert_awaited_once()
+        assert not unrelated_comma_viewer.done()
+      finally:
+        unrelated_comma_viewer.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+          await unrelated_comma_viewer
+    asyncio.run(check())

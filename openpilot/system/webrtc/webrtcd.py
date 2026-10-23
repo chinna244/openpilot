@@ -235,6 +235,7 @@ class StreamSession:
     self.params = Params()
     builder = WebRTCAnswerBuilder(body.sdp, bind_address=_default_route_ip())
 
+    self.konik = body.konik
     self.enabled = body.enabled
     self.video_tracks = []
     for camera in body.cameras:
@@ -287,7 +288,7 @@ class StreamSession:
         match msg_type:
           case "livestreamCameraSwitch":
             # only needed for 1 track stream
-            if len(self.video_tracks) == 1:
+            if not self.konik and len(self.video_tracks) == 1:
               self.video_tracks[0].switch_camera(payload["data"]["camera"])
           case "livestreamSettings":
             if self.bitrate_controller is not None:
@@ -319,6 +320,12 @@ class StreamSession:
     except Exception:
       self.logger.exception("Cereal incoming proxy failure")
 
+  async def _watch_konik_policy(self, owner: asyncio.Task):
+    # These params change in other processes; revoke only this session when they change.
+    while self.params.get_bool("KonikUploadsEnabled") and self.params.get_bool("IsOffroad"):  # noqa: ASYNC110
+      await asyncio.sleep(0.25)
+    owner.cancel()
+
   async def run_normal_session(self):
     try:
       await asyncio.wait_for(self.stream.wait_for_disconnection(), timeout=SESSION_TIMEOUT_SECONDS)
@@ -333,7 +340,10 @@ class StreamSession:
     await self.stream.wait_for_disconnection()
 
   async def run(self):
+    policy_task = None
     try:
+      if self.konik:
+        policy_task = asyncio.create_task(self._watch_konik_policy(asyncio.current_task()))
       self.params.put("LivestreamRequestKeyframe", True)
 
       # avoid datachannel race by adding messange_handler immediately
@@ -363,6 +373,10 @@ class StreamSession:
       with cloudlog.ctx(session_id=self.identifier):
         cloudlog.exception("webrtcd.session.exception")
     finally:
+      if policy_task is not None:
+        policy_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+          await policy_task
       await self.post_run_cleanup()
 
   async def post_run_cleanup(self):

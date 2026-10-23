@@ -108,7 +108,7 @@ class KonikBackupButton(BigButton):
   def __init__(self):
     self._icon = gui_app.texture("icons_mici/settings/device/green_settings.png", 64, 64)
     super().__init__("Konik backups", "", self._icon,
-                     description="Back up drives on parked Wi-Fi; comma stays active. Pending drives may be deleted if storage fills.")
+                     description="Enable Konik online status and parked live view; back up drives on parked Wi-Fi. comma stays connected.")
     self.set_click_callback(self._confirm)
 
   def _confirm(self):

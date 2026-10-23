@@ -17,15 +17,19 @@ class KonikBackupPage(NavScroller):
     self._qr = None
     self._last_refresh = float('-inf')
     self._status = GreyBigButton('Konik backup', '')
+    self._online = GreyBigButton('Konik connection', '')
     self._scroller.add_widgets([
       self._status,
+      self._online,
       GreyBigButton('pair Konik', 'Open stable.konik.ai, add a device and scan the QR below.'),
-      GreyBigButton('', 'Backups need parked, unmetered Wi-Fi. comma Connect stays active.'),
+      GreyBigButton('', 'Backups need parked Wi-Fi. Konik online status and parked live view are also enabled.'),
+      GreyBigButton('', 'comma stays connected. Only one live-view session can use the cameras at a time.'),
       GreyBigButton('', 'Pending drives can be deleted if local storage fills before they upload.'),
     ])
 
   def _refresh(self):
     self._status.set_value(self._params.get('KonikUploadStatus') or 'enable backups and park on Wi-Fi')
+    self._online.set_value(self._params.get('KonikConnectionStatus') or 'waiting for connection')
     now = time.monotonic()
     if now - self._last_refresh < (300 if self._qr else 5):
       return

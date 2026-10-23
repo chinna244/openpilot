@@ -28,6 +28,8 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"KonikUploadsEnabled", {PERSISTENT, BOOL, "0"}},
     {"KonikDongleId", {PERSISTENT | DONT_LOG, STRING}},
     {"KonikUploadStatus", {CLEAR_ON_MANAGER_START, STRING}},
+    {"KonikConnectionStatus", {CLEAR_ON_MANAGER_START, STRING}},
+    {"KonikLastAthenaPingTime", {CLEAR_ON_MANAGER_START, INT}},
     {"ControlsReady", {CLEAR_ON_MANAGER_START | CLEAR_ON_ONROAD_TRANSITION, BOOL}},
     {"CurrentBootlog", {PERSISTENT, STRING}},
     {"CurrentRoute", {CLEAR_ON_MANAGER_START | CLEAR_ON_ONROAD_TRANSITION, STRING}},

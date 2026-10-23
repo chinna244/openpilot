@@ -39,6 +39,8 @@ class TestSunnylinkdMethods(OpenpilotTestCase):
       "KonikUploadsEnabled": "1",
       "KonikDongleId": "attacker",
       "KonikUploadStatus": "fake success",
+      "KonikConnectionStatus": "fake connection",
+      "KonikLastAthenaPingTime": "123",
     }
 
     sunnylinkd.saveParams(blocked_params)
