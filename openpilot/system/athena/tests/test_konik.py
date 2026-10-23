@@ -89,7 +89,7 @@ def test_all_unapproved_remote_commands_are_rejected(setup, method):
 def test_rpc_dispatcher_is_not_comma_dispatcher(setup):
   methods = setup.connection.methods()
   assert methods is not konik.rpc.dispatcher
-  assert set(methods) == {'echo', 'getVersion', 'getNetworkType', 'getNetworkMetered', 'startStream'}
+  assert set(methods) == {'echo', 'getVersion', 'getNetworkType', 'getNetworkMetered', 'startStream', 'listUploadQueue', 'cancelUpload'}
   assert call(setup, 'echo', ['hello'])['result'] == 'hello'
 
 
@@ -177,3 +177,59 @@ def test_failed_connect_leaves_comma_state_unchanged(setup):
     setup.connection.session()
   assert setup.params.get('LastAthenaPingTime') == 12345
   assert setup.params.get('KonikConnectionStatus') == 'disconnected'
+
+
+def test_upload_queue_reflects_pending_konik_files_and_current_progress(setup, tmp_path, mocker):
+  from openpilot.system.loggerd import konik as uploader
+  root = tmp_path / 'logs'
+  segment = root / '00000001--abc--2'
+  segment.mkdir(parents=True)
+  pending = segment / 'qcamera.ts'
+  pending.write_bytes(b'pending video')
+  done = segment / 'qlog.zst'
+  done.write_bytes(b'uploaded')
+  import os
+  os.setxattr(done, uploader.UPLOAD_ATTR_NAME, b'1')
+  mocker.patch.object(konik.Paths, 'log_root', return_value=str(root))
+  setup.params.values['KonikCurrentUpload'] = {'path': '00000001--abc--2/qcamera.ts', 'progress': 0.5}
+  result = call(setup, 'listUploadQueue')['result']
+  assert len(result) == 1
+  item = result[0]
+  assert item['path'] == '00000001--abc--2/qcamera.ts'
+  assert item['id']  # The website labels empty IDs as Offline and reconciles rows by ID.
+  assert call(setup, 'listUploadQueue')['result'][0]['id'] == item['id']
+  assert item['current'] is True
+  assert item['progress'] == 0.5
+  # Konik's queue UI derives route, segment and filename from URL components 3, 4, 5.
+  from urllib.parse import urlsplit
+  assert urlsplit(item['url']).path.split('/')[3:] == ['00000001--abc', '2', 'qcamera.ts']
+  assert item['headers'] == {}
+  assert setup.params.get('DongleId') == 'comma-id'
+  os.setxattr(pending, uploader.UPLOAD_ATTR_NAME, b'1')
+  assert call(setup, 'listUploadQueue')['result'] == []
+
+
+def test_queue_rpc_cannot_select_arbitrary_directories(setup):
+  result = call(setup, 'listUploadQueue', {'root': '/persist'})
+  assert result['error']['code'] == -32602
+
+
+def test_large_queue_response_is_fragmented_without_changing_json(setup):
+  payload = konik.rpc.dumps_result(1, ['pending route'] * 2000)
+  setup.connection.send_response(setup.ws, payload)
+  frames = [entry.args[0] for entry in setup.ws.send_frame.call_args_list]
+  assert len(frames) > 1
+  assert frames[0].opcode == ABNF.OPCODE_TEXT
+  assert all(f.opcode == ABNF.OPCODE_CONT for f in frames[1:])
+  assert all(not f.fin for f in frames[:-1]) and frames[-1].fin
+  assert b''.join(f.data for f in frames).decode() == payload
+
+
+
+def test_remote_cancel_does_not_modify_automatic_backup_queue(setup):
+  setup.params.values['KonikCurrentUpload'] = {'path': 'route/qcamera.ts', 'progress': 0.5}
+  result = call(setup, 'cancelUpload', {'upload_id': ['backup-id']})
+  assert result['error']['code'] == -32000
+  assert 'device' in result['error']['message']
+  assert setup.params.get('KonikCurrentUpload')['progress'] == 0.5
+  assert setup.params.get_bool('KonikUploadsEnabled')

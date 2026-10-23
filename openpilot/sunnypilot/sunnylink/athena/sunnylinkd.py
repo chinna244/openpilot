@@ -52,6 +52,7 @@ BLOCKED_PARAMS = {
   "KonikUploadsEnabled",  # Backup consent is local-only
   "KonikDongleId",        # Managed by the separate Konik registration
   "KonikUploadStatus",    # Managed by the backup worker
+  "KonikCurrentUpload",
   "KonikConnectionStatus",
   "KonikLastAthenaPingTime",
   "CompletedSunnylinkConsentVersion",

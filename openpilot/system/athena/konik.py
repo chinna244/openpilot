@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
 """Restricted Konik presence and parked live view, isolated from comma Athena."""
+import os
+import hashlib
 import threading
+from urllib.parse import quote
 import time
 
 from websocket import ABNF, WebSocketTimeoutException, create_connection
 
-from openpilot.common.api.konik import KonikApi, valid_id
+from openpilot.common.api.konik import API_HOST, KonikApi, valid_id
+from openpilot.common.hardware.hw import Paths
+from openpilot.system.loggerd.konik import pending_upload_files
 from openpilot.common.hardware import HARDWARE
 from openpilot.common.params import Params
 from openpilot.common.swaglog import cloudlog
@@ -46,6 +51,35 @@ class KonikConnection:
     self._check_stream_allowed()
     return post_stream_request(StreamRequestBody(sdp, ['wideRoad'], enabled, [], ['carState', 'deviceState'], konik=True))
 
+  def list_upload_queue(self) -> list[dict]:
+    dongle_id = self.params.get('KonikDongleId')
+    if not self.configured(dongle_id):
+      return []
+    current = self.params.get('KonikCurrentUpload') or {}
+    items = []
+    for key, path in pending_upload_files(Paths.log_root()):
+      folder, name = os.path.split(key)
+      route, separator, segment = folder.rpartition('--')
+      if not separator or not segment.isdecimal():
+        continue
+      try:
+        created_at = int(os.stat(path).st_mtime * 1000)
+      except OSError:
+        continue
+      remote_name = name + '.zst' if name in ('qlog', 'rlog') else name
+      active = current.get('path') == key
+      # Display-only URL: Konik's UI extracts route/segment/file from its path.
+      # Do not fetch signed URLs or disclose credentials to list the local backlog.
+      url = f'{API_HOST}/queue/{dongle_id}/{quote(route)}/{segment}/{quote(remote_name)}'
+      items.append({'path': key, 'url': url, 'headers': {}, 'created_at': created_at, 'id': 'backup-' + hashlib.sha256(key.encode()).hexdigest(),
+                    'retry_count': 0, 'current': active, 'progress': current.get('progress', 0.0) if active else 0.0,
+                    'allow_cellular': False, 'priority': 99})
+    return items
+
+  @staticmethod
+  def cancel_upload(upload_id: str | list[str]):
+    raise RuntimeError('Automatic backups are managed on the device. Disable Konik backups there to pause uploads.')
+
   def methods(self) -> dict:
     # Never use the global dispatcher, queues, proxy or upload handlers from athenad.
     return {
@@ -54,7 +88,21 @@ class KonikConnection:
       'getNetworkType': HARDWARE.get_network_type,
       'getNetworkMetered': lambda: HARDWARE.get_network_metered(HARDWARE.get_network_type()),
       'startStream': self.start_stream,
+      'listUploadQueue': self.list_upload_queue,
+      'cancelUpload': self.cancel_upload,
     }
+
+  @staticmethod
+  def send_response(ws, response: str):
+    # A backlog can contain thousands of files; use the same fragment size as comma Athena.
+    encoded = response.encode()
+    if len(encoded) <= 4096:
+      ws.send(response)
+      return
+    for offset in range(0, len(encoded), 4096):
+      chunk = encoded[offset:offset + 4096]
+      opcode = ABNF.OPCODE_TEXT if offset == 0 else ABNF.OPCODE_CONT
+      ws.send_frame(ABNF.create_frame(chunk, opcode, offset + 4096 >= len(encoded)))
 
   def session(self):
     ws = None
@@ -90,12 +138,12 @@ class KonikConnection:
           try:
             message = rpc.loads(data)
           except (TypeError, ValueError, UnicodeDecodeError):
-            ws.send(rpc.dumps_error(None, 'parse error', rpc.PARSE_ERROR))
+            self.send_response(ws, rpc.dumps_error(None, 'parse error', rpc.PARSE_ERROR))
             continue
           if rpc.is_call(message):
             response = rpc.handle(message, methods)
             if 'id' in message:
-              ws.send(response)
+              self.send_response(ws, response)
     finally:
       try:
         if ws is not None:

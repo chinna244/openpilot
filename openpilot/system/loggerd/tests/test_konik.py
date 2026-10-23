@@ -288,3 +288,24 @@ def test_invalid_registration_response_not_persisted(mocker, invalid):
     api.register(params)
   assert params.get('KonikDongleId') is None
   assert params.get('DongleId') == 'comma-id'
+
+
+def test_active_upload_progress_is_reported_and_cleared(context):
+  file(context, 'qcamera.ts')
+  def transfer(*args, **kwargs):
+    current = context.params.get('KonikCurrentUpload')
+    assert current['path'] == '00000001--abc--0/qcamera.ts'
+    assert current['progress'] == 0
+    kwargs['data'].read()
+    assert context.params.get('KonikCurrentUpload')['progress'] == 1
+    return SimpleNamespace(status_code=200)
+  context.put.side_effect = transfer
+  assert context.worker.step() is True
+  assert context.params.get('KonikCurrentUpload') == {}
+
+
+def test_failed_transfer_clears_active_progress(context):
+  file(context)
+  context.put.side_effect = OSError('network failure')
+  assert context.worker.step() is False
+  assert context.params.get('KonikCurrentUpload') == {}

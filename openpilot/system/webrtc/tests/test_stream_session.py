@@ -90,14 +90,15 @@ class TestStreamSession(OpenpilotTestCase):
 
 
 class TestCameraSwitchPolicy:
-  def test_restricted_session_rejects_camera_switch(self, mocker):
+  @pytest.mark.parametrize("camera", ["driver", "road", "wideRoad"])
+  def test_konik_session_allows_supported_camera_switch(self, mocker, camera):
     from openpilot.system.webrtc.webrtcd import StreamSession
     session = object.__new__(StreamSession)
     session.konik = True
     track = mocker.Mock()
     session.video_tracks = [track]
-    session.message_handler(json.dumps({'type': 'livestreamCameraSwitch', 'data': {'camera': 'driver'}}).encode())
-    track.switch_camera.assert_not_called()
+    session.message_handler(json.dumps({'type': 'livestreamCameraSwitch', 'data': {'camera': camera}}).encode())
+    track.switch_camera.assert_called_once_with(camera)
 
   def test_existing_sessions_keep_camera_switch(self, mocker):
     from openpilot.system.webrtc.webrtcd import StreamSession
@@ -146,3 +147,25 @@ class TestCameraSwitchPolicy:
         with contextlib.suppress(asyncio.CancelledError):
           await unrelated_comma_viewer
     asyncio.run(check())
+
+
+  @pytest.mark.parametrize("camera", ["sendcan", "../driver", "unknown", None])
+  def test_konik_session_rejects_unknown_camera(self, mocker, camera):
+    from openpilot.system.webrtc.webrtcd import StreamSession
+    session = object.__new__(StreamSession)
+    session.konik = True
+    track = mocker.Mock()
+    session.video_tracks = [track]
+    session.message_handler(json.dumps({'type': 'livestreamCameraSwitch', 'data': {'camera': camera}}).encode())
+    track.switch_camera.assert_not_called()
+
+
+def test_camera_switch_requests_new_keyframe_and_resets_decoder_state(mocker):
+  track = object.__new__(LiveStreamVideoStreamTrack)
+  track._seen_keyframe = True
+  track._make_sock = mocker.Mock(return_value='driver socket')
+  track.request_keyframe = mocker.Mock()
+  track.switch_camera('driver')
+  assert track._sock == 'driver socket'
+  assert track._seen_keyframe is False
+  track.request_keyframe.assert_called_once()

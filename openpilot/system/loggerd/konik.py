@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Independent, offroad Wi-Fi archive uploads. No Konik remote-command connection."""
 import os
+import errno
 import threading
 import time
 
@@ -14,11 +15,37 @@ from openpilot.common.params import Params
 from openpilot.common.swaglog import cloudlog
 from openpilot.common.utils import CallbackReader, get_upload_stream
 from openpilot.system.loggerd.uploader import listdir_by_creation
-from openpilot.system.loggerd.xattr_cache import getxattr, setxattr
+from openpilot.system.loggerd.xattr_cache import setxattr
 
 NetworkType = log.DeviceState.NetworkType
 UPLOAD_ATTR_NAME = 'user.konik.upload'
 ARCHIVE_FILES = ('qlog', 'qlog.zst', 'qcamera.ts', 'rlog', 'rlog.zst', 'fcamera.hevc', 'ecamera.hevc')
+
+
+def pending_upload_files(root: str):
+  """Read markers fresh: the queue RPC runs in a different process from uploads."""
+  for segment in listdir_by_creation(root):
+    directory = os.path.join(root, segment)
+    if os.path.islink(directory):
+      continue
+    try:
+      names = os.listdir(directory)
+      if any(name.endswith('.lock') for name in names):
+        continue
+      for name in ARCHIVE_FILES:
+        path = os.path.join(directory, name)
+        if name not in names or os.path.islink(path) or not os.path.isfile(path):
+          continue
+        try:
+          if os.getxattr(path, UPLOAD_ATTR_NAME) == b'1':
+            continue
+        except OSError as e:
+          if e.errno not in (errno.ENODATA, getattr(errno, 'ENOATTR', errno.ENODATA)):
+            raise
+        yield os.path.join(segment, name), path
+    except OSError:
+      # The normal free-space deleter can remove a segment during a scan.
+      continue
 
 
 class UploadPaused(Exception):
@@ -51,26 +78,10 @@ class KonikUploader:
     pending = set()
     candidate = None
     now = time.monotonic()
-    for segment in listdir_by_creation(self.root):
-      directory = os.path.join(self.root, segment)
-      if os.path.islink(directory):
-        continue
-      try:
-        names = os.listdir(directory)
-        if any(name.endswith('.lock') for name in names):
-          continue
-        for name in ARCHIVE_FILES:
-          path = os.path.join(directory, name)
-          if name not in names or os.path.islink(path) or not os.path.isfile(path):
-            continue
-          if getxattr(path, UPLOAD_ATTR_NAME) == b'1':
-            continue
-          pending.add(path)
-          if candidate is None and now >= self.retry_at.get(path, 0):
-            candidate = (os.path.join(segment, name), path)
-      except OSError:
-        # Normal free-space deletion can remove a segment during this scan.
-        continue
+    for key, path in pending_upload_files(self.root):
+      pending.add(path)
+      if candidate is None and now >= self.retry_at.get(path, 0):
+        candidate = (key, path)
     self.retry_at = {path: retry for path, retry in self.retry_at.items() if path in pending}
     return candidate
 
@@ -96,6 +107,9 @@ class KonikUploader:
       self._status('retry pending' if self.retry_at else 'backup up to date')
       return None
     key, path = item
+    current = {'path': key, 'progress': 0.0}
+    self.params.put('KonikCurrentUpload', current, block=True)
+    last_progress = time.monotonic()
     try:
       self._status('uploading to Konik')
       api = KonikApi(dongle_id)
@@ -108,9 +122,18 @@ class KonikUploader:
       if response.status_code != 200:
         raise RuntimeError(f'Konik upload URL returned {response.status_code}')
       signed = response.json()
-      with get_upload_stream(path, key.endswith('.zst') and not path.endswith('.zst'))[0] as stream:
+      stream, stream_size = get_upload_stream(path, key.endswith('.zst') and not path.endswith('.zst'))
+      def progress(bytes_read):
+        nonlocal last_progress
         self._check_policy()
-        response = requests.put(signed['url'], headers=signed['headers'], data=CallbackReader(stream, self._check_policy), timeout=30)
+        now = time.monotonic()
+        if now - last_progress >= 1 or bytes_read >= stream_size:
+          current['progress'] = min(bytes_read / max(stream_size, 1), 1.0)
+          self.params.put('KonikCurrentUpload', current, block=True)
+          last_progress = now
+      with stream:
+        self._check_policy()
+        response = requests.put(signed['url'], headers=signed['headers'], data=CallbackReader(stream, progress), timeout=30)
       self._check_policy()
       if response.status_code not in (200, 201, 204):
         raise RuntimeError(f'Konik file upload returned {response.status_code}')
@@ -125,11 +148,14 @@ class KonikUploader:
       self.retry_at[path] = time.monotonic() + 60
       self._status('backup failed; will retry')
       return False
+    finally:
+      self.params.put('KonikCurrentUpload', {}, block=True)
 
 
 def main(exit_event: threading.Event | None = None):
   exit_event = exit_event or threading.Event()
   params = Params()
+  params.put('KonikCurrentUpload', {}, block=True)
   sm = messaging.SubMaster(['deviceState'])
   def current_device_state():
     sm.update(0)
