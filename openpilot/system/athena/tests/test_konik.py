@@ -379,3 +379,28 @@ def test_voltage_read_disabled_with_konik(setup, mocker):
   socket = mocker.patch.object(konik.messaging, 'sub_sock')
   assert 'error' in call(setup, 'getMessage', {'service': 'peripheralState'})
   socket.assert_not_called()
+
+
+def test_connection_retries_after_network_failure_and_stops_cleanly(mocker):
+  end = mocker.Mock()
+  end.is_set.return_value = False
+  connection = mocker.patch.object(konik, 'KonikConnection').return_value
+  connection.session.side_effect = [ConnectionError('network unavailable'), None]
+  mocker.patch.object(konik, 'Params')
+  def retry_wait(delay):
+    if end.wait.call_count == 2:
+      end.is_set.return_value = True
+  end.wait.side_effect = retry_wait
+  konik.main(end)
+  assert connection.session.call_count == 2
+  assert [c.args[0] for c in end.wait.call_args_list] == [2, 4]
+  assert all(c.args[0] <= 60 for c in end.wait.call_args_list)
+
+
+def test_remote_socket_close_clears_presence_without_touching_comma(setup):
+  setup.ws.recv_data.return_value = (ABNF.OPCODE_CLOSE, b'')
+  setup.connection.session()
+  setup.ws.close.assert_called_once()
+  assert setup.params.get('KonikConnectionStatus') == 'disconnected'
+  assert setup.params.get('KonikLastAthenaPingTime') is None
+  assert setup.params.get('LastAthenaPingTime') == 12345

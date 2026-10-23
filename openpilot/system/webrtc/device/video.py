@@ -61,9 +61,12 @@ class LiveStreamVideoStreamTrack(TiciVideoStreamTrack):
     self.request_keyframe()
 
   def enable(self, enabled: bool):
+    resumed = enabled and not self.video_enabled
     self.video_enabled = enabled
-    if not enabled:
+    if not enabled or resumed:
       self._seen_keyframe = False
+    if resumed:
+      self.request_keyframe()
 
   def request_keyframe(self) -> None:
     self.params.put("LivestreamRequestKeyframe", True, block=False)

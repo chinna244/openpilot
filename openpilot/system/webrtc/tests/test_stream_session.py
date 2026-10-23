@@ -169,3 +169,49 @@ def test_camera_switch_requests_new_keyframe_and_resets_decoder_state(mocker):
   assert track._sock == 'driver socket'
   assert track._seen_keyframe is False
   track.request_keyframe.assert_called_once()
+
+
+def test_resuming_live_video_requests_a_fresh_keyframe(mocker):
+  track = object.__new__(LiveStreamVideoStreamTrack)
+  track.video_enabled = False
+  track._seen_keyframe = True
+  track.request_keyframe = mocker.Mock()
+  track.enable(True)
+  assert track.video_enabled is True
+  assert track._seen_keyframe is False
+  track.request_keyframe.assert_called_once()
+
+
+def test_redundant_video_enable_does_not_restart_keyframes(mocker):
+  track = object.__new__(LiveStreamVideoStreamTrack)
+  track.video_enabled = True
+  track._seen_keyframe = True
+  track.request_keyframe = mocker.Mock()
+  track.enable(True)
+  assert track._seen_keyframe is True
+  track.request_keyframe.assert_not_called()
+
+
+@pytest.mark.parametrize("quality", ["low", "med", "high", "auto"])
+def test_website_quality_control_reaches_bitrate_controller(mocker, quality):
+  from openpilot.system.webrtc.webrtcd import StreamSession
+  session = object.__new__(StreamSession)
+  session.bitrate_controller = mocker.Mock()
+  session.message_handler(json.dumps({'type': 'livestreamSettings', 'data': {'quality': quality}}).encode())
+  session.bitrate_controller.set_quality.assert_called_once_with(quality)
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_website_pause_controls_video_and_telemetry(mocker, enabled):
+  from openpilot.system.webrtc.webrtcd import StreamSession
+  session = object.__new__(StreamSession)
+  track = mocker.Mock()
+  session.video_tracks = [track]
+  session.outgoing_bridge = mocker.Mock()
+  session.bitrate_controller = mocker.Mock()
+  session.params = mocker.Mock()
+  session.message_handler(json.dumps({'type': 'livestreamVideoEnable', 'data': {'enabled': enabled}}).encode())
+  assert session.enabled is enabled
+  track.enable.assert_called_once_with(enabled)
+  session.outgoing_bridge.enable.assert_called_once_with(enabled)
+  session.bitrate_controller.enable.assert_called_once_with(enabled)
