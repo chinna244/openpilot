@@ -6,11 +6,14 @@ as before.
 """
 from unittest import mock
 
+import numpy as np
 import pytest
 
 from opendbc.car import structs
 from openpilot.common.realtime import DT_MDL
+from opendbc.car.interfaces import ACCEL_MAX
 from openpilot.selfdrive.controls.lib.longitudinal_planner import get_cruise_accel
+from openpilot.sunnypilot.selfdrive.controls.lib.smart_cruise_control.limits import OP_LONG_A_BUDGET, op_long_cruise_jerk
 
 from openpilot.sunnypilot.selfdrive.controls.lib.smart_cruise_control.zoompilot import vision_controller
 from openpilot.sunnypilot.selfdrive.controls.lib.smart_cruise_control.zoompilot.vision_controller import SmartCruiseControlVision
@@ -18,7 +21,16 @@ from openpilot.sunnypilot.selfdrive.controls.lib.smart_cruise_control.zoompilot.
 
 A_MIN = vision_controller._IN_TURN_A_MIN
 SIDES = pytest.mark.parametrize("side", [1., -1.], ids=["left", "right"])
-HOST_CP = structs.CarParams(steerRatio=15.5, wheelbase=2.7)
+V_CRUISE = 20.
+
+
+def host_cruise(v_target, v_car, a_prev):
+  """The host's cruise candidate on the SCC target: upstream's, then rebuilt on SCC's budget while SCC is the target."""
+  a = get_cruise_accel(v_target, v_car, a_prev, DT_MDL)
+  if v_target >= V_CRUISE:
+    return a
+  j = op_long_cruise_jerk(v_car) * DT_MDL
+  return min(a, float(np.clip(np.clip(v_target - v_car, -OP_LONG_A_BUDGET, ACCEL_MAX), a_prev - j, a_prev + j)))
 
 
 def corner(k_near: float, k_after: float, side: float, d_split: float = 4.0):
@@ -43,8 +55,8 @@ class TestInTurnBraking(VisionCase):
     sm = self.make_sm(v, kappa_fn, cur_curvature, v_car=v_car)
     a_min = a_cruise = 0.
     for _ in range(40):
-      scc.update(sm, True, False, v, 0., 20.)
-      a_cruise = get_cruise_accel(True, scc.output_v_target, v_car, a_cruise, 0., HOST_CP, DT_MDL, 0., True)
+      scc.update(sm, True, False, v, 0., V_CRUISE)
+      a_cruise = host_cruise(scc.output_v_target, v_car, a_cruise)
       a_min = min(a_min, scc.output_a_target, a_cruise)
     return a_min
 
@@ -97,12 +109,12 @@ def test_planner_cruise_candidate_holds_the_cap_with_actuator_lag():
   from collections import deque
   from openpilot.selfdrive.controls.lib.longcontrol import LongCtrlState
   from openpilot.sunnypilot.selfdrive.car.tests.fakes import FakeParams
-  from openpilot.sunnypilot.selfdrive.controls.lib.dec.tests.test_dec_planner_gate import build_planner, build_sm
+  from openpilot.sunnypilot.selfdrive.controls.lib.tests.test_experimental_gate import build_planner, build_sm
   from openpilot.sunnypilot.selfdrive.controls.lib.smart_cruise_control.zoompilot import make_smart_cruise_control
   from openpilot.sunnypilot.selfdrive.controls.lib.smart_cruise_control.zoompilot.tests.vision_harness import model_for_road
 
   kappa = 0.05
-  p = build_planner(False, 'acc')
+  p = build_planner(False)
   p.CP.brand = 'mazda'
   p.CP.openpilotLongitudinalControl = True
   p.CP.longitudinalActuatorDelay = 0.36
@@ -113,9 +125,10 @@ def test_planner_cruise_candidate_holds_the_cap_with_actuator_lag():
   p.e2e_set_speed.params = FakeParams(ExperimentalModeSetSpeed=False)
   p.e2e_lead_gap.params = FakeParams(ExperimentalModeLeadGap=False)
   p.v_desired_filter.x = 8.
-  sm = build_sm(True)
-  sm['controlsState'].longControlState = LongCtrlState.pid
-  sm['controlsState'].curvature = kappa
+  sm = build_sm(False)
+  cs_ctrl = sm['controlsState'].as_builder()
+  cs_ctrl.longControlState, cs_ctrl.curvature = LongCtrlState.pid, kappa
+  sm['controlsState'] = cs_ctrl.as_reader()
 
   v, a, delayed = 8., 0., deque([0.] * 7)
   lagged = capped = 0

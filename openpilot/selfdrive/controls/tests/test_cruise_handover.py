@@ -7,6 +7,8 @@ from openpilot.cereal import custom, messaging
 from opendbc.car import structs
 from openpilot.selfdrive.controls.lib.longcontrol import LongCtrlState
 from openpilot.selfdrive.controls.lib.longitudinal_planner import LongitudinalPlanner, A_CRUISE_MIN
+from openpilot.sunnypilot.selfdrive.controls.lib.longitudinal_planner import SCC_SOURCES
+from openpilot.sunnypilot.selfdrive.controls.lib.smart_cruise_control.limits import OP_LONG_A_BUDGET
 
 V_EGO = 6.0  # m/s
 FAST = V_EGO * 3.6 + 30.  # kph: a permissive cruise target
@@ -33,8 +35,11 @@ def build_sm(v_cruise_kph=FAST, a_ego=-0.6, gas=False, brake=False, enabled=True
   ctl.controlsState.longControlState = LongCtrlState.off if override or not enabled else LongCtrlState.pid
   services['controlsState'] = ctl.controlsState.as_reader()
   sd = messaging.new_message('selfdriveState')
-  sd.selfdriveState.experimentalMode, sd.selfdriveState.enabled = e2e, enabled
+  sd.selfdriveState.enabled = enabled
   services['selfdriveState'] = sd.selfdriveState.as_reader()
+  sd_sp = messaging.new_message('selfdriveStateSP')
+  sd_sp.selfdriveStateSP.zoompilot.experimentalMode = e2e
+  services['selfdriveStateSP'] = sd_sp.selfdriveStateSP.as_reader()
   cc = messaging.new_message('carControl')
   cc.carControl.enabled = enabled
   cc.carControl.orientationNED = [0., 0., 0.]  # flat: the coast accel is -0.3
@@ -133,12 +138,14 @@ def test_after_the_return_the_cruise_candidate_is_the_committed_one():
 
 @pytest.mark.parametrize("a_ego", [-0.3, -1.0])
 def test_a_target_that_turns_restrictive_at_release_still_brakes(a_ego):
-  # permissive while the gas is held, 10 km/h under the speed at the release: the target asks the most braking it can
+  # permissive while the gas is held, 10 km/h under the speed at the release: the target asks the most braking it can,
+  # A_CRUISE_MIN (upstream's gentle set-speed drop). The reference can brake harder only from the measured accel the
+  # reset left in its state, the artefact this correction removes.
   p, ref = planner(), reference()
   for q in (p, ref):
     press(q, gas=True, a_ego=a_ego)
     q.update(build_sm(v_cruise_kph=V_EGO * 3.6 - 10., a_ego=a_ego))
-  assert sent(p) <= sent(ref) + 1e-6
+  assert sent(p) <= max(sent(ref), A_CRUISE_MIN) + 1e-6
   assert sent(p) <= max(a_ego, A_CRUISE_MIN) + 0.1
 
 
@@ -174,13 +181,12 @@ def test_the_committed_braking_is_kept_one_cycle_after_release():
 
 
 @pytest.mark.parametrize("a_ego", [-0.1, -0.8])
-def test_acc_mode_brakes_at_least_to_the_coast_target(a_ego):
-  # without throttle ACC caps the cruise accel at the coast (-0.3 here), even under the set speed
-  p, ref = planner(), reference()
-  for q in (p, ref):
-    press(q, gas=True, a_ego=a_ego, e2e=False)
-    q.update(build_sm(a_ego=a_ego, e2e=False))
-  assert sent(p) <= max(sent(ref), -0.3) + 1e-6
+def test_acc_mode_hands_over_clean(a_ego):
+  # upstream's cruise accel has no coast cap: in ACC under the set speed the target asks no braking
+  p = planner()
+  press(p, gas=True, a_ego=a_ego, e2e=False)
+  p.update(build_sm(a_ego=a_ego, e2e=False))
+  assert sent(p) >= 0.
 
 
 def test_repeated_short_gas_presses_each_hand_over_clean():
@@ -261,3 +267,11 @@ def test_outside_the_correction_both_plans_match_the_internal_one():
   lp, lpsp = pm.sent['longitudinalPlan'].longitudinalPlan, pm.sent['longitudinalPlanSP'].longitudinalPlanSP
   assert lp.aTarget == pytest.approx(p.output_a_target) == pytest.approx(lpsp.aTarget)
   assert lp.longitudinalPlanSource == p.mpc.source
+
+
+def test_the_ask_takes_scc_budget_without_its_jerk_limit():
+  # SCC brakes through the cruise candidate on its own budget: the handover's ask is that budget, not a jerk step
+  p = planner()
+  p.source, p.output_v_target, p.v_ego, p.a_cruise_prev = SCC_SOURCES[0], V_EGO - 3., V_EGO, 0.
+  assert p.update_cruise_accel(0., unlimited=True) == pytest.approx(-OP_LONG_A_BUDGET)
+  assert p.update_cruise_accel(0.) > -0.1
