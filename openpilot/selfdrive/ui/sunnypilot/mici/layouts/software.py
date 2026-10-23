@@ -11,6 +11,8 @@ import pyray as rl
 from openpilot.selfdrive.ui.mici.layouts.settings.software import (CheckUpdateButton, InstallUpdateButton, SoftwareLayoutMici,
                                                                     TargetBranchButton, UpdaterState, _split_description)
 from openpilot.selfdrive.ui.mici.widgets.button import BigButton
+from openpilot.selfdrive.ui.mici.widgets.dialog import BigConfirmationDialog
+from openpilot.selfdrive.ui.mici.widgets.konik import KonikBackupPage
 from openpilot.selfdrive.ui.ui_state import ui_state
 from openpilot.system.ui.lib.application import gui_app
 from openpilot.system.ui.lib.multilang import tr
@@ -102,9 +104,36 @@ class CheckUpdateButtonSP(CheckUpdateButton):
     super()._handle_mouse_release(mouse_pos)
 
 
+class KonikBackupButton(BigButton):
+  def __init__(self):
+    self._icon = gui_app.texture("icons_mici/settings/device/green_settings.png", 64, 64)
+    super().__init__("Konik backups", "", self._icon,
+                     description="Back up drives on parked Wi-Fi; comma stays active. Pending drives may be deleted if storage fills.")
+    self.set_click_callback(self._confirm)
+
+  def _confirm(self):
+    if ui_state.is_offroad():
+      enabled = not ui_state.params.get_bool("KonikUploadsEnabled")
+      title = "enable Konik backups" if enabled else "disable Konik backups"
+      gui_app.push_widget(BigConfirmationDialog(title, self._icon, lambda: self._apply(enabled)))
+
+  def _apply(self, enabled):
+    if ui_state.is_offroad():
+      ui_state.params.put_bool("KonikUploadsEnabled", enabled, block=True)
+
+  def _update_state(self):
+    super()._update_state()
+    self.set_enabled(ui_state.is_offroad())
+    self.set_value("enabled" if ui_state.params.get_bool("KonikUploadsEnabled") else "disabled")
+
+
 class SoftwareLayoutSP(SoftwareLayoutMici):
   def __init__(self):
     super().__init__()
+    self._scroller.add_widget(KonikBackupButton())
+    pair_button = BigButton("Konik account", "pair and view backup status")
+    pair_button.set_click_callback(lambda: gui_app.push_widget(KonikBackupPage()))
+    self._scroller.add_widget(pair_button)
 
     # the check button says when the update is downloaded; the branch button rechecks through it
     items = self._scroller.items

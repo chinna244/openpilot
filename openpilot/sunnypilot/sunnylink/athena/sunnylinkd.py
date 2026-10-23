@@ -49,6 +49,9 @@ params = Params()
 # Parameters that should never be remotely modified
 BLOCKED_PARAMS = {
   "AdbEnabled",
+  "KonikUploadsEnabled",  # Backup consent is local-only
+  "KonikDongleId",        # Managed by the separate Konik registration
+  "KonikUploadStatus",    # Managed by the backup worker
   "CompletedSunnylinkConsentVersion",
   "CompletedTrainingVersion",
   "GithubUsername",  # Could grant SSH access

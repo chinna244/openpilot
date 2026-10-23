@@ -14,7 +14,8 @@ from openpilot.system.ui.lib.multilang import tr, tr_noop
 from openpilot.system.ui.widgets import DialogResult
 from openpilot.system.ui.widgets.confirm_dialog import ConfirmDialog
 
-from openpilot.system.ui.sunnypilot.widgets.list_view import toggle_item_sp
+from openpilot.system.ui.sunnypilot.widgets.list_view import toggle_item_sp, button_item_sp
+from openpilot.selfdrive.ui.widgets.konik import KonikPairingDialog
 from openpilot.system.ui.sunnypilot.widgets.tree_dialog import TreeOptionDialog, TreeNode, TreeFolder
 
 
@@ -31,6 +32,14 @@ DESCRIPTIONS = {
 class SoftwareLayoutSP(SoftwareLayout):
   def __init__(self):
     super().__init__()
+    self.konik_toggle = toggle_item_sp(
+      "Konik backups", "Back up drives on parked Wi-Fi; comma stays active. Pending drives may be deleted if storage fills.",
+      initial_state=ui_state.params.get_bool("KonikUploadsEnabled"), callback=self._on_konik_toggled,
+      enabled=ui_state.is_offroad,
+    )
+    self._scroller.add_widget(self.konik_toggle)
+    self._scroller.add_widget(button_item_sp("Konik account", "Pair", callback=lambda: gui_app.push_widget(KonikPairingDialog()),
+                                           description=lambda: ui_state.params.get("KonikUploadStatus") or "Enable backups and park on Wi-Fi"))
     self.disable_updates_toggle = toggle_item_sp(
       lambda: tr("Disable Updates"),
       description="",
@@ -38,6 +47,12 @@ class SoftwareLayoutSP(SoftwareLayout):
       callback=self._on_disable_updates_toggled,
     )
     self._scroller.add_widget(self.disable_updates_toggle)
+
+  def _on_konik_toggled(self, enabled):
+    if ui_state.is_offroad():
+      ui_state.params.put_bool("KonikUploadsEnabled", enabled, block=True)
+    else:
+      self.konik_toggle.action_item.set_state(ui_state.params.get_bool("KonikUploadsEnabled"))
 
   def _handle_reboot(self, result):
     if result == DialogResult.CONFIRM:
