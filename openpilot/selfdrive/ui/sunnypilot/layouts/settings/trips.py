@@ -12,6 +12,8 @@ import pyray as rl
 from openpilot.common.api import api_get
 from openpilot.common.constants import CV
 from openpilot.common.params import Params
+from openpilot.selfdrive.ui.layouts.drive_replay import DriveReplayLayout
+from openpilot.system.ui.widgets.button import Button
 from openpilot.common.swaglog import cloudlog
 from openpilot.selfdrive.ui.lib.api_helpers import get_token
 from openpilot.selfdrive.ui.ui_state import ui_state, device
@@ -29,6 +31,7 @@ class TripsLayout(Widget):
   def __init__(self):
     super().__init__()
     self._params = Params()
+    self._replay = self._child(Button(tr("Drive replay"), lambda: gui_app.push_widget(DriveReplayLayout()), font_size=40))
     self._session = requests.Session()
     self._stats = self._get_stats()
 
@@ -136,7 +139,10 @@ class TripsLayout(Widget):
     w = rect.width
 
     spacing = 30
-    available_h = rect.height - 30
+    self._replay.set_enabled(ui_state.is_offroad())
+    self._replay.render(rl.Rectangle(x + w - 330, y, 330, 90))
+    y += 110
+    available_h = rect.height - 140
     card_height = available_h / 2
 
     is_metric = self._params.get_bool("IsMetric")

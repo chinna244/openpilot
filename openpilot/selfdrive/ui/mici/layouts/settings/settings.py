@@ -1,4 +1,6 @@
 from openpilot.common.params import Params
+from openpilot.selfdrive.ui.layouts.drive_replay import DriveReplayLayout
+from openpilot.selfdrive.ui.ui_state import ui_state
 from openpilot.system.ui.widgets.scroller import NavScroller
 from openpilot.selfdrive.ui.mici.widgets.button import BigButton
 from openpilot.selfdrive.ui.mici.layouts.settings.toggles import TogglesLayoutMici
@@ -44,11 +46,16 @@ class SettingsLayout(NavScroller):
     firehose_btn = SettingsBigButton("firehose", "", gui_app.texture("icons_mici/settings/firehose.png", 52, 62))
     firehose_btn.set_click_callback(lambda: gui_app.push_widget(firehose_panel))
 
+    replay_btn = SettingsBigButton("drive replay", "")
+    replay_btn.set_click_callback(lambda: gui_app.push_widget(DriveReplayLayout()))
+    replay_btn.set_enabled(lambda: not ui_state.started and self._params.get_bool("IsOffroad"))
+
     self._scroller.add_widgets([
       toggles_btn,
       network_btn,
       self._device_button,
       software_btn,
+      replay_btn,
       firehose_btn,
       developer_btn,
     ])
