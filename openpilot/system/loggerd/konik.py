@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Independent, offroad Wi-Fi archive uploads. No Konik remote-command connection."""
 import os
-import errno
 import threading
 import time
 
@@ -14,38 +13,11 @@ from openpilot.common.hardware.hw import Paths
 from openpilot.common.params import Params
 from openpilot.common.swaglog import cloudlog
 from openpilot.common.utils import CallbackReader, get_upload_stream
-from openpilot.system.loggerd.uploader import listdir_by_creation
 from openpilot.system.loggerd.xattr_cache import setxattr
+from openpilot.system.loggerd import konik_queue
+from openpilot.system.loggerd.konik_queue import ARCHIVE_FILES as ARCHIVE_FILES, UPLOAD_ATTR_NAME as UPLOAD_ATTR_NAME, pending_upload_files
 
 NetworkType = log.DeviceState.NetworkType
-UPLOAD_ATTR_NAME = 'user.konik.upload'
-ARCHIVE_FILES = ('qlog', 'qlog.zst', 'qcamera.ts', 'rlog', 'rlog.zst', 'fcamera.hevc', 'ecamera.hevc')
-
-
-def pending_upload_files(root: str):
-  """Read markers fresh: the queue RPC runs in a different process from uploads."""
-  for segment in listdir_by_creation(root):
-    directory = os.path.join(root, segment)
-    if os.path.islink(directory):
-      continue
-    try:
-      names = os.listdir(directory)
-      if any(name.endswith('.lock') for name in names):
-        continue
-      for name in ARCHIVE_FILES:
-        path = os.path.join(directory, name)
-        if name not in names or os.path.islink(path) or not os.path.isfile(path):
-          continue
-        try:
-          if os.getxattr(path, UPLOAD_ATTR_NAME) == b'1':
-            continue
-        except OSError as e:
-          if e.errno not in (errno.ENODATA, getattr(errno, 'ENOATTR', errno.ENODATA)):
-            raise
-        yield os.path.join(segment, name), path
-    except OSError:
-      # The normal free-space deleter can remove a segment during a scan.
-      continue
 
 
 class UploadPaused(Exception):
@@ -60,28 +32,57 @@ class KonikUploader:
     self.exit_event = exit_event or threading.Event()
     self.retry_at: dict[str, float] = {}
     self.registration_retry_at = 0.0
+    self._request = None
+    self._active_key = None
+    self._control_checked = 0.0
+    self._cancelled = set()
 
   def allowed(self) -> bool:
     device = self.device_state()
     return (device is not None and not self.exit_event.is_set() and self.params.get_bool('KonikUploadsEnabled') and self.params.get_bool('IsOffroad')
             and device.networkType == NetworkType.wifi and not device.networkMetered)
 
-  def _check_policy(self, *_):
+  def _check_policy(self, *_, force: bool = False):
     if not self.allowed():
       raise UploadPaused()
+    if self._active_key is not None:
+      now = time.monotonic()
+      if force or now - self._control_checked >= 0.5:
+        self._cancelled = set(konik_queue.control(self.params)['cancelled'])
+        self._control_checked = now
+      if self._active_key in self._cancelled:
+        raise UploadPaused()
 
   def _status(self, status: str):
     if self.params.get('KonikUploadStatus') != status:
       self.params.put('KonikUploadStatus', status, block=True)
 
   def next_file(self) -> tuple[str, str] | None:
+    state = konik_queue.control(self.params)
+    self._request = None
+    now = time.monotonic()
+    requests_pending = list(konik_queue.pending_requests(state, self.root))
+    requested_keys = {key for _, key, _ in requests_pending}
     pending = set()
     candidate = None
-    now = time.monotonic()
-    for key, path in pending_upload_files(self.root):
+    rank = None
+    for job, key, path in requests_pending:
       pending.add(path)
-      if candidate is None and now >= self.retry_at.get(path, 0):
-        candidate = (key, path)
+      priority = (0, job['priority'])
+      if now >= self.retry_at.get(path, 0) and (rank is None or priority < rank):
+        candidate, rank, self._request = (key, path), priority, job
+    for key, path in pending_upload_files(self.root):
+      if key in requested_keys or key in state['cancelled']:
+        continue
+      pending.add(path)
+      name = os.path.basename(path)
+      route = key.split('/')[0].rpartition('--')[0]
+      viewed = route in state['viewed']
+      preview = name in ('qlog', 'qlog.zst', 'qcamera.ts')
+      priority = (1 if viewed and preview else 2 if name.startswith('qlog') else 3 if preview else 4 if viewed else 5, 0)
+      if now >= self.retry_at.get(path, 0) and (rank is None or priority < rank):
+        candidate, rank = (key, path), priority
+        self._request = None
     self.retry_at = {path: retry for path, retry in self.retry_at.items() if path in pending}
     return candidate
 
@@ -104,10 +105,13 @@ class KonikUploader:
       return False
     item = self.next_file()
     if item is None:
-      self._status('retry pending' if self.retry_at else 'backup up to date')
+      cancelled = konik_queue.control(self.params)['cancelled']
+      self._status('retry pending' if self.retry_at else 'files cancelled; request them again to resume' if cancelled else 'backup up to date')
       return None
     key, path = item
-    current = {'path': key, 'progress': 0.0}
+    self._active_key = key
+    self._control_checked = float('-inf')
+    current = {'path': key, 'progress': 0.0, 'id': self._request['id'] if self._request else konik_queue.automatic_id(key)}
     self.params.put('KonikCurrentUpload', current, block=True)
     last_progress = time.monotonic()
     try:
@@ -137,6 +141,9 @@ class KonikUploader:
       self._check_policy()
       if response.status_code not in (200, 201, 204):
         raise RuntimeError(f'Konik file upload returned {response.status_code}')
+      self._check_policy(force=True)
+      if self._request is not None:
+        setxattr(path, konik_queue.REQUEST_ATTR_NAME, self._request['id'].encode())
       setxattr(path, UPLOAD_ATTR_NAME, b'1')
       self.retry_at.pop(path, None)
       return True
@@ -149,6 +156,7 @@ class KonikUploader:
       self._status('backup failed; will retry')
       return False
     finally:
+      self._active_key = None
       self.params.put('KonikCurrentUpload', {}, block=True)
 
 

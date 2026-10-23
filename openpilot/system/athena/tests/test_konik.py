@@ -79,8 +79,8 @@ def test_ping_state_is_separate_and_cleared_on_disconnect(setup):
   assert setup.params.get('KonikConnectionStatus') == 'disconnected'
 
 
-@pytest.mark.parametrize('method', ['startLocalProxy', 'uploadFileToUrl', 'getMessage', 'getPublicKey', 'getSshAuthorizedKeys',
-                                    'getParams', 'saveParams', 'listDataDirectory', 'reboot', 'ssh', 'setRouteViewed'])
+@pytest.mark.parametrize('method', ['startLocalProxy', 'uploadFileToUrl', 'getPublicKey', 'getSshAuthorizedKeys',
+                                    'getParams', 'saveParams', 'listDataDirectory', 'reboot', 'ssh'])
 def test_all_unapproved_remote_commands_are_rejected(setup, method):
   result = call(setup, method)
   assert result['error']['code'] == -32601
@@ -89,7 +89,8 @@ def test_all_unapproved_remote_commands_are_rejected(setup, method):
 def test_rpc_dispatcher_is_not_comma_dispatcher(setup):
   methods = setup.connection.methods()
   assert methods is not konik.rpc.dispatcher
-  assert set(methods) == {'echo', 'getVersion', 'getNetworkType', 'getNetworkMetered', 'startStream', 'listUploadQueue', 'cancelUpload'}
+  assert set(methods) == {'echo', 'getVersion', 'getNetworkType', 'getNetworkMetered', 'startStream', 'listUploadQueue',
+                          'cancelUpload', 'uploadFilesToUrls', 'setRouteViewed', 'getMessage'}
   assert call(setup, 'echo', ['hello'])['result'] == 'hello'
 
 
@@ -226,10 +227,155 @@ def test_large_queue_response_is_fragmented_without_changing_json(setup):
 
 
 
-def test_remote_cancel_does_not_modify_automatic_backup_queue(setup):
+def test_unknown_cancel_does_not_modify_automatic_backup_queue(setup):
   setup.params.values['KonikCurrentUpload'] = {'path': 'route/qcamera.ts', 'progress': 0.5}
   result = call(setup, 'cancelUpload', {'upload_id': ['backup-id']})
-  assert result['error']['code'] == -32000
-  assert 'device' in result['error']['message']
+  assert result['result']['success'] == 0
   assert setup.params.get('KonikCurrentUpload')['progress'] == 0.5
   assert setup.params.get_bool('KonikUploadsEnabled')
+
+
+def make_recording(root, name='qcamera.ts', folder='00000001--abc--2'):
+  path = root / folder / name
+  path.parent.mkdir(parents=True, exist_ok=True)
+  path.write_bytes(b'recording')
+  return path
+
+
+def test_website_requests_recordings_without_trusting_remote_upload_destination(setup, tmp_path, mocker):
+  make_recording(tmp_path)
+  mocker.patch.object(konik.Paths, 'log_root', return_value=str(tmp_path))
+  response = call(setup, 'uploadFilesToUrls', {'files_data': [
+    {'fn': '00000001--abc--2/qcamera.ts', 'url': 'http://localhost/private', 'headers': {'Authorization': 'untrusted'}, 'allow_cellular': True}
+  ]})
+  assert response['result']['enqueued'] == 1
+  job = response['result']['items'][0]
+  assert job['id'].startswith('request-')
+  assert job['allow_cellular'] is False
+  state = setup.params.get('KonikUploadControl')
+  assert 'localhost' not in json.dumps(state)
+  assert 'untrusted' not in json.dumps(state)
+  assert setup.params.get('DongleId') == 'comma-id'
+  assert len(call(setup, 'listUploadQueue')['result']) == 1
+
+
+@pytest.mark.parametrize('name', ['/persist/comma/id_ecdsa', '../id_ecdsa', '00000001--abc--2/../../secret',
+                                 '00000001--abc--2/arbitrary.txt', '00000001--abc--2/qcamera.ts/extra', '', None])
+def test_website_requests_cannot_read_non_recordings(setup, tmp_path, mocker, name):
+  mocker.patch.object(konik.Paths, 'log_root', return_value=str(tmp_path))
+  result = call(setup, 'uploadFilesToUrls', {'files_data': [{'fn': name, 'url': 'https://anything.test/file'}]})
+  assert result['result']['enqueued'] == 0
+  assert result['result']['failed']
+
+
+def test_request_rejects_symlink_and_locked_recording(setup, tmp_path, mocker):
+  file = make_recording(tmp_path, 'rlog')
+  outside = tmp_path / 'secret'
+  outside.write_bytes(b'private')
+  (file.parent / 'qcamera.ts').symlink_to(outside)
+  mocker.patch.object(konik.Paths, 'log_root', return_value=str(tmp_path))
+  result = call(setup, 'uploadFilesToUrls', {'files_data': [{'fn': '00000001--abc--2/qcamera.ts'}]})
+  assert result['result']['enqueued'] == 0
+  (file.parent / 'rlog.lock').touch()
+  result = call(setup, 'uploadFilesToUrls', {'files_data': [{'fn': '00000001--abc--2/rlog.zst'}]})
+  assert result['result']['enqueued'] == 0
+
+
+def test_cancel_automatic_file_and_request_again_resumes_it(setup, tmp_path, mocker):
+  path = make_recording(tmp_path)
+  mocker.patch.object(konik.Paths, 'log_root', return_value=str(tmp_path))
+  item = call(setup, 'listUploadQueue')['result'][0]
+  cancelled = call(setup, 'cancelUpload', {'upload_id': item['id']})
+  assert cancelled['result']['success'] == 1
+  assert call(setup, 'listUploadQueue')['result'] == []
+  import os
+  import errno
+  with pytest.raises(OSError) as error:
+    os.getxattr(path, 'user.konik.upload')
+  assert error.value.errno == errno.ENODATA
+  assert call(setup, 'uploadFilesToUrls', {'files_data': [{'fn': item['path']}]})['result']['enqueued'] == 1
+  assert len(call(setup, 'listUploadQueue')['result']) == 1
+
+
+def test_request_deduplicates_and_resolves_compressed_log(setup, tmp_path, mocker):
+  make_recording(tmp_path, 'rlog')
+  mocker.patch.object(konik.Paths, 'log_root', return_value=str(tmp_path))
+  payload = {'files_data': [{'fn': '00000001--abc--2/rlog.zst'}]}
+  assert call(setup, 'uploadFilesToUrls', payload)['result']['enqueued'] == 1
+  assert call(setup, 'uploadFilesToUrls', payload)['result']['enqueued'] == 0
+  assert len(call(setup, 'listUploadQueue')['result']) == 1
+
+
+def test_route_view_notifications_are_konik_only_and_keep_ten_routes(setup):
+  for i in range(12):
+    result = call(setup, 'setRouteViewed', {'route': f'konik-id|00000001--route{i}'})
+    assert result['result']['success'] == 1
+  state = setup.params.get('KonikUploadControl')
+  assert len(state['viewed']) == 10
+  assert state['viewed'][-1] == '00000001--route11'
+  assert setup.params.get('AthenadRecentlyViewedRoutes') is None
+
+
+@pytest.mark.parametrize('route', ['comma-id|00000001--abc', '../route', 'konik-id|/persist', 'konik-id|bad/route'])
+def test_route_view_notifications_reject_invalid_routes(setup, route):
+  assert 'error' in call(setup, 'setRouteViewed', {'route': route})
+
+
+def test_deleted_cancellations_do_not_exhaust_capacity(setup, tmp_path, mocker):
+  from openpilot.system.loggerd import konik_queue
+  setup.params.values['KonikUploadControl'] = {'requested': [], 'cancelled': [f'00000001--deleted--{i}/qcamera.ts' for i in range(10000)], 'viewed': []}
+  make_recording(tmp_path)
+  mocker.patch.object(konik.Paths, 'log_root', return_value=str(tmp_path))
+  item = call(setup, 'listUploadQueue')['result'][0]
+  result = call(setup, 'cancelUpload', {'upload_id': item['id']})
+  assert result['result']['success'] == 1
+  assert len(konik_queue.control(setup.params)['cancelled']) == 1
+
+
+def test_cancel_pruning_preserves_locked_recordings(setup, tmp_path, mocker):
+  make_recording(tmp_path)
+  mocker.patch.object(konik.Paths, 'log_root', return_value=str(tmp_path))
+  item = call(setup, 'listUploadQueue')['result'][0]
+  locked = tmp_path / '00000001--locked--0'
+  locked.mkdir()
+  (locked / 'qcamera.ts').write_bytes(b'video')
+  (locked / 'qcamera.ts.lock').touch()
+  key = locked.name + '/qcamera.ts'
+  setup.params.values['KonikUploadControl'] = {'requested': [], 'cancelled': [key], 'viewed': []}
+  assert call(setup, 'cancelUpload', {'upload_id': item['id']})['result']['success'] == 1
+  assert key in setup.params.values['KonikUploadControl']['cancelled']
+
+
+def test_voltage_badge_reads_peripheral_state(setup, mocker):
+  socket = mocker.patch.object(konik.messaging, 'sub_sock')
+  message = mocker.Mock()
+  message.to_dict.return_value = {'peripheralState': {'voltage': 12400}}
+  receive = mocker.patch.object(konik.messaging, 'recv_one', return_value=message)
+  result = call(setup, 'getMessage', {'service': 'peripheralState', 'timeout': 5000})
+  assert result['result'] == {'peripheralState': {'voltage': 12400}}
+  socket.assert_called_once_with('peripheralState', timeout=5000)
+  receive.assert_called_once_with(socket.return_value)
+
+
+@pytest.mark.parametrize('params', [
+  {'service': 'sendcan'}, {'service': 'carState'}, {'service': None},
+  {'service': 'peripheralState', 'timeout': -1}, {'service': 'peripheralState', 'timeout': 5001},
+  {'service': 'peripheralState', 'timeout': True}, {'service': 'peripheralState', 'timeout': '5000'},
+])
+def test_voltage_rpc_rejects_other_services_and_unbounded_timeouts(setup, mocker, params):
+  socket = mocker.patch.object(konik.messaging, 'sub_sock')
+  assert 'error' in call(setup, 'getMessage', params)
+  socket.assert_not_called()
+
+
+def test_voltage_read_timeout_returns_error(setup, mocker):
+  mocker.patch.object(konik.messaging, 'sub_sock')
+  mocker.patch.object(konik.messaging, 'recv_one', return_value=None)
+  assert 'error' in call(setup, 'getMessage', {'service': 'peripheralState'})
+
+
+def test_voltage_read_disabled_with_konik(setup, mocker):
+  setup.params.values['KonikUploadsEnabled'] = False
+  socket = mocker.patch.object(konik.messaging, 'sub_sock')
+  assert 'error' in call(setup, 'getMessage', {'service': 'peripheralState'})
+  socket.assert_not_called()

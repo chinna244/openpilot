@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
 """Restricted Konik presence and parked live view, isolated from comma Athena."""
-import os
-import hashlib
 import threading
-from urllib.parse import quote
 import time
+
+import openpilot.cereal.messaging as messaging
 
 from websocket import ABNF, WebSocketTimeoutException, create_connection
 
-from openpilot.common.api.konik import API_HOST, KonikApi, valid_id
+from openpilot.common.api.konik import KonikApi, valid_id
 from openpilot.common.hardware.hw import Paths
-from openpilot.system.loggerd.konik import pending_upload_files
+from openpilot.system.loggerd import konik_queue
 from openpilot.common.hardware import HARDWARE
 from openpilot.common.params import Params
 from openpilot.common.swaglog import cloudlog
@@ -55,41 +54,47 @@ class KonikConnection:
     dongle_id = self.params.get('KonikDongleId')
     if not self.configured(dongle_id):
       return []
-    current = self.params.get('KonikCurrentUpload') or {}
-    items = []
-    for key, path in pending_upload_files(Paths.log_root()):
-      folder, name = os.path.split(key)
-      route, separator, segment = folder.rpartition('--')
-      if not separator or not segment.isdecimal():
-        continue
-      try:
-        created_at = int(os.stat(path).st_mtime * 1000)
-      except OSError:
-        continue
-      remote_name = name + '.zst' if name in ('qlog', 'rlog') else name
-      active = current.get('path') == key
-      # Display-only URL: Konik's UI extracts route/segment/file from its path.
-      # Do not fetch signed URLs or disclose credentials to list the local backlog.
-      url = f'{API_HOST}/queue/{dongle_id}/{quote(route)}/{segment}/{quote(remote_name)}'
-      items.append({'path': key, 'url': url, 'headers': {}, 'created_at': created_at, 'id': 'backup-' + hashlib.sha256(key.encode()).hexdigest(),
-                    'retry_count': 0, 'current': active, 'progress': current.get('progress', 0.0) if active else 0.0,
-                    'allow_cellular': False, 'priority': 99})
-    return items
+    return konik_queue.queue_items(self.params, Paths.log_root(), dongle_id)
 
-  @staticmethod
-  def cancel_upload(upload_id: str | list[str]):
-    raise RuntimeError('Automatic backups are managed on the device. Disable Konik backups there to pause uploads.')
+  def cancel_upload(self, upload_id: str | list[str]):
+    return konik_queue.cancel(self.params, Paths.log_root(), self.params.get('KonikDongleId'), upload_id)
+
+  def upload_files(self, files_data: list[dict]):
+    if not self.configured():
+      raise RuntimeError('Konik is not enabled and registered')
+    return konik_queue.enqueue(self.params, Paths.log_root(), files_data)
+
+  def route_viewed(self, route: str):
+    return konik_queue.view_route(self.params, self.params.get('KonikDongleId'), route)
+
+  def get_message(self, service: str, timeout: int = 1000) -> dict:
+    # Stable's voltage badge uses this RPC; no other messaging service is exposed.
+    if service != 'peripheralState' or type(timeout) is not int or not 1 <= timeout <= 5000:
+      raise ValueError('only peripheralState with a timeout of 1 to 5000 ms is supported')
+    if not self.configured():
+      raise RuntimeError('Konik is not enabled and registered')
+    socket = messaging.sub_sock('peripheralState', timeout=timeout)
+    try:
+      message = messaging.recv_one(socket)
+      if message is None:
+        raise TimeoutError('peripheralState unavailable')
+      return message.to_dict()
+    finally:
+      del socket
 
   def methods(self) -> dict:
     # Never use the global dispatcher, queues, proxy or upload handlers from athenad.
     return {
       'echo': lambda s: s,
+      'getMessage': self.get_message,
       'getVersion': get_version,
       'getNetworkType': HARDWARE.get_network_type,
       'getNetworkMetered': lambda: HARDWARE.get_network_metered(HARDWARE.get_network_type()),
       'startStream': self.start_stream,
       'listUploadQueue': self.list_upload_queue,
       'cancelUpload': self.cancel_upload,
+      'uploadFilesToUrls': self.upload_files,
+      'setRouteViewed': self.route_viewed,
     }
 
   @staticmethod

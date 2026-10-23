@@ -309,3 +309,66 @@ def test_failed_transfer_clears_active_progress(context):
   context.put.side_effect = OSError('network failure')
   assert context.worker.step() is False
   assert context.params.get('KonikCurrentUpload') == {}
+
+
+def request_file(context, name='qcamera.ts'):
+  from openpilot.system.loggerd import konik_queue
+  return konik_queue.enqueue(context.params, str(context.segment.parent), [{'fn': context.segment.name + '/' + name}])['items'][0]
+
+
+def test_requested_completed_file_reuploads_using_fixed_konik_signing(context):
+  path = file(context, 'qcamera.ts', marker='user.konik.upload')
+  item = request_file(context)
+  assert context.worker.step() is True
+  assert getxattr(str(path), 'user.konik.request') == item['id'].encode()
+  assert context.client.get.call_count == 1
+  assert context.put.call_count == 1
+  assert getxattr(str(path), 'user.upload') is None
+  assert context.worker.step() is None
+
+
+def test_cancelled_inflight_upload_never_marks_complete(context):
+  from openpilot.system.loggerd import konik_queue
+  path = file(context, 'qcamera.ts')
+  def transfer(*args, **kwargs):
+    items = konik_queue.queue_items(context.params, str(context.segment.parent), 'konik-id')
+    konik_queue.cancel(context.params, str(context.segment.parent), 'konik-id', items[0]['id'])
+    return SimpleNamespace(status_code=200)
+  context.put.side_effect = transfer
+  assert context.worker.step() is None
+  assert getxattr(str(path), 'user.konik.upload') is None
+  assert context.worker.step() is None
+
+
+def test_manual_request_has_priority_over_automatic_backups(context):
+  file(context, 'qlog.zst')
+  selected = file(context, 'dcamera.hevc')
+  request_file(context, 'dcamera.hevc')
+  assert context.worker.next_file()[1] == str(selected)
+  assert context.worker.step() is True
+
+
+def test_viewed_route_preview_precedes_other_full_quality_files(context):
+  from openpilot.system.loggerd import konik_queue
+  file(context, 'fcamera.hevc')
+  folder = context.segment.parent / '00000002--recent--0'
+  folder.mkdir()
+  preview = folder / 'qcamera.ts'
+  preview.write_bytes(b'preview')
+  konik_queue.view_route(context.params, 'konik-id', 'konik-id|00000002--recent')
+  assert context.worker.next_file()[1] == str(preview)
+
+
+def test_new_request_during_upload_is_not_lost_when_worker_finishes(context):
+  from openpilot.system.loggerd import konik_queue
+  file(context, 'qcamera.ts')
+  file(context, 'rlog')
+  request_file(context)
+  def transfer(*args, **kwargs):
+    request_file(context, 'rlog.zst')
+    return SimpleNamespace(status_code=200)
+  context.put.side_effect = transfer
+  assert context.worker.step() is True
+  items = konik_queue.queue_items(context.params, str(context.segment.parent), 'konik-id')
+  assert len(items) == 1
+  assert items[0]['path'].endswith('rlog')

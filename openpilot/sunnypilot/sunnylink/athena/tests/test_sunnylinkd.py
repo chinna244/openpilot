@@ -39,6 +39,7 @@ class TestSunnylinkdMethods(OpenpilotTestCase):
       "KonikUploadsEnabled": "1",
       "KonikDongleId": "attacker",
       "KonikUploadStatus": "fake success",
+      "KonikUploadControl": "fake requests",
       "KonikCurrentUpload": "fake progress",
       "KonikConnectionStatus": "fake connection",
       "KonikLastAthenaPingTime": "123",
