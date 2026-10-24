@@ -41,6 +41,7 @@ from openpilot.selfdrive.modeld.fill_model_msg import fill_model_msg, fill_drivi
 from openpilot.selfdrive.modeld.constants import ModelConstants, Plan
 from openpilot.selfdrive.modeld.helpers import MODELS_DIR, chestnut_present, chestnut_compiled, modeld_pkl_path, load_oob, wait_for_chestnut
 from openpilot.sunnypilot import jetlink_adapter
+from openpilot.sunnypilot.jetlink_adapter.gps import JETSON_GPS_SERVICE, JetsonGps, fill as fill_jetson_gps
 from openpilot.sunnypilot.livedelay.helpers import get_lat_delay
 from openpilot.sunnypilot.modeld_v2.modeld_base import ModelStateBase
 from openpilot.sunnypilot.selfdrive.controls.lib.relc import RoadEdgeLaneChangeController
@@ -307,7 +308,7 @@ def main(demo=False):
   config_realtime_process(7, 54)
 
   # messaging
-  pub_socks = ["modelV2", "drivingModelData", "cameraOdometry", "modelDataV2SP"] + (["chestnutGpuState"] if CHESTNUT else [])
+  pub_socks = ["modelV2", "drivingModelData", "cameraOdometry", "modelDataV2SP", JETSON_GPS_SERVICE] + (["chestnutGpuState"] if CHESTNUT else [])
   pm = PubMaster(pub_socks)
   sm = SubMaster(["deviceState", "carState", "narrowRoadCameraState", "extrinsicsCalibration", "driverMonitoringState",
                   "carControl", "controlsState", "lateralDelay"])
@@ -339,6 +340,7 @@ def main(demo=False):
   # TODO Move smooth seconds to action function
   long_delay = CP.longitudinalActuatorDelay + LONG_SMOOTH_SECONDS
   prev_action = log.ModelDataV2.Action()
+  jetson_gps = JetsonGps()
 
   DH = DesireHelper()
   RELC = RoadEdgeLaneChangeController()
@@ -478,6 +480,15 @@ def main(demo=False):
       pm.send('drivingModelData', drivingdata_send)
       pm.send('cameraOdometry', posenet_send)
       pm.send('modelDataV2SP', mdv2sp_send)
+
+    # the Jetson's USB GPS, when the last reply carried a new fix; never at the frame loop's expense
+    try:
+      if (jetson_fix := jetson_gps.poll(model)) is not None:
+        jetson_gps_send = messaging.new_message(JETSON_GPS_SERVICE, valid=True)
+        if fill_jetson_gps(jetson_gps_send, jetson_fix):
+          pm.send(JETSON_GPS_SERVICE, jetson_gps_send)
+    except Exception:
+      cloudlog.exception("modeld.jetson_gps_failed")
     last_vipc_frame_id = meta_main.frame_id
 
 if __name__ == "__main__":

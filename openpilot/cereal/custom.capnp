@@ -504,7 +504,21 @@ struct CustomReserved16 @0xfc6241ed8877b611 {
 struct CustomReserved17 @0xa30662f84033036c {
 }
 
+# zoompilot: the Jetson's USB GPS fix, from the JetLink telemetry modeld receives (jetlink_adapter/gps.py).
+# The service is customReserved18. ubloxd publishes it as gpsLocationExternal only while the comma's own
+# GNSS has no trustworthy fix (system/ubloxd/gps_arbiter.py); pigeond aids the ublox with it.
 struct CustomReserved18 @0xc86a3d38d13eb3ef {
+  latitude @0 :Float64;
+  longitude @1 :Float64;
+  altitude @2 :Float64;            # m above the WGS84 ellipsoid (as a ublox reports), 0 when the receiver gave none
+  speed @3 :Float32;               # m/s over ground
+  bearingDeg @4 :Float32;          # true course, NaN when the receiver gave none
+  hdop @5 :Float32;                # NaN when the receiver gave none
+  satelliteCount @6 :UInt8;
+  fixQuality @7 :UInt8;            # NMEA GGA quality: 1 GPS, 2 DGPS/SBAS, 4/5 RTK
+  fixType @8 :UInt8;               # NMEA GSA: 2 2D, 3 3D, 0 unknown
+  unixTimestampMillis @9 :Int64;   # the receiver's UTC for the fix
+  ageMs @10 :UInt32;               # the fix's age on the Jetson when the reply was written
 }
 
 # zoompilot: the liveTorqueParametersSP message (torqued_ext), on the last of sunnypilot's

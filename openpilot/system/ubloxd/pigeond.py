@@ -17,6 +17,8 @@ from openpilot.common.swaglog import cloudlog
 from openpilot.common.hardware import COMMA_HARDWARE
 from openpilot.common.gpio import gpio_init, gpio_set
 from openpilot.common.hardware.comma.pins import GPIO
+from openpilot.sunnypilot.jetlink_adapter.gps import JETSON_GPS_SERVICE
+from openpilot.system.ubloxd.gps_arbiter import EXTERNAL_MAX_AGE, UERE, ExternalFix
 
 UBLOX_TTY = "/dev/ttyHS0"
 
@@ -26,6 +28,12 @@ UBLOX_SOS_ACK = b"\xb5\x62\x09\x14\x08\x00\x02\x00\x00\x00\x01\x00\x00\x00"
 UBLOX_SOS_NACK = b"\xb5\x62\x09\x14\x08\x00\x02\x00\x00\x00\x00\x00\x00\x00"
 UBLOX_BACKUP_RESTORE_MSG = b"\xb5\x62\x09\x14\x08\x00\x03"
 UBLOX_ASSIST_ACK = b"\xb5\x62\x13\x60\x08\x00"
+
+# the Jetson's USB GPS aids a ublox that has had no fix this long, at most once a period
+JETSON_AID_AFTER = 20.  # s
+JETSON_AID_PERIOD = 120.  # s
+JETSON_AID_TIME_ACC = 2  # s: the fix's UTC plus its measured age, over a 1 Hz link
+JETSON_AID_POS_MARGIN = 50.  # m on top of the fix's own error
 
 def set_power(enabled: bool) -> None:
   gpio_init(GPIO.UBLOX_SAFEBOOT_N, True)
@@ -148,14 +156,16 @@ class TTYPigeon:
         return True
     return False
 
-def send_time(pigeon: TTYPigeon) -> None:
-  if not system_time_valid():
-    return
+def send_time(pigeon: TTYPigeon, t_now: datetime | None = None, acc_s: int = 30) -> None:
+  """The system time, or `t_now` (naive UTC) good to `acc_s`."""
+  if t_now is None:
+    if not system_time_valid():
+      return
+    t_now = datetime.now(UTC).replace(tzinfo=None)
 
-  cloudlog.warning("Sending current time to ublox")
+  cloudlog.warning(f"Sending time to ublox (+/- {acc_s} s)")
 
   # UBX-MGA-INI-TIME_UTC
-  t_now = datetime.now(UTC).replace(tzinfo=None)
   msg = add_ubx_checksum(b"\xB5\x62\x13\x40\x18\x00" + struct.pack("<BBBBHBBBBBxIHxxI",
     0x10,
     0x00,
@@ -168,7 +178,7 @@ def send_time(pigeon: TTYPigeon) -> None:
     t_now.minute,
     t_now.second,
     t_now.microsecond * 1000,
-    30,
+    acc_s,
     0
   ))
   pigeon.send_with_ack(msg, ack=UBLOX_ASSIST_ACK)
@@ -203,16 +213,31 @@ def send_position(pigeon: TTYPigeon) -> None:
     if datetime.now(UTC).timestamp() - gps.unixTimestampMillis / 1000 > 7 * 24 * 3600:
       return
     cloudlog.warning("Sending last position to ublox")
+    latitude, longitude, altitude = gps.latitude, gps.longitude, gps.altitude
+  send_position_llh(pigeon, latitude, longitude, altitude, 100_000)
 
-    # UBX-MGA-INI-POS_LLH
-    msg = add_ubx_checksum(b"\xB5\x62\x13\x40\x14\x00" + struct.pack("<BB2xiiiI",
-      0x01, 0x00,
-      round(gps.latitude * 1e7),
-      round(gps.longitude * 1e7),
-      round(gps.altitude * 100),
-      100_000 * 100,
-    ))
+def send_position_llh(pigeon: TTYPigeon, latitude: float, longitude: float, altitude: float, acc_m: float) -> None:
+  # UBX-MGA-INI-POS_LLH
+  msg = add_ubx_checksum(b"\xB5\x62\x13\x40\x14\x00" + struct.pack("<BB2xiiiI",
+    0x01, 0x00,
+    round(latitude * 1e7),
+    round(longitude * 1e7),
+    round(altitude * 100),
+    round(acc_m * 100),
+  ))
   pigeon.send_with_ack(msg, ack=UBLOX_ASSIST_ACK)
+
+def send_jetson_aid(pigeon: TTYPigeon, fix: ExternalFix, now: float) -> None:
+  """The Jetson's fix as UBX-MGA-INI time and position, for a ublox without one."""
+  age = max(fix.age(now), 0.)
+  cloudlog.warning(f"Aiding ublox with the Jetson's GPS fix ({age:.1f} s old)")
+  t_fix = datetime.fromtimestamp(fix.utc_ms / 1000 + age, UTC).replace(tzinfo=None)
+  send_time(pigeon, t_fix, JETSON_AID_TIME_ACC)
+  send_position_llh(pigeon, fix.latitude, fix.longitude, fix.altitude, fix.hdop * UERE + fix.speed * age + JETSON_AID_POS_MARGIN)
+
+def jetson_aid_due(now: float, last_ublox_fix: float, last_aid: float, fix: ExternalFix | None) -> bool:
+  return (fix is not None and fix.valid() and 0 <= fix.age(now) <= EXTERNAL_MAX_AGE and
+          now - last_ublox_fix >= JETSON_AID_AFTER and now - last_aid >= JETSON_AID_PERIOD)
 
 
 def init_pigeon(pigeon: TTYPigeon) -> bool:
@@ -313,6 +338,8 @@ def run_receiving(duration: int = 0):
   last_almanac_save = time.monotonic()
   assist_attempted = False
   assist_messages = None
+  sm = messaging.SubMaster([JETSON_GPS_SERVICE, 'gpsLocationExternal'])
+  last_ublox_fix, last_jetson_aid, last_aid_check = start_time, float('-inf'), start_time
 
   def download_assistnow() -> None:
     nonlocal assist_messages
@@ -337,6 +364,21 @@ def run_receiving(duration: int = 0):
         cloudlog.warning("AssistNow messages sent")
       except Exception:
         cloudlog.warning("failed to send AssistNow messages")
+
+    now = time.monotonic()
+    if now - last_aid_check >= 1.:
+      last_aid_check = now
+      sm.update(0)
+      gps = sm['gpsLocationExternal']
+      if sm.updated['gpsLocationExternal'] and gps.hasFix and gps.source == log.GpsLocationData.SensorSource.ublox:
+        last_ublox_fix = now
+      jetson = ExternalFix.from_msg(sm[JETSON_GPS_SERVICE], sm.logMonoTime[JETSON_GPS_SERVICE]) if sm.seen[JETSON_GPS_SERVICE] else None
+      if jetson_aid_due(now, last_ublox_fix, last_jetson_aid, jetson):
+        last_jetson_aid = now
+        try:
+          send_jetson_aid(pigeon, jetson, now)
+        except Exception:
+          cloudlog.exception("failed to aid ublox with the Jetson's GPS fix")
 
     dat = pigeon.receive()
     if len(dat) > 0:
