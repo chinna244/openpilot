@@ -90,6 +90,30 @@ def test_failed_upload_retries_without_marking(context, status):
   assert context.put.call_count == 2
 
 
+def test_konik_queued_worker_acknowledges_file_without_retry(context):
+  path = file(context)
+  context.client.get.return_value.json = lambda: {'url': 'https://api.konik.ai/upload/file', 'headers': {}}
+  context.put.return_value = SimpleNamespace(status_code=403, text='Queued Worker', url='https://api.konik.ai/upload/file')
+  assert context.worker.step() is True
+  assert getxattr(str(path), 'user.konik.upload') == b'1'
+  assert getxattr(str(path), 'user.upload') is None
+  assert context.worker.step() is None
+  assert context.put.call_count == 1
+
+
+@pytest.mark.parametrize('url,text', [
+  ('https://api.konik.ai/upload/file', 'Forbidden'),
+  ('https://api.konik.ai/upload/file', 'Permission denied'),
+  ('https://storage.test/file', 'Queued Worker'),
+  ('http://api.konik.ai/upload/file', 'Queued Worker'),
+])
+def test_other_forbidden_responses_are_not_queued_acknowledgements(context, url, text):
+  path = file(context)
+  context.put.return_value = SimpleNamespace(status_code=403, text=text, url=url)
+  assert context.worker.step() is False
+  assert getxattr(str(path), 'user.konik.upload') is None
+
+
 @pytest.mark.parametrize('blocked', ['onroad', 'disabled', 'metered', 'cellular', 'offline'])
 def test_upload_requires_enabled_offroad_unmetered_wifi(context, blocked):
   file(context)

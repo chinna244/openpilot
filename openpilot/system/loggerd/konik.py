@@ -3,6 +3,7 @@
 import os
 import threading
 import time
+from urllib.parse import urlparse
 
 import requests
 
@@ -139,13 +140,20 @@ class KonikUploader:
         self._check_policy()
         response = requests.put(signed['url'], headers=signed['headers'], data=CallbackReader(stream, progress), timeout=30)
       self._check_policy()
-      if response.status_code not in (200, 201, 204):
+      queued = False
+      if response.status_code == 403 and getattr(response, 'text', '').strip() == 'Queued Worker':
+        # Konik's proxy acknowledges a queued upload with this comma-compatible response.
+        endpoint = urlparse(response.url)
+        queued = endpoint.scheme == 'https' and endpoint.hostname == 'api.konik.ai'
+      if response.status_code not in (200, 201, 204) and not queued:
         raise RuntimeError(f'Konik file upload returned {response.status_code}')
       self._check_policy(force=True)
       if self._request is not None:
         setxattr(path, konik_queue.REQUEST_ATTR_NAME, self._request['id'].encode())
       setxattr(path, UPLOAD_ATTR_NAME, b'1')
       self.retry_at.pop(path, None)
+      if queued:
+        self._status('queued for processing on Konik')
       return True
     except UploadPaused:
       self._status('paused')
