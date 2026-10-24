@@ -301,3 +301,30 @@ def test_consecutive_video_frames_use_pyray_compatible_pixel_pointer(mocker):
                                           'frame': (2, 2, pixels), 'error': '', 'loading': False, 'playing': True}
     panel._render(ui.rl.Rectangle(0, 0, 536, 240))
   assert uploaded == [(7, b'\xff\x00\x00' * 4), (7, b'\x00\x00\xff' * 4)]
+
+
+@pytest.mark.parametrize('width,height,crop_y,crop_height', [
+  (536, 240, 47.23880597, 235.52238806),
+  (2160, 1080, 33.5, 263.),
+])
+def test_playback_fills_window_without_stretching(mocker, width, height, crop_y, crop_height):
+  from types import SimpleNamespace
+  from openpilot.selfdrive.ui.layouts import drive_replay as ui
+
+  mocker.patch.object(ui.rl, 'draw_rectangle_rec')
+  draw = mocker.patch.object(ui.rl, 'draw_texture_pro')
+  panel = object.__new__(ui.DriveReplayLayout)
+  panel._parked = lambda: True
+  panel._route = replay.LocalRoute('route', (replay.PreviewClip('qcamera.ts', 0, 0),))
+  panel._texture = SimpleNamespace(width=526, height=330)
+  panel._back = mocker.Mock()
+  panel._controls = [mocker.Mock() for _ in range(5)]
+  panel._text = mocker.Mock()
+  panel._player = mocker.Mock()
+  panel._player.snapshot.return_value = {'clip_index': 0, 'position': 1., 'duration': 30.,
+                                        'frame': None, 'error': '', 'loading': False, 'playing': True}
+  panel._render(ui.rl.Rectangle(10, 20, width, height))
+
+  source, target = draw.call_args.args[1:3]
+  assert (target.x, target.y, target.width, target.height) == (10, 20, width, height)
+  assert (source.x, source.y, source.width, source.height) == pytest.approx((0, crop_y, 526, crop_height))
