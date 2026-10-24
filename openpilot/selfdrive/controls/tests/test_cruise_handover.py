@@ -1,4 +1,4 @@
-"""After a gas override the cruise candidate starts no lower than its target asks, only for the driver's gas while engaged.
+"""After a gas override or an engagement the cruise candidate starts no lower than its target asks (not after a brake).
 Route 00000177 t=183: reset to a -0.55 measured accel, the cruise candidate sent -0.41 while the model asked +0.24."""
 import numpy as np
 import pytest
@@ -7,7 +7,7 @@ from openpilot.cereal import custom, messaging
 from opendbc.car import structs
 from openpilot.selfdrive.controls.lib.longcontrol import LongCtrlState
 from openpilot.selfdrive.controls.lib.longitudinal_planner import LongitudinalPlanner, A_CRUISE_MIN
-from openpilot.sunnypilot.selfdrive.controls.lib.longitudinal_planner import SCC_SOURCES
+from openpilot.sunnypilot.selfdrive.controls.lib.longitudinal_planner import SCC_SOURCES, LongitudinalPlannerSP
 from openpilot.sunnypilot.selfdrive.controls.lib.smart_cruise_control.limits import OP_LONG_A_BUDGET
 
 V_EGO = 6.0  # m/s
@@ -201,7 +201,6 @@ def test_repeated_short_gas_presses_each_hand_over_clean():
 @pytest.mark.parametrize("kwargs", [
   {'gas': True, 'brake': True},      # gas and brake together
   {'brake': True},                   # brake release alone
-  {'gas': True, 'enabled': False},   # gas while disengaged
 ])
 def test_other_resets_keep_the_measured_seed(kwargs):
   p = planner()
@@ -275,3 +274,244 @@ def test_the_ask_takes_scc_budget_without_its_jerk_limit():
   p.source, p.output_v_target, p.v_ego, p.a_cruise_prev = SCC_SOURCES[0], V_EGO - 3., V_EGO, 0.
   assert p.update_cruise_accel(0., unlimited=True) == pytest.approx(-OP_LONG_A_BUDGET)
   assert p.update_cruise_accel(0.) > -0.1
+
+
+def engage(p, **kwargs):
+  press(p, enabled=False, **kwargs)
+
+
+@pytest.mark.parametrize("a_ego", [-0.3, -0.6])
+def test_engaging_while_slowing_under_a_high_set_speed_does_not_brake(a_ego):
+  # routes 00000169-00000180: engaged slowing, set speed well above, -0.27 to -0.48 for 0.2-0.3 s
+  p = planner()
+  engage(p, a_ego=a_ego)
+  for _ in range(5):
+    p.update(build_sm(a_ego=a_ego))
+    assert sent(p) >= 0.
+
+
+def test_an_engagement_long_control_trails_still_hands_over():
+  p = planner()
+  engage(p, a_ego=-0.6)
+  press(p, n=2, a_ego=-0.6)  # engaged, longControlState still off
+  p.update(build_sm(a_ego=-0.6))
+  assert sent(p) >= 0.
+
+
+def test_a_brake_after_engaging_keeps_the_measured_seed():
+  p = planner()
+  engage(p, a_ego=-0.6)
+  press(p, n=3, brake=True, a_ego=-0.6)  # engaged, then a brake override
+  p.update(build_sm(a_ego=-0.6))
+  assert sent(p) < -0.4
+
+
+def test_engaging_while_disengaged_on_the_gas_hands_over_clean():
+  p = planner()
+  engage(p, gas=True, a_ego=-0.6)
+  p.update(build_sm(a_ego=-0.6))
+  assert sent(p) >= 0.
+
+
+@pytest.mark.parametrize("over", [0.2, 0.4, 0.9])
+def test_engaging_just_over_the_set_speed_lifts_off(over):
+  # route 00000184 t=1125: SET at 32.7 mph set 32, gaining speed, the model at +0.53: -0.43 sent
+  p = planner()
+  kph = (V_EGO - over) * 3.6
+  engage(p, a_ego=0.6, v_cruise_kph=kph)
+  for _ in range(int(5.0 / p.dt) - 1):
+    p.update(build_sm(a_ego=0.6, v_cruise_kph=kph, model_a=0.5))
+    assert -0.15 - 1e-6 <= sent(p) <= 0.6 + 1e-6
+  assert sent(p) == pytest.approx(-0.15, abs=1e-6)
+
+
+def test_the_settle_ends_and_the_set_speed_is_held():
+  # still over after the window: the set speed brakes as committed, from the lift-off, at the jerk limit
+  p, ref = planner(), reference()
+  kph = (V_EGO - 0.5) * 3.6
+  for q in (p, ref):
+    engage(q, a_ego=0.6, v_cruise_kph=kph)
+  for _ in range(int(5.0 / p.dt) - 1):
+    p.update(build_sm(a_ego=0.0, v_cruise_kph=kph, model_a=0.5))
+  assert sent(p) == pytest.approx(-0.15, abs=1e-6)
+  for _ in range(40):
+    p.update(build_sm(a_ego=0.0, v_cruise_kph=kph, model_a=0.5))
+  assert sent(p) <= -0.45
+
+
+@pytest.mark.parametrize("over", [1.2, 2.0])
+def test_engaging_well_over_the_set_speed_brakes_as_committed(over):
+  # RES to a stored speed well under: the gentle set-speed drop as before
+  p = planner()
+  kph = (V_EGO - over) * 3.6
+  engage(p, a_ego=0.0, v_cruise_kph=kph)
+  for _ in range(20):
+    p.update(build_sm(a_ego=0.0, v_cruise_kph=kph, model_a=0.5))
+  assert sent(p) <= -0.45
+
+
+def test_the_settle_ends_once_back_at_the_set_speed():
+  # under the set speed once, the window is over: a later climb over it brakes as committed
+  p = planner()
+  kph = (V_EGO - 0.5) * 3.6
+  engage(p, a_ego=0.6, v_cruise_kph=kph)
+  for _ in range(5):
+    p.update(build_sm(a_ego=0.6, v_cruise_kph=kph, model_a=0.5))
+  for _ in range(5):
+    p.update(build_sm(a_ego=0.0, v_cruise_kph=FAST, model_a=0.5))
+  for _ in range(30):
+    p.update(build_sm(a_ego=0.0, v_cruise_kph=kph, model_a=0.5))
+  assert sent(p) <= -0.45
+
+
+def test_set_with_the_gas_held_settles_after_the_release():
+  # the usual rolling SET (route 00000184 t=1125): engaged with the foot still on the gas, released 0.9 mph over
+  p = planner()
+  kph = (V_EGO - 0.5) * 3.6
+  engage(p, a_ego=0.6, v_cruise_kph=kph)
+  press(p, n=3, gas=True, a_ego=0.6, v_cruise_kph=kph)  # engaged, gas held
+  for _ in range(40):
+    p.update(build_sm(a_ego=0.6, v_cruise_kph=kph, model_a=0.5))
+    assert sent(p) >= -0.15 - 1e-6
+
+
+def test_a_lowered_set_speed_ends_the_settle():
+  p = planner()
+  kph = (V_EGO - 0.3) * 3.6
+  engage(p, a_ego=0.0, v_cruise_kph=kph)
+  for _ in range(5):
+    p.update(build_sm(a_ego=0.0, v_cruise_kph=kph, model_a=0.5))
+  lower = (V_EGO - 0.8) * 3.6  # still inside the band
+  for _ in range(20):
+    p.update(build_sm(a_ego=0.0, v_cruise_kph=lower, model_a=0.5))
+  assert sent(p) <= -0.45
+
+
+class NoSettlePlanner(LongitudinalPlanner):
+  engage_settle_frames = property(lambda self: 0, lambda self, v: None)
+
+
+@pytest.mark.parametrize("a_ego", [0.6, -0.6])
+@pytest.mark.parametrize("over", [0.5, 0.9])
+def test_the_settle_leaves_the_cruise_state_alone(a_ego, over):
+  # only the candidate is lifted: the cruise state (e2e lead gap, accel boost and SCC's jerk all read it) is as without the
+  # settle, through the window and after it
+  p, ref = planner(), planner(NoSettlePlanner)
+  kph = (V_EGO - over) * 3.6
+  for q in (p, ref):
+    engage(q, a_ego=a_ego, v_cruise_kph=kph)
+  for _ in range(int(8.0 / p.dt)):
+    for q in (p, ref):
+      q.update(build_sm(a_ego=a_ego, v_cruise_kph=kph, model_a=0.5))
+    assert p.a_cruise == pytest.approx(ref.a_cruise, abs=1e-9)
+
+
+def test_after_the_window_the_candidate_eases_back_at_the_jerk_limit():
+  p = planner()
+  kph = (V_EGO - 0.5) * 3.6
+  engage(p, a_ego=0.0, v_cruise_kph=kph)
+  for _ in range(int(5.0 / p.dt) - 1):
+    p.update(build_sm(a_ego=0.0, v_cruise_kph=kph, model_a=0.5))
+  last = sent(p)
+  assert last == pytest.approx(-0.15, abs=1e-6)
+  for _ in range(20):
+    p.update(build_sm(a_ego=0.0, v_cruise_kph=kph, model_a=0.5))
+    assert last - 1.6 * p.dt - 1e-6 <= sent(p) <= last + 1e-6
+    last = sent(p)
+  assert sent(p) == pytest.approx(p.a_cruise, abs=1e-6)
+
+
+def test_a_curve_or_speed_limit_target_after_engaging_brakes_as_it_asks(monkeypatch):
+  # the settle is for the driver's set speed only: an SCC or SLA target is not lifted
+  orig = LongitudinalPlannerSP.update_targets
+
+  def as_scc(self, *args):
+    out = orig(self, *args)
+    self.source = SCC_SOURCES[1]
+    return out
+  monkeypatch.setattr(LongitudinalPlannerSP, 'update_targets', as_scc)
+  p = planner()
+  kph = (V_EGO - 0.5) * 3.6
+  engage(p, a_ego=0.0, v_cruise_kph=kph)
+  for _ in range(20):
+    p.update(build_sm(a_ego=0.0, v_cruise_kph=kph, model_a=0.5))
+  assert sent(p) <= -0.45
+
+
+@pytest.mark.parametrize("closer", [0.9, 0.5])
+def test_coming_into_the_band_after_engaging_well_over_is_no_step(closer):
+  # review: engaged 1.3 m/s over, the set speed raised to 0.9 over: the candidate stepped -0.5 -> -0.15 in one frame
+  p, ref = planner(), planner(NoSettlePlanner)
+  for q in (p, ref):
+    engage(q, a_ego=0.0, v_cruise_kph=(V_EGO - 1.3) * 3.6)
+  for kph, n in (((V_EGO - 1.3) * 3.6, 20), ((V_EGO - closer) * 3.6, 40)):
+    for _ in range(n):
+      for q in (p, ref):
+        q.update(build_sm(a_ego=0.0, v_cruise_kph=kph, model_a=0.5))
+      assert sent(p) == pytest.approx(sent(ref), abs=1e-6)
+
+
+def test_a_raised_set_speed_mid_settle_rises_without_a_dip():
+  # route 00000184 t=1129.5: the set speed raised while the lift held -0.15; easing down to the state dipped to -0.26
+  p = planner()
+  kph = (V_EGO - 0.4) * 3.6
+  engage(p, a_ego=0.0, v_cruise_kph=kph)
+  for _ in range(30):
+    p.update(build_sm(a_ego=0.0, v_cruise_kph=kph, model_a=0.5))
+  last = sent(p)
+  assert last == pytest.approx(-0.15, abs=1e-6)
+  for _ in range(30):
+    p.update(build_sm(a_ego=0.0, v_cruise_kph=FAST, model_a=0.5))
+    assert last - 1e-6 <= sent(p) <= last + 1.6 * p.dt + 1e-6  # up only, at the jerk limit
+    assert sent(p) <= max(0., p.a_cruise) + 1e-6  # never lifted past what the gas handover would
+    last = sent(p)
+  assert sent(p) >= 0.
+
+
+def test_a_later_set_speed_drop_brakes_as_committed():
+  # once the candidate is back at the state nothing is left over: braking later in the drive is as without the settle
+  p, ref = planner(), planner(NoSettlePlanner)
+  over, under, lowered = (V_EGO - 0.5) * 3.6, FAST, (V_EGO - 0.9) * 3.6
+  for q in (p, ref):
+    engage(q, a_ego=0.0, v_cruise_kph=over)
+  for kph, n in ((over, 20), (under, 200), (lowered, 60)):
+    for _ in range(n):
+      for q in (p, ref):
+        q.update(build_sm(a_ego=0.0, v_cruise_kph=kph, model_a=0.5))
+      if kph == lowered:
+        assert sent(p) == pytest.approx(sent(ref), abs=1e-6)
+  assert sent(p) <= -0.45
+
+
+def test_a_curve_target_mid_window_brakes_from_the_cruise_state_at_once(monkeypatch):
+  orig = LongitudinalPlannerSP.update_targets
+  scc = {'on': False}
+
+  def maybe_scc(self, *args):
+    out = orig(self, *args)
+    if scc['on']:
+      self.source = SCC_SOURCES[0]
+    return out
+  monkeypatch.setattr(LongitudinalPlannerSP, 'update_targets', maybe_scc)
+  p = planner()
+  kph = (V_EGO - 0.5) * 3.6
+  engage(p, a_ego=0.0, v_cruise_kph=kph)
+  for _ in range(20):
+    p.update(build_sm(a_ego=0.0, v_cruise_kph=kph, model_a=0.5))
+  assert sent(p) == pytest.approx(-0.15, abs=1e-6)
+  scc['on'] = True
+  p.update(build_sm(a_ego=0.0, v_cruise_kph=kph, model_a=0.5))
+  assert sent(p) == pytest.approx(p.a_cruise, abs=1e-6)
+  assert sent(p) <= -0.45
+
+
+def test_a_model_stop_and_a_close_lead_still_win_after_engaging():
+  p = planner()
+  engage(p, a_ego=-0.6)
+  p.update(build_sm(model_a=-1.5))
+  assert sent(p) <= -1.4
+  q = planner()
+  engage(q, a_ego=-0.6, lead=8.)
+  q.update(build_sm(lead=8.))
+  assert sent(q) < -0.5
+

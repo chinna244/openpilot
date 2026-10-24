@@ -20,6 +20,15 @@ from openpilot.sunnypilot.selfdrive.controls.lib.longitudinal_planner import Lon
 J_CRUISE_VALS = [1.6, 1.2, 0.8, 0.6]
 J_CRUISE_BP = [0., 10.0, 25., 40.]
 A_CRUISE_MIN = -0.5
+# SET pressed while gaining speed sets the speed rounded down, so the car is up to a mph or two over it at once; for
+# ENGAGE_SETTLE_TIME after engaging (or after a gas held through SET), while that close over a plain set speed that has not
+# been lowered, the cruise candidate lifts off instead of braking, then eases to what the set speed asks at its jerk limit
+# (routes 00000152-00000186: 7 of 82 rolling engagements braked -0.2 to -0.5 for 0.6-1.6 s while the model asked more,
+# route 00000184 t=1125: -0.43 at 0.9 mph over with the model at +0.53). Only the candidate is lifted, as for the gas
+# handover: the cruise state and everything that reads it are unchanged.
+ENGAGE_SETTLE_BAND = 1.0  # m/s over the set speed
+ENGAGE_SETTLE_ACCEL = -0.15  # m/s^2
+ENGAGE_SETTLE_TIME = 5.0  # s
 CONTROL_N_T_IDX = ModelConstants.T_IDXS[:CONTROL_N]
 
 
@@ -44,6 +53,10 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
     self.a_cruise = init_a
     self.gas_override = False  # the last reset was the driver's gas while engaged, no brake
     self.gas_return = False  # since that handover, until the cruise state is back at its target's ask
+    self.disengaged = False  # a reset while disengaged since the last control cycle: the next one is an engagement
+    self.engage_settle_frames = 0  # what is left of the settle window after engaging
+    self.engage_v_cruise = 0.  # the set speed the window opened on: lowering it ends the window
+    self.a_settle = None  # the cruise candidate the settle lifted last cycle, while it eases back to the state
     self.a_target_published = init_a  # the plan sent: the internal one, lifted while a gas override is held
     self.source_published = LongitudinalPlanSource.cruise
     self.output_a_target = init_a
@@ -90,14 +103,26 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
     # cycle in the plan published while the gas is held (the first cycle after the release still uses it) and from the
     # handover until the state is back there: a target that turns restrictive at any point gets at least what it asks.
     # longControlState can trail the pedal by a cycle, so the gas is latched for the whole override.
+    # An engagement starts from the same measured accel: engaging while slowing braked 0.2-0.3 s at -0.27 to -0.48 under a
+    # set speed well above (routes 00000169-00000180, 5 of 82), so it hands over the same way.
     if reset_state:
       if not sm['selfdriveState'].enabled or sm['carState'].brakePressed:
         self.gas_override = False
       elif sm['carState'].gasPressed:
         self.gas_override = True
       self.gas_return = False
-    elif self.gas_override:
-      self.gas_override, self.gas_return = False, True
+      # kept through the engaged cycles longControlState trails by and a gas held through SET; a brake ends it
+      if not sm['selfdriveState'].enabled:
+        self.disengaged = True
+      elif sm['carState'].brakePressed:
+        self.disengaged = False
+      self.engage_settle_frames = 0
+      self.a_settle = None
+    elif self.gas_override or self.disengaged:
+      if self.disengaged:
+        self.engage_settle_frames = int(ENGAGE_SETTLE_TIME / self.dt)
+        self.engage_v_cruise = v_cruise
+      self.gas_override, self.disengaged, self.gas_return = False, False, True
 
     self.mpc.set_weights(prev_accel_constraint, personality=sm['selfdriveState'].personality)
     if self.CP.openpilotLongitudinalControl:
@@ -137,6 +162,28 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
         self.gas_return = False
       else:
         a_cruise = max(self.a_cruise, cruise_ask)
+    if self.engage_settle_frames > 0:
+      self.engage_settle_frames -= 1
+      # once under the set speed, further over it than the band or with it lowered, the window is over: the lift only ever
+      # starts on engaging, never as a step mid-way
+      if v_ego <= v_cruise or v_ego - v_cruise > ENGAGE_SETTLE_BAND or v_cruise < self.engage_v_cruise:
+        self.engage_settle_frames = 0
+    settle = None
+    if self.source != LongitudinalPlanSource.cruise:
+      # SCC and SLA targets brake as they ask, from the cruise state
+      self.engage_settle_frames = 0
+    elif self.engage_settle_frames > 0:
+      settle = ENGAGE_SETTLE_ACCEL
+    elif self.a_settle is not None:
+      # toward what the set speed asks now (never above 0) at the cruise jerk limit: down while still over it, up once
+      # under it (a raised set speed), until the state is back over the candidate
+      j = float(np.interp(v_ego, J_CRUISE_BP, J_CRUISE_VALS)) * self.dt
+      settle = float(np.clip(min(get_cruise_accel(v_cruise, v_ego, 0., 1e3), 0.), self.a_settle - j, self.a_settle + j))
+    if settle is not None and settle > a_cruise:
+      a_cruise = settle
+      self.a_settle = a_cruise
+    else:
+      self.a_settle = None
     cruise_should_stop = should_stop(v_ego, self.a_cruise)
 
     output_a_target_e2e = self.accel_boost.update(sm, output_a_target_e2e, output_a_target_mpc, self.a_cruise)
