@@ -173,6 +173,8 @@ class DriveReplayLayout(Widget):
     rl.draw_rectangle_rec(rl.Rectangle(rect.x, rect.y, rect.width, 44 * scale), rl.Color(0, 0, 0, 170))
     rl.draw_rectangle_rec(rl.Rectangle(rect.x, rect.y + 190 * scale, rect.width, 50 * scale), rl.Color(0, 0, 0, 170))
     self._back.render(rl.Rectangle(rect.x + pad, rect.y + pad, 66 * scale, bar))
+    if self._route is None:  # Back handles its touch during render and closes playback.
+      return
     self._text(f'Clip {clip.number}  |  {state["position"]:.0f} / {state["duration"]:.0f}s',
                rect.x + 84 * scale, rect.y + 14 * scale, 17)
     if state['error'] or state['loading']:

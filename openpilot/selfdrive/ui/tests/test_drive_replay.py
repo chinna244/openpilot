@@ -328,3 +328,79 @@ def test_playback_fills_window_without_stretching(mocker, width, height, crop_y,
   source, target = draw.call_args.args[1:3]
   assert (target.x, target.y, target.width, target.height) == (10, 20, width, height)
   assert (source.x, source.y, source.width, source.height) == pytest.approx((0, crop_y, 526, crop_height))
+
+
+@pytest.fixture(params=['separate_frames', 'same_frame'])
+def touch_replay(tmp_path, mocker, request):
+  from types import SimpleNamespace
+  from openpilot.selfdrive.ui.layouts import drive_replay as ui
+  from openpilot.system.ui import widgets
+  from openpilot.system.ui.lib.application import MouseEvent, MousePos
+
+  mocker.patch.object(ui.gui_app, 'font', return_value=ui.rl.Font())
+  mocker.patch.object(widgets, 'device', SimpleNamespace(awake=True))
+  # Keep real buttons and touch processing; replace only drawing and decoding.
+  mocker.patch.object(ui.Button, '_render')
+  mocker.patch.object(ui.DriveReplayLayout, '_text')
+  mocker.patch.object(ui.rl, 'draw_rectangle_rec')
+  mocker.patch.object(ui.rl, 'draw_rectangle')
+  mocker.patch.object(replay.threading.Thread, 'start')
+  panel = ui.DriveReplayLayout()
+  panel._parked = lambda: True
+  panel._player.parked = panel._parked
+  for route in range(4):
+    for clip in range(2):
+      recording(tmp_path, route=f'0000000{route}--abc', segment=clip)
+  panel._routes = replay.local_routes(str(tmp_path))
+  mocker.patch.object(ui.gui_app, '_mouse_events', [])
+
+  def tap(x, y):
+    events = [MouseEvent(MousePos(x, y), 0, pressed, released, pressed, time.monotonic())
+              for pressed, released in [(True, False), (False, True)]]
+    for batch in ([events] if request.param == 'same_frame' else [[event] for event in events]):
+      ui.gui_app._mouse_events = batch
+      panel.render(ui.rl.Rectangle(0, 0, 536, 240))
+    ui.gui_app._mouse_events = []
+  yield panel, tap
+  panel.hide_event()
+
+
+def test_back_touch_returns_from_playback_without_crashing(touch_replay):
+  panel, tap = touch_replay
+  tap(200, 65)
+  assert panel._route is not None
+  tap(40, 24)
+  assert panel._route is None
+  assert not panel._player.snapshot()['playing']
+  tap(200, 110)
+  assert panel._route == panel._routes[1]
+
+
+def test_playback_buttons_accept_repeated_touches(touch_replay):
+  panel, tap = touch_replay
+  tap(200, 65)
+  panel._player._state.update(position=15., duration=60.)
+  tap(268, 214)  # Pause
+  assert not panel._player.snapshot()['playing']
+  tap(268, 214)  # Play
+  assert panel._player.snapshot()['playing']
+  tap(166, 214)  # -10s
+  assert panel._player.snapshot()['position'] == 5.
+  tap(370, 214)  # +10s
+  assert panel._player.snapshot()['position'] == 15.
+  tap(470, 214)  # Next clip
+  assert panel._player.snapshot()['clip_index'] == 1
+  tap(55, 214)  # Previous clip
+  assert panel._player.snapshot()['clip_index'] == 0
+
+
+def test_browser_paging_and_exit_accept_touches(touch_replay, mocker):
+  from openpilot.selfdrive.ui.layouts import drive_replay as ui
+  panel, tap = touch_replay
+  pop = mocker.patch.object(ui.gui_app, 'pop_widget')
+  tap(55, 210)
+  assert panel._page == 1
+  tap(475, 210)
+  assert panel._page == 0
+  tap(40, 24)
+  pop.assert_called_once()
