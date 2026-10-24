@@ -271,3 +271,136 @@ def test_render_after_ignition_does_not_draw_or_recreate_resources(mocker):
   draw = mocker.patch.object(ui.rl, 'draw_rectangle_rec', side_effect=AssertionError('rendered after going onroad'))
   panel._render(ui.rl.Rectangle(0, 0, 536, 240))
   draw.assert_not_called()
+
+
+def test_consecutive_video_frames_use_pyray_compatible_pixel_pointer(mocker):
+  from types import SimpleNamespace
+  from openpilot.selfdrive.ui.layouts import drive_replay as ui
+
+  # Exercise pyray's actual void-pointer conversion without a GPU context.
+  uploaded = []
+  @ui.rl.ffi.callback('void(int, const void *)')
+  def upload(texture_id, pixels):
+    uploaded.append((texture_id, bytes(ui.rl.ffi.buffer(pixels, 12))))
+  wrapped_upload = ui.rl._wrap_function(upload)
+  mocker.patch.object(ui.rl, 'update_texture', side_effect=lambda texture, pixels: wrapped_upload(texture.id, pixels))
+  for name in ('draw_rectangle_rec', 'draw_texture_pro'):
+    mocker.patch.object(ui.rl, name)
+
+  panel = object.__new__(ui.DriveReplayLayout)
+  panel._parked = lambda: True
+  panel._route = replay.LocalRoute('route', (replay.PreviewClip('qcamera.ts', 0, 0),))
+  panel._texture = SimpleNamespace(id=7, width=2, height=2)
+  panel._last_frame = None
+  panel._back = mocker.Mock()
+  panel._controls = [mocker.Mock() for _ in range(5)]
+  panel._text = mocker.Mock()
+  panel._player = mocker.Mock()
+  for pixels in (b'\xff\x00\x00' * 4, b'\x00\x00\xff' * 4):
+    panel._player.snapshot.return_value = {'clip_index': 0, 'position': 1., 'duration': 30.,
+                                          'frame': (2, 2, pixels), 'error': '', 'loading': False, 'playing': True}
+    panel._render(ui.rl.Rectangle(0, 0, 536, 240))
+  assert uploaded == [(7, b'\xff\x00\x00' * 4), (7, b'\x00\x00\xff' * 4)]
+
+
+@pytest.mark.parametrize('width,height,crop_y,crop_height', [
+  (536, 240, 47.23880597, 235.52238806),
+  (2160, 1080, 33.5, 263.),
+])
+def test_playback_fills_window_without_stretching(mocker, width, height, crop_y, crop_height):
+  from types import SimpleNamespace
+  from openpilot.selfdrive.ui.layouts import drive_replay as ui
+
+  mocker.patch.object(ui.rl, 'draw_rectangle_rec')
+  draw = mocker.patch.object(ui.rl, 'draw_texture_pro')
+  panel = object.__new__(ui.DriveReplayLayout)
+  panel._parked = lambda: True
+  panel._route = replay.LocalRoute('route', (replay.PreviewClip('qcamera.ts', 0, 0),))
+  panel._texture = SimpleNamespace(width=526, height=330)
+  panel._back = mocker.Mock()
+  panel._controls = [mocker.Mock() for _ in range(5)]
+  panel._text = mocker.Mock()
+  panel._player = mocker.Mock()
+  panel._player.snapshot.return_value = {'clip_index': 0, 'position': 1., 'duration': 30.,
+                                        'frame': None, 'error': '', 'loading': False, 'playing': True}
+  panel._render(ui.rl.Rectangle(10, 20, width, height))
+
+  source, target = draw.call_args.args[1:3]
+  assert (target.x, target.y, target.width, target.height) == (10, 20, width, height)
+  assert (source.x, source.y, source.width, source.height) == pytest.approx((0, crop_y, 526, crop_height))
+
+
+@pytest.fixture(params=['separate_frames', 'same_frame'])
+def touch_replay(tmp_path, mocker, request):
+  from types import SimpleNamespace
+  from openpilot.selfdrive.ui.layouts import drive_replay as ui
+  from openpilot.system.ui import widgets
+  from openpilot.system.ui.lib.application import MouseEvent, MousePos
+
+  mocker.patch.object(ui.gui_app, 'font', return_value=ui.rl.Font())
+  mocker.patch.object(widgets, 'device', SimpleNamespace(awake=True))
+  # Keep real buttons and touch processing; replace only drawing and decoding.
+  mocker.patch.object(ui.Button, '_render')
+  mocker.patch.object(ui.DriveReplayLayout, '_text')
+  mocker.patch.object(ui.rl, 'draw_rectangle_rec')
+  mocker.patch.object(ui.rl, 'draw_rectangle')
+  mocker.patch.object(replay.threading.Thread, 'start')
+  panel = ui.DriveReplayLayout()
+  panel._parked = lambda: True
+  panel._player.parked = panel._parked
+  for route in range(4):
+    for clip in range(2):
+      recording(tmp_path, route=f'0000000{route}--abc', segment=clip)
+  panel._routes = replay.local_routes(str(tmp_path))
+  mocker.patch.object(ui.gui_app, '_mouse_events', [])
+
+  def tap(x, y):
+    events = [MouseEvent(MousePos(x, y), 0, pressed, released, pressed, time.monotonic())
+              for pressed, released in [(True, False), (False, True)]]
+    for batch in ([events] if request.param == 'same_frame' else [[event] for event in events]):
+      ui.gui_app._mouse_events = batch
+      panel.render(ui.rl.Rectangle(0, 0, 536, 240))
+    ui.gui_app._mouse_events = []
+  yield panel, tap
+  panel.hide_event()
+
+
+def test_back_touch_returns_from_playback_without_crashing(touch_replay):
+  panel, tap = touch_replay
+  tap(200, 65)
+  assert panel._route is not None
+  tap(40, 24)
+  assert panel._route is None
+  assert not panel._player.snapshot()['playing']
+  tap(200, 110)
+  assert panel._route == panel._routes[1]
+
+
+def test_playback_buttons_accept_repeated_touches(touch_replay):
+  panel, tap = touch_replay
+  tap(200, 65)
+  panel._player._state.update(position=15., duration=60.)
+  tap(268, 214)  # Pause
+  assert not panel._player.snapshot()['playing']
+  tap(268, 214)  # Play
+  assert panel._player.snapshot()['playing']
+  tap(166, 214)  # -10s
+  assert panel._player.snapshot()['position'] == 5.
+  tap(370, 214)  # +10s
+  assert panel._player.snapshot()['position'] == 15.
+  tap(470, 214)  # Next clip
+  assert panel._player.snapshot()['clip_index'] == 1
+  tap(55, 214)  # Previous clip
+  assert panel._player.snapshot()['clip_index'] == 0
+
+
+def test_browser_paging_and_exit_accept_touches(touch_replay, mocker):
+  from openpilot.selfdrive.ui.layouts import drive_replay as ui
+  panel, tap = touch_replay
+  pop = mocker.patch.object(ui.gui_app, 'pop_widget')
+  tap(55, 210)
+  assert panel._page == 1
+  tap(475, 210)
+  assert panel._page == 0
+  tap(40, 24)
+  pop.assert_called_once()

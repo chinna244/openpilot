@@ -131,8 +131,8 @@ class DriveReplayLayout(Widget):
     scale = rect.height / 240
     pad, bar = 8 * scale, 32 * scale
     rl.draw_rectangle_rec(rect, rl.BLACK)
-    self._back.render(rl.Rectangle(rect.x + pad, rect.y + pad, 66 * scale, bar))
     if self._route is None:
+      self._back.render(rl.Rectangle(rect.x + pad, rect.y + pad, 66 * scale, bar))
       self._text('Drive replay', rect.x + 84 * scale, rect.y + 14 * scale)
       self._refresh.render(rl.Rectangle(rect.x + rect.width - 100 * scale, rect.y + pad, 92 * scale, bar))
       if self._scanning or not self._routes:
@@ -154,8 +154,6 @@ class DriveReplayLayout(Widget):
 
     state = self._player.snapshot()
     clip = self._route.clips[state['clip_index']]
-    self._text(f'Clip {clip.number}  |  {state["position"]:.0f} / {state["duration"]:.0f}s',
-               rect.x + 84 * scale, rect.y + 14 * scale, 17)
     frame = state['frame']
     if frame is not None and frame is not self._last_frame:
       width, height, pixels = frame
@@ -165,15 +163,20 @@ class DriveReplayLayout(Widget):
         self._texture = rl.load_texture_from_image(image)
         rl.set_texture_filter(self._texture, rl.TextureFilter.TEXTURE_FILTER_BILINEAR)
       else:
-        rl.update_texture(self._texture, rl.ffi.from_buffer(pixels))
+        rl.update_texture(self._texture, rl.ffi.cast('void *', rl.ffi.from_buffer(pixels)))
       self._last_frame = frame
     if self._texture is not None:
-      area = rl.Rectangle(rect.x + pad, rect.y + 44 * scale, rect.width - 2 * pad, 145 * scale)
-      factor = min(area.width / self._texture.width, area.height / self._texture.height)
-      width, height = self._texture.width * factor, self._texture.height * factor
-      rl.draw_texture_pro(self._texture, rl.Rectangle(0, 0, self._texture.width, self._texture.height),
-                          rl.Rectangle(area.x + (area.width - width) / 2, area.y + (area.height - height) / 2, width, height),
-                          rl.Vector2(0, 0), 0, rl.WHITE)
+      factor = max(rect.width / self._texture.width, rect.height / self._texture.height)
+      width, height = rect.width / factor, rect.height / factor
+      source = rl.Rectangle((self._texture.width - width) / 2, (self._texture.height - height) / 2, width, height)
+      rl.draw_texture_pro(self._texture, source, rect, rl.Vector2(0, 0), 0, rl.WHITE)
+    rl.draw_rectangle_rec(rl.Rectangle(rect.x, rect.y, rect.width, 44 * scale), rl.Color(0, 0, 0, 170))
+    rl.draw_rectangle_rec(rl.Rectangle(rect.x, rect.y + 190 * scale, rect.width, 50 * scale), rl.Color(0, 0, 0, 170))
+    self._back.render(rl.Rectangle(rect.x + pad, rect.y + pad, 66 * scale, bar))
+    if self._route is None:  # Back handles its touch during render and closes playback.
+      return
+    self._text(f'Clip {clip.number}  |  {state["position"]:.0f} / {state["duration"]:.0f}s',
+               rect.x + 84 * scale, rect.y + 14 * scale, 17)
     if state['error'] or state['loading']:
       rl.draw_rectangle(int(rect.x), int(rect.y + 86 * scale), int(rect.width), int(52 * scale), rl.Color(0, 0, 0, 220))
       self._text(state['error'] or 'Loading preview...', rect.x + pad, rect.y + 100 * scale, 16,
