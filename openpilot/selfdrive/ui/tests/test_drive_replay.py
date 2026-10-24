@@ -271,3 +271,33 @@ def test_render_after_ignition_does_not_draw_or_recreate_resources(mocker):
   draw = mocker.patch.object(ui.rl, 'draw_rectangle_rec', side_effect=AssertionError('rendered after going onroad'))
   panel._render(ui.rl.Rectangle(0, 0, 536, 240))
   draw.assert_not_called()
+
+
+def test_consecutive_video_frames_use_pyray_compatible_pixel_pointer(mocker):
+  from types import SimpleNamespace
+  from openpilot.selfdrive.ui.layouts import drive_replay as ui
+
+  # Exercise pyray's actual void-pointer conversion without a GPU context.
+  uploaded = []
+  @ui.rl.ffi.callback('void(int, const void *)')
+  def upload(texture_id, pixels):
+    uploaded.append((texture_id, bytes(ui.rl.ffi.buffer(pixels, 12))))
+  wrapped_upload = ui.rl._wrap_function(upload)
+  mocker.patch.object(ui.rl, 'update_texture', side_effect=lambda texture, pixels: wrapped_upload(texture.id, pixels))
+  for name in ('draw_rectangle_rec', 'draw_texture_pro'):
+    mocker.patch.object(ui.rl, name)
+
+  panel = object.__new__(ui.DriveReplayLayout)
+  panel._parked = lambda: True
+  panel._route = replay.LocalRoute('route', (replay.PreviewClip('qcamera.ts', 0, 0),))
+  panel._texture = SimpleNamespace(id=7, width=2, height=2)
+  panel._last_frame = None
+  panel._back = mocker.Mock()
+  panel._controls = [mocker.Mock() for _ in range(5)]
+  panel._text = mocker.Mock()
+  panel._player = mocker.Mock()
+  for pixels in (b'\xff\x00\x00' * 4, b'\x00\x00\xff' * 4):
+    panel._player.snapshot.return_value = {'clip_index': 0, 'position': 1., 'duration': 30.,
+                                          'frame': (2, 2, pixels), 'error': '', 'loading': False, 'playing': True}
+    panel._render(ui.rl.Rectangle(0, 0, 536, 240))
+  assert uploaded == [(7, b'\xff\x00\x00' * 4), (7, b'\x00\x00\xff' * 4)]

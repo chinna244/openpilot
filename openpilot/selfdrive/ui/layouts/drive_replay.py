@@ -165,7 +165,7 @@ class DriveReplayLayout(Widget):
         self._texture = rl.load_texture_from_image(image)
         rl.set_texture_filter(self._texture, rl.TextureFilter.TEXTURE_FILTER_BILINEAR)
       else:
-        rl.update_texture(self._texture, rl.ffi.from_buffer(pixels))
+        rl.update_texture(self._texture, rl.ffi.cast('void *', rl.ffi.from_buffer(pixels)))
       self._last_frame = frame
     if self._texture is not None:
       area = rl.Rectangle(rect.x + pad, rect.y + 44 * scale, rect.width - 2 * pad, 145 * scale)
