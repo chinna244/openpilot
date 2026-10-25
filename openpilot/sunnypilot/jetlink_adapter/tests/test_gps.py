@@ -79,3 +79,20 @@ class TestFill:
     assert fill(msg, {**GPS, "sats": 400, "quality": -1, "fix_type": math.inf, "speed_mps": -3.})
     fix = msg.customReserved18
     assert (fix.satelliteCount, fix.fixQuality, fix.fixType, fix.speed) == (255, 0, 0, 0.)
+
+
+class TestAsk:
+  def test_asks_once_a_second(self, monkeypatch):
+    from openpilot.sunnypilot.jetlink_adapter import gps as gps_mod
+    clock = [100.]
+    monkeypatch.setattr(gps_mod.time, "monotonic", lambda: clock[0])
+    gps = JetsonGps()
+    asked = []
+    for _ in range(80):  # 5 s of frames, 1/16 s apart so the clock adds up exactly
+      after_enqueue = gps.ask()
+      if after_enqueue is not None:
+        after_enqueue()  # what end() does with it: nothing
+        asked.append(clock[0])
+      clock[0] += 0.0625
+    assert len(asked) == 5
+    assert all(b - a == pytest.approx(1.0) for a, b in zip(asked, asked[1:], strict=False))

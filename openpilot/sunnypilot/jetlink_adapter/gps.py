@@ -12,8 +12,15 @@ Standard library only: modeld calls it on its frame loop.
 from __future__ import annotations
 
 import math
+import time
 
 JETSON_GPS_SERVICE = "customReserved18"
+# the receiver fixes once a second
+TELEMETRY_PERIOD = 1.0  # s
+
+
+def _ask() -> None:
+  pass
 
 
 class JetsonGps:
@@ -22,6 +29,18 @@ class JetsonGps:
 
   def __init__(self):
     self._last_state: dict | None = None
+    self._last_ask = -math.inf
+
+  def ask(self):
+    """model.run's after_enqueue about once a second, else None: a frame run with one asks the Jetson for its
+    telemetry, and so its fix. jetlink's own once-a-second ask seldom fires (model_state: prepare's log resets
+    the timer send reads just after), which left fixes 1 to 11 s apart. For a modeld without a chestnut's
+    after_enqueue of its own."""
+    now = time.monotonic()
+    if now - self._last_ask < TELEMETRY_PERIOD:
+      return None
+    self._last_ask = now
+    return _ask
 
   def poll(self, model) -> dict | None:
     state = getattr(getattr(model, 'client', None), 'last_state', None)

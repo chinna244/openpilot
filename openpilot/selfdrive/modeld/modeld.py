@@ -429,7 +429,8 @@ def main(demo=False):
     try:
       send_chestnut = (chestnut_state is not None and
                        run_count % round(ModelConstants.MODEL_RUN_FREQ / SERVICE_LIST['chestnutGpuState'].frequency) == 0)
-      model_output = model.run(bufs, transforms, inputs, chestnut_state.send if send_chestnut else None)
+      model_output = model.run(bufs, transforms, inputs,
+                               chestnut_state.send if send_chestnut else (jetson_gps.ask() if chestnut_state is None else None))
     except Exception:
       if not model.chestnut:
         raise
