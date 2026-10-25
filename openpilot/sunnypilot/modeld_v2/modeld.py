@@ -56,6 +56,7 @@ from openpilot.sunnypilot.modeld_v2.model_adapters import get_model_adapter
 from openpilot.sunnypilot.models.helpers import get_active_bundle
 from openpilot.sunnypilot.selfdrive.controls.lib.relc import RoadEdgeLaneChangeController
 from openpilot.sunnypilot import jetlink_adapter
+from openpilot.sunnypilot.jetlink_adapter.gps import JETSON_GPS_SERVICE, JetsonGps, fill as fill_jetson_gps
 
 PROCESS_NAME = "openpilot.selfdrive.modeld.modeld_tinygrad"
 BIG_MODEL_TIMEOUT = 60
@@ -340,7 +341,7 @@ def main(demo=False):
   config_realtime_process(7, 54)
 
   # messaging
-  pub_socks = ["modelV2", "drivingModelData", "cameraOdometry", "modelDataV2SP"] + (["chestnutGpuState"] if CHESTNUT else [])
+  pub_socks = ["modelV2", "drivingModelData", "cameraOdometry", "modelDataV2SP", JETSON_GPS_SERVICE] + (["chestnutGpuState"] if CHESTNUT else [])
   pm = PubMaster(pub_socks)
   sm = SubMaster(["deviceState", "carState", "narrowRoadCameraState", "extrinsicsCalibration", "driverMonitoringState",
                   "carControl", "controlsState", "lateralDelay"])
@@ -375,6 +376,7 @@ def main(demo=False):
 
   # TODO Move smooth seconds to action function
   prev_action = log.ModelDataV2.Action()
+  jetson_gps = JetsonGps()
 
   DH = DesireHelper()
   meta_constants = load_meta_constants()
@@ -527,6 +529,15 @@ def main(demo=False):
       pm.send('drivingModelData', drivingdata_send)
       pm.send('cameraOdometry', posenet_send)
       pm.send('modelDataV2SP', mdv2sp_send)
+
+    # the Jetson's USB GPS, when the last reply carried a new fix; never at the frame loop's expense
+    try:
+      if (jetson_fix := jetson_gps.poll(model)) is not None:
+        jetson_gps_send = messaging.new_message(JETSON_GPS_SERVICE, valid=True)
+        if fill_jetson_gps(jetson_gps_send, jetson_fix):
+          pm.send(JETSON_GPS_SERVICE, jetson_gps_send)
+    except Exception:
+      cloudlog.exception("modeld.jetson_gps_failed")
     last_vipc_frame_id = meta_main.frame_id
 
 if __name__ == "__main__":
