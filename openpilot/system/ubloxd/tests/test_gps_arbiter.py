@@ -218,9 +218,19 @@ class TestFill:
     assert gps.bearingAccuracyDeg == 180.
     assert list(gps.vNED) == [0., 0., 0.]
 
+  def test_moving_without_a_course_is_not_a_standstill(self):
+    # 20 m/s, the receiver left the course blank: no projection, and the zero velocity carries no weight
+    gps = self.fill(ext(10., age=0.5, speed=20.), 10.5)
+    assert (gps.latitude, gps.longitude) == (LAT, LON)
+    assert list(gps.vNED) == [0., 0., 0.]
+    assert gps.speed == 20.
+    assert gps.speedAccuracy >= 20.
+    assert gps.bearingAccuracyDeg == 180.
+    assert gps.horizontalAccuracy == pytest.approx(0.45 * ga.UERE + 20 * 1.)
+
   def test_passes_locationd_sanity_checks(self):
     # sunnypilot/selfdrive/locationd/locationd.cc Localizer::handle_gps
-    for speed, bearing in ((0., math.nan), (35., 271.)):
+    for speed, bearing in ((0., math.nan), (35., 271.), (35., math.nan)):
       gps = self.fill(ext(10., speed=speed, bearing=bearing), 10. + ga.EXTERNAL_EXIT_AGE)
       assert gps.hasFix and gps.flags % 2 == 1
       assert gps.verticalAccuracy > 0 and gps.speedAccuracy > 0 and gps.bearingAccuracyDeg > 0

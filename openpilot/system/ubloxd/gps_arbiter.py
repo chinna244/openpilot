@@ -163,9 +163,13 @@ class GpsArbiter:
     assert fix is not None
     age = max(fix.age(now), 0.)
     moving = fix.speed > 0.5 and math.isfinite(fix.bearing_deg)
+    # moving with no course (a receiver may leave it blank at low speed): the velocity's direction is unknown,
+    # so it goes out as zero with an accuracy as large as the speed, never as a confident standstill
+    no_course = fix.speed > 0.5 and not moving
     lat, lon = project(fix.latitude, fix.longitude, fix.bearing_deg, fix.speed * age) if moving else (fix.latitude, fix.longitude)
     bearing = math.radians(fix.bearing_deg) if moving else 0.
-    h_acc = fix.hdop * UERE + 0.5 * fix.speed * age
+    # projected, the error is the course's; not projected, it is the whole way travelled since the fix
+    h_acc = fix.hdop * UERE + (fix.speed * age if no_course else 0.5 * fix.speed * age)
 
     gps.source = 'external'
     gps.hasFix = True
@@ -178,7 +182,7 @@ class GpsArbiter:
     gps.vNED = [fix.speed * math.cos(bearing), fix.speed * math.sin(bearing), 0.] if moving else [0., 0., 0.]
     gps.horizontalAccuracy = h_acc
     gps.verticalAccuracy = 2 * h_acc
-    gps.speedAccuracy = 1.
-    gps.bearingAccuracyDeg = 5. if fix.speed > 2 else 180.
+    gps.speedAccuracy = max(1., fix.speed) if no_course else 1.
+    gps.bearingAccuracyDeg = 5. if moving and fix.speed > 2 else 180.
     gps.satelliteCount = fix.satellites
     gps.unixTimestampMillis = int(fix.utc_ms + age * 1e3)
