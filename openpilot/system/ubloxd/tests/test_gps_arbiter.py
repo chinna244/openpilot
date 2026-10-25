@@ -58,12 +58,12 @@ class TestArbitration:
     out = sim.run(5, ublox_fix=True, h_acc=26.)
     assert sim.arb.using_external and not out[-1]
 
-  def test_falls_back_after_two_seconds_without_ublox_fix(self):
+  def test_falls_back_a_third_of_a_second_without_ublox_fix(self):
     sim = Sim()
     sim.run(10, ublox_fix=True)
     out = sim.run(5, ublox_fix=False)
     first_external = out.index(False)
-    assert first_external == 19  # 2.0 s after the last trusted fix, at index -1
+    assert first_external == 3  # 0.4 s after the last trusted fix (the first wake past 0.35 s), at index -1
     assert not any(out[first_external:])
     assert sim.arb.switches == 1
 
@@ -128,10 +128,64 @@ class TestArbitration:
     assert not arb.internal(False, 0., 13. - 0.3 + ga.EXTERNAL_EXIT_AGE - 0.01)
     assert arb.internal(False, 0., 13. - 0.3 + ga.EXTERNAL_EXIT_AGE + 0.01)
 
-  def test_no_fallback_in_the_first_seconds(self):
+  def test_no_fallback_in_the_first_moment(self):
     sim = Sim()
-    out = sim.run(1.9, ublox_fix=False)
+    out = sim.run(0.2, ublox_fix=False)
     assert all(out)
+
+  def test_a_dropped_message_or_two_passes_as_it_is(self):
+    sim = Sim()
+    sim.run(10, ublox_fix=True)
+    assert all(sim.run(0.2, ublox_fix=False))
+    assert all(sim.run(1, ublox_fix=True))
+    assert sim.arb.switches == 0
+
+  def test_hands_back_only_to_a_good_ublox(self):
+    # route 0000018f's start: an 11-20 m ublox is trusted, but the Jetson keeps the fix until the ublox is at 10 m
+    sim = Sim()
+    sim.run(10, ublox_fix=False)
+    assert not any(sim.run(20, ublox_fix=True, h_acc=15.))
+    assert sim.arb.using_external
+    out = sim.run(6, ublox_fix=True, h_acc=10.)
+    assert out.index(True) == 50 and sim.arb.switches == 2
+
+  def test_at_speed_hands_back_to_a_ublox_as_good_as_the_jetson(self):
+    # at 30 m/s the Jetson's 1 Hz fix projected 2.5 s is ~40 m: a 15 m ublox is the better one
+    arb = GpsArbiter(0.)
+    t, out = 0., []
+    for i in range(160):  # 10 s without a ublox fix, then 6 s of a 15 m one; the Jetson fresh and moving all along
+      t = round(t + 0.1, 6)
+      if i % 10 == 0:
+        arb.external(ext(t, lat=LAT + 30. * t / 111320., speed=30., bearing=0.))
+      arb.tick(t)
+      out.append(arb.internal(i >= 100, 15., t))
+    assert arb.external_h_acc(2.5) == pytest.approx(0.45 * 5. + 0.5 * 30. * 2.5)
+    assert not any(out[20:100]) and out.index(True, 100) == 150 and arb.switches == 2
+
+  def test_at_speed_an_untrusted_ublox_is_never_handed_back_to(self):
+    # review: at 30 m/s the Jetson's ~40 m bar let a 30 m (untrusted) ublox count as good and churn a switch every 5 s
+    arb = GpsArbiter(0.)
+    t = 0.
+    for i in range(300):
+      t = round(t + 0.1, 6)
+      if i % 10 == 0:
+        arb.external(ext(t, lat=LAT + 30. * t / 111320., speed=30., bearing=0.))
+      arb.tick(t)
+      arb.internal(True, 30., t)
+    assert arb.using_external and arb.switches == 1
+
+  def test_hands_back_at_10_m_but_not_just_over(self):
+    for h_acc, back in ((10., True), (10.5, False)):
+      sim = Sim()
+      sim.run(10, ublox_fix=False)
+      sim.run(6, ublox_fix=True, h_acc=h_acc)
+      assert sim.arb.using_external != back
+
+  def test_a_usable_ublox_keeps_priority(self):
+    # 11-25 m is still trusted while the ublox has the fix: no fallback for it
+    sim = Sim()
+    assert all(sim.run(10, ublox_fix=True, h_acc=20.))
+    assert sim.arb.switches == 0
 
   def test_silent_ublox_is_covered_by_tick(self):
     sim = Sim()
@@ -140,6 +194,25 @@ class TestArbitration:
     sim.run(2, ublox_fix=None)
     # not for the first SILENT_UBLOX, then every TICK_PUBLISH_PERIOD
     assert sim.arb.using_external and 15 <= sim.ticks <= 16
+
+  def test_a_late_good_message_is_not_switched_away_from(self):
+    # review: a 0.4 s serial hiccup, then a good fix: tick() runs first on that wake and must not fall back
+    sim = Sim()
+    sim.run(10, ublox_fix=True)
+    sim.run(0.4, ublox_fix=None)
+    assert all(sim.run(1, ublox_fix=True))
+    assert sim.arb.switches == 0
+
+  def test_a_silent_ublox_falls_back_after_a_second(self):
+    sim = Sim()
+    sim.run(10, ublox_fix=True)
+    sim.run(0.9, ublox_fix=None)
+    assert not sim.arb.using_external
+    sim.run(0.2, ublox_fix=None)
+    assert sim.arb.using_external
+    # and stays: the good fixes before the silence are no recovery (they flipped it back every wake)
+    sim.run(5, ublox_fix=None)
+    assert sim.arb.using_external and sim.arb.switches == 1
 
   def test_tick_is_quiet_while_ublox_talks(self):
     sim = Sim()
