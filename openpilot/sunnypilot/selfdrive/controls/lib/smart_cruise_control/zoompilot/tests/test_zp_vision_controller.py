@@ -289,3 +289,8 @@ class TestPlannedStop(VisionCase):
     # pulling into a corner: the car is as slow as the plan, so the curvature stands
     self.run_road(4., lambda s: CURVE_KAPPA, v_model=3.)
     assert np.isfinite(self.scc_v.v_near_min)
+
+  def test_a_bend_planned_just_over_the_cut_keeps_its_curvature(self):
+    # 45 mph, the plan at 5 m/s: over the 4.5 m/s cut, so the bend is read even though the car is 4x faster
+    self.run_road(20., lambda s: CURVE_KAPPA, v_model=5.)
+    assert np.isfinite(self.scc_v.v_near_min)

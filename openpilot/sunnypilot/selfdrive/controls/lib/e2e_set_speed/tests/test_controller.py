@@ -483,6 +483,13 @@ def test_a_steady_far_lead_leaves_the_floor_on():
   assert ctl.inhibit == Inhibit.none and ctl.boost > 0.
 
 
+def test_a_steady_lead_past_the_40_m_minimum_is_far_when_slow():
+  # 6 m/s: 5 s of headway is 30 m, so the 40 m minimum sets the bar; 45 m and steady is far
+  ctl = new_controller()
+  run(ctl, SETTLE_FRAMES, build_sm(6., lead=True, lead_d=45., lead_vrel=0.), v_cruise=9.)
+  assert ctl.inhibit == Inhibit.none and ctl.boost > 0.
+
+
 @pytest.mark.parametrize("v, sm_kwargs", [
   (V_EGO, {**FAR, "lead_d": (c.FAR_LEAD_T - 0.5) * V_EGO}),  # inside the headway
   (V_EGO, {**FAR, "lead_vrel": CLOSING}),  # closing
@@ -493,7 +500,7 @@ def test_a_steady_far_lead_leaves_the_floor_on():
   (V_EGO, {**FAR, "lead2": (FAR["lead_d"] + 20., CLOSING - 20. / c.FAR_LEAD_CLOSE_T, 0.)}),  # a second lead that is closing
   (V_EGO, {**FAR, "lead_vrel": float('nan')}),  # a closing speed that is not a number is not clearly far
   (V_EGO, {"lead": True, "lead_d": 30., "lead_vrel": 0.}),  # a cut-in inside the headway, not closing
-  (6., {"lead": True, "lead_d": c.FAR_LEAD_MIN - 5., "lead_vrel": 1.}),  # slow: 5 s is under the minimum distance
+  (6., {"lead": True, "lead_d": 35., "lead_vrel": 1.}),  # slow: 5 s (30 m) is under the 40 m minimum
 ])
 def test_a_near_or_closing_lead_still_stands_the_floor_down_at_once(v, sm_kwargs):
   ctl = new_controller()
