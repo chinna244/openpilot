@@ -25,7 +25,8 @@ OP_LONG_IDS = ["op_long", "stock"]
 def hallucination(s):
   # the replayed failure: at 68 mph the model reported an r=330 m bend between 120 and 200 m
   # on a road that never bent (steering curvature stayed under 1/1900 for 20 s)
-  return 0.003 if 120. <= s <= 200. else 0.
+  # (0.003 then, over the 2.3 ceiling; at the 2.6 one that misread no longer reads as a curve, so scaled to keep the case)
+  return 0.0035 if 120. <= s <= 200. else 0.
 
 
 class TestHighwayHorizon(VisionCase):

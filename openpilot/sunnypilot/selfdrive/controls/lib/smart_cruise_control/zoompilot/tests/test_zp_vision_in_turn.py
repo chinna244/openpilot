@@ -67,7 +67,7 @@ class TestInTurnBraking(VisionCase):
 
   @SIDES
   def test_turning_through_a_town_corner_brakes_gently(self, side):
-    # 8 m/s (18 mph) in a 20 m corner: 3.2 m/s2 now and past the lead, over the 2.3 ceiling
+    # 8 m/s (18 mph) in a 20 m corner: 3.2 m/s2 now and past the lead, over the 2.8 ceiling
     assert self.drive(8., corner(0.05, 0.05, side), side * 0.05) == pytest.approx(A_MIN)
 
   @SIDES

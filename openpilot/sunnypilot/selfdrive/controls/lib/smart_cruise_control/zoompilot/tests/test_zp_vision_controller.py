@@ -60,7 +60,7 @@ class TestHoldSetSpeed(VisionCase):
   def test_distant_curve_holds_set_speed(self):
     # a curve 185 m out, as the model actually reports one at that range: even with the
     # under-read corrected it asks well under the 0.7 * 1.2 commit, so the car holds
-    self.run_road(V_EGO, curve_at(185., kappa=0.013), attenuate=True)  # 0.012 under the 2.2 ceiling, scaled to 2.4
+    self.run_road(V_EGO, curve_at(185., kappa=0.015), attenuate=True)  # 0.012 under the 2.2 ceiling, scaled to 2.8
     assert self.scc_v.state == VisionState.enabled
     assert self.scc_v.output_v_target == V_CRUISE_UNSET
     assert 0. < self.scc_v.a_required < 0.84
@@ -146,7 +146,7 @@ class TestFarFieldCurvatureBias(VisionCase):
 
   def test_bias_correction_commits_earlier(self):
     # Bias correction moves the reported corner above the commit threshold.
-    road = curve_at(110., kappa=0.013)
+    road = curve_at(110., kappa=0.015)
     self.run_road(V_EGO, road, attenuate=True)
     assert self.scc_v.is_active
 
@@ -254,6 +254,12 @@ class TestCurveRecovery(VisionCase):
       assert float(vision_controller.curve_speed(kappa)) == pytest.approx(v)
     speeds = vision_controller.curve_speed(np.linspace(0.0005, 0.03, 200))
     assert np.all(np.diff(speeds) < 0)
+
+  def test_curves_are_taken_at_this_drivers_own_lateral_acceleration(self):
+    # a 50 m radius at 2.8 m/s2 (less the 5 % margin) by 35 mph; 2.8 at 55 mph and 2.6 at 70 mph
+    assert float(vision_controller.curve_speed(0.02)) == pytest.approx((2.8 * 0.95 / 0.02) ** 0.5, rel=1e-3)
+    assert float(vision_controller.curve_speed(2.8 * 0.95 / 24.6 ** 2)) == pytest.approx(24.6, rel=1e-3)
+    assert float(vision_controller.curve_speed(2.6 * 0.95 / 31.3 ** 2)) == pytest.approx(31.3, rel=1e-3)
 
   def test_stock_target_rises_to_the_profile_below_the_allowed_speed(self):
     scc = self.commit(self.stock())

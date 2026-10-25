@@ -27,7 +27,7 @@ from openpilot.sunnypilot.selfdrive.controls.lib.smart_cruise_control.zoompilot.
 VisionState = custom.LongitudinalPlanSP.SmartCruiseControl.VisionState
 
 V_EXIT = 5.7  # m/s, 12.8 mph: just over MIN_V, where the pauses began
-K_TURN = 0.08  # 1/m, a 12.5 m intersection corner (2.6 m/s2 at V_EXIT)
+K_TURN = 0.093  # 1/m, a 10.8 m intersection corner (3.0 m/s2 at V_EXIT, over the 2.8 ceiling as 2.6 was over 2.4)
 SIDES = pytest.mark.parametrize("side", [1., -1.], ids=["left", "right"])
 
 
@@ -128,7 +128,8 @@ class TestLongCurvesKeepTheirProtection(VisionCase):
     peak_now = pull_away_peak_lat(self.scc_v, 1. / radius, side)
     with floor_turns_never_latch():
       peak_before = pull_away_peak_lat(SmartCruiseControlVision(make_cp()), 1. / radius, side)
-    assert peak_before < 3.5  # the curve is protected at all
+    # the curve is protected at all: at the 2.8 town ceiling the lag puts a loop from a stop 0.9 over it
+    assert peak_before < 3.9
     assert peak_now <= peak_before + 0.01
 
   @SIDES

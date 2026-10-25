@@ -33,7 +33,13 @@ _A_LAT_CURVE_BP = [15.6, 24.6, 31.3]  # m/s curve speed; 35, 55, 70 mph
 # Local tuning (zoompilot 2.2, 2.1, 2.2): this driver's own turns peak at a median 2.4 m/s2 at 15-24 mph (31 turns,
 # routes 0000014e-00000163), and the model's own plan took a 210 m bend at about 2.6 (route 00000160 830 s) where
 # 2.0 held the car 7 mph under it.
-_A_LAT_CURVE = [2.4, 2.3, 2.3]
+# This driver's own curves (gyro yaw rate x speed, routes 00000160-0000018f, 107 curves): taken without slowing, apex
+# 2.5 to 3.1 m/s2 median and 3.6 to 3.8 p90 at 20-40 mph, 1.6 to 1.7 median and 2.0 to 2.4 p90 from 50 mph, and up to
+# 2.9 at p90 where curve control slowed the car and the driver pressed the gas. Replayed on 41 drives (closed loop):
+# town curves braked 47 -> 38 (101 -> 73 s), highway 15 -> 12 (50 -> 32 s). The town value stops at 2.8: with the
+# actuator lag a hairpin entered from a stop peaks 0.9 over it (3.8 at r = 15 m, about this driver's own p90), and 3.5
+# would put loops at 4.0-4.5.
+_A_LAT_CURVE = [2.8, 2.8, 2.6]
 # Reserve margin for actuation delay at the apex.
 _PLAN_MARGIN = 0.95
 # The same table by curvature (ascending), so each point's ceiling needs no speed solve.
@@ -99,7 +105,7 @@ _KAPPA_V_FRAC = 0.5  # of vEgo
 # _FLOOR_TURN_LAT_CAP on the curvature past the actuation lead _FLOOR_TURN_PROJ_T on (the turn goes
 # on: loops, hairpins, a tightening corner), or gets more than the in-curve margin over the curve.
 _FLOOR_TURN_LAT_ACC = 1.6  # m/s2, already turning
-_FLOOR_TURN_LAT_CAP = 2.8  # m/s2; at this cap synthetic R15/R20 loops from a stop peak as before
+_FLOOR_TURN_LAT_CAP = 2.8  # m/s2; at this cap synthetic R15/R20 loops from a stop peaked as before under the 2.4 ceiling
 _FLOOR_TURN_PROJ_T = 1.0  # s
 
 # In-turn braking (openpilot long, town speed). Through an intersection corner the near field still reads the bend
