@@ -36,6 +36,82 @@ _CONFIRM_T = [0., 2.5]  # s
 # decel (which divides by the distance) saws at every fix. A tunnel or underpass sends no fix; past
 # this the position counts as lost rather than reckoned on
 _FIX_HOLD_T = 3.  # s
+# mapd sets a target at every OSM node from that node's curvature at its fixed lateral accel.
+# Interchanges map a sweeping bend as a few kinked nodes, so a bend the road takes at 61 mph
+# reads as a 40 mph corner (route 18b 465 s: the car drove 1.7 m from the point, at 57 mph).
+# At speed, a target is relaxed to the bend's curvature over a longer stretch (the heading
+# change between the chords L before and after the node, over L) when that is clearly
+# gentler. Map geometry alone cannot tell a kink from a real short curve (a well-mapped 45 deg
+# curve of 100 m radius reads 14.1 -> 17.8 m/s), so the camera must agree: a target relaxes
+# only once the model's path covers it, to the lower of the two readings, and then stays
+# relaxed until passed. The model path reaches 190-360 m at speed and covers a target within
+# about 2 s of it binding; it reads real curves within 2-5 mph of mapd (186 461 s: 39 vs 44)
+# and the kinks as straight or gentle (18b 465 s: 40 vs 78); a closer, tighter reading lowers it
+# again. Not in town, where a real corner
+# is a single node (junction turns would read 29 -> 36 and 37 -> 60 mph), nor below 25 mph,
+# where a ramp ends in a short tight corner (186 859 s)
+_MAPD_LAT_ACC = 2.0  # m/s2, mapd's TARGET_LAT_ACCEL
+_RELAX_V_EGO = 20.1  # m/s (45 mph)
+_RELAX_MIN_V = 11.18  # m/s (25 mph)
+_RELAX_RATIO = 1.2
+_RELAX_L = (100., 150.)  # m
+_RELAX_V_MAX = 40.  # m/s; a straight reads as an infinite curve speed
+_CAMERA_L = (30., 50.)  # m; the model path is read over this either side of the target
+# the camera must read the target gentle this many judged frames in a row (its tightest reading is
+# taken): one noisy frame at the path's far end must not relax a real curve
+_CAMERA_FRAMES = 10
+
+
+def relaxed_velocities(targets) -> np.ndarray:
+  """Each target's velocity, raised to its longer-stretch curve speed where that is clearly higher.
+  A point without L of path on both sides is not relaxed."""
+  v = np.array([float(p["velocity"]) for p in targets])
+  if len(v) < 3:
+    return v
+  lat = np.radians([p["latitude"] for p in targets])
+  lon = np.radians([p["longitude"] for p in targets])
+  P = np.stack([R * lon * np.cos(lat[0]), R * lat], axis=1)
+  s = np.concatenate([[0.], np.cumsum(np.hypot(*np.diff(P, axis=0).T))])
+  v_long = np.full(len(P), np.inf)
+  for L in _RELAX_L:
+    a = np.stack([np.interp(s - L, s, P[:, 0]), np.interp(s - L, s, P[:, 1])], axis=1)
+    b = np.stack([np.interp(s + L, s, P[:, 0]), np.interp(s + L, s, P[:, 1])], axis=1)
+    h_in = np.arctan2(*(P - a).T[::-1])
+    h_out = np.arctan2(*(b - P).T[::-1])
+    turn = np.abs(np.angle(np.exp(1j * (h_out - h_in))))
+    with np.errstate(divide='ignore'):
+      v_L = np.sqrt(_MAPD_LAT_ACC * L / turn)
+    covered = (s - L >= 0.) & (s + L <= s[-1])
+    v_long = np.minimum(v_long, np.where(covered, v_L, 0.))
+  v_long = np.minimum(v_long, _RELAX_V_MAX)
+  return np.where((v >= _RELAX_MIN_V) & (v_long >= _RELAX_RATIO * v), v_long, v)
+
+
+def model_curve_speed(px, py, x0: float) -> float | None:
+  """Curve speed (at mapd's lateral accel) of the model's path around x0 m ahead: the lower over
+  _CAMERA_L of the heading change between the path L before and L after, over L. None when the path
+  does not reach L past x0."""
+  px, py = np.asarray(px, dtype=float), np.asarray(py, dtype=float)
+  if len(px) < 2 or not np.isfinite(x0) or not (np.isfinite(px).all() and np.isfinite(py).all()):
+    return None
+  if x0 - max(_CAMERA_L) < 0. or x0 + max(_CAMERA_L) > px[-1] or np.any(np.diff(px) <= 0.):
+    return None
+  v = np.inf
+  for L in _CAMERA_L:
+    xs = np.array([x0 - L, x0, x0 + L])
+    ys = np.interp(xs, px, py)
+    turn = abs(np.angle(np.exp(1j * (np.arctan2(ys[2] - ys[1], L) - np.arctan2(ys[1] - ys[0], L)))))
+    with np.errstate(divide='ignore'):
+      v = min(v, float(np.sqrt(_MAPD_LAT_ACC * L / turn)))
+  return v
+
+
+def ahead_distance(lat0: float, lon0: float, bearing_deg: float, lats, lons) -> np.ndarray:
+  """How far ahead (m, along the bearing) each point lies from (lat0, lon0)"""
+  east = R * np.radians(np.asarray(lons) - lon0) * np.cos(np.radians(lat0))
+  north = R * np.radians(np.asarray(lats) - lat0)
+  h = np.radians(bearing_deg)
+  return east * np.sin(h) + north * np.cos(h)
 
 
 def target_binds(v_ego: float, tv, d, lim: PlanningLimits) -> np.ndarray:
@@ -55,10 +131,13 @@ class SmartCruiseControlMap(UpstreamMap):
     self.limits = get_planning_limits(CP)
     self.v_target = 0.
     self.target_distance = 0.
-    self.candidate = None  # (v, lat, lon) selected this frame, bound once confirmed
+    self.candidate = None  # (mapd v, lat, lon) selected this frame, bound once confirmed
     self.candidate_age = 0  # frames the same candidate has been selected
     self._a_out = 0.
-    self.fix: tuple[Coordinate, int] | None = None  # the last position with a fix, and its logMonoTime
+    self.fix: tuple[Coordinate, int, float] | None = None  # the last position with a fix, its logMonoTime and bearing
+    self.relaxed: dict[tuple[float, float, float], float] = {}  # (lat, lon, mapd velocity) -> relaxed, kept until passed
+    self.votes: dict[tuple[float, float, float], tuple[int, float]] = {}  # camera frames agreeing so far, tightest reading
+    self.target_mapd_v = 0.  # the bound target's mapd velocity: its identity while its published velocity moves
 
   def get_a_target_from_control(self) -> float:
     # keys ICBM's overshoot gap on stock ACC; ramped since the plan aTarget seeds the MPC
@@ -73,15 +152,50 @@ class SmartCruiseControlMap(UpstreamMap):
     Upstream takes every message, and one without a fix reads as (0, 0), thousands of km away."""
     gps = sm[self.gps_location_service]
     if gps.hasFix:
-      self.fix = Coordinate(gps.latitude, gps.longitude), sm.logMonoTime[self.gps_location_service]
+      self.fix = Coordinate(gps.latitude, gps.longitude), sm.logMonoTime[self.gps_location_service], gps.bearingDeg
     if self.fix is None:
       return None
     self.last_position = self.fix[0]
     age = max(0., (sm.logMonoTime['modelV2'] - self.fix[1]) * 1e-9)
     return age if age <= _FIX_HOLD_T else None
 
+  def relax_targets(self, path, pose) -> None:
+    """Swap in relaxed velocities: new ones only at speed and once the model path (px, py) covers the
+    target, earlier ones while the point is still listed with the same mapd velocity. A later, tighter
+    camera reading lowers a relaxed target (never under mapd's). An empty list (mapd or the localizer
+    dropping out) keeps them. pose: (lat, lon, bearing, m travelled since the fix)."""
+    keys = [(p["latitude"], p["longitude"], p["velocity"]) for p in self.target_velocities]
+    if keys:
+      self.relaxed = {k: self.relaxed[k] for k in keys if k in self.relaxed}
+      self.votes = {k: self.votes[k] for k in keys if k in self.votes}
+    if path is not None:
+      v_map = relaxed_velocities(self.target_velocities) if self.v_ego >= _RELAX_V_EGO else np.zeros(len(keys))
+      # once per frame each: a repeated node (two ways joining) must not vote twice
+      judge = list({k: i for i, (k, p) in enumerate(zip(keys, self.target_velocities, strict=True))
+                    if v_map[i] > p["velocity"] or k in self.relaxed}.values())
+      if judge:
+        x = ahead_distance(pose[0], pose[1], pose[2], [keys[i][0] for i in judge], [keys[i][1] for i in judge]) - pose[3]
+        for i, xi in zip(judge, x, strict=True):
+          k, v_cam = keys[i], model_curve_speed(path[0], path[1], float(xi))
+          if v_cam is None:
+            continue
+          if k in self.relaxed:
+            self.relaxed[k] = max(k[2], min(self.relaxed[k], v_cam))
+          elif min(v_map[i], v_cam) >= _RELAX_RATIO * k[2]:
+            n, v_low = self.votes.get(k, (0, np.inf))
+            n, v_low = n + 1, min(v_low, v_map[i], v_cam)
+            if n >= _CAMERA_FRAMES:
+              self.relaxed[k] = float(v_low)
+              self.votes.pop(k, None)
+            else:
+              self.votes[k] = (n, v_low)
+          else:
+            self.votes.pop(k, None)
+    self.target_velocities = [{**p, "velocity": self.relaxed.get(k, p["velocity"]), "mapd_v": p["velocity"]}
+                              for k, p in zip(keys, self.target_velocities, strict=True)]
+
   def _release_target(self) -> None:
-    self.v_target, self.target_lat, self.target_lon, self.target_distance = 0., 0., 0., 0.
+    self.v_target, self.target_lat, self.target_lon, self.target_distance, self.target_mapd_v = 0., 0., 0., 0., 0.
 
   def update_calculations(self, sm: messaging.SubMaster) -> None:
     age = self.fix_age(sm)
@@ -91,6 +205,15 @@ class SmartCruiseControlMap(UpstreamMap):
       return
     # targets belong to the position mapd was given; without a valid one they are stale
     self.target_velocities = (velocities_from_param("MapTargetVelocities", self.mem_params) or []) if self.position_valid else []
+    try:
+      position = sm['modelV2'].position
+      path = (np.array(position.x), np.array(position.y))
+    except KeyError:
+      path = None
+    # a gps without a course reports 0 (or nothing): the camera window would sit on the wrong road
+    if not np.isfinite(self.fix[2]) or self.fix[2] == 0.:
+      path = None
+    self.relax_targets(path, (self.fix[0].latitude, self.fix[0].longitude, self.fix[2], self.v_ego * age))
     lat, lon = self.last_position.latitude * TO_RADIANS, self.last_position.longitude * TO_RADIANS
     distances = [distance_to_point(lat, lon, p["latitude"] * TO_RADIANS, p["longitude"] * TO_RADIANS) for p in self.target_velocities]
 
@@ -102,10 +225,11 @@ class SmartCruiseControlMap(UpstreamMap):
     forward = [p for p, _ in ahead]
     forward_d = [d for _, d in ahead]
     binds = target_binds(self.v_ego, [p["velocity"] for p in forward], forward_d, self.limits)
-    valid = [(float(p["velocity"]), p["latitude"], p["longitude"], d) for p, d, b in zip(forward, forward_d, binds, strict=True) if b]
+    valid = [(float(p["velocity"]), p["latitude"], p["longitude"], d, p["mapd_v"]) for p, d, b in zip(forward, forward_d, binds, strict=True) if b]
     best = min(valid, key=lambda x: x[0], default=None)  # the slowest target, nearest on a tie
 
-    candidate = best[:3] if best else None
+    # identity is mapd's own velocity: a relaxed target lowered by the camera stays the same target
+    candidate = (best[4], best[1], best[2]) if best else None
     self.candidate_age = self.candidate_age + 1 if candidate == self.candidate else 0
     self.candidate = candidate
     t_confirm = float(np.interp(self.v_ego, _CONFIRM_V_BP, _CONFIRM_T))
@@ -113,12 +237,13 @@ class SmartCruiseControlMap(UpstreamMap):
 
     if self.v_target != 0. and (best is None or self.v_target < best[0] or not confirmed):
       for p, d in zip(forward, forward_d, strict=True):
-        if p["velocity"] <= self.v_ego and (p["velocity"], p["latitude"], p["longitude"]) == (self.v_target, self.target_lat, self.target_lon):
+        if p["velocity"] <= self.v_ego and (p["mapd_v"], p["latitude"], p["longitude"]) == (self.target_mapd_v, self.target_lat, self.target_lon):
           # still ahead, just under the commit gate (or a deeper target is not confirmed yet):
-          # keep the target at its current distance, since the published decel divides by it
-          self.target_distance = d
+          # keep the target at its current distance, since the published decel divides by it, and
+          # at its current velocity, which the camera may have lowered
+          self.v_target, self.target_distance = float(p["velocity"]), d
           return
       self._release_target()
 
     if confirmed:
-      self.v_target, self.target_lat, self.target_lon, self.target_distance = best
+      self.v_target, self.target_lat, self.target_lon, self.target_distance, self.target_mapd_v = best
