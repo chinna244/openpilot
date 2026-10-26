@@ -24,7 +24,8 @@ class MockSubMaster(dict):
     return True
 
 
-def build_sm(v_cruise_kph=FAST, a_ego=-0.6, gas=False, brake=False, enabled=True, override=False, model_a=0.2, lead=None, e2e=True):
+def build_sm(v_cruise_kph=FAST, a_ego=-0.6, gas=False, brake=False, enabled=True, override=False, model_a=0.2, lead=None, e2e=True,
+             force_decel=False):
   services = {s: getattr(messaging.new_message(s), s) for s in ("vehicleParameters", "carStateSP", "liveMapDataSP",
                                                                 "gpsLocationExternal", "gpsLocation")}
   cs = messaging.new_message('carState')
@@ -33,6 +34,7 @@ def build_sm(v_cruise_kph=FAST, a_ego=-0.6, gas=False, brake=False, enabled=True
   services['carState'] = cs.carState.as_reader()
   ctl = messaging.new_message('controlsState')
   ctl.controlsState.longControlState = LongCtrlState.off if override or not enabled else LongCtrlState.pid
+  ctl.controlsState.forceDecel = force_decel
   services['controlsState'] = ctl.controlsState.as_reader()
   sd = messaging.new_message('selfdriveState')
   sd.selfdriveState.enabled = enabled
@@ -515,3 +517,150 @@ def test_a_model_stop_and_a_close_lead_still_win_after_engaging():
   q.update(build_sm(lead=8.))
   assert sent(q) < -0.5
 
+
+
+def lift_over(p, over, **kwargs):
+  """Gas held over the set speed by `over` m/s, then released; the set speed in kph for the frames that follow."""
+  kph = (V_EGO - over) * 3.6
+  press(p, gas=True, a_ego=0.1, v_cruise_kph=kph, **kwargs)
+  return kph
+
+
+@pytest.mark.parametrize("over", [1.5, 3.0, 6.0])
+def test_lifting_off_over_the_set_speed_coasts_down(over):
+  # route 0000018b t=2689: 84 mph, set 77, the model at +0.1: -0.50 from 0.8 s on
+  p, ref = planner(), reference()
+  for q in (p, ref):
+    kph = lift_over(q, over)
+  seen, prev = [], 0.
+  for _ in range(int(3.0 / p.dt)):
+    for q in (p, ref):
+      q.update(build_sm(a_ego=0.0, v_cruise_kph=kph, model_a=0.1))
+    seen.append(sent(p))
+    assert sent(p) >= -0.3 - 1e-6
+    assert prev - sent(p) <= 0.3 * p.dt + 1e-6  # in at 0.3 m/s^3
+    prev = sent(p)
+  assert sent(p) == pytest.approx(-0.3, abs=1e-6)
+  assert sent(ref) == pytest.approx(A_CRUISE_MIN, abs=1e-6)  # what it did before
+
+
+def test_a_release_just_over_the_set_speed_is_unchanged():
+  p, ref = planner(), reference()
+  for q in (p, ref):
+    kph = lift_over(q, 0.4)
+  for _ in range(20):
+    for q in (p, ref):
+      q.update(build_sm(a_ego=0.0, v_cruise_kph=kph, model_a=0.1))
+    assert sent(p) == pytest.approx(sent(ref), abs=1e-6)
+
+
+def test_a_set_speed_lowered_at_the_release_brakes_as_before():
+  p, ref = planner(), reference()
+  for q in (p, ref):
+    lift_over(q, 0.)
+  for _ in range(30):
+    for q in (p, ref):
+      q.update(build_sm(a_ego=0.0, v_cruise_kph=(V_EGO - 3.0) * 3.6, model_a=0.1))
+  assert not p.gas_coast and sent(p) == pytest.approx(A_CRUISE_MIN, abs=1e-6)
+
+
+def test_the_coast_leaves_the_cruise_state_alone():
+  p = planner()
+  kph = lift_over(p, 3.0)
+  for _ in range(40):
+    p.update(build_sm(a_ego=0.0, v_cruise_kph=kph, model_a=0.1))
+  assert p.a_cruise == pytest.approx(A_CRUISE_MIN, abs=1e-6)
+  assert sent(p) > p.a_cruise
+
+
+def test_back_at_the_set_speed_the_coast_eases_out_without_a_step():
+  p = planner()
+  kph = lift_over(p, 3.0)
+  for _ in range(40):
+    p.update(build_sm(a_ego=0.0, v_cruise_kph=kph, model_a=0.1))
+  at = V_EGO * 3.6  # the set speed reached
+  prev = sent(p)
+  for _ in range(40):
+    p.update(build_sm(a_ego=-0.3, v_cruise_kph=at, model_a=0.1))
+    assert abs(sent(p) - prev) <= np.interp(V_EGO, [0., 10.], [1.6, 1.2]) * p.dt + 1e-6  # the cruise jerk limit
+    prev = sent(p)
+  assert not p.gas_coast and sent(p) == pytest.approx(0., abs=1e-6)
+
+
+def test_a_lowered_set_speed_ends_the_coast():
+  p = planner()
+  kph = lift_over(p, 2.0)
+  for _ in range(10):
+    p.update(build_sm(a_ego=0.0, v_cruise_kph=kph, model_a=0.1))
+  for _ in range(40):
+    p.update(build_sm(a_ego=0.0, v_cruise_kph=kph - 10., model_a=0.1))
+  assert not p.gas_coast and sent(p) <= A_CRUISE_MIN + 1e-6
+
+
+def test_the_gas_again_ends_the_coast():
+  p = planner()
+  kph = lift_over(p, 3.0)
+  for _ in range(10):
+    p.update(build_sm(a_ego=0.0, v_cruise_kph=kph, model_a=0.1))
+  press(p, n=2, gas=True, v_cruise_kph=kph)
+  assert not p.gas_coast and p.a_settle is None
+
+
+def test_a_close_lead_and_a_model_stop_still_win_while_coasting():
+  p = planner()
+  kph = lift_over(p, 3.0)
+  for _ in range(5):
+    p.update(build_sm(a_ego=0.0, v_cruise_kph=kph, model_a=-1.5))
+  assert sent(p) <= -1.0
+  q = planner()
+  kph = lift_over(q, 3.0)
+  for _ in range(20):
+    q.update(build_sm(a_ego=0.0, v_cruise_kph=kph, model_a=0.1, lead=8.))
+  assert sent(q) < -1.0
+
+
+def test_a_curve_target_while_coasting_brakes_from_the_cruise_state_at_once(monkeypatch):
+  orig = LongitudinalPlannerSP.update_targets
+  scc = {'on': False}
+
+  def maybe_scc(self, *args):
+    out = orig(self, *args)
+    if scc['on']:
+      self.source = SCC_SOURCES[0]
+    return out
+  monkeypatch.setattr(LongitudinalPlannerSP, 'update_targets', maybe_scc)
+  p = planner()
+  kph = lift_over(p, 3.0)
+  for _ in range(40):
+    p.update(build_sm(a_ego=0.0, v_cruise_kph=kph, model_a=0.1))
+  assert sent(p) == pytest.approx(-0.3, abs=1e-6)
+  scc['on'] = True
+  p.update(build_sm(a_ego=0.0, v_cruise_kph=kph, model_a=0.1))
+  assert not p.gas_coast and sent(p) == pytest.approx(p.a_cruise, abs=1e-6)
+  assert sent(p) <= -0.45
+
+
+@pytest.mark.parametrize("from_the_gas", [True, False])
+def test_a_forced_decel_brakes_as_before_never_coasts(from_the_gas):
+  # review: forceDecel already on while the gas was held opened a coast that held -0.3 for good
+  p, ref = planner(), reference()
+  for q in (p, ref):
+    kph = lift_over(q, 3.0, force_decel=from_the_gas)
+  if not from_the_gas:
+    for _ in range(10):
+      p.update(build_sm(a_ego=0.0, v_cruise_kph=kph, model_a=0.1))
+      ref.update(build_sm(a_ego=0.0, v_cruise_kph=kph, model_a=0.1))
+  for i in range(40):
+    for q in (p, ref):
+      q.update(build_sm(a_ego=0.0, v_cruise_kph=kph, model_a=0.1, force_decel=True))
+    # from the first forced frame on, the plan is the one before this change: no coast, no easing in
+    assert not p.gas_coast and sent(p) == pytest.approx(sent(ref), abs=1e-6), i
+  assert sent(p) <= A_CRUISE_MIN + 1e-6
+
+
+def test_gas_held_through_set_settles_and_does_not_coast():
+  p = planner()
+  kph = (V_EGO - 3.0) * 3.6
+  engage(p, gas=True, a_ego=0.1, v_cruise_kph=kph)
+  p.update(build_sm(a_ego=0.0, v_cruise_kph=kph, model_a=0.1))
+  assert not p.gas_coast

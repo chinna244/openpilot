@@ -29,6 +29,15 @@ A_CRUISE_MIN = -0.5
 ENGAGE_SETTLE_BAND = 1.0  # m/s over the set speed
 ENGAGE_SETTLE_ACCEL = -0.15  # m/s^2
 ENGAGE_SETTLE_TIME = 5.0  # s
+# Lifting off the gas over the set speed, the cruise candidate went to A_CRUISE_MIN in 0.8 s and held it to the set speed:
+# at 60-75 mph -0.86 at a jerk of 1.22 where this driver's own lift-off coasts at -0.42 and 0.61 (routes
+# 00000160-0000018f; route 0000018b t=2689: 84 mph, set 77, -0.50 from 0.8 s on with the model at +0.1). Released
+# GAS_COAST_BAND or more over the set speed, the candidate coasts instead: to GAS_COAST_ACCEL at GAS_COAST_JERK until the
+# car is back at the set speed (or it is lowered), then eases to what the set speed asks at the cruise jerk limit. Like
+# the settle it lifts only the candidate: leads, the model, curves and limits brake as before.
+GAS_COAST_BAND = 0.5  # m/s over the set speed
+GAS_COAST_ACCEL = -0.3  # m/s^2
+GAS_COAST_JERK = 0.3  # m/s^3
 CONTROL_N_T_IDX = ModelConstants.T_IDXS[:CONTROL_N]
 
 
@@ -57,6 +66,10 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
     self.engage_settle_frames = 0  # what is left of the settle window after engaging
     self.engage_v_cruise = 0.  # the set speed the window opened on: lowering it ends the window
     self.a_settle = None  # the cruise candidate the settle lifted last cycle, while it eases back to the state
+    self.gas_coast = False  # coasting down to the set speed after a gas release over it
+    self.gas_coast_v_cruise = 0.  # the set speed the coast started on: lowering it ends the coast
+    self.gas_v_cruise = 0.  # the set speed while the gas was held: one lowered at the release is braked to as before
+    self.a_coast = 0.  # the coast's own ramp, lifted onto the candidate while above it
     self.a_target_published = init_a  # the plan sent: the internal one, lifted while a gas override is held
     self.source_published = LongitudinalPlanSource.cruise
     self.output_a_target = init_a
@@ -110,6 +123,7 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
         self.gas_override = False
       elif sm['carState'].gasPressed:
         self.gas_override = True
+        self.gas_v_cruise = v_cruise
       self.gas_return = False
       # kept through the engaged cycles longControlState trails by and a gas held through SET; a brake ends it
       if not sm['selfdriveState'].enabled:
@@ -118,10 +132,13 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
         self.disengaged = False
       self.engage_settle_frames = 0
       self.a_settle = None
+      self.gas_coast = False
     elif self.gas_override or self.disengaged:
       if self.disengaged:
         self.engage_settle_frames = int(ENGAGE_SETTLE_TIME / self.dt)
         self.engage_v_cruise = v_cruise
+      elif v_ego - v_cruise >= GAS_COAST_BAND and v_cruise >= self.gas_v_cruise:
+        self.gas_coast, self.gas_coast_v_cruise, self.a_coast = True, v_cruise, min(self.a_cruise, 0.)
       self.gas_override, self.disengaged, self.gas_return = False, False, True
 
     self.mpc.set_weights(prev_accel_constraint, personality=sm['selfdriveState'].personality)
@@ -168,12 +185,21 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
       # starts on engaging, never as a step mid-way
       if v_ego <= v_cruise or v_ego - v_cruise > ENGAGE_SETTLE_BAND or v_cruise < self.engage_v_cruise:
         self.engage_settle_frames = 0
+    if self.gas_coast and (self.source != LongitudinalPlanSource.cruise or v_ego <= v_cruise or v_cruise < self.gas_coast_v_cruise or
+                           sm['controlsState'].forceDecel):
+      # back at the set speed: ease on from where the coast is; a forced decel takes the state at once
+      self.gas_coast = False
+      self.a_settle = None if sm['controlsState'].forceDecel else self.a_coast
     settle = None
     if self.source != LongitudinalPlanSource.cruise:
       # SCC and SLA targets brake as they ask, from the cruise state
       self.engage_settle_frames = 0
     elif self.engage_settle_frames > 0:
       settle = ENGAGE_SETTLE_ACCEL
+    elif self.gas_coast:
+      j = float(np.interp(v_ego, J_CRUISE_BP, J_CRUISE_VALS)) * self.dt
+      self.a_coast = float(np.clip(GAS_COAST_ACCEL, self.a_coast - GAS_COAST_JERK * self.dt, self.a_coast + j))
+      settle = self.a_coast
     elif self.a_settle is not None:
       # toward what the set speed asks now (never above 0) at the cruise jerk limit: down while still over it, up once
       # under it (a raised set speed), until the state is back over the candidate
