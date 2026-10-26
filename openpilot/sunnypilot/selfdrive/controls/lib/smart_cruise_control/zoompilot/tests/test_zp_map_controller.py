@@ -280,6 +280,71 @@ class TestSmartCruiseControlMap(OpenpilotTestCase):
     assert self.scc_m.v_target != pytest.approx(15.)
     assert self.scc_m.v_target in (0., pytest.approx(23.94, abs=0.01))
 
+  def _reversal(self, start, v=2.):
+    """mapd's list from start m ahead, doubling back at its third node (route 17a, the bridge); the car heads east"""
+    lat0, lon0 = 32.0, -117.0
+    m_per_deg = R * math.pi / 180.
+    targets, ahead, right = [], start, 0.
+    for i in range(8):
+      # heading east: ahead is east, right is south
+      targets.append({"latitude": lat0 - right / m_per_deg, "longitude": lon0 + ahead / (m_per_deg * math.cos(math.radians(lat0))),
+                      "velocity": v if 1 <= i <= 3 else 40.0})
+      h = 0. if i < 2 else math.radians(150.)
+      ahead, right = ahead + 20. * math.cos(h), right + 20. * math.sin(h)
+    self.sm.fix(lat0, lon0)
+    self.sm[self.sm.service].bearingDeg = 90.
+    self.mem_params.put("MapTargetVelocities", json.dumps(targets), block=True)
+
+  def _straight_model(self):
+    model = messaging.new_message('modelV2').modelV2
+    model.position.x = np.linspace(0., 200., 33).tolist()
+    model.position.y = [0.] * 33
+    self.sm['modelV2'] = model
+
+  def _fresh(self, model: bool):
+    self.scc_m = SmartCruiseControlMap(structs.CarParams(brand="mazda", openpilotLongitudinalControl=True, longitudinalActuatorDelay=0.36))
+    self.sm = FakeSM(self.scc_m.gps_location_service)
+    if model:
+      self._straight_model()
+
+  def test_reversal_on_a_straight_road_dropped(self):
+    """With the camera seeing the road straight, the reversal's targets are dropped; not below 15 mph,
+    where a gps course is unreliable"""
+    self._fresh(model=True)
+    self._reversal(5.)
+    self.bind(self.scc_m, 6.7, 20.)
+    assert self.scc_m.v_target == 0.
+    self._fresh(model=True)
+    self._reversal(5.)
+    self.bind(self.scc_m, 6.6, 20.)
+    assert self.scc_m.v_target == pytest.approx(2.)
+
+  def test_reversal_target_being_braked_for_is_kept(self):
+    """A target bound before the guard could judge it (here: no model path yet) is not dropped"""
+    self._fresh(model=False)
+    self._reversal(5.)
+    self.bind(self.scc_m, 6.7, 20.)
+    assert self.scc_m.v_target == pytest.approx(2.)
+    self._straight_model()
+    self.bind(self.scc_m, 6.7, 20.)
+    assert self.scc_m.v_target == pytest.approx(2.)
+
+  def test_reversal_judged_on_the_reckoned_position(self):
+    """Between 1 Hz fixes the reversal node (65 m from the fix) comes within the 60 m judged as the car
+    covers the road, before its 7 m/s targets would bind"""
+    first = {}
+    for model in (False, True):
+      self._fresh(model)
+      self._reversal(25., v=7.)
+      self.sm.fresh = False
+      bound = []
+      for _ in range(int(2.9 / DT_MDL)):
+        self.scc_m.update(self.sm.tick(), True, False, 10., 0., 20.)
+        bound.append(self.scc_m.v_target)
+      first[model] = next((i for i, v in enumerate(bound) if v != 0.), None)
+    assert first[False] is not None and first[False] == 12  # 0.6 s: the node is in reach by then
+    assert first[True] is None
+
   def test_retained_target_tracks_distance(self):
     """A target that slips under the commit gate while still ahead (the car is already
     slowing) is retained. Its distance must keep tracking the car: the published decel

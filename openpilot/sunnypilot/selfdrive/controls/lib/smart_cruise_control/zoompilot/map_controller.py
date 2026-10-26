@@ -60,6 +60,29 @@ _CAMERA_L = (30., 50.)  # m; the model path is read over this either side of the
 # the camera must read the target gentle this many judged frames in a row (its tightest reading is
 # taken): one noisy frame at the path's far end must not relax a real curve
 _CAMERA_FRAMES = 10
+# mapd can match the car to the wrong way where two cross or run side by side (route 17a on a
+# bridge, 16a): its list then turns back on itself at one node, and the targets around that node
+# read as a 17-23 mph corner on a straight road (about 4 s of braking each). A target is dropped
+# when a node within two of it (its curvature uses those), within _GUARD_REACH m of the car and
+# _GUARD_LATERAL m of the model's path (17a's other carriageway was 9.9 m off), turns by more than
+# _GUARD_NODE_DEG and leaves more than _GUARD_HEAD_DEG off the path, which must run straight on
+# _GUARD_PAST m past the node: the camera sees no corner there. The
+# reversals left 153-169 deg off the path (17a at least 109, 159 in 9 frames of 10), a real corner
+# mostly 100-135; the path ran straight 30 m past them in every frame. A node ahead the camera
+# cannot see 30 m past is not judged; one behind the car is, on the map and gps course alone (its
+# exit on a road the car drove points ahead). The target being braked for is never dropped.
+# The first listed node has no map predecessor: its turn is taken against the model's path.
+# Only on a near-straight path: the position is the last 1 Hz fix reckoned straight ahead, so in a
+# bend (town corners at 10 mph turn 90-130 deg over the reach) the map sits rotated against the
+# path; the corpus's reversals came with the path within 3 deg of straight. Nor below 15 mph,
+# where a gps course is unreliable (parking lots read as reversals); they were at 20-34 mph
+_GUARD_V_EGO = 6.7  # m/s (15 mph)
+_GUARD_REACH = 60.  # m
+_GUARD_LATERAL = 12.  # m
+_GUARD_STRAIGHT_DEG = 15.
+_GUARD_NODE_DEG = 100.
+_GUARD_HEAD_DEG = 135.
+_GUARD_PAST = 30.  # m
 
 
 def relaxed_velocities(targets) -> np.ndarray:
@@ -112,6 +135,41 @@ def ahead_distance(lat0: float, lon0: float, bearing_deg: float, lats, lons) -> 
   north = R * np.radians(np.asarray(lats) - lat0)
   h = np.radians(bearing_deg)
   return east * np.sin(h) + north * np.cos(h)
+
+
+def car_frame(lat0: float, lon0: float, bearing_deg: float, lats, lons) -> tuple[np.ndarray, np.ndarray]:
+  """Points in the model's frame at (lat0, lon0): m ahead along the bearing, and to the right"""
+  east = R * np.radians(np.asarray(lons) - lon0) * np.cos(np.radians(lat0))
+  north = R * np.radians(np.asarray(lats) - lat0)
+  h = np.radians(bearing_deg)
+  return east * np.sin(h) + north * np.cos(h), east * np.cos(h) - north * np.sin(h)
+
+
+def reversal_keep(px, py, x, y) -> np.ndarray:
+  """Which targets (x ahead, y right of the car, in list order) to keep against the model's path
+  (px, py): not those within two nodes of a covered node that doubles back off the path"""
+  x, y = np.asarray(x, dtype=float), np.asarray(y, dtype=float)
+  px, py = np.asarray(px, dtype=float), np.asarray(py, dtype=float)
+  keep = np.ones(len(x), dtype=bool)
+  if len(x) < 2 or len(px) < 2 or not all(np.isfinite(a).all() for a in (x, y, px, py)):
+    return keep
+  sr = np.concatenate([[0.], np.cumsum(np.hypot(np.diff(px), np.diff(py)))])
+  # the path's heading: of its chord to _GUARD_PAST m, steadier than its first (sub-metre) step
+  l0 = min(_GUARD_PAST, sr[-1])
+  h0 = np.arctan2(np.interp(l0, sr, py) - py[0], np.interp(l0, sr, px) - px[0])
+  h_path = np.arctan2(np.diff(py), np.diff(px))
+  if np.any(np.abs(np.angle(np.exp(1j * (h_path[sr[:-1] < _GUARD_REACH + _GUARD_PAST] - h0)))) > np.radians(_GUARD_STRAIGHT_DEG)):
+    return keep
+  covered = (np.hypot(x, y) < _GUARD_REACH) & (np.abs(y - np.interp(x, px, py)) < _GUARD_LATERAL) & (x + _GUARD_PAST <= sr[-1])
+  h_map = np.arctan2(np.diff(y), np.diff(x))  # node i to i+1
+  h_off = np.abs(np.angle(np.exp(1j * (h_map - h0))))
+  off = np.zeros(len(x), dtype=bool)
+  off[:-1] = covered[:-1] & (h_off > np.radians(_GUARD_HEAD_DEG))
+  turn = np.zeros(len(x))
+  turn[1:-1] = np.abs(np.angle(np.exp(1j * np.diff(h_map))))
+  turn[0] = h_off[0]  # off only where covered
+  bad = (turn > np.radians(_GUARD_NODE_DEG)) & off
+  return np.convolve(bad, np.ones(5), 'full')[2:len(x) + 2] == 0
 
 
 def target_binds(v_ego: float, tv, d, lim: PlanningLimits) -> np.ndarray:
@@ -213,6 +271,13 @@ class SmartCruiseControlMap(UpstreamMap):
     # a gps without a course reports 0 (or nothing): the camera window would sit on the wrong road
     if not np.isfinite(self.fix[2]) or self.fix[2] == 0.:
       path = None
+    if path is not None and self.target_velocities and self.v_ego >= _GUARD_V_EGO:
+      x, y = car_frame(self.fix[0].latitude, self.fix[0].longitude, self.fix[2], [p["latitude"] for p in self.target_velocities],
+                       [p["longitude"] for p in self.target_velocities])
+      keep = reversal_keep(path[0], path[1], x - self.v_ego * age, y)
+      bound = (self.target_mapd_v, self.target_lat, self.target_lon)  # (0, 0, 0) once released
+      self.target_velocities = [p for p, k in zip(self.target_velocities, keep, strict=True)
+                                if k or (p["velocity"], p["latitude"], p["longitude"]) == bound]
     self.relax_targets(path, (self.fix[0].latitude, self.fix[0].longitude, self.fix[2], self.v_ego * age))
     lat, lon = self.last_position.latitude * TO_RADIANS, self.last_position.longitude * TO_RADIANS
     distances = [distance_to_point(lat, lon, p["latitude"] * TO_RADIANS, p["longitude"] * TO_RADIANS) for p in self.target_velocities]
