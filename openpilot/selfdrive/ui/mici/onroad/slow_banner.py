@@ -83,9 +83,13 @@ class SlowBanner(Widget):
     self._should_draw = False
     self._text = ''
     self._top_shown = 0.
+    self._alert_bottom = 0.
 
   def set_should_draw(self, should_draw: bool):
     self._should_draw = should_draw
+
+  def set_alert_bottom(self, alert_bottom: float):
+    self._alert_bottom = alert_bottom
 
   @staticmethod
   def _box_x(rect: rl.Rectangle, text_w: float) -> float:
@@ -93,11 +97,13 @@ class SlowBanner(Widget):
     return max(rect.x + LEFT_MARGIN, rect.x + (rect.width - text_w) / 2 - 14)
 
   @staticmethod
-  def _top(alert_size: int, rect: rl.Rectangle) -> float | None:
-    """Banner top edge: under a small alert, which covers the top of the screen; hidden under bigger ones."""
+  def _top(alert_size: int, rect: rl.Rectangle, alert_bottom: float = 0.) -> float | None:
+    """Banner top edge: just under a small alert's text (or its 140 px band before it is drawn); hidden under bigger ones."""
     if alert_size == log.SelfdriveState.AlertSize.none:
       return rect.y + 12
     if alert_size == log.SelfdriveState.AlertSize.small:
+      if alert_bottom > rect.y:
+        return min(alert_bottom + 6, rect.y + round(rect.height * SMALL_ALERT_HEIGHT) + 4)
       return rect.y + round(rect.height * SMALL_ALERT_HEIGHT) + 4
     return None
 
@@ -135,7 +141,7 @@ class SlowBanner(Widget):
                                   sm['longitudinalPlanSP'].speedLimit.resolver.speedLimit, ui_state.is_metric)
 
   def _render(self, rect: rl.Rectangle) -> None:
-    top = self._top(ui_state.sm['selfdriveState'].alertSize, rect)
+    top = self._top(ui_state.sm['selfdriveState'].alertSize, rect, self._alert_bottom)
     if top is not None:
       self._top_shown = top
     alpha = self._alpha_filter.update(self._should_draw and self._filter.reason is not None and top is not None)

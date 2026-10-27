@@ -172,3 +172,12 @@ class TestPlacement:
     rect = rl.Rectangle(0, 0, 476, 240)
     assert SlowBanner._box_x(rect, 200) == 124  # (476 - 200) / 2 - 14
     assert SlowBanner._box_x(rect, 330) == 84  # would reach the icon: pushed right
+
+  def test_top_follows_small_alert_text(self):
+    import pyray as rl
+    from openpilot.selfdrive.ui.mici.onroad.slow_banner import SlowBanner
+    rect = rl.Rectangle(0, 0, 476, 240)
+    assert SlowBanner._top(1, rect, 52.) == 58  # 6 px under the alert text
+    assert SlowBanner._top(1, rect, 200.) == 144  # never lower than the small alert band
+    assert SlowBanner._top(1, rect, 0.) == 144  # alert text not drawn yet
+    assert SlowBanner._top(0, rect, 52.) == 12

@@ -268,6 +268,7 @@ class AugmentedRoadView(CameraView):
     self._alert_renderer.render(self._content_rect)
     # over a small alert's gradient, under the HUD
     self._slow_banner.set_should_draw(not self._hud_renderer.drawing_top_icons())
+    self._slow_banner.set_alert_bottom(self._alert_renderer.text_bottom)
     self._slow_banner.render(self._content_rect)
     self._hud_renderer.render(self._content_rect)
 

@@ -94,6 +94,7 @@ class AlertRenderer(Widget, SpeedLimitAlertRenderer):
   def __init__(self):
     Widget.__init__(self)
     SpeedLimitAlertRenderer.__init__(self)
+    self.text_bottom = 0.  # y where the last drawn alert text ends
 
     self._alert_text1_label = UnifiedLabel(text="", font_size=ALERT_FONT_BIG, font_weight=FontWeight.DISPLAY, line_height=0.86,
                                            letter_spacing=-0.02)
@@ -335,6 +336,7 @@ class AlertRenderer(Widget, SpeedLimitAlertRenderer):
     self._alert_text1_label.set_font_size(font_size)
     self._alert_text1_label.set_alignment(TextAlignment.LEFT if icon_side != 'left' else TextAlignment.RIGHT)
     self._alert_text1_label.render(text_rect1)
+    self.text_bottom = self._alert_text1_label.rect.y + self._alert_text1_label.get_content_height(int(alert_layout.text_rect.width))
 
     alert_text2 = alert.text2.lower()
 
@@ -367,3 +369,4 @@ class AlertRenderer(Widget, SpeedLimitAlertRenderer):
       self._alert_text2_label.set_font_size(small_font_size)
       self._alert_text2_label.set_alignment(TextAlignment.LEFT if icon_side != 'left' else TextAlignment.RIGHT)
       self._alert_text2_label.render(text_rect2)
+      self.text_bottom = text_rect2.y + self._alert_text2_label.get_content_height(int(alert_layout.text_rect.width))
