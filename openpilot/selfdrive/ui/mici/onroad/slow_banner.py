@@ -18,17 +18,30 @@ HOLD_TIME = 2.0  # s a shown reason stays before another one replaces it
 V_MIN = 2.0  # m/s, not while stopped or creeping
 FONT_SIZE = 32
 LEFT_MARGIN = 84  # px, clear of the driver monitoring icon
+LEAD_TTC = 8.  # s, a slower radar lead closer than this in time is the reason
+MODEL_SLOW_V = 4.  # m/s, model speed 4 s out below this: a stop or a turn ahead
+TURN_V_MAX = 15.  # m/s, a blinker below this speed is a turn
+SMALL_ALERT_HEIGHT = 0.583  # of the screen height, as alert_renderer draws a small alert
 
 SP_REASONS = {PlanSourceSP.sccVision: 'curve', PlanSourceSP.sccMap: 'map', PlanSourceSP.speedLimitAssist: 'limit'}
 
 
-def slow_reason(plan_source: int, sp_source: int, lead_present: bool, d_rel: float, v_lead: float, v_ego: float) -> str:
+def slow_reason(plan_source: int, sp_source: int, lead_present: bool, d_rel: float, v_lead: float, v_ego: float,
+                blinker: bool = False, model_v4: float = 1e3, model_v_end: float = 1e3) -> str:
   """Which planner candidate is braking: the MPC on a lead, the model, or a cruise target (SCC-V, SCC-M, SLA, set speed)."""
   if plan_source in (PlanSource.lead0, PlanSource.lead1, PlanSource.lead2):
     return 'lead'
   if plan_source == PlanSource.e2e:
-    # the model slows for a close, slower radar lead too
-    return 'lead' if lead_present and d_rel < max(40., 3. * v_ego) and v_lead < v_ego + 1. else 'model'
+    # the model slows for a close, slower radar lead too, or one it closes on within 8 s
+    if lead_present and v_lead < v_ego + 1. and (d_rel < max(40., 3. * v_ego) or d_rel < LEAD_TTC * (v_ego - v_lead)):
+      return 'model_lead'
+    # a blinker at town speed; above it more likely a lane change
+    if blinker and v_ego < TURN_V_MAX:
+      return 'turn'
+    # a plan down to a crawl within 4 s, or to a stop: stop sign, light, corner
+    if model_v_end < 1. or model_v4 < MODEL_SLOW_V:
+      return 'stop'
+    return 'model'
   return SP_REASONS.get(sp_source, 'cruise')
 
 
@@ -69,20 +82,38 @@ class SlowBanner(Widget):
     self._font = gui_app.font(FontWeight.BOLD)
     self._should_draw = False
     self._text = ''
+    self._top_shown = 0.
 
   def set_should_draw(self, should_draw: bool):
     self._should_draw = should_draw
 
   @staticmethod
+  def _box_x(rect: rl.Rectangle, text_w: float) -> float:
+    """Centered on the screen, pushed right only as far as the driver monitoring icon needs."""
+    return max(rect.x + LEFT_MARGIN, rect.x + (rect.width - text_w) / 2 - 14)
+
+  @staticmethod
+  def _top(alert_size: int, rect: rl.Rectangle) -> float | None:
+    """Banner top edge: under a small alert, which covers the top of the screen; hidden under bigger ones."""
+    if alert_size == log.SelfdriveState.AlertSize.none:
+      return rect.y + 12
+    if alert_size == log.SelfdriveState.AlertSize.small:
+      return rect.y + round(rect.height * SMALL_ALERT_HEIGHT) + 4
+    return None
+
+  @staticmethod
   def _text_for(reason: str, lead_present: bool, d_rel: float, speed_limit: float, metric: bool) -> str:
-    if reason == 'lead':
+    """The system that brakes first (Lead = radar MPC, Model = e2e, SCC-V, SCC-M, SLA), then what for."""
+    if reason in ('lead', 'model_lead'):
+      system = 'Lead' if reason == 'lead' else 'Model: car'
       if not lead_present or not math.isfinite(d_rel) or d_rel <= 0:
-        return 'Car ahead'
-      return f'Car ahead {round(d_rel)} m' if metric else f'Car ahead {round(d_rel * CV.METER_TO_FOOT / 10) * 10} ft'
+        return system
+      return f'{system} {round(d_rel)} m' if metric else f'{system} {round(d_rel * CV.METER_TO_FOOT / 10) * 10} ft'
     if reason == 'limit':
       limit = speed_limit * (CV.MS_TO_KPH if metric else CV.MS_TO_MPH)
-      return f'Speed limit {round(limit)}' if limit > 1 else 'Speed limit'
-    return {'model': 'Slowing for road', 'curve': 'Curve ahead', 'map': 'Map curve', 'cruise': 'Slowing'}[reason]
+      return f'SLA {round(limit)}' if limit > 1 else 'SLA'
+    return {'model': 'Model', 'stop': 'Model: stop/turn', 'turn': 'Model: turning', 'curve': 'SCC-V curve', 'map': 'SCC-M map curve',
+            'cruise': 'Set speed'}[reason]
 
   def _update_state(self) -> None:
     sm = ui_state.sm
@@ -93,8 +124,10 @@ class SlowBanner(Widget):
       return
     cc, cs, lead = sm['carControl'], sm['carState'], sm['radarState'].leadOne
     active = cc.longActive and not cs.gasPressed and cs.vEgo > V_MIN
+    v_plan = sm['modelV2'].velocity.x
     reason = slow_reason(sm['longitudinalPlan'].longitudinalPlanSource.raw, sm['longitudinalPlanSP'].longitudinalPlanSource.raw,
-                         lead.present, lead.dRel, lead.vLead, cs.vEgo)
+                         lead.present, lead.dRel, lead.vLead, cs.vEgo, cs.leftBlinker or cs.rightBlinker,
+                         v_plan[min(len(v_plan) - 1, 20)] if len(v_plan) else 1e3, v_plan[-1] if len(v_plan) else 1e3)
     if self._filter.update(rl.get_time(), active, cc.actuators.accel < ACCEL_ON, reason) is not None:
       # the MPC's second lead is radard's leadTwo
       shown = sm['radarState'].leadTwo if sm['longitudinalPlan'].longitudinalPlanSource == PlanSource.lead1 else lead
@@ -102,17 +135,19 @@ class SlowBanner(Widget):
                                   sm['longitudinalPlanSP'].speedLimit.resolver.speedLimit, ui_state.is_metric)
 
   def _render(self, rect: rl.Rectangle) -> None:
-    visible = (self._should_draw and self._filter.reason is not None and
-               ui_state.sm['selfdriveState'].alertSize == log.SelfdriveState.AlertSize.none)
-    alpha = self._alpha_filter.update(visible)
+    top = self._top(ui_state.sm['selfdriveState'].alertSize, rect)
+    if top is not None:
+      self._top_shown = top
+    alpha = self._alpha_filter.update(self._should_draw and self._filter.reason is not None and top is not None)
     if alpha < 1e-2 or not self._text:
       return
+    top = self._top_shown
 
     # right of the driver monitoring icon (x 16 to 76)
-    x0, w = rect.x + LEFT_MARGIN, rect.width - LEFT_MARGIN - 8
+    w = rect.width - LEFT_MARGIN - 8
     sz = measure_text_cached(self._font, self._text, FONT_SIZE)
     font_size = min(FONT_SIZE, FONT_SIZE * (w - 28) / max(sz.x, 1.))
     sz = measure_text_cached(self._font, self._text, round(font_size))
-    box = rl.Rectangle(x0 + (w - sz.x) / 2 - 14, rect.y + 12, sz.x + 28, sz.y + 10)
+    box = rl.Rectangle(self._box_x(rect, sz.x), top, sz.x + 28, sz.y + 10)
     rl.draw_rectangle_rounded(box, 0.5, 10, rl.Color(0, 0, 0, int(255 * 0.6 * alpha)))
     rl.draw_text_ex(self._font, self._text, rl.Vector2(box.x + 14, box.y + 5), round(font_size), 0, rl.Color(255, 255, 255, int(255 * 0.9 * alpha)))

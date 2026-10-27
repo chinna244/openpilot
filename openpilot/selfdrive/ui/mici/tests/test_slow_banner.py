@@ -12,9 +12,9 @@ class TestSlowReason:
     assert slow_reason(4, 0, False, 0., 0., 20.) == 'model'
 
   def test_model_behind_close_slower_lead(self):
-    assert slow_reason(4, 0, True, 30., 15., 20.) == 'lead'
+    assert slow_reason(4, 0, True, 30., 15., 20.) == 'model_lead'
     # within 3 s of travel above 40 m
-    assert slow_reason(4, 0, True, 59., 15., 20.) == 'lead'
+    assert slow_reason(4, 0, True, 59., 15., 20.) == 'model_lead'
 
   def test_model_lead_far_or_faster(self):
     assert slow_reason(4, 0, True, 61., 15., 20.) == 'model'
@@ -81,37 +81,94 @@ class TestSlowReasonFilter:
 
 class TestSlowReasonEdges:
   def test_lead_floor_forty_metres(self):
-    assert slow_reason(4, 0, True, 35., 5., 10.) == 'lead'
+    assert slow_reason(4, 0, True, 35., 5., 10.) == 'model_lead'
 
   def test_lead_slightly_faster_still_lead(self):
-    assert slow_reason(4, 0, True, 30., 20.5, 20.) == 'lead'
+    assert slow_reason(4, 0, True, 30., 20.5, 20.) == 'model_lead'
 
 
 class TestBannerText:
   def test_lead_distance(self):
     from openpilot.selfdrive.ui.mici.onroad.slow_banner import SlowBanner
     t = SlowBanner._text_for
-    assert t('lead', True, 36.6, 0., False) == 'Car ahead 120 ft'
-    assert t('lead', True, 36.6, 0., True) == 'Car ahead 37 m'
-    assert t('lead', True, 37.5, 0., False) == 'Car ahead 120 ft'  # 123 ft, to 10 ft
+    assert t('lead', True, 36.6, 0., False) == 'Lead 120 ft'
+    assert t('lead', True, 36.6, 0., True) == 'Lead 37 m'
+    assert t('lead', True, 37.5, 0., False) == 'Lead 120 ft'  # 123 ft, to 10 ft
 
   def test_lead_lost_or_bad(self):
     from openpilot.selfdrive.ui.mici.onroad.slow_banner import SlowBanner
     t = SlowBanner._text_for
-    assert t('lead', False, 36.6, 0., False) == 'Car ahead'
-    assert t('lead', True, 0., 0., False) == 'Car ahead'
-    assert t('lead', True, float('nan'), 0., False) == 'Car ahead'
+    assert t('lead', False, 36.6, 0., False) == 'Lead'
+    assert t('lead', True, 0., 0., False) == 'Lead'
+    assert t('lead', True, float('nan'), 0., False) == 'Lead'
 
   def test_speed_limit(self):
     from openpilot.selfdrive.ui.mici.onroad.slow_banner import SlowBanner
     t = SlowBanner._text_for
-    assert t('limit', False, 0., 15.6464, False) == 'Speed limit 35'
-    assert t('limit', False, 0., 15.6464, True) == 'Speed limit 56'
-    assert t('limit', False, 0., 0., False) == 'Speed limit'
-    assert t('limit', False, 0., 0.3, False) == 'Speed limit'  # 0.7 mph
-    assert t('limit', False, 0., float('nan'), False) == 'Speed limit'
+    assert t('limit', False, 0., 15.6464, False) == 'SLA 35'
+    assert t('limit', False, 0., 15.6464, True) == 'SLA 56'
+    assert t('limit', False, 0., 0., False) == 'SLA'
+    assert t('limit', False, 0., 0.3, False) == 'SLA'  # 0.7 mph
+    assert t('limit', False, 0., float('nan'), False) == 'SLA'
 
   def test_other_labels(self):
     from openpilot.selfdrive.ui.mici.onroad.slow_banner import SlowBanner
     t = SlowBanner._text_for
-    assert [t(r, False, 0., 0., False) for r in ('model', 'curve', 'map', 'cruise')] == ['Slowing for road', 'Curve ahead', 'Map curve', 'Slowing']
+    assert [t(r, False, 0., 0., False) for r in ('model', 'curve', 'map', 'cruise')] == ['Model', 'SCC-V curve', 'SCC-M map curve', 'Set speed']
+
+
+class TestModelReasons:
+  def test_lead_closing_within_eight_seconds(self):
+    # 70 m back, 10 m/s slower: 7 s
+    assert slow_reason(4, 0, True, 70., 5., 15.) == 'model_lead'
+    assert slow_reason(4, 0, True, 90., 5., 15.) == 'model'
+
+  def test_blinker_is_turn(self):
+    assert slow_reason(4, 0, False, 0., 0., 10., True) == 'turn'
+    # before the plan check
+    assert slow_reason(4, 0, False, 0., 0., 10., True, 1., 0.) == 'turn'
+
+  def test_blinker_fast_is_not_turn(self):
+    assert slow_reason(4, 0, False, 0., 0., 15.1, True) == 'model'
+    assert slow_reason(4, 0, False, 0., 0., 14.9, True) == 'turn'
+
+  def test_plan_slow_is_stop(self):
+    assert slow_reason(4, 0, False, 0., 0., 10., False, 3.9, 8.) == 'stop'
+    assert slow_reason(4, 0, False, 0., 0., 10., False, 4.1, 8.) == 'model'
+    assert slow_reason(4, 0, False, 0., 0., 10., False, 8., 0.9) == 'stop'
+    assert slow_reason(4, 0, False, 0., 0., 10., False, 8., 1.1) == 'model'
+
+  def test_lead_before_turn(self):
+    assert slow_reason(4, 0, True, 20., 5., 10., True, 1., 0.) == 'model_lead'
+
+  def test_cruise_sources_ignore_model_inputs(self):
+    assert slow_reason(0, 1, False, 0., 0., 10., True, 1., 0.) == 'curve'
+
+  def test_labels(self):
+    from openpilot.selfdrive.ui.mici.onroad.slow_banner import SlowBanner
+    assert SlowBanner._text_for('stop', False, 0., 0., False) == 'Model: stop/turn'
+    assert SlowBanner._text_for('turn', False, 0., 0., False) == 'Model: turning'
+
+
+class TestPlacement:
+  def test_top_by_alert_size(self):
+    import pyray as rl
+    from openpilot.selfdrive.ui.mici.onroad.slow_banner import SlowBanner
+    rect = rl.Rectangle(0, 0, 476, 240)
+    # alertSize none 0, small 1, mid 2, full 3; a small alert is 140 px tall on this screen
+    assert SlowBanner._top(0, rect) == 12
+    assert SlowBanner._top(1, rect) == 144
+    assert SlowBanner._top(2, rect) is None
+    assert SlowBanner._top(3, rect) is None
+
+  def test_model_car_label(self):
+    from openpilot.selfdrive.ui.mici.onroad.slow_banner import SlowBanner
+    assert SlowBanner._text_for('model_lead', True, 45.7, 0., False) == 'Model: car 150 ft'
+    assert SlowBanner._text_for('model_lead', False, 45.7, 0., False) == 'Model: car'
+
+  def test_box_centered_unless_icon(self):
+    import pyray as rl
+    from openpilot.selfdrive.ui.mici.onroad.slow_banner import SlowBanner
+    rect = rl.Rectangle(0, 0, 476, 240)
+    assert SlowBanner._box_x(rect, 200) == 124  # (476 - 200) / 2 - 14
+    assert SlowBanner._box_x(rect, 330) == 84  # would reach the icon: pushed right
