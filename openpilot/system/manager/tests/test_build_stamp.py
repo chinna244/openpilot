@@ -7,7 +7,9 @@ import time
 
 import pytest
 
-from openpilot.system.manager.build import SCONSIGN, STAMP, invalidate_stale_outputs, record_build
+import json
+
+from openpilot.system.manager.build import SCONSIGN, STAMP, invalidate_stale_outputs, record_build, up_to_date
 
 OUTPUTS = ("openpilot/common/libparams_c.so", "openpilot/selfdrive/pandad/pandad", "panda/board/obj/panda_h7.bin.signed",
            "openpilot/system/camerad/camerad", "third_party/acados/lib/libqpOASES_e.so.3.1")
@@ -97,3 +99,49 @@ def test_no_git_means_no_trust(repo):
   scons_build(repo)
   shutil.rmtree(repo / ".git")
   assert invalidate_stale_outputs(str(repo))
+
+
+def test_reboot_without_changes_skips_the_build(repo):
+  scons_build(repo)
+  assert up_to_date(str(repo))
+
+
+def test_no_build_recorded_is_not_up_to_date(repo):
+  assert not up_to_date(str(repo))
+
+
+def test_a_source_edit_needs_a_build(repo):
+  scons_build(repo)
+  (repo / "SConstruct").write_text("# edited over ssh\n")
+  assert not up_to_date(str(repo))
+  assert not invalidate_stale_outputs(str(repo)), "outputs are still the built ones: scons rebuilds only what the edit touches"
+
+
+def test_an_update_to_a_new_commit_needs_a_build(repo):
+  scons_build(repo)
+  (repo / "SConstruct").write_text("# newer source\n")
+  git(repo, "commit", "-qam", "update")
+  assert not up_to_date(str(repo))
+
+
+def test_restored_outputs_need_a_build(repo):
+  scons_build(repo)
+  git(repo, "checkout", "--", OUTPUTS[0])
+  assert not up_to_date(str(repo))
+
+
+def test_a_stamp_from_before_the_source_digest_builds_once(repo):
+  scons_build(repo)
+  stamp = json.loads((repo / STAMP).read_text())
+  del stamp["source"]
+  (repo / STAMP).write_text(json.dumps(stamp))
+  assert not up_to_date(str(repo))
+  assert not invalidate_stale_outputs(str(repo))
+  record_build(str(repo))
+  assert up_to_date(str(repo))
+
+
+def test_no_git_is_never_up_to_date(repo):
+  scons_build(repo)
+  shutil.rmtree(repo / ".git")
+  assert not up_to_date(str(repo))

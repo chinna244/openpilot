@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import hashlib
 import json
 import os
 import re
@@ -42,13 +43,38 @@ def build_state(basedir: str = BASEDIR) -> dict | None:
   return {"head": head, "outputs": outputs}
 
 
-def invalidate_stale_outputs(basedir: str = BASEDIR) -> bool:
-  """Drop .sconsign unless the tree is exactly what the last successful build left. True if dropped."""
+def source_digest(basedir: str = BASEDIR) -> str | None:
+  """Uncommitted changes against HEAD (build outputs show as one "Binary files differ" line each); None when git cannot say.
+  --no-optional-locks: reading must not write to .git."""
+  try:
+    diff = subprocess.check_output(["git", "--no-optional-locks", "diff", "HEAD"], cwd=basedir)
+  except (OSError, subprocess.CalledProcessError):
+    return None
+  return hashlib.sha256(diff).hexdigest()
+
+
+def read_stamp(basedir: str = BASEDIR) -> dict | None:
   try:
     with open(os.path.join(basedir, STAMP)) as f:
-      recorded = json.load(f)
+      return json.load(f)
   except (OSError, ValueError):
-    recorded = None
+    return None
+
+
+def up_to_date(basedir: str = BASEDIR) -> bool:
+  """The tree is exactly what the last successful build left, sources included: nothing to build."""
+  recorded = read_stamp(basedir)
+  if not isinstance(recorded, dict) or recorded.get("source") is None:
+    return False
+  state = build_state(basedir)
+  return state is not None and {k: v for k, v in recorded.items() if k != "source"} == state and recorded["source"] == source_digest(basedir)
+
+
+def invalidate_stale_outputs(basedir: str = BASEDIR) -> bool:
+  """Drop .sconsign unless the tree is exactly what the last successful build left. True if dropped."""
+  recorded = read_stamp(basedir)
+  if isinstance(recorded, dict):
+    recorded.pop("source", None)
   state = build_state(basedir)
   if state is not None and recorded == state:
     return False
@@ -63,6 +89,7 @@ def invalidate_stale_outputs(basedir: str = BASEDIR) -> bool:
 def record_build(basedir: str = BASEDIR) -> None:
   state = build_state(basedir)
   if state is not None:
+    state["source"] = source_digest(basedir)
     tmp = os.path.join(basedir, STAMP + ".tmp")
     with open(tmp, "w") as f:
       json.dump(state, f)
@@ -70,6 +97,11 @@ def record_build(basedir: str = BASEDIR) -> None:
 
 
 def build() -> None:
+  # a reboot without an update or an edit: same binaries, nothing for scons to do
+  if up_to_date():
+    print("build: this tree was already built here; skipping")
+    return
+
   spinner = Spinner()
   spinner.update_progress(0, 100)
 
