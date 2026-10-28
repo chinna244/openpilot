@@ -9,6 +9,12 @@ from opendbc.car.gm.cancel_remap import aol_enabled
 
 def _diagnostic_mask(cp):
   try:
+    if cp.brand == 'mazda':
+      from opendbc.car.mazda.values import CAR
+      # The comma's CAN2 interrupt-rate diagnostic latches at every Mazda boot, in elm327 before the Mazda
+      # safety mode (develop routes too). Only it is exempt, only on the controllable Mazda profiles.
+      return (1 << 3) if (cp.carFingerprint in (CAR.MAZDA_CX5_2022, CAR.MAZDA_CX9_2021) and not cp.dashcamOnly and
+                          len(cp.safetyConfigs) == 1 and cp.safetyConfigs[0].safetyModel == 'mazda') else 0
     if cp.brand == 'honda':
       from opendbc.car.honda.stock_aol import qualified, CLASSIC_BOSCH, RADARLESS
       if (cp.carFingerprint in CLASSIC_BOSCH and cp.openpilotLongitudinalControl) or str(cp.fingerprintSource) == 'fixed':
