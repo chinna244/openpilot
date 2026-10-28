@@ -56,7 +56,7 @@
   },
   {
     "name": "boot",
-    "url": "https://files.firestar.link/x/31f0wvnkr4vh/boot31.img.xz",
+    "url": "https://files-east.firestar.link/x/191w2n28bgbb/boot31.img.xz",
     "fallback_urls": [
       "https://files-east.firestar.link/x/191w2n28bgbb/boot31.img.xz"
     ],
@@ -70,7 +70,7 @@
   },
   {
     "name": "system",
-    "url": "https://files.firestar.link/x/ffkgctpyunid/system30.img.xz",
+    "url": "https://files-east.firestar.link/x/9ft817s9f5no/system30.img.xz",
     "fallback_urls": [
       "https://files-east.firestar.link/x/9ft817s9f5no/system30.img.xz"
     ],
