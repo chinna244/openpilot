@@ -1,0 +1,39 @@
+# Source provenance
+
+## Jetlink external inference
+
+The comma-side Jetlink client and USB transport in `jetlink_repo` are by Zeph Leggett and the [Jetlink contributors](https://github.com/zoompilot/jetlink). They are vendored from revision `bf4dc940e98f5d3ed9b7163adb021439010d634f` under the MIT license, retained in [jetlink_repo/LICENSE](jetlink_repo/LICENSE). StarPilot's adapter (`openpilot/starpilot/models/jetlink_adapter.py`) builds on Jetlink's openpilot layer and owns its param names, Always On Lateral rule, model runner reset, settings and alerts. Companion applications and inference servers remain distributed by Jetlink.
+
+## MRR35 Hyundai angle and radar
+
+The four MRR35 angle platforms (2026 Genesis GV70, second-generation electrified GV70, 2025 Genesis GV80, and Hyundai Ioniq 9) adapt Hyundai CAN FD angle-control design and the MRR35 radar DBC generator from the locally frozen StarPilot source snapshot `678af783`. That snapshot traces its Hyundai extension work to sunnypilot/opendbc `hkg-angle-steering-2025` at `cc4b08625a98e94b318cab15e45e05dad58042bd`; its historical import revision is not established. The relevant upstream contributors include Haibin (Jason) Wen, Shane Smiskol, and DevTekVE. Their authorship remains attributable to the upstream history; they do not maintain or endorse this port.
+
+The copied MRR35 generator source and DBC definition are at `opendbc_repo/opendbc/dbc/generator/hyundai/hyundai_mrr35_radar.py` and `.dbc`. The host angle adapter and native safety profile are adaptations, not copies of a generic DBC or of unrelated vehicle support. Applicable upstream notices are preserved in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
+## Ford support adapted from BluePilot
+
+The Ford lateral strategies, extended CAN constructors, camera-radar filtering and native checks are adapted from StarPilot `2efe6017bfe14cee4807833e05f9a7f6ba255cdb`. Their lineage includes BluePilot's `bp-7.0` Ford work, principally by Alan Polk, with contributions from John Christman, Jacob Neulight, tonesto7, Haibin Wen and other sunnypilot and BluePilot contributors. The reference snapshot is [`e1d051d7ba270261b4455068bd68f1a58db15a4a`](https://github.com/BluePilotDev/bluepilot/commit/e1d051d7ba270261b4455068bd68f1a58db15a4a); the exact checkout used for the earlier StarPilot import was not recorded.
+
+Relevant lineage includes the controller and integration work in [`db2bdff05`](https://github.com/BluePilotDev/bluepilot/commit/db2bdff05df103d71df62f45c2a3cb5211aba6e6) and [`d0aac605f`](https://github.com/BluePilotDev/bluepilot/commit/d0aac605f99d37e9da205e419f7989c1e9eaa386), extended CAN and safety work in [`8f8d6d15f`](https://github.com/BluePilotDev/bluepilot/commit/8f8d6d15f0a590f42b78de964ffb0d0af7f5d63d), and manual-turn detection in [`97867c1eb`](https://github.com/BluePilotDev/bluepilot/commit/97867c1eb57b7472f6fc3de62f0fef576e5a5497).
+
+The vehicle strategy and CAN/native owners preserve that attribution while adapting to the current controller interfaces and shared safety limits. Upstream contributors do not maintain or endorse this adaptation. Applicable notices are retained in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
+## Optional Ford angle controller
+
+The vendored `opendbc_repo/opendbc/bluepilot_lateral` angle core, codecs and Ford-only safety hooks are adapted directly from [BluePilot bp-7.0 e1d051d7ba270261b4455068bd68f1a58db15a4a](https://github.com/BluePilotDev/bluepilot/commit/e1d051d7ba270261b4455068bd68f1a58db15a4a), principally by Alan Polk, with John Christman, Jacob Neulight, Nathan Ingraham, Praeuner and other BluePilot, sunnypilot and comma contributors. Exact source paths and intentionally stricter safety checks are recorded in that folder. Both upstream `LICENSE` and `LICENSE.md` notices are retained. Its layout follows Alan Polk's September 2026 library proposal; this is a StarPilot adapter, not a published BluePilot library release.
+
+## RAV4 Continental ARS510 receiver
+
+The optional ACC-target and fused-track receivers and DBC preserve firestar5683's Dom integration from `b220a37f4bd119e402225a7aa16a7cd84878d0af` (Sea Turtles, 2026-10-13) and its ARS510 source attribution to ds-sebastian/ars510-radar `fb5b29c2b5999f34afeb6f7ac494a73949d66c67`, copyright 2026 ARS510 radar contributors. The complete MIT permission and warranty notice is retained in THIRD_PARTY_NOTICES.md. Startup/settings ownership is adapted to the current StarPilot architecture; no original firmware binaries or safety permissions are copied.
+
+## Spotify Bluetooth output
+
+Spotify's Bluetooth output binds the comma's BlueALSA A2DP source to the selected speaker through a process-local ALSA configuration, leaving the system ALSA default, soundd and the warning speaker untouched. That approach is adapted from firestar5683's RoadScore Bluetooth output (`roadscore/prototype/bluetooth_output.py`, firestar5683/StarPilot `RoadScore` at `249eb88b3a397db847e4a595d7e23b7e85d329e5`). The Soloist player itself is never included: each user downloads it from Spotify, and the PulseAudio server that carries its audio is vendored unmodified from Ubuntu (see THIRD_PARTY_NOTICES.md).
+
+## Tesla Pre-AP pedal control
+
+The Pre-AP configuration, pedal codec/feedback, VirtualDAS feedforward table, grade compensation, torque-zero estimator and vehicle-specific gains preserve firestar5683's intentional Dom work, including `7837a3c1aab`, `aed0b7fdb9e9` and pinned `b220a37f4bd119e402225a7aa16a7cd84878d0af`. Original author attribution: firestar5683 <168790843+firestar5683@users.noreply.github.com>. Startup/calibration ownership, current upstream button/PID interfaces and native command bounds are adapted to the current StarPilot architecture; the old permissive native gateway is not transplanted. Existing source/license notices remain intact.
+
+## Ford optional pinion measurement
+
+The default-off Use Pinion Yaw Sensor measurement option is adapted from jrneulight’s BluePilot PR #145 (https://github.com/BluePilotDev/bluepilot/pull/145), merged as `fe5b019568c8c13fb894dc6d8d779d60985051a8`. Its per-platform geometry, native pinion measurement, integrity requirements and host vehicle-model compensation are retained. StarPilot adapts the option to its existing exact safety-profile word, modern curvature checks, AOL authority and Galaxy/native settings; the upstream maintainers do not maintain this integration. Existing upstream copyright and license notices remain in THIRD_PARTY_NOTICES.md.
