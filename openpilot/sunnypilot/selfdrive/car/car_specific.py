@@ -14,6 +14,7 @@ from openpilot.selfdrive.selfdrived.events import Events
 from openpilot.sunnypilot.mads.mads import SET_SPEED_BUTTONS
 from opendbc.sunnypilot.car.stock_ecu import ENGAGES_NORMALLY
 from openpilot.common.params import Params
+from openpilot.common.realtime import DT_CTRL
 from openpilot.sunnypilot.selfdrive.car.stock_ecu_handback import FAILED_KEY
 from openpilot.sunnypilot.selfdrive.selfdrived.events import EventsSP
 
@@ -32,6 +33,10 @@ class CarEventsSP(EventsSP):
 
 
 class CarSpecificEventsSP:
+  # the camera's fault holds lateral this long past its clear, so a fault flickering as it clears
+  # cannot toggle steering or replay the onset alert
+  CAMERA_FAULT_CLEAR_FRAMES = int(1.0 / DT_CTRL)
+
   def __init__(self, CP: structs.CarParams, CP_SP: structs.CarParamsSP, params=None):
     self.CP = CP
     self.CP_SP = CP_SP
@@ -40,6 +45,7 @@ class CarSpecificEventsSP:
     self.stock_ecu_prev = StockEcuState.notNeeded
     self.stock_ecu_off_prev = False
     self.alpha_long_announced = False
+    self.camera_fault_clear_frames = self.CAMERA_FAULT_CLEAR_FRAMES
     # set by the stop that ended the last session; selfdrived starts fresh every session
     self.stock_cruise_failed = (params or Params()).get_bool(FAILED_KEY)
 
@@ -82,6 +88,15 @@ class CarSpecificEventsSP:
         # upstream's no-entry stands.
         events.remove(EventName.invalidLkasSetting)
         events_sp.zp.add(EventNameZP.stockLkasOff)
+      self.camera_fault_clear_frames = 0 if CS.steerFaultPermanent else self.camera_fault_clear_frames + 1
+      if mads_enabled_toggle and self.camera_fault_clear_frames < self.CAMERA_FAULT_CLEAR_FRAMES:
+        # MADS on: the camera's fault (CAM_LKAS ERR_BIT_1, the only source of steerFaultPermanent
+        # here) is glare, fog or a blocked windshield as often as a failure, and it can clear
+        # mid-drive (route 00000172: 46 s). It takes lateral, which controlsd already gates on
+        # steerFaultPermanent and the EPS sees in our command, not cruise: MADS pauses on it and
+        # resumes 1 s after it clears (mads.py). With MADS off upstream's immediate disable stands.
+        events.remove(EventName.steerUnavailable)
+        events_sp.zp.add(EventNameZP.cameraLkasFault)
       if mads_enabled and CS_SP.zoompilot.lkasArming:
         # LKA back on with lateral coming back, the EPS not delivering yet
         events_sp.zp.add(EventNameZP.stockLkasArming)

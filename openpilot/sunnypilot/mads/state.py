@@ -20,8 +20,9 @@ ENABLED_STATES = (State.paused, *ACTIVE_STATES)
 
 GEARS_ALLOW_PAUSED_SILENT = [EventNameSP.silentWrongGear, EventNameSP.silentReverseGear, EventNameSP.silentBrakeHold,
                              EventNameSP.silentDoorOpen, EventNameSP.silentSeatbeltNotLatched, EventNameSP.silentParkBrake]
-# stockLkasOff: held paused until the car's lane keep is back on (mads.py update_stock_lkas)
-GEARS_ALLOW_PAUSED_SILENT_ZP = [EventNameZP.silentPedalPressed, EventNameZP.stockLkasOff]
+# stockLkasOff, cameraLkasFault: held paused until the car's lane keep is back on, or the camera's
+# fault clears (mads.py update_stock_lkas)
+GEARS_ALLOW_PAUSED_SILENT_ZP = [EventNameZP.silentPedalPressed, EventNameZP.stockLkasOff, EventNameZP.cameraLkasFault]
 
 
 def paused_silent(events_sp) -> bool:

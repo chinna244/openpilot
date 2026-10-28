@@ -170,6 +170,36 @@ EVENTS_ZP: dict[int, dict[str, Alert | AlertCallbackType]] = {
     **({ET.PERMANENT: NormalPermanentAlert("Lateral Disabled", "LKAS is off", priority=Priority.LOW)} if IS_MICI else {}),
   },
 
+  # Mazda: steerUnavailable (the camera's fault) is swapped for this when MADS is on
+  # (CarSpecificEventsSP); MADS holds lateral paused on it and cruise stays engaged.
+  EventNameZP.cameraLkasFault: {
+    ET.NO_ENTRY: Alert(
+      "Lateral Disabled",
+      "Camera blocked",
+      AlertStatus.normal, AlertSize.mid,
+      Priority.LOW, VisualAlert.none, AudibleAlert.refuse, 3.),
+    ET.PERMANENT: NormalPermanentAlert("Steering Paused", "Camera blocked", priority=Priority.LOW),
+  },
+
+  # The fault's first frame while MADS is on (mads.py): as loud as a soft disable for 3 s, but
+  # cruise has not let go, so it says steer, not TAKE CONTROL.
+  EventNameZP.cameraLkasFaultOnset: {
+    ET.PERMANENT: Alert(
+      "Steering Paused: Steer Now",
+      "Camera blocked",
+      AlertStatus.userPrompt, AlertSize.mid,
+      Priority.MID, VisualAlert.steerRequired, AudibleAlert.warningSoft, 3.),
+  },
+
+  # The camera cleared and MADS resumed lateral from the pause the fault put it in.
+  EventNameZP.cameraLkasResumed: {
+    ET.PERMANENT: Alert(
+      "Steering Resumed",
+      "",
+      AlertStatus.normal, AlertSize.small,
+      Priority.LOW, VisualAlert.none, AudibleAlert.engage, 2.),
+  },
+
   # LKA back on with lateral resuming, the EPS not delivering yet: still disabled to the driver.
   EventNameZP.stockLkasArming: {
     ET.PERMANENT: NormalPermanentAlert("Lateral Disabled", "Waiting for steering", priority=Priority.LOW),
@@ -279,7 +309,8 @@ EVENTS_ZP: dict[int, dict[str, Alert | AlertCallbackType]] = {
 
 # The radar messages chime once: another alert shown over one (an engage chime, a gear change)
 # must not replay its sound when it comes back (route 00000133, 163.3 s and 271.2 s).
-for _event in (EventNameZP.stockEcuReady, EventNameZP.stockEcuHandedBack, EventNameZP.alphaLongNextStop):
+for _event in (EventNameZP.stockEcuReady, EventNameZP.stockEcuHandedBack, EventNameZP.alphaLongNextStop,
+               EventNameZP.cameraLkasFaultOnset, EventNameZP.cameraLkasResumed):
   EVENTS_ZP[_event][ET.PERMANENT].sound_once = True
 
 

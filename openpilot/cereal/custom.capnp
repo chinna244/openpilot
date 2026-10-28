@@ -616,6 +616,9 @@ struct OnroadEventZP @0xeff60a9f4d5cb12f {
     stockEcuHandedBack @11;
     alphaLongNextStop @12;
     stockCruiseFailed @13;
+    cameraLkasFault @14;
+    cameraLkasFaultOnset @15;
+    cameraLkasResumed @16;
   }
 }
 
