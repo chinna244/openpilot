@@ -207,7 +207,7 @@ EVENTS_ZP: dict[int, dict[str, Alert | AlertCallbackType]] = {
       Priority.LOW, VisualAlert.steerRequired, AudibleAlert.prompt, .5),
   },
 
-  # The three stock ECU alerts are PERMANENT, not the *AlertOnly WARNING convention: WARNING
+  # The stock ECU alerts are PERMANENT, not the *AlertOnly WARNING convention: WARNING
   # shows only while cruise or MADS lateral is active, and these must reach a driver whose
   # lateral is off or paused (brake held at the stop where the takeover happens; route
   # 0000021b showed nothing for three minutes). Each press is one frame; the alert's own
@@ -216,7 +216,7 @@ EVENTS_ZP: dict[int, dict[str, Alert | AlertCallbackType]] = {
     ET.PERMANENT: stock_ecu_not_ready_alert,
   },
 
-  # Parked with the takeover still starting: unprompted, re-raised every frame it holds. MID so
+  # Stopped with the takeover still starting: unprompted, re-raised every frame it holds. MID so
   # the startup and big model banners (LOWER/LOW) cannot cover it while the driver waits.
   EventNameZP.stockEcuInitializing: {
     ET.PERMANENT: NormalPermanentAlert("Stay still", "AEB turning off", priority=Priority.MID),
@@ -240,6 +240,16 @@ EVENTS_ZP: dict[int, dict[str, Alert | AlertCallbackType]] = {
   EventNameZP.alphaLongNextStop: {
     ET.PERMANENT: Alert("Alpha long", "next stop, 2 s", AlertStatus.normal, AlertSize.mid,
                         Priority.LOW, VisualAlert.none, AudibleAlert.prompt, 3.),
+  },
+
+  # The last session's hand-back failed and its stop went ahead anyway: the radar is left to
+  # recover on its own, which blocks stock cruise until the next ignition. Held the whole session.
+  EventNameZP.stockCruiseFailed: {
+    ET.PERMANENT: Alert(
+      "Stock Cruise Failed",
+      "Restart the car",
+      AlertStatus.normal, AlertSize.mid,
+      Priority.LOW, VisualAlert.none, AudibleAlert.prompt, .2),
   },
 
   # an accelerator ready while something is in control: it swaps in only when

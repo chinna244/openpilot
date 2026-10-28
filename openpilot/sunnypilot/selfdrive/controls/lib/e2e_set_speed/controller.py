@@ -4,38 +4,35 @@ Copyright (c) 2026-, Zeph Leggett.
 This file is part of zoompilot and is licensed under the MIT License.
 See the LICENSE.md file in the root directory for more details.
 
-Set-speed floor for experimental mode.
+Set Speed Assist for experimental mode.
 
-The driving model has no set-speed input. With no lead it cruises at its own pace, and the
-planner's min() keeps the car there: in our experimental-mode logs the model was the binding
-candidate for 90% of lead-free straight cruise, a median 5.5 mph under the set speed. It
-accelerates lazily and then holds.
+The driving model has no set-speed input and keeps its own following distance. With no lead it
+cruises at its own pace, a median 5.5 mph under the set speed in our experimental-mode logs; behind
+a lead it followed a median 57 m further back than long_mpc's gap on aggressive. The planner's
+min() keeps the car at the model's pace either way.
 
-This raises the e2e candidate toward the set speed, inside a speed envelope read from the
-model's own plan:
+This lifts the e2e candidate toward what chill mode would do and never lowers it:
 
-  e2e = a_model + boost,  boost -> gain * max(0, min(floor, bound) - a_model)
+  e2e = a_model + lift,  lift -> gain * fade * max(0, floor - a_model)
 
-floor approaches the target the way stock cruise does, a little firmer. bound is the envelope:
-the model's plan with the speed we added taken back out (the model keeps speed it did not
-choose, so its plan carries ours), scaled up toward the target where the plan is flat and left
-at the model's own speed where it means to slow, capped at a comfortable curve speed. A backward
-pass in distance turns that into the fastest speed at every point from which a gentle slowdown
-still meets every ceiling further on, and the boost may only accelerate toward it.
+floor is chill mode's answer, the lower of the planner's own lead MPC and cruise candidates
+(upstream's cruise law with SCC and SLA's targets), so with nothing to slow for experimental mode
+drives and follows as chill does. gain fades the lift out as the model eases off (its own
+acceleration and its throttle probability) and below walking pace, and fade as the road ahead bends
+at the current speed. Every slowdown is the model's: the lift only lets go of it, and a lead that
+brakes binds through the MPC candidate at once.
 
-Because the model will not shed speed we added before a bend or a stop, the boost goes negative
-when the car is over the envelope: it gives back the speed it put on, never more, so the car
-reaches each slowdown at the model's own speed. Hazards (FCW, a near lead, the driver, a lane change)
-cut the boost and hold it off for a few seconds.
-
-Without a lead nothing above the e2e candidate bounds it (the MPC's synthetic lead and the e2e
-cruise candidate both sit near +2 m/s^2), so the envelope and the hazards are the whole safety
-case. Design and data: docs/zoompilot/e2e-set-speed.md.
+A lift that could go negative made the car pump on a straight road: the plan's far end flickers
+by several mph from one frame to the next, and handing back added speed on each flicker
+alternated throttle and brake every 15-20 s. Read only through the model's own acceleration and
+probability, and the road's geometry, the lift has no such input to chase. Design and data:
+docs/zoompilot/e2e-set-speed.md.
 """
 import math
 
 import numpy as np
 
+from opendbc.car import rate_limit
 import openpilot.cereal.messaging as messaging
 from openpilot.cereal import custom, log
 from openpilot.common.params import Params
@@ -48,111 +45,45 @@ LaneChangeState = log.LaneChangeState
 
 PARAM = "ExperimentalModeSetSpeed"
 
-# Floor: close the gap a little firmer than stock MRCC after a set-speed step (~7.7 s, peaking at
-# a median 0.57 m/s^2, p90 0.72), faded in above walking pace. Local tuning: 4.0 s (zoompilot 6.0)
-# for a quicker pickup back to the set speed.
-TAU = 4.0  # s
-# Held to stock's median peak: at 15-30 mph without a lead this driver's own push is 0.48 (p50) to 0.71
-# (p75) against 0.62 to 0.81 engaged at 0.8 (routes 00000160-00000168), every kickdown came at 0.75 or
-# more, and the more boost there is the harder a plan dip cuts it (route 00000168 t=81: 0.8 to 0 in 1.3 s).
-# Back to 0.8 with the Mazda 4th-gear and upshift ceilings at 0.75: at 0.6 town pickups ran 20-28 mph in 6.2 s
-# (00000168-00000177) against 5.1 s at 0.8 and this driver's own 5.3 s.
-FLOOR_MAX = 0.8  # m/s^2
+# The lift fades in above walking pace: stop-and-go stays the model's.
 MIN_SPEED = 5.0  # m/s
 FULL_SPEED = 8.0  # m/s
 
-# The model's acceleration wanders +-0.15 m/s^2 below 0.3 Hz in steady cruise, so the gain ramps
-# outside that band.
-GAIN_BP = [-0.2, -0.05]  # m/s^2
+# The model's acceleration wanders +-0.15 m/s^2 below 0.3 Hz in cruise and settles near -0.05..-0.1
+# at the set speed, where it pushes back toward its own pace; the gain ramps below both.
+GAIN_BP = [-0.3, -0.1]  # m/s^2
+# No lift where the road ahead bends harder than this at the current speed.
+FADE_LAT_BP = [0.6, 1.0]  # m/s^2
+LAT_HORIZON = 10.0  # s
 
-# Envelope. Where the plan has dropped TAPER_DROP below where it starts, the model means it and
-# the ceiling is its own speed; where it is flat, the ceiling scales its pace up to the target.
-TAPER_DROP = 1.5  # m/s
-RATIO_MAX = 1.5
-CURVE_LAT_ACCEL = 1.0  # m/s^2, no boost past this in a bend the model takes slower than it allows
-# Fastest speed from which A_DEC still meets every ceiling further on; the boost accelerates
-# toward the value LOOK_T ahead.
-A_DEC = 0.4  # m/s^2
-LOOK_T = 2.0  # s
-# Where the plan has dropped SLOWING_DROP or more, the boost must also reach the model's speed there
-# at a constant rate from now: a slowdown starts shaping the boost as soon as it shows.
-SLOWING_DROP = 0.5  # m/s
-SLOWING_T = (1.0, 10.0)  # s
-# The envelope drops at once and recovers with this time constant, so a wobbling plan cannot pump
-# the boost.
-BOUND_TAU = 1.0  # s
+# The lift rises at upstream's cruise jerk, as the cruise candidate it stands in for, and falls fast
+# so the model's own braking is never held off.
+LIFT_FALL = 2.4  # m/s^3
 
-# Give-back: speed this controller put on the car, shed by the model at SHED_RATE in cruise and
-# not at all before a slowdown. Over the envelope it is handed back over GIVE_T, at most GIVE_MAX.
-SHED_RATE = 0.038  # 1/s
-# While another candidate holds the car below the model itself (a lead's MPC), a model-only car would
-# be held to the same limit: the speed we added converges out about as fast as the MPC tracks. One
-# that binds only under our lift (cruise near the set speed) would not have held a model-only car.
-CONVERGE_T = 2.0  # s
-GIVE_T = 2.0  # s
-GIVE_MAX = 0.6  # m/s^2
-# Only a plan that needs this much braking hands speed back; a gentler drop just stops the boost.
-# Replayed on routes 00000166-0000016e: 7 of 8 let-offs on a clear road went (0000016e t=92 gave
-# -0.60 for nothing), all 10 before a real slowdown still gave back, +0.6 mph mean into them.
-GIVE_PLAN = -0.6  # m/s^2
-
-BOOST_RATE = 0.5  # m/s^3, both ways
-HAZARD_FALL = 2.4  # m/s^3, cutting a boost for a hazard
-HOLD_TIME = 1.5  # s after the last hazard (local tuning, zoompilot 3.0: re-arms sooner)
-
-# A lead is a hazard only when it is near, closing or braking. Further ahead and steady, the MPC candidate
-# already holds its gap and the planner takes the lowest candidate, so the floor can ask only for what the
-# MPC allows, while the gap assist stays out for seconds after a new or uncertain lead (routes 0000015b
-# 96-115 s and 0000015c 82-85 s: a lead 55-116 m ahead pulling away at 6-9 s, the model asking 0.2-0.4 m/s^2
-# under a 0.8 floor).
-FAR_LEAD_T = 5.0  # s of headway
-FAR_LEAD_MIN = 40.  # m, at any speed
-# A far lead becomes closing only if its gap would close within FAR_LEAD_CLOSE_T (any lead, radar or camera); once a lead
-# has been near or closing it is clear again only above the original closing bar too, so a closer that the camera then
-# under-reads stays a hazard until a lead is seen clear or the controller goes idle (not on frames without a lead or
-# with an invalid model).
-# A camera-only lead 85-110 m ahead read -2.3..+2.4 m/s from frame to frame while the gap grew 87 -> 99 m, and under the
-# bar alone its dips held the boost off 14.5 of 23 s (route 00000178 t=83). Replayed on 45 drives, every window ending
-# at the driver's first input: far-lead holds 466 -> 323 s; where it cut later than the bar, no lead came within 3 s of
-# headway or 6 s TTC in the next 10 s; lead-braking onsets at most +0.47 mph faster. The one far lead closing before a
-# hard stop (0000014b t=166-171, 120 -> 94 m at 2-5 m/s) read 20-55 s: cut on its 20 s readings, later than the bar did.
-FAR_LEAD_CLOSE_T = 25.  # s
-FAR_LEAD_CLOSING = -0.5  # m/s, the original closing bar; with FAR_LEAD_REARM_CLOSING what a latched lead must clear
-FAR_LEAD_BRAKING = -0.5  # m/s^2, the gap assist's own bar for a braking lead
-# A far lead that is braking but not closing winds the boost down at BOOST_RATE instead of cutting it: the MPC
-# candidate is not binding yet, so a hazard-rate cut would only be a jerk. Near or closing still cuts at once.
-# Coming back to far from near asks for a little more than staying far does, so a lead hovering at the edge does not
-# cut and re-grow the boost. Only the way back is slower, never the way into a hazard.
-FAR_LEAD_REARM_T = 1.0  # s of extra headway
-FAR_LEAD_REARM_CLOSING = 0.3  # m/s
-FAR_LEAD_REARM_BRAKING = 0.2  # m/s^2
-
-# Highway: the floor's ceiling and the boost's rise ease from the city values above to these across
-# FLOOR_SPEED_BP. A full floor re-entering at BOOST_RATE after a hold or an uphill sag surged the car to
-# the Mazda ceiling and on top of the model's own pull (route 00000159). The boost falls at BOOST_RATE
-# everywhere.
+# Local tuning (this fork, Mazda CX-5), carried onto the lift from the earlier set-speed floor.
+# The floor approaches the cruise target the way stock cruise does, over TAU, and never past the
+# ceiling for the speed: a full floor at Mazda's ceiling surged the car on top of the model's own pull
+# (route 00000159), so the ceiling and the lift's rise ease from the town values to the highway ones
+# across FLOOR_SPEED_BP.
+TAU = 4.0  # s
+FLOOR_MAX = 0.8  # m/s^2
 FLOOR_SPEED_BP = [15., 25.]  # m/s
 FLOOR_MAX_HIGHWAY = 0.5  # m/s^2
-BOOST_RISE_HIGHWAY = 0.25  # m/s^3
+LIFT_RISE = 0.5  # m/s^3
+LIFT_RISE_HIGHWAY = 0.25  # m/s^3
 
-# Town: the boost over the model is held to TOWN_BOOST_MAX below TOWN_BOOST_BP[0] and eases back to FLOOR_MAX by
-# TOWN_BOOST_BP[1]. A hesitant model (0.1-0.2 m/s^2) under the full floor pushed 0.6 for 7 s into stops it saw late
-# (routes 0000016a t=312-318 and 0000016b t=387-394: 20 to 29 mph, driver braked), and every plan dip cut 0.4-0.6 of
-# boost at once and re-grew it (0000016b t=182-188, t=292-297). Replayed on 00000166-0000016b: the run-ups end
-# 1.4-2.0 mph slower, the cut-and-regrow swings halve, the 15-30 mph push p50 is 0.44-0.60 against this driver's 0.48.
-# At 0.3 town recoveries ran ~10 mph under the set speed with the boost on the cap (route 00000173: 19 -> 32 mph took
-# 22 s). 0.45 over 11 town drives (00000166-00000173): +27.9 mph on 30 recoveries with no stop after, +16.3 mph on 19
-# pushes before a real slowdown (worst +3.5, 00000173 t=368); plan-lead braking and the give-back gate own those stops.
-# 0.6 with FLOOR_MAX 0.8: in replay the same pickup gain as 0.8 (median 0.40 s on 20 pickups, 00000174-00000177).
-TOWN_BOOST_BP = [12.5, 15.6]  # m/s, 28 to 35 mph
-TOWN_BOOST_MAX = 0.6  # m/s^2
+# Town: the lift over the model is held to TOWN_LIFT_MAX below TOWN_LIFT_BP[0], easing back to FLOOR_MAX by
+# TOWN_LIFT_BP[1]. A hesitant model under the full floor pushed 0.6 for 7 s into stops it saw late (routes
+# 0000016a t=312-318, 0000016b t=387-394); 0.6 with FLOOR_MAX 0.8 kept the same pickup gain as 0.8 in replay
+# (median 0.40 s on 20 pickups, 00000174-00000177).
+TOWN_LIFT_BP = [12.5, 15.6]  # m/s, 28 to 35 mph
+TOWN_LIFT_MAX = 0.6  # m/s^2
 
 # Plan-lead braking. Before a stop the model's action lags its own plan: route 0000016a t=153-158 the plan slowed
 # to 5 mph within 100-130 m (a constant -0.7 to -1.0 m/s^2) while the action stayed at -0.04 to -0.26, then it
 # braked at -2.3 and the driver took over. Without a lead, once the plan has needed PLB_ON or more for PLB_ARM,
 # the e2e candidate brakes at PLB_GAIN of what the plan needs until it needs less than PLB_OFF. Replayed on routes
-# 00000166-0000016a: 27 episodes, 22 ahead of a real slowdown, 5 ahead of a partial one (15-40% of the speed),
-# none on a clear road; at 0016a t=157 it starts 5 s before the model and adds up to 0.75 m/s^2.
+# 00000166-0000016a: 27 episodes, 22 ahead of a real slowdown, 5 ahead of a partial one, none on a clear road.
 PLB_ON = -0.6  # m/s^2
 PLB_OFF = -0.3  # m/s^2
 PLB_ARM = 0.5  # s
@@ -162,54 +93,20 @@ PLB_DROP = 0.5  # m/s, plan speeds this far under the start count as slowing
 PLB_JERK = 1.0  # m/s^3, into the brake
 PLB_RELEASE = 1.0  # m/s^3, out of it
 
-LAT_HORIZON = 10.0  # s, for the friction circle
-
-# Upstream's ACC friction circle (selfdrive/controls/lib/longitudinal_planner.py), mirrored
-# because importing it from here is circular; tests pin the copy.
-A_TOTAL_MAX_BP = [20., 40.]
-A_TOTAL_MAX_V = [1.7, 3.2]
-
 T_IDXS = np.asarray(ModelConstants.T_IDXS)
 LAT_MASK = T_IDXS <= LAT_HORIZON
-SLOWING_MASK = (T_IDXS >= SLOWING_T[0]) & (T_IDXS <= SLOWING_T[1])
 
 
 def floor_max(v_ego: float) -> float:
   return float(np.interp(v_ego, FLOOR_SPEED_BP, [FLOOR_MAX, FLOOR_MAX_HIGHWAY]))
 
 
-def boost_rise(v_ego: float) -> float:
-  return float(np.interp(v_ego, FLOOR_SPEED_BP, [BOOST_RATE, BOOST_RISE_HIGHWAY]))
+def lift_rise(v_ego: float) -> float:
+  return float(np.interp(v_ego, FLOOR_SPEED_BP, [LIFT_RISE, LIFT_RISE_HIGHWAY]))
 
 
-def boost_max(v_ego: float) -> float:
-  return float(np.interp(v_ego, TOWN_BOOST_BP, [TOWN_BOOST_MAX, FLOOR_MAX]))
-
-
-def envelope_bound(vel: np.ndarray, yaw_rate: np.ndarray, pos: np.ndarray, v_target: float, added: float) -> float:
-  """Most acceleration the envelope allows now. vel, pos and v_target in the plan's own frame."""
-  v_now = float(vel[0])
-  curvature = np.abs(yaw_rate) / np.maximum(vel, 1.)
-  # the model's own plan: ours taken back out. It holds speed it did not choose before a slowdown
-  # (it sheds it only in open cruise, slowly), so its plan carries all of it.
-  vel = np.maximum(vel - added, 0.)
-  pos = np.maximum.accumulate(pos - pos[0] - added * T_IDXS)
-  v0 = max(float(vel[0]), 0.1)
-  drop = v0 - np.minimum.accumulate(vel)
-
-  ratio = 1. + (min(max(v_target / v0, 1.), RATIO_MAX) - 1.) * np.clip(1. - drop / TAPER_DROP, 0., 1.)
-  v_curve = np.sqrt(CURVE_LAT_ACCEL / np.maximum(curvature, 1e-6))
-  ceil = np.minimum(vel * ratio, np.maximum(vel, v_curve))
-
-  # vmax[n] = min over m >= n of sqrt(ceil[m]^2 + 2 A_DEC (pos[m] - pos[n])): a running min in v^2
-  reach = ceil ** 2 + 2. * A_DEC * pos
-  vmax = np.sqrt(np.minimum.accumulate(reach[::-1])[::-1] - 2. * A_DEC * pos)
-  bound = (float(np.interp(max(v_now, 0.5) * LOOK_T, pos, vmax)) - v_now) / LOOK_T
-
-  slowing = SLOWING_MASK & (drop > SLOWING_DROP)
-  if slowing.any():
-    bound = min(bound, float(np.min((ceil[slowing] - v_now) / T_IDXS[slowing])))
-  return bound
+def lift_max(v_ego: float) -> float:
+  return float(np.interp(v_ego, TOWN_LIFT_BP, [TOWN_LIFT_MAX, FLOOR_MAX]))
 
 
 def plan_decel(vel: np.ndarray, pos: np.ndarray) -> float:
@@ -225,114 +122,50 @@ class E2ESetSpeedController:
   def __init__(self, params=None, dt: float = DT_MDL):
     self.params = params or Params()
     self.dt = dt
-    self.hold_frames = int(round(HOLD_TIME / dt))
-    self.plb_arm_frames = int(round(PLB_ARM / dt))
     self.params_frames = int(PARAMS_UPDATE_PERIOD / dt)
-    self.bound_k = dt / (BOUND_TAU + dt)
+    self.plb_arm_frames = int(round(PLB_ARM / dt))
     self.frame = -1
     self.enabled = False
-    self.lead_near = False  # a lead was near and has not been far since
     self._reset(Inhibit.disabled)
 
   def _reset(self, reason) -> None:
-    if reason != Inhibit.invalid:  # invalid model frames keep what the leads have shown
-      self.lead_near = False
     self.gain = 0.
+    self.fade = 0.
     self.floor = 0.
-    self.bound = math.nan  # unset: the next bound is taken as is
-    self.boost = 0.
-    self.added = 0.
-    self.a_model = 0.
+    self.lift = 0.
     self.plb_count = 0
     self.plb_armed = False
+    self.slowing_count = 0
     # an invalid model frame lets an active plan-lead brake ease out instead of dropping it
     if reason != Inhibit.invalid:
       self.plb = 0.
       self.plb_active = False
-    # invalid means no model to trust, a hazard. Engaging or leaving experimental mode is not.
-    self.hold_left = self.hold_frames if reason == Inhibit.invalid else 0
     self.inhibit = reason
-
-  @property
-  def authority(self) -> float:
-    """1 unless a hazard holds the boost off."""
-    return 1. if self.inhibit in (Inhibit.none, Inhibit.modelBraking, Inhibit.planSlowing) else 0.
 
   def _update_params(self) -> None:
     if self.frame % self.params_frames == 0:
       self.enabled = self.params.get_bool(PARAM)
 
-  def delivered(self, a_out: float, a_e2e: float) -> None:
-    """The planner's output and its final e2e candidate this frame. Everything lifted onto the e2e
-    candidate over the model (ours and the gap assist's) that reached the car is speed added."""
-    if self.inhibit in (Inhibit.disabled, Inhibit.inactive, Inhibit.invalid):
-      return
-    lift = a_e2e - self.a_model
-    self.added = max(0., self.added + float(np.clip(a_out - self.a_model, min(lift, 0.), max(lift, 0.))) * self.dt)
-    if a_out < min(a_e2e, self.a_model) - 0.01:
-      self.added *= 1. - self.dt / CONVERGE_T
-
   def fill(self, msg) -> None:
     """Report into LongitudinalPlanZP.e2eSetSpeed."""
-    msg.authority = float(self.authority)
     msg.gain = float(self.gain)
+    msg.fade = float(self.fade)
     msg.floor = float(self.floor)
-    msg.boost = float(self.boost)
+    msg.boost = float(self.lift)
     msg.inhibit = self.inhibit
-    msg.bound = float(self.bound) if math.isfinite(self.bound) else 0.
-    msg.added = float(self.added)
 
-  def _lead_class(self, lead, v_ego: float) -> int:
-    """0 far and steady, 1 far and not closing but braking, 2 near or closing; anything not clearly far is 2. A distance or
-    closing speed that is not finite is not clearly far; an acceleration that is not finite is not clearly steady."""
-    if not lead.present:
-      return 0
-    if not (math.isfinite(lead.dRel) and math.isfinite(lead.vRel)):
-      return 2
-    back = self.lead_near  # after a near lead, far takes a little more
-    headway = (FAR_LEAD_T + (FAR_LEAD_REARM_T if back else 0.)) * v_ego
-    closing = lead.dRel < FAR_LEAD_CLOSE_T * -lead.vRel or (back and lead.vRel < FAR_LEAD_CLOSING + FAR_LEAD_REARM_CLOSING)
-    if lead.dRel < max(headway, FAR_LEAD_MIN) or closing:
-      return 2
-    steady = math.isfinite(lead.aLeadK) and lead.aLeadK >= FAR_LEAD_BRAKING + (FAR_LEAD_REARM_BRAKING if back else 0.)
-    return 0 if steady else 1
-
-  def _lead_level(self, sm: messaging.SubMaster) -> int:
-    """The worst of the leads: 0 far and steady (or none), 1 far but braking, 2 near or closing."""
-    rs, v_ego = sm['radarState'], sm['carState'].vEgo
-    level = max(self._lead_class(rs.leadOne, v_ego), self._lead_class(rs.leadTwo, v_ego))
-    if level == 2:
-      self.lead_near = True
-    elif level == 0 and (rs.leadOne.present or rs.leadTwo.present):
-      # only a lead seen clear clears it: a camera lead dropping out for a frame does not
-      self.lead_near = False
-    return level
-
-  def _hazard(self, sm: messaging.SubMaster, fcw: bool):
-    CS, md, cs = sm['carState'], sm['modelV2'], sm['controlsState']
-    if fcw:
-      return Inhibit.fcw
-    if md.meta.hardBrakePredicted:
-      return Inhibit.hardBrake
-    if cs.forceDecel:
-      return Inhibit.forceDecel
-    if self._lead_level(sm) == 2:
-      return Inhibit.lead
-    if CS.gasPressed or CS.brakePressed:
-      return Inhibit.driver
-    if md.meta.laneChangeState != LaneChangeState.off:
-      return Inhibit.laneChange
-    return None
-
-  def update(self, sm: messaging.SubMaster, a_model: float, v_cruise: float, is_e2e: bool, reset_state: bool,
-             allow_throttle: bool, fcw: bool, accel_coast: float, steer_lat_accel: float = 0.) -> float:
-    """Return the e2e candidate; a_model unchanged whenever the feature is off or idle. Call delivered()
-    with the planner's output once it has chosen.
-    steer_lat_accel: lateral acceleration from the measured steering angle."""
+  def update(self, sm: messaging.SubMaster, a_model: float, a_chill: float, is_e2e: bool, reset_state: bool,
+             steer_lat_accel: float = 0., v_cruise: float = math.inf) -> float:
+    """Return the e2e candidate; a_model unchanged whenever the feature is off or idle.
+    a_chill: chill mode's acceleration, the lower of the planner's lead MPC and cruise candidates.
+    steer_lat_accel: lateral acceleration from the measured steering angle.
+    v_cruise: this frame's cruise target after SCC and SLA, which the floor approaches over TAU."""
     self.frame += 1
     self._update_params()
 
-    if not self.enabled:
+    # switched off with a lift on: it goes out at LIFT_FALL below, then the controller idles; so does a
+    # plan-lead brake, at PLB_RELEASE
+    if not self.enabled and self.lift == 0. and not self.plb_active:
       self._reset(Inhibit.disabled)
       return a_model
     if not is_e2e or reset_state:
@@ -345,71 +178,49 @@ class E2ESetSpeedController:
     yaw_rate = np.asarray(md.orientationRate.z, dtype=float)
     pos = np.asarray(md.position.x, dtype=float)
     curvature = md.action.desiredCurvature
-    plan = (vel, yaw_rate, pos)
-    if (any(len(x) != ModelConstants.IDX_N for x in plan) or not all(np.isfinite(x).all() for x in plan) or
-        not all(math.isfinite(x) for x in (v_ego, a_model, v_cruise, accel_coast, curvature))):
+    throttle_probs = md.meta.disengagePredictions.gasPressProbs
+    throttle_prob = throttle_probs[1] if len(throttle_probs) > 1 else 1.
+    if (any(len(x) != ModelConstants.IDX_N for x in (vel, yaw_rate, pos)) or
+        not (np.isfinite(vel).all() and np.isfinite(yaw_rate).all() and np.isfinite(pos).all()) or
+        not all(math.isfinite(x) for x in (v_ego, a_model, a_chill, throttle_prob, curvature)) or math.isnan(v_cruise)):
       self._reset(Inhibit.invalid)
       return self._plan_lead(a_model, None) if math.isfinite(a_model) else a_model
 
-    self.a_model = a_model
-    self.added *= 1. - SHED_RATE * self.dt
-
+    # the road's geometry ahead at the current speed, not the plan's speeds, which flicker
     lat_now = max(abs(curvature) * v_ego ** 2, abs(steer_lat_accel))
-    lat_accel = max(lat_now, float(np.max(np.abs(yaw_rate * vel)[LAT_MASK])))
+    kappa_ahead = float(np.max((np.abs(yaw_rate) / np.maximum(vel, 1.))[LAT_MASK]))
+    lat_ahead = max(lat_now, kappa_ahead * v_ego ** 2)
 
-    floor = float(np.clip((v_cruise - v_ego) / TAU, 0., floor_max(v_ego))) * float(np.interp(v_ego, [MIN_SPEED, FULL_SPEED], [0., 1.]))
-    a_total_max = float(np.interp(v_ego, A_TOTAL_MAX_BP, A_TOTAL_MAX_V))
-    floor = min(floor, math.sqrt(max(a_total_max ** 2 - lat_accel ** 2, 0.)))
-    if not allow_throttle:
-      floor = min(floor, accel_coast)
-    self.floor = floor
+    approach = float(np.clip((v_cruise - v_ego) / TAU, 0., floor_max(v_ego))) if math.isfinite(v_cruise) else floor_max(v_ego)
+    self.floor = min(a_chill, approach)
+    # stop-and-go stays the model's: the gain fades in above walking pace
+    self.gain = (float(np.interp(a_model, GAIN_BP, [0., 1.])) * float(np.clip(throttle_prob, 0., 1.)) *
+                 float(np.interp(v_ego, [MIN_SPEED, FULL_SPEED], [0., 1.])))
+    self.fade = float(np.interp(lat_ahead, FADE_LAT_BP, [1., 0.]))
 
-    # the plan's speeds run a little above vEgo (which reads 2-3% low); compare like with like
-    bound = envelope_bound(vel, yaw_rate, pos, v_cruise + float(vel[0]) - v_ego, self.added)
-    if math.isnan(self.bound) or bound < self.bound:
-      self.bound = bound
-    else:
-      self.bound += self.bound_k * (bound - self.bound)
-    self.gain = float(np.interp(a_model, GAIN_BP, [0., 1.]))
-
-    hazard = self._hazard(sm, fcw)
-    soft = False
-    if hazard is None and self._lead_level(sm) == 1:
-      hazard, soft = Inhibit.lead, True  # no new boost; the old one winds down
-    if hazard is not None:
-      self.hold_left = self.hold_frames
-      self.inhibit = hazard
-    elif self.hold_left > 0:
-      self.hold_left -= 1
-      self.inhibit = Inhibit.hold
-    elif self.gain == 0.:
-      self.inhibit = Inhibit.modelBraking
-    elif self.bound < floor:
-      self.inhibit = Inhibit.planSlowing
+    if not self.enabled:
+      self.inhibit = Inhibit.disabled
+    elif md.meta.laneChangeState != LaneChangeState.off:
+      self.inhibit = Inhibit.laneChange
     else:
       self.inhibit = Inhibit.none
-
-    target = min(self.gain * max(0., min(floor, self.bound) - a_model), boost_max(v_ego)) if self.authority else 0.
-    # over the envelope, hand back what we added; behind a lead the MPC and the gap assist own the
-    # speed, so nothing new is handed back there and what was is let go at the normal rate. Only
-    # where the plan drops TAPER_DROP does the model mean to slow; a smaller wobble just stops the
-    # boost (routes 00000150/00000152: a ~1 mph dip handed back GIVE_MAX on a clear road)
-    give = min(self.added / GIVE_T, GIVE_MAX)
+    # No lift once the model's plan has slowed by PLB_OFF or more for PLB_ARM: the old envelope held it off
+    # there, and a hesitant model under the full floor pushed into stops it saw late (routes 0000016a,
+    # 0000016b). A plan whose far end flickers frame to frame never holds that long.
     req = plan_decel(vel, pos)
-    if self.bound < a_model and give > 0. and hazard != Inhibit.lead and vel[0] - vel.min() >= TAPER_DROP and req <= GIVE_PLAN:
-      target = -min(give, a_model - self.bound)
-    # a hazard cuts a boost fast; handing speed back is never urgent
-    fall = HAZARD_FALL if not self.authority and self.boost > 0. and not soft else BOOST_RATE
-    self.boost = max(-give, float(np.clip(target, self.boost - fall * self.dt, self.boost + boost_rise(v_ego) * self.dt)))
+    self.slowing_count = self.slowing_count + 1 if req <= PLB_OFF else 0
+    slowing = self.slowing_count >= self.plb_arm_frames
+    target = min(self.gain * self.fade * max(0., self.floor - a_model), lift_max(v_ego)) if self.inhibit == Inhibit.none and not slowing else 0.
+    self.lift = rate_limit(target, self.lift, -LIFT_FALL * self.dt, lift_rise(v_ego) * self.dt)
 
     # Arms on PLB_ARM of consecutive need, only at speed; once armed it stays through the final approach under
     # MIN_SPEED, where the model's lag would otherwise leave it the hardest braking.
-    if sm['radarState'].leadOne.present or req > PLB_OFF:
+    if not self.enabled or sm['radarState'].leadOne.present or req > PLB_OFF:
       self.plb_count, self.plb_armed = 0, False
     elif not self.plb_armed:
       self.plb_count = self.plb_count + 1 if req <= PLB_ON and v_ego >= MIN_SPEED else 0
       self.plb_armed = self.plb_count >= self.plb_arm_frames
-    return self._plan_lead(a_model + self.boost, max(PLB_GAIN * req, PLB_MIN) if self.plb_armed else None)
+    return self._plan_lead(a_model + self.lift, max(PLB_GAIN * req, PLB_MIN) if self.plb_armed else None)
 
   def _plan_lead(self, candidate: float, want: float | None) -> float:
     """The e2e candidate under plan-lead braking. want: the brake it asks for, None when disarmed. It eases from

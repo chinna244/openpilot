@@ -113,6 +113,6 @@ class TestExperimentalGate(OpenpilotTestCase):
     sm['controlsState'] = controls_state.as_reader()
     seen = []
     update = planner.e2e_set_speed.update
-    planner.e2e_set_speed.update = lambda *args: seen.append(args[-1]) or update(*args)
+    planner.e2e_set_speed.update = lambda *args: seen.append(args[5]) or update(*args)  # steer_lat_accel, before v_cruise
     planner.update(sm)
     assert seen == [pytest.approx(0.002 * V_EGO ** 2)]

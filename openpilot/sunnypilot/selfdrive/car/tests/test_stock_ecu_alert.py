@@ -19,6 +19,8 @@ from openpilot.selfdrive.selfdrived.alertmanager import AlertManager
 from openpilot.selfdrive.selfdrived.events import Events
 from openpilot.selfdrive.selfdrived.state import StateMachine
 from openpilot.sunnypilot.selfdrive.car.car_specific import CarSpecificEventsSP
+from openpilot.sunnypilot.selfdrive.car.stock_ecu_handback import FAILED_KEY
+from openpilot.sunnypilot.selfdrive.car.tests.fakes import FakeParams
 from openpilot.sunnypilot.selfdrive.selfdrived.events import EventsSP
 from openpilot.sunnypilot.selfdrive.selfdrived.events_zp import EVENTS_ZP
 from openpilot.sunnypilot.selfdrive.selfdrived.events_base import ET, AudibleAlert
@@ -29,10 +31,10 @@ EventNameZP = custom.OnroadEventZP.EventName
 ButtonType = structs.CarState.ButtonEvent.Type
 
 
-def _car_events(brand: str = 'mazda') -> CarSpecificEventsSP:
+def _car_events(brand: str = 'mazda', **params) -> CarSpecificEventsSP:
   CP = structs.CarParams()
   CP.brand = brand
-  return CarSpecificEventsSP(CP, structs.CarParamsSP())
+  return CarSpecificEventsSP(CP, structs.CarParamsSP(), FakeParams(**params))
 
 
 def _update(car_events: CarSpecificEventsSP, state: str, button=None, pressed: bool = True, standstill: bool = False):
@@ -53,6 +55,14 @@ def _car_state_sp(state: str):
   CS_SP = messaging.new_message('carStateSP').carStateSP
   CS_SP.zoompilot.stockEcu = state
   return CS_SP
+
+
+def _shown(events_sp, state: str) -> list[str]:
+  """Alert types a disabled selfdrived would create from these events."""
+  machine = StateMachine()
+  machine.update(Events())
+  args = [structs.CarParams(), structs.CarState(), {'carStateSP': _car_state_sp(state)}, False, 0, None]
+  return [a.alert_type for a in events_sp.create_alerts(machine.current_alert_types, args)]
 
 
 def _alert(state: str, standstill: bool):
@@ -83,12 +93,7 @@ class TestStockEcuNotReady:
   def test_shows_with_nothing_engaged(self):
     # selfdrived disabled, MADS not active: the state a driver presses SET in before the
     # takeover, and the one the *AlertOnly WARNING convention never reaches
-    events_sp = _events_for("parkToTakeOver")
-    machine = StateMachine()
-    machine.update(Events())
-    args = [structs.CarParams(), structs.CarState(), {'carStateSP': _car_state_sp("parkToTakeOver")}, False, 0, None]
-    alerts = events_sp.create_alerts(machine.current_alert_types, args)
-    assert [a.alert_type for a in alerts] == ["stockEcuNotReady/permanent"]
+    assert _shown(_events_for("parkToTakeOver"), "parkToTakeOver") == ["stockEcuNotReady/permanent"]
 
   def test_the_no_entry_shape(self):
     alert, _ = _alert("parkToTakeOver", standstill=False)
@@ -108,10 +113,10 @@ class TestStockEcuNotReady:
 
 
 class TestStockEcuUnprompted:
-  """Two alerts need no press: parked with the takeover still starting (waiting helps; route
+  """Two alerts need no press: stopped with the takeover still starting (waiting helps; route
   0000021b pulled away 5 s short of it), and the edge into ready."""
 
-  def test_parked_and_starting_shows_the_line_every_frame(self):
+  def test_stopped_and_starting_shows_the_line_every_frame(self):
     car_events = _car_events()
     for _ in range(3):
       events_sp = _update(car_events, "starting", standstill=True)
@@ -154,12 +159,8 @@ class TestStockEcuUnprompted:
   def test_both_show_with_nothing_engaged(self):
     car_events = _car_events()
     _update(car_events, "starting", standstill=True)
-    machine = StateMachine()
-    machine.update(Events())
-    args = [structs.CarParams(), structs.CarState(), {'carStateSP': _car_state_sp("ready")}, False, 0, None]
-    shown = lambda events_sp: [a.alert_type for a in events_sp.create_alerts(machine.current_alert_types, args)]  # noqa: E731
-    assert shown(_update(car_events, "starting", standstill=True)) == ["stockEcuInitializing/permanent"]
-    assert shown(_update(car_events, "ready")) == ["stockEcuReady/permanent"]
+    assert _shown(_update(car_events, "starting", standstill=True), "starting") == ["stockEcuInitializing/permanent"]
+    assert _shown(_update(car_events, "ready"), "ready") == ["stockEcuReady/permanent"]
 
   def test_before_selfdrived_initializes(self):
     # selfdrived runs the stock ECU block ahead of its init gate; the ready edge carries over
@@ -320,3 +321,23 @@ class TestStockEcuTextFits:
     for event in (EventNameZP.stockEcuInitializing, EventNameZP.stockEcuReady, EventNameZP.stockEcuHandedBack,
                   EventNameZP.alphaLongNextStop):
       assert len(EVENTS_ZP[event][ET.PERMANENT].alert_text_1) <= 12
+class TestStockCruiseFailed:
+  """A stop that went ahead on a failed hand-back leaves stock cruise blocked until ignition:
+  the next session says so for as long as it runs."""
+
+  def test_raised_every_frame_of_the_next_session(self):
+    car_events = _car_events(**{FAILED_KEY: True})
+    for state in ("notNeeded", "notNeeded", "starting"):
+      assert _update(car_events, state).zp.has(EventNameZP.stockCruiseFailed)
+
+  def test_not_without_the_flag(self):
+    assert not _update(_car_events(), "notNeeded").zp.has(EventNameZP.stockCruiseFailed)
+
+  def test_shape(self):
+    alert = EVENTS_ZP[EventNameZP.stockCruiseFailed][ET.PERMANENT]
+    assert {alert.alert_text_1, alert.alert_text_2} == {"Stock Cruise Failed", "Restart the car"}
+    assert alert.audible_alert == AudibleAlert.prompt
+
+  def test_shows_with_nothing_engaged(self):
+    events_sp = _update(_car_events(**{FAILED_KEY: True}), "notNeeded")
+    assert _shown(events_sp, "notNeeded") == ["stockCruiseFailed/permanent"]

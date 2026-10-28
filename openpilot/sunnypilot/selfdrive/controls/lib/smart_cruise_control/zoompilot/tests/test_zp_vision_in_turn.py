@@ -123,7 +123,6 @@ def test_planner_cruise_candidate_holds_the_cap_with_actuator_lag():
   p.scc.map.params = FakeParams(SmartCruiseControlMap=False)
   p.sla_machine = None
   p.e2e_set_speed.params = FakeParams(ExperimentalModeSetSpeed=False)
-  p.e2e_lead_gap.params = FakeParams(ExperimentalModeLeadGap=False)
   p.v_desired_filter.x = 8.
   sm = build_sm(False)
   cs_ctrl = sm['controlsState'].as_builder()
