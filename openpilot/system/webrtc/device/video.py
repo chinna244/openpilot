@@ -57,6 +57,8 @@ class LiveStreamVideoStreamTrack(TiciVideoStreamTrack):
 
   def switch_camera(self, camera_type: str) -> None:
     self._sock = self._make_sock(camera_type)
+    self._seen_keyframe = False
+    self.request_keyframe()
 
   def enable(self, enabled: bool):
     self.video_enabled = enabled

@@ -86,6 +86,21 @@ def jetlink_enabled(started: bool, params: Params, CP: car.CarParams) -> bool:
 def navigation(started: bool, params: Params, CP: car.CarParams) -> bool:
   return started and params.get_bool("NavigationEnabled")
 
+def konik_backup_allowed(params: Params) -> bool:
+  # Konik as StarPilot's own active cloud provider already uploads there; the backup would duplicate it
+  from openpilot.starpilot.connect.provider import active_provider
+  return params.get_bool("KonikUploadsEnabled") and active_provider().name != 'konik'
+
+
+def konik_uploads_ready(started: bool, params: Params, CP: car.CarParams) -> bool:
+  return not started and konik_backup_allowed(params)
+
+
+def konik_connect_ready(started: bool, params: Params, CP: car.CarParams) -> bool:
+  from openpilot.common.konik_api import valid_id
+  return konik_backup_allowed(params) and valid_id(params.get("KonikDongleId"))
+
+
 def only_offroad(started: bool, params: Params, CP: car.CarParams) -> bool:
   return not started
 
@@ -185,6 +200,9 @@ procs = [
   PythonProcess("tombstoned", "openpilot.system.tombstoned", always_run, enabled=not PC),
   PythonProcess("updated", "openpilot.system.updated.updated", only_offroad, enabled=not PC),
   PythonProcess("uploader", "openpilot.system.loggerd.uploader", always_run),
+  # develop: independent Konik drive backups and presence alongside the active cloud provider
+  PythonProcess("konik_uploader", "openpilot.system.loggerd.konik", konik_uploads_ready),
+  PythonProcess("konik_connect", "openpilot.system.athena.konik", konik_connect_ready),
 
   # debug procs
   NativeProcess("bridge", "openpilot/cereal/messaging", ["./bridge"], notcar),
