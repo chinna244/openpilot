@@ -16,10 +16,10 @@ def record(**changes):
   return dict(fingerprint=str(CAR.MAZDA_CX5_2022), state='ready', radarOff=True, alphaRequested=False, monoTime=NOW, **changes)
 
 
-def test_aeb_off_and_failed_restore_are_visible_without_replacing_existing_alerts():
+def test_failed_restore_is_visible_without_replacing_existing_alerts():
   current = cp()
-  alert = notice(OnroadAlert(), current, record(), False, NOW)
-  assert 'AEB' in alert.text1 and 'off' in alert.text1.lower()
+  # develop shows the takeover as one-time events (selfdrived add_mazda_takeover_events), not a standing notice
+  assert notice(OnroadAlert(), current, record(), False, NOW).size == AlertSize.NONE
   failed = notice(OnroadAlert(), current, None, True, NOW)
   assert 'restore' in failed.text1.lower() and 'restart' in failed.text2.lower()
   critical = OnroadAlert(AlertSize.FULL, 'TAKE CONTROL', 'Brake', True)
@@ -34,11 +34,10 @@ def test_missing_or_stale_status_cannot_claim_aeb_ownership(stamp):
   assert notice(OnroadAlert(), cp(), data, False, NOW).size == AlertSize.NONE
 
 
-def test_requested_takeover_explains_the_next_stop():
+def test_requested_takeover_has_no_standing_notice():
   data = record()
   data.update(state='parkToTakeOver', radarOff=False, alphaRequested=True)
-  alert = notice(OnroadAlert(), cp(), data, False, NOW)
-  assert 'stop' in (alert.text1 + alert.text2).lower()
+  assert notice(OnroadAlert(), cp(), data, False, NOW).size == AlertSize.NONE  # alphaLongNextStop says it once
 
 
 def test_settings_status_is_bound_to_the_current_vehicle():

@@ -590,7 +590,12 @@ class Car:
                                              now_ns=now_ns, is_metric=self.is_metric,
                                              enabled=bool(host_control_enabled and can_rcv_valid and not self.params.get_bool("SafeMode")))
     consumed = self.v_cruise_helper.slc_consumed_button
+    published_CS = CS
     if self.aol_card_intent is not None:
+      lateral_holds = getattr(self.aol_card_intent, 'observe_lateral_holds', None)
+      if lateral_holds is not None:
+        # Mazda TJA: the AOL owners below see the camera's fault as a lateral pause, not a disarming fault
+        CS = lateral_holds(CS)
       if self.aol_process_fault_context is None:
         self.aol_process_fault_context = AolProcessFaultContext()
       self.aol_process_fault_context.observe(self.sm, now_ns)
@@ -694,7 +699,7 @@ class Car:
           0 < self.aol_card_intent.physical_arm_ns <= native.observedMonoTime):
         self._angle_aol_acknowledged_arm_ns = self.aol_card_intent.physical_arm_ns
       rejected = native_reset or (not angle_arm_pending and
-        native_latch_rejected(self.CP, native, state=CS if angle_panda_ready else None))
+        native_latch_rejected(self.CP, native, state=published_CS if angle_panda_ready else None))
       rejection_ns = now_ns if native_reset else int(native.observedMonoTime) if rejected else 0
       observe_physical = getattr(self.aol_card_intent, 'observe_physical_samples', None)
       if observe_physical is not None:
@@ -732,6 +737,7 @@ class Car:
     gm_claim = getattr(self, 'gm_distance_claim_tracker', None)
     if gm_claim is not None:
       gm_claim.observe(CS)
+    CS = published_CS
     self.manual_receipt = None
     self.traffic_receipt = None
     if (self.conditional_replay and (not REPLAY or hasattr(self, 'can_log_mono_time')) and
@@ -1567,7 +1573,8 @@ class Car:
       self.params.put("MazdaStockEcuState", status)
       self.mazda_ecu_status = status
     payload = {"state": status, "radarOff": bool(controller.stock_ecu_off),
-               "alphaRequested": bool(controller.alpha_long_requested), "fingerprint": str(self.CP.carFingerprint)}
+               "alphaRequested": bool(controller.alpha_long_requested), "fingerprint": str(self.CP.carFingerprint),
+               "aebSettingOff": bool(getattr(self.CI.CS, 'aeb_setting_off', False))}
     now_ns = time.monotonic_ns()
     if payload != self.mazda_status_payload or now_ns - self.mazda_status_written_ns >= 1_000_000_000:
       self.params.put("MazdaStockEcuStatus", {**payload, "monoTime": now_ns})
@@ -1789,6 +1796,9 @@ class Car:
         update_subaru_sng(self, CS, CC, now_nanos)
         from openpilot.starpilot.car.subaru.stop_start_caller import update as update_subaru_startup
         update_subaru_startup(self, now_nanos)
+      if self.CP.brand == "mazda" and getattr(self.aol_card_intent, 'tja_button', False):
+        # The dash white wheel follows the TJA latch as develop's MADS state did, not momentary latActive.
+        self.CI.CC.aol_lateral_latched = bool(self.aol_card_intent.allowed_latch and not self.aol_card_intent.pause_lateral)
       self.last_actuators_output, can_sends = self.CI.apply(CC, now_nanos)
       self.publish_sendcan(can_sends, valid=CS.canValid)
       if learning_snapshot is not None and self.learning_send_committed_mono_ns:

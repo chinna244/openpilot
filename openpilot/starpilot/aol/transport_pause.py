@@ -1629,9 +1629,13 @@ class TransportPauseFeedback:
         self.retention_started_ns = self.retention_event_ns = 0
         self.retention_verified = False
       native = _healthy_transport_native(sm, cp, cs, str(axis.sessionId), now_ns)
+      from opendbc.car.mazda.stock_aol import qualified as mazda_qualified
+      # Mazda's TJA intent pauses lateral on the same frame the panda withholds it (camera fault, LKAS off):
+      # the exact configuration with lateral restricted is the paused transport, not a failed one.
+      mazda_tja_pause = bool(intent_paused and mazda_qualified(cp, marked_only=True) and cp.safetyConfigs[0].safetyParam & 8)
       if (native is None and intent_paused and cs.canValid and not cs.canTimeout and
-          not cs.steerFaultPermanent and not any(signature[9:13])):
-        native = _configured_transport_native(sm, cp, str(axis.sessionId), now_ns)
+          not cs.steerFaultPermanent and (not any(signature[9:13]) or mazda_tja_pause)):
+        native = _configured_transport_native(sm, cp, str(axis.sessionId), now_ns, allow_restricted_lateral=mazda_tja_pause)
       from opendbc.car import structs
       previous = self.signature
       inactive = bool(not self.failed and self.session and previous is not None and

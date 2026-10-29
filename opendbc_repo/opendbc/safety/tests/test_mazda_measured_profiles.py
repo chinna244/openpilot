@@ -955,21 +955,27 @@ class TestMazdaMeasuredAol(unittest.TestCase):
         self.assertEqual(1, h.safety.aol_get_permission_mask())
 
   def test_faults_withhold_lateral(self):
-    # EPS LKAS_BLOCK and gear-not-D are temporary; a camera fault consumes the token (mazda_stock_aol.h:116-126)
+    # gear-not-D is temporary; a camera fault consumes the token. LKAS_BLOCK (the EPS's re-arm/standby state,
+    # delivering partly above ~4 m/s) never withholds lateral: gating on it kept AOL from ever starting.
     for word in WORDS:
       with self.subTest(word=word):
         h = MazdaAolHarness(self, word)
         h.arm()
-        for fault in ({"lkas_block": 1}, {"gear": 2}):
-          h.feed(**fault)
-          self.assertEqual(0, h.lat(), fault)
-          self.assertFalse(h.safety.safety_tx_hook(h.torque(5)))
-          h.feed()
-          self.assertEqual(1, h.lat(), fault)
+        h.feed(gear=2)
+        self.assertEqual(0, h.lat())
+        self.assertFalse(h.safety.safety_tx_hook(h.torque(5)))
+        h.feed()
+        self.assertEqual(1, h.lat())
+        h.feed(lkas_block=1)
+        self.assertEqual(1, h.lat())
+        self.assertTrue(h.safety.safety_tx_hook(h.torque(5)))
+        h.feed()
         h.feed(cam_err=1)
         self.assertEqual(0, h.lat())
+        self.assertFalse(h.safety.safety_tx_hook(h.torque(5)))
         h.feed()
-        self.assertEqual(0, h.lat())
+        # with the TJA button the camera's fault pauses (develop's MADS); otherwise it consumes the token
+        self.assertEqual(1 if _is_tja(word) else 0, h.lat())
 
   def test_stale_sources_withhold_lateral(self):
     required = ["CRZ_BTNS", "STEER_TORQUE", "ENGINE_DATA", "PEDALS", "GEAR", "STEER_RATE", "CAM_LKAS"]
@@ -1032,7 +1038,7 @@ class TestMazdaMeasuredAol(unittest.TestCase):
             h.feed(**fault)
             self.assertTrue(h.safety.get_controls_allowed(), fault)
             self.assertTrue(h.safety.safety_tx_hook(accel), fault)
-            if experience == AOL:
+            if experience == AOL and "lkas_block" not in fault:
               self.assertEqual(0, h.lat(), fault)
               self.assertEqual(2, h.safety.aol_get_permission_mask() & 2, fault)
             self.assertTrue(h.safety.safety_tx_hook(zero))

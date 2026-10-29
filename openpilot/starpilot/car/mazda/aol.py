@@ -1,5 +1,5 @@
 from opendbc.car import structs
-from opendbc.car.mazda.stock_aol import qualified, temporary_restriction
+from opendbc.car.mazda.stock_aol import STOPPED_LATERAL_SPEED, qualified, temporary_restriction
 from openpilot.starpilot.aol.policy import AolVehiclePolicy
 from openpilot.starpilot.car.mazda.stock_intent import MazdaStockCardIntent
 
@@ -28,8 +28,18 @@ def ordinary_axis_request_allowed(cp, state):
   return qualified(cp, marked_only=True) and state.canValid and not state.canTimeout and not state.steerFaultPermanent
 
 
+def stopped_lateral_inhibit(cp, state):
+  # Withdraw the host request across opendbc's stopped band (STOPPED_LATERAL_SPEED), which card's
+  # temporary_restriction also covers, so a stop or pull-away with cruise engaged pauses lateral cleanly.
+  return bool(qualified(cp, marked_only=True) and (state.standstill or state.vEgo < STOPPED_LATERAL_SPEED))
+
+
 def retain_on_native_denial(cp, native, state):
-  return temporary_restriction(cp, state)
+  # With the TJA button the camera's fault pauses lateral (develop's MADS): the panda withholds it on the
+  # fault frame, which card reads from the published CarState, so the denial is a pause, not a rejection.
+  return temporary_restriction(cp, state) or bool(
+    state is not None and cp.safetyConfigs[0].safetyParam & 8 and qualified(cp, marked_only=True) and
+    state.canValid and not state.canTimeout and state.steerFaultPermanent)
 
 
 def create_intent(cp, settings):

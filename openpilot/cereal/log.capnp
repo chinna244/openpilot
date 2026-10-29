@@ -131,6 +131,18 @@ struct OnroadEvent @0xc4fa6047f024e718 {
     userBookmarkNotPaired @104;
     stockEcuNotReady @105;
     stockEcuFailed @106;
+    cameraLkasFault @107;
+    cameraLkasFaultOnset @108;
+    cameraLkasResumed @109;
+    stockLkasOff @110;
+    stockLkasOffPress @111;
+    stockEcuInitializing @112;
+    stockEcuReady @113;
+    stockEcuHandedBack @114;
+    alphaLongNextStop @115;
+    manualSteeringRequired @116;
+    manualLongitudinalRequired @117;
+    cameraLkasFaultPress @118;
     excessiveActuation @96;
     bigModelLoading @100;
     bigModelFailed @102;

@@ -144,6 +144,11 @@ class SelfdriveD:
     # Mazda alpha long's radar transition, read by params_thread: display evidence only
     self.mazda_stock_ecu = None
     self.mazda_handback_failed = False
+    self.mazda_stock_state_prev = None
+    self.mazda_radar_off_prev = False
+    self.mazda_alpha_announced = False
+    self.mazda_camera_fault_prev = False
+    self.mazda_camera_paused = False
     from openpilot.starpilot.car.tesla.stock_events import StockCruiseConsumer
     self.tesla_stock_consumer = StockCruiseConsumer(self.CP)
     self.tesla_stock_alerts = []
@@ -337,6 +342,38 @@ class SelfdriveD:
         self.events.add(EventName.pedalPressed)
 
     self.add_mazda_stock_ecu_events(CS)
+    self.add_mazda_tja_events(CS)
+
+  def add_mazda_tja_events(self, CS):
+    """Develop's MADS banners and camera-fault alerts for Mazda's declared TJA button, whose latch AOL owns."""
+    from opendbc.car.mazda.stock_aol import qualified as mazda_aol_qualified
+    if not (mazda_aol_qualified(self.CP, marked_only=True) and self.CP.safetyConfigs[0].safetyParam & 8):
+      return
+    intent = getattr(self, 'aol_last_intent', None)
+    latched = bool(intent is not None and intent.allowedLatch)
+    for be in CS.buttonEvents:
+      if be.type == ButtonType.lkas and be.pressed:
+        if latched:
+          if self.enabled:
+            self.events.add(EventName.manualSteeringRequired)
+        elif CS.invalidLkasSetting:
+          self.events.add(EventName.stockLkasOffPress)
+        elif EventName.cameraLkasFault in self.events.names:
+          self.events.add(EventName.cameraLkasFaultPress)
+      elif be.type == ButtonType.cancel and be.pressed and latched and self.enabled:
+        self.events.add(EventName.manualLongitudinalRequired)
+    # The camera's fault: loud on its first frame while TJA steering is on, "Steering Resumed" once lateral is back.
+    camera_fault = EventName.cameraLkasFault in self.events.names
+    if camera_fault and not self.mazda_camera_fault_prev and latched:
+      self.events.add(EventName.cameraLkasFaultOnset)
+    self.mazda_camera_fault_prev = camera_fault
+    if not latched:
+      self.mazda_camera_paused = False
+    elif camera_fault:
+      self.mazda_camera_paused = True
+    elif self.mazda_camera_paused and self.aol_axis_decision.lateral_active:
+      self.mazda_camera_paused = False
+      self.events.add(EventName.cameraLkasResumed)
 
   def add_mazda_stock_ecu_events(self, CS):
     from openpilot.selfdrive.selfdrived.events import STOCK_ECU_PRESS_STATE
@@ -348,6 +385,33 @@ class SelfdriveD:
     if not_ready is not None:
       STOCK_ECU_PRESS_STATE[0] = not_ready
       self.events.add(EventName.stockEcuNotReady)
+    self.add_mazda_takeover_events(CS)
+
+  def add_mazda_takeover_events(self, CS):
+    """Develop's unprompted radar-takeover lines (car_specific.py update_stock_ecu); display only."""
+    from opendbc.car.mazda.stock_ecu import StockEcuState
+    from openpilot.starpilot.car.mazda.radar_status import current
+    record = self.mazda_stock_ecu
+    if self.CP.brand != 'mazda' or not self.CP.openpilotLongitudinalControl or not current(record, self.CP, time.monotonic_ns()):
+      return
+    state = record['state']
+    # stopped with the takeover still starting; one line on the ready edge
+    if state == StockEcuState.STARTING and CS.standstill:
+      self.events.add(EventName.stockEcuInitializing)
+    if state == StockEcuState.READY and self.mazda_stock_state_prev != StockEcuState.READY:
+      self.events.add(EventName.stockEcuReady)
+    self.mazda_stock_state_prev = state
+    # the car's AEB counted as back, said once, and not while the driver's own setting keeps AEB off
+    off = record['radarOff']
+    if self.mazda_radar_off_prev and not off and not record.get('aebSettingOff', False):
+      self.events.add(EventName.stockEcuHandedBack)
+    self.mazda_radar_off_prev = off
+    # RES registered: said once per request while driving; pressed at a stop, said on pulling away
+    if not record['alphaRequested']:
+      self.mazda_alpha_announced = False
+    elif not self.mazda_alpha_announced and not CS.standstill:
+      self.events.add(EventName.alphaLongNextStop)
+      self.mazda_alpha_announced = True
 
 
   def update_events(self, CS):
@@ -1676,6 +1740,7 @@ class SelfdriveD:
     from openpilot.starpilot.car.mazda.aol import physical_cancel_lateral_allowed as mazda_cancel_lateral_allowed
     from openpilot.starpilot.car.ford.aol import physical_cancel_lateral_allowed as ford_cancel_lateral_allowed
     from openpilot.starpilot.car.subaru.aol import sng_standstill_lateral_inhibit
+    from openpilot.starpilot.car.mazda.aol import stopped_lateral_inhibit as mazda_stopped_lateral_inhibit
     from openpilot.starpilot.aol.dm import lateral_event_context
     from openpilot.starpilot.car.toyota.legacy_lateral import below_engage_lateral_allowed as toyota_below_engage_lateral_allowed
     retained_dm_lateral, lateral_events = lateral_event_context(self, CS, intent, native, now_ns, ordinary_lag)
@@ -1721,7 +1786,8 @@ class SelfdriveD:
                         self.sm['driverMonitoringState'].alertLevel == AlertLevel.three)),
       pause_brake_mps=self.aol_settings.pause_brake_mps if self.aol_settings is not None else 0.0,
       gear_pause=reverse_pause,
-      lateral_inhibit=self.aol_dm_lateral_inhibit or sng_standstill_lateral_inhibit(self.CP, CS) or any(
+      lateral_inhibit=self.aol_dm_lateral_inhibit or sng_standstill_lateral_inhibit(self.CP, CS) or
+        mazda_stopped_lateral_inhibit(self.CP, CS) or any(
         sample.steerFaultTemporary or sample.brakePressed and not sample.standstill and
         sample.vEgo < (self.aol_settings.pause_brake_mps if self.aol_settings is not None else 0.0)
         for sample, _ in getattr(self, 'car_state_samples', ())))

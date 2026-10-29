@@ -148,10 +148,13 @@ class CarController(CarControllerBase, IntelligentCruiseButtonManagementInterfac
   def update(self, CC, CS, now_nanos):
     # StarPilot's native lateral owner (AOL) stands in for the source's MADS: without it there is no
     # independent lateral, so ordinary engaged lateral must not draw the MADS white wheel or rearm.
+    # Card passes the TJA latch (aol_lateral_latched): MADS enabled is the latch, active keeps it through a stop
+    # (lateral is withheld there, as under MADS) and drops while steering is paused moving.
     mads = qualified_aol(self.CP, marked_only=True)
+    latched = getattr(self, 'aol_lateral_latched', None)
     self.control_context.mads.available = mads and not self.CP.passive and not CS.out.steerFaultPermanent
-    self.control_context.mads.enabled = mads and CC.latActive
-    self.control_context.mads.active = mads and CC.latActive
+    self.control_context.mads.enabled = mads and (CC.latActive if latched is None else latched)
+    self.control_context.mads.active = mads and (CC.latActive if latched is None else latched and (CC.latActive or CS.out.standstill))
     return self.update_with_context(CC, self.control_context, CS, now_nanos)
 
   def update_with_context(self, CC, CC_SP, CS, now_nanos):

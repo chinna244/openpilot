@@ -1,5 +1,5 @@
-"""Mazda through the real Card: the native owner's raw LKAS_BLOCK pause reaches the published CarState only
-while AOL (the native lateral owner) is active; without it the source's delivery semantics stand."""
+"""Mazda through the real Card: a raw LKAS_BLOCK never reaches the published CarState as a fault, with or
+without AOL (the native lateral owner). Gating on it kept AOL from ever starting (route 00000002--29b68afa8a)."""
 import gc
 from unittest.mock import patch
 
@@ -62,7 +62,7 @@ def bus_frames(sim, frames, **state):
     sim.frame += 1
 
 
-def test_raw_block_reaches_carstate_only_with_the_native_owner(mazda_card):
+def test_raw_block_is_no_fault_with_or_without_the_native_owner(mazda_card):
   card = mazda_card
   aol = card.CP.alternativeExperience == 32
   assert card.CP.carFingerprint == CAR.MAZDA_CX5_2022
@@ -74,15 +74,15 @@ def test_raw_block_reaches_carstate_only_with_the_native_owner(mazda_card):
   assert not card.CI.CS.lkas_blocked and not state.steerFaultTemporary
   for t, frames in bus_frames(sim, 50, lkas_block=True):
     state = card.CI.update([(t, frames)])
-    assert state.steerFaultTemporary == aol
+    assert not state.steerFaultTemporary
   for t, frames in bus_frames(sim, 2, lkas_block=False):
     state = card.CI.update([(t, frames)])
   assert not card.CI.CS.lkas_blocked and not state.steerFaultTemporary
 
 
 @pytest.mark.parametrize("word", [2, 3, 10, 11])
-def test_native_owner_withholds_lateral_on_the_frame_card_reads(word):
-  # The STEER_RATE frame card's view reads: mazda_aol_permission drops lateral on it and restores it after.
+def test_native_owner_keeps_lateral_through_lkas_block(word):
+  # The STEER_RATE frame card's view reads: mazda_aol_permission keeps lateral through the block.
   from opendbc.safety.tests.test_mazda_stock_aol import TestMazdaStockAol
   native = TestMazdaStockAol()
   native.configure(word=word)
@@ -102,6 +102,6 @@ def test_native_owner_withholds_lateral_on_the_frame_card_reads(word):
   native.safety.aol_set_host_request(1)
   assert native.safety.aol_get_permission_mask() & 1
   native.safety.safety_rx_hook(native.packet('STEER_RATE', {'LKAS_BLOCK': 1}))
-  assert not native.safety.aol_get_permission_mask() & 1
+  assert native.safety.aol_get_permission_mask() & 1
   native.safety.safety_rx_hook(native.packet('STEER_RATE', {'LKAS_BLOCK': 0}))
   assert native.safety.aol_get_permission_mask() & 1

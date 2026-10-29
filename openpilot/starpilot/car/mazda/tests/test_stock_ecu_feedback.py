@@ -64,7 +64,8 @@ def test_only_mazda_alpha_long_gets_stock_ecu_events():
 
 
 def test_selfdrived_adds_the_display_events_from_its_params_view():
-  sd = SimpleNamespace(CP=cp(), events=Events(), mazda_stock_ecu=None, mazda_handback_failed=True)
+  sd = SimpleNamespace(CP=cp(), events=Events(), mazda_stock_ecu=None, mazda_handback_failed=True,
+                       add_mazda_takeover_events=lambda CS: None)
   sd.mazda_stock_ecu = record(StockEcuState.STARTING)
   sd.mazda_stock_ecu['monoTime'] = 1  # stale on purpose: still unknown, failure flag still shown
   SelfdriveD.add_mazda_stock_ecu_events(sd, SimpleNamespace(buttonEvents=press()))

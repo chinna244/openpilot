@@ -69,11 +69,12 @@ class TestMazdaEngagementAol(unittest.TestCase):
     self.frame(active=True)
     self.frame(brake=True)
     self.assertEqual(self.safety.aol_get_permission_mask(), 1)
-    for restriction in ({'reverse': True}, {'temporary': True}):
-      self.frame(**restriction)
-      self.assertEqual(self.safety.aol_get_permission_mask(), 0)
-      self.frame()
-      self.assertEqual(self.safety.aol_get_permission_mask(), 1)
+    self.frame(reverse=True)
+    self.assertEqual(self.safety.aol_get_permission_mask(), 0)
+    self.frame()
+    self.assertEqual(self.safety.aol_get_permission_mask(), 1)
+    self.frame(temporary=True)  # LKAS_BLOCK never withholds lateral
+    self.assertEqual(self.safety.aol_get_permission_mask(), 1)
     self.assertFalse(self.safety.get_controls_allowed())
 
   def test_fault_and_source_loss_require_new_healthy_engagement(self):

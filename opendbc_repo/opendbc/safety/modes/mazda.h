@@ -116,6 +116,7 @@ static safety_config mazda_init(uint16_t param) {
 
   mazda_aol_reset();
   mazda_aol_alpha_long = false;
+  mazda_aol_tja = false;
   mazda_aol_enabled = (param == 0U) && ((unsigned int)alternative_experience == 32U);
   MAZDA_TX_MSGS[0].check_relay = !mazda_aol_enabled;
   MAZDA_TX_MSGS[2].check_relay = !mazda_aol_enabled;

@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 from opendbc.can import CANPacker
 from opendbc.car import Bus, structs
-from opendbc.car.mazda.values import CAR, DBC
+from opendbc.car.mazda.values import CAR, DBC, MazdaFlags
 from opendbc.car.mazda.tests.test_stock_startup import complete_frames, exercise_startup
 
 
@@ -406,12 +406,17 @@ def _exercise_actual_family_callers(identity, monkeypatch, *, scenario='brake', 
             'Mapped Cancel toggle could not rearm from a fresh physical Cancel')
         return
       if scenario == 'temporary':
+        # A raw EPS LKAS_BLOCK: the panda never withholds lateral on it (the EPS holds it until torque arrives),
+        # and the steer-to-zero EPS keeps steering through it as develop does. The older EPS's road-speed block
+        # is its steerFaultTemporary, which pauses lateral on the host. Neither erases the TJA intent.
         kwargs = {'temporary': True}
+        steer_to_zero = bool(card.CP.flags & MazdaFlags.STEER_TO_ZERO_EPS)
         for _ in range(30):
           state, axis, host_state, command = step(**kwargs)
           assert card.aol_card_intent.allowed_latch, f'Temporary Mazda restriction erased existing intent: {card.aol_card_intent.latch_clear_reason}'
-          assert not axis.lateralActive and not command.latActive
-          assert safety.aol_get_permission_mask() == 0
+          if not unbelted:
+            assert (axis.lateralActive and command.latActive) == steer_to_zero
+            assert not steer_to_zero or safety.aol_get_permission_mask() & 1
           assert not axis.longitudinalActive and not command.longActive
         for _ in range(30):
           state, axis, host_state, command = step()

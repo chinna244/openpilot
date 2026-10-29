@@ -3,6 +3,10 @@ from opendbc.car.mazda.stock_aol import qualified
 from openpilot.selfdrive.car.cruise import CRUISE_LONG_PRESS
 from openpilot.starpilot.aol.intent import AolCardIntent, AOL_TOGGLE, ButtonType
 
+# develop (car_specific.py): the camera's fault holds lateral this long past its clear, so a fault flickering
+# as it clears cannot toggle steering
+CAMERA_FAULT_CLEAR_FRAMES = 100
+
 
 class MazdaStockCardIntent(AolCardIntent):
   observe_stock_engagement = True
@@ -11,6 +15,10 @@ class MazdaStockCardIntent(AolCardIntent):
     super().__init__(settings, explicit_latch=True)
     self.cp = cp
     self.tja_button = bool(cp.safetyConfigs[0].safetyParam & 8)
+    self.observe_stock_engagement = not self.tja_button
+    self.camera_fault_clear_frames = CAMERA_FAULT_CLEAR_FRAMES
+    self.lkas_off = False
+    self.pending_rejection_ns = 0
     self.independent_cruise_buttons = self.tja_button
     self.main_seen = False
     self.startup_main_pending = not self.tja_button
@@ -86,6 +94,18 @@ class MazdaStockCardIntent(AolCardIntent):
       self._perform(action)
 
   def update(self, CS, **kwargs):
+    if self.tja_button:
+      # The panda can withhold lateral for the camera's fault one sample before card parses it: hold a native
+      # rejection one sample, and drop it when the fault's pause shows up instead.
+      rejection = kwargs.get('native_rejection_ns', 0)
+      if not rejection or self.lateral_held:
+        self.pending_rejection_ns = 0
+        kwargs['native_rejection_ns'] = 0 if self.lateral_held else rejection
+      elif not self.pending_rejection_ns:
+        self.pending_rejection_ns = rejection
+        kwargs['native_rejection_ns'] = 0
+      else:
+        kwargs['native_rejection_ns'] = self.pending_rejection_ns
     state = structs.CarState(**CS.to_dict())
     if self.tja_button:
       # Only this lateral-intent view is independent of MRCC; cruiseState stays physical on the wire.
@@ -103,7 +123,9 @@ class MazdaStockCardIntent(AolCardIntent):
           self.cancel_ticks = 0
       elif event.type in (ButtonType.mainCruise, ButtonType.lkas):
         action = self.main_action if event.type == ButtonType.mainCruise else self.lkas_action
-        if action == AOL_TOGGLE:
+        if self.tja_button and event.type == ButtonType.lkas and not self.allowed_latch and self.lateral_held:
+          pass  # as develop: TJA cannot turn steering on through the camera's fault or with LKAS off (refused)
+        elif action == AOL_TOGGLE:
           events.append(structs.CarState.ButtonEvent(**event.to_dict()))
         elif (not self.tja_button and event.type == ButtonType.mainCruise and action == 0 and
               (not self.allowed_latch or not event.pressed)):
@@ -150,6 +172,9 @@ class MazdaStockCardIntent(AolCardIntent):
       elif self.startup_native_ready and source_ns > 0:
         self.startup_main_source_ns = source_ns
     state.buttonEvents = events
+    if self.tja_button:
+      # a TJA press toggles the latch itself, also while a hold below pauses it
+      self.pause_lateral = not self.allowed_latch
     super().update(state.as_reader(), **kwargs)
     if startup_main and not self._fault_inhibit:
       self.allowed_latch = True
@@ -162,3 +187,33 @@ class MazdaStockCardIntent(AolCardIntent):
         self.cancel_action(self.settings.cancel_actions[1])
       elif self.cancel_ticks == CRUISE_LONG_PRESS * 5:
         self.cancel_action(self.settings.cancel_actions[2])
+    if self.tja_button:
+      # As develop's MADS with the declared TJA button: only TJA turns steering on or off; SET/RES, cancel and
+      # main never do. Ordinary cruise engagement gets no lateral of its own while the latch is off. The camera's
+      # fault and the car's lane keep switched off pause it, keeping the latch and cruise, and resume on their own.
+      self.pause_lateral = not self.allowed_latch or self.lateral_held
+
+  @property
+  def lateral_held(self):
+    return self.camera_fault_clear_frames < CAMERA_FAULT_CLEAR_FRAMES or self.lkas_off
+
+  def observe_lateral_holds(self, CS):
+    """Card's view for the AOL owners: with the TJA button the camera's fault (CAM_LKAS ERR_BIT_1, Mazda's only
+    steerFaultPermanent) pauses lateral as develop's MADS did instead of disarming the driver's intent. The published
+    CarState keeps the fault: selfdrived withholds lateral on it and the panda withholds torque."""
+    if not self.tja_button:
+      return CS
+    self.camera_fault_clear_frames = 0 if CS.steerFaultPermanent else min(self.camera_fault_clear_frames + 1,
+                                                                          CAMERA_FAULT_CLEAR_FRAMES)
+    self.lkas_off = bool(CS.invalidLkasSetting)
+    if self.lateral_held:
+      self.pause_lateral = True  # this frame, before the AOL owners read it
+    if not CS.steerFaultPermanent:
+      return CS
+    view = structs.CarState(**CS.to_dict())
+    view.steerFaultPermanent = False
+    return view.as_reader()
+
+  def _arm_from_full_engagement(self, CS, *, source_ns):
+    if not self.tja_button:
+      super()._arm_from_full_engagement(CS, source_ns=source_ns)

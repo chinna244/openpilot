@@ -28,7 +28,7 @@ def test_standard_parser_preserves_blind_spot_signals():
 
 
 def test_standard_parser_keeps_a_raw_eps_block_out_of_the_steering_fault():
-  # The native owner's raw pause is card's view (stock_aol.native_lateral_pause); a single raw block is
+  # With or without AOL a single raw block is
   # not a steerFaultTemporary (test_mazda_production_eps covers delivery, re-arm and the delayed fault).
   cp = CarInterface.get_params(CAR.MAZDA_CX5_2022, gen_empty_fingerprint(), [], False, False, False)
   ci = CarInterface(cp)

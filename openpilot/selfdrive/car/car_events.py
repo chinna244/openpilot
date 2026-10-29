@@ -23,6 +23,7 @@ class CarEvents:
     self.low_speed_alert = False
     self.no_steer_warning = False
     self.silent_steer_warning = True
+    self.camera_fault_clear_frames = 100
 
   def update(self, CS: car.CarState, CS_prev: car.CarState, CC: car.CarControl):
     if self.CP.brand in ('body', 'mock'):
@@ -92,6 +93,27 @@ class CarEvents:
       # TODO: this needs to be implemented generically in carState struct
       # if CC.eps_timer_soft_disable_alert:
       #   events.add(EventName.steerTimeLimit)
+
+    elif self.CP.brand == 'mazda':
+      from opendbc.car.mazda.values import MazdaFlags
+      if self.CP.flags & MazdaFlags.STEER_TO_ZERO_EPS and EventName.steerTempUnavailable in events.events:
+        # As develop: steerFaultTemporary on this EPS is the non-delivery latch reporting a sustained road-speed
+        # block. The latch has already zeroed the command, so a soft disable protects nothing; keep the banner.
+        events.events.remove(EventName.steerTempUnavailable)
+        events.add(EventName.steerTempUnavailableSilent)
+      from opendbc.car.mazda.stock_aol import qualified as mazda_aol_qualified
+      if mazda_aol_qualified(self.CP, marked_only=True) and self.CP.safetyConfigs[0].safetyParam & 8:
+        # As develop's MADS with the TJA button: the car's lane keep switched off and the camera's fault (CAM_LKAS
+        # ERR_BIT_1, Mazda's only steerFaultPermanent) pause lateral and leave cruise alone. The TJA intent holds
+        # lateral paused on the same 1 s clear hold (stock_intent.py); controlsd still gates on the fault.
+        if CS.invalidLkasSetting and EventName.invalidLkasSetting in events.events:
+          events.events.remove(EventName.invalidLkasSetting)
+          events.add(EventName.stockLkasOff)
+        self.camera_fault_clear_frames = 0 if CS.steerFaultPermanent else min(self.camera_fault_clear_frames + 1, 100)
+        if self.camera_fault_clear_frames < 100:
+          while EventName.steerUnavailable in events.events:
+            events.events.remove(EventName.steerUnavailable)
+          events.add(EventName.cameraLkasFault)
 
     return events
 

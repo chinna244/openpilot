@@ -22,19 +22,17 @@ def qualified(cp, *, marked_only=False):
   return bool(legacy or measured)
 
 
+# The panda grants Mazda lateral only while moving (vehicle_moving, > 0.1 kph). The host withdraws its request a
+# little above that (starpilot/car/mazda/aol.py stopped_lateral_inhibit), and the whole band is a restriction, so a
+# stop or pull-away with cruise engaged pauses lateral instead of reading as a native denial.
+STOPPED_LATERAL_SPEED = 0.3  # m/s
+
+
 def temporary_restriction(cp, state):
   return bool(state is not None and qualified(cp, marked_only=True) and state.canValid and not state.canTimeout and
               not state.steerFaultPermanent and (state.gearShifter != structs.CarState.GearShifter.drive or
-                                                 state.steerFaultTemporary or state.standstill or (cp.minSteerSpeed > 0 and state.vEgo < cp.minSteerSpeed)))
-
-
-def native_lateral_pause(cp, carstate) -> bool:
-  """mazda_aol_permission withholds lateral while 0x241 LKAS_BLOCK is raised: true only while that
-  native owner is active (AOL marked), from the interface's raw parse of the same frame. Steer-to-zero
-  firmware only: older firmware raises the block below its 45 kph floor by design, where AOL's own
-  restriction (vEgo < minSteerSpeed) covers it and carstate keeps base StarPilot's speed-gated fault."""
-  return bool(int(cp.flags) & int(MazdaFlags.STEER_TO_ZERO_EPS) and qualified(cp, marked_only=True) and
-              getattr(carstate, 'lkas_blocked', False))
+                                                 state.steerFaultTemporary or state.standstill or state.vEgo < STOPPED_LATERAL_SPEED or
+                                                 (cp.minSteerSpeed > 0 and state.vEgo < cp.minSteerSpeed)))
 
 
 def native_observation(native, *, latched, panda_ready, restricted, now_ns, pending_since_ns):

@@ -2,14 +2,12 @@
 CX-5 sends, with the EPS closing the loop on the torque it was sent. steerFaultTemporary must keep the
 source's semantics (docs/zoompilot/mazda-lateral.md, "LKAS_BLOCK is not all-or-nothing"): partial
 delivery keeps steering, only sustained road-speed zero delivery is a fault, and the lane-keep re-arm
-block is never one. Only while StarPilot's native lateral owner is active (AOL) does a raw block publish
-the pause, because mazda_aol_permission then withholds all lateral torque (stock_aol.native_lateral_pause).
+block is never one. The same holds under StarPilot's native lateral owner (AOL).
 """
 from opendbc.can import CANPacker
 from opendbc.car import DT_CTRL
 from opendbc.car.mazda.carstate import LKAS_REARM_FAULT_FRAMES
 from opendbc.car.mazda.interface import CarInterface
-from opendbc.car.mazda.stock_aol import native_lateral_pause
 from opendbc.car.mazda.tests.conftest import DBC_NAME, car_control, car_params
 from opendbc.car.mazda.tests.test_mazda_golden_tx import D, SimCar
 from opendbc.car.mazda.values import CAR, CarControllerParams, MazdaFlags
@@ -101,20 +99,12 @@ def test_sustained_zero_delivery_latches_then_faults_then_recovers():
   assert all(torque != 0 for _, torque, _ in recovered[10:])
 
 
-def test_native_owner_pause_is_published_only_under_aol():
+def test_aol_keeps_steering_through_a_partial_block():
+  # AOL takes the source's semantics: a raw block with partial delivery is no fault (route 00000002--29b68afa8a)
   ci, sim = production_interface(aol=True), DeliveringSimCar(delivered=0.4)
-  assert native_lateral_pause(ci.CP, ci.CS) is False
   settled(ci, sim)
-  blocked = drive(ci, sim, 50, lkas_block=True)
-  # the native owner withholds the torque the EPS would partly deliver: the pause is real and immediate
-  assert all(fault for fault, _, _ in blocked[1:])
-  recovered = drive(ci, sim, 20, lkas_block=False)
-  assert not any(fault for fault, _, _ in recovered[1:])
-
-  # the same CAN without the native owner keeps steering through the partial block
-  ci, sim = production_interface(), DeliveringSimCar(delivered=0.4)
-  settled(ci, sim)
-  assert not any(fault for fault, _, _ in drive(ci, sim, 50, lkas_block=True))
+  assert not any(fault for fault, _, _ in drive(ci, sim, 300, lkas_block=True))
+  assert not ci.CS.steer_undelivered
 
 
 def test_legacy_firmware_under_aol_keeps_the_speed_gated_rule():
@@ -125,4 +115,3 @@ def test_legacy_firmware_under_aol_keeps_the_speed_gated_rule():
   ci, sim = CarInterface(cp), DeliveringSimCar()
   drive(ci, sim, 200, v=8., lkas_block=False)
   assert not any(fault for fault, _, _ in drive(ci, sim, 100, v=8., lkas_block=True))
-  assert not native_lateral_pause(ci.CP, ci.CS)

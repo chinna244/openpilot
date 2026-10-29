@@ -45,24 +45,19 @@ def notice(native, cp, record, restore_failed, now_ns):
                        alert_type='mazdaRadarRestore/permanent')
   if not cp.openpilotLongitudinalControl or not current(record, cp, now_ns):
     return native
-  if record['radarOff']:
-    detail = 'Restoring factory radar' if record['state'] == 'restoring' else 'Mazda alpha longitudinal has radar control'
-    return OnroadAlert(AlertSize.SMALL, 'Factory AEB off', detail, alert_type='mazdaRadarOwnership/permanent')
-  if record['alphaRequested'] and record['state'] in ('starting', 'parkToTakeOver'):
-    return OnroadAlert(AlertSize.SMALL, 'Alpha long requested', 'Takes over at the next stop',
-                       alert_type='mazdaRadarTakeover/permanent')
+  # develop shows the takeover as one-time events (stockEcuReady, alphaLongNextStop, stockEcuHandedBack), not standing notices
   return native
 
 
 # A SET/RES press the car will not engage on while alpha long's radar transition is not done.
 SET_SPEED_BUTTONS = ('accelCruise', 'resumeCruise', 'decelCruise', 'setCruise')
-NOT_READY_TEXT = {
-  StockEcuState.STARTING: ('Alpha Long Not Ready', 'Stay stopped: factory AEB turning off'),
-  StockEcuState.PARK_TO_TAKE_OVER: ('Alpha Long Not Ready', 'Stop first: takes over at the next stop'),
-  StockEcuState.RESTORING: ('Factory Cruise Restarting', 'Wait about 12 s'),
-  StockEcuState.FAILED: ('Factory Radar Not Restored', 'Restart the car'),
+NOT_READY_TEXT = {  # develop (events_zp.py STOCK_ECU_ALERT_TEXT): (title, line)
+  StockEcuState.STARTING: ('AEB turning off', 'Stay still'),
+  StockEcuState.PARK_TO_TAKE_OVER: ('openpilot cruise at stop', 'Stop first'),
+  StockEcuState.RESTORING: ('car cruise restarting', 'Wait ~12 s'),
+  StockEcuState.FAILED: ('radar switch failed', 'Restart car'),
 }
-UNKNOWN_TEXT = ('Alpha Long Not Ready', 'Radar status unavailable')
+UNKNOWN_TEXT = NOT_READY_TEXT[StockEcuState.STARTING]
 
 
 def stock_ecu_events(cp, record, restore_failed, button_events, now_ns):
