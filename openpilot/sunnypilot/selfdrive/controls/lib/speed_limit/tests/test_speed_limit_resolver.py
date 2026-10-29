@@ -12,7 +12,9 @@ from openpilot.common.parameterized import parameterized
 from openpilot.cereal import custom
 from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit import LIMIT_MAX_MAP_DATA_AGE
 
-from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.speed_limit_resolver import SpeedLimitResolver, ALL_SOURCES, CAR_LIMIT_MIN
+from openpilot.common.realtime import DT_MDL
+from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.speed_limit_resolver import SpeedLimitResolver, ALL_SOURCES, CAR_LIMIT_MIN, \
+  LAST_LIMIT_SETTLE
 from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.common import Policy
 from openpilot.common.test import OpenpilotTestCase
 
@@ -294,3 +296,81 @@ class TestSpeedLimitResolverGpsFix(OpenpilotTestCase):
     resolver.policy = Policy.map_data_only
     resolver.update(20., gps_sm(mocker, 0., 0., ahead_limit=10., ahead_distance=100.))
     assert resolver.speed_limit == 10.
+
+  # the last limit a source dropout falls back to must have held LAST_LIMIT_SETTLE
+
+  def _feed(self, resolver, mocker, car_limit, map_limit, seconds):
+    for _ in range(max(1, int(seconds / DT_MDL))):
+      resolver.update(10., gps_sm(mocker, car_limit, map_limit))
+
+  def test_a_blip_before_a_dropout_is_not_the_last_limit(self, resolver_class, mocker):
+    # route 00000009 220.05 s: map 25 held, the camera read 35 for 0.72 s as the map dropped, then nothing
+    resolver = resolver_class()
+    resolver.policy = Policy.combined
+    self._feed(resolver, mocker, 35 * MPH, 25 * MPH, 10.)
+    self._feed(resolver, mocker, 35 * MPH, 0., 0.7)
+    assert resolver.speed_limit == 35 * MPH and resolver.speed_limit_last == 35 * MPH  # a live reading still counts at once
+    self._feed(resolver, mocker, 0., 0., 1.)
+    assert resolver.speed_limit == 0.
+    assert resolver.speed_limit_last == 25 * MPH
+    assert resolver.speed_limit_final_last == 25 * MPH + resolver.speed_limit_offset
+
+  def test_a_reading_that_held_stays_the_last_limit(self, resolver_class, mocker):
+    resolver = resolver_class()
+    resolver.policy = Policy.car_state_only
+    self._feed(resolver, mocker, 25 * MPH, 0., 10.)
+    self._feed(resolver, mocker, 35 * MPH, 0., LAST_LIMIT_SETTLE + 0.1)
+    self._feed(resolver, mocker, 0., 0., 5.)
+    assert resolver.speed_limit_last == 35 * MPH
+
+  def test_a_short_lower_reading_still_lowers_the_last_limit(self, resolver_class, mocker):
+    # it may be a real sign: a short reading never raises the last limit, it may lower it
+    resolver = resolver_class()
+    resolver.policy = Policy.car_state_only
+    self._feed(resolver, mocker, 35 * MPH, 0., 10.)
+    self._feed(resolver, mocker, 25 * MPH, 0., 0.7)
+    self._feed(resolver, mocker, 0., 0., 1.)
+    assert resolver.speed_limit_last == 25 * MPH
+
+  def test_a_blip_with_nothing_held_before_stays(self, resolver_class, mocker):
+    resolver = resolver_class()
+    resolver.policy = Policy.car_state_only
+    self._feed(resolver, mocker, 35 * MPH, 0., 0.5)
+    self._feed(resolver, mocker, 0., 0., 1.)
+    assert resolver.speed_limit_last == 35 * MPH
+
+  def test_a_new_limit_still_applies_at_once(self, resolver_class, mocker):
+    resolver = resolver_class()
+    resolver.policy = Policy.car_state_only
+    self._feed(resolver, mocker, 35 * MPH, 0., 10.)
+    resolver.update(10., gps_sm(mocker, 25 * MPH, 0.))
+    assert resolver.speed_limit_last == 25 * MPH
+
+  def test_a_limit_from_before_a_dropout_is_never_brought_back(self, resolver_class, mocker):
+    # a stale town 25 must not replace a real 65 seen briefly after minutes with no limit
+    resolver = resolver_class()
+    resolver.policy = Policy.car_state_only
+    self._feed(resolver, mocker, 25 * MPH, 0., 60.)
+    self._feed(resolver, mocker, 0., 0., 300.)
+    self._feed(resolver, mocker, 65 * MPH, 0., 1.5)
+    self._feed(resolver, mocker, 0., 0., 1.)
+    assert resolver.speed_limit_last == 65 * MPH
+
+  def test_a_flickering_new_limit_takes_over(self, resolver_class, mocker):
+    # a road read in pieces: after its first gap the old limit is gone for good
+    resolver = resolver_class()
+    resolver.policy = Policy.car_state_only
+    self._feed(resolver, mocker, 25 * MPH, 0., 10.)
+    for _ in range(10):
+      self._feed(resolver, mocker, 45 * MPH, 0., 1.5)
+      self._feed(resolver, mocker, 0., 0., 0.5)
+    assert resolver.speed_limit_last == 45 * MPH
+
+  def test_a_chain_of_short_readings_falls_back_to_the_held_one(self, resolver_class, mocker):
+    resolver = resolver_class()
+    resolver.policy = Policy.car_state_only
+    self._feed(resolver, mocker, 25 * MPH, 0., 10.)
+    self._feed(resolver, mocker, 30 * MPH, 0., 0.5)
+    self._feed(resolver, mocker, 35 * MPH, 0., 0.5)
+    self._feed(resolver, mocker, 0., 0., 1.)
+    assert resolver.speed_limit_last == 25 * MPH

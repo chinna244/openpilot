@@ -548,3 +548,16 @@ class TestCruiseArbiterNonPcm:
     self.run(CONFIRM_FOLLOW_PERIOD, 36, 40, 30.)
     self.press(ButtonType.accelCruise, 36, 40)
     assert self.arb.state == SpeedLimitAssistState.inactive
+
+  def test_a_source_dropout_behind_an_unchanged_target_asks_nothing(self):
+    """Route 00000009 227 s: the map dropped out (25 -> none) while the last limit stayed 25; the raw change re-prompted
+    an active session at the same target."""
+    self.go_pre_active(40, 45)
+    self.press(ButtonType.accelCruise, 40, 45)
+    assert self.arb.state == SpeedLimitAssistState.active
+    lp = self._lp(45)
+    lp.speedLimit.resolver.speedLimit = 0.  # no live source, the last limit holds
+    for _ in range(5):
+      self.arb.update_limit(lp)
+      self.v_cruise_kph = self.arb.step(car_struct.CarState(), True, self.v_cruise_kph, 41 * CV.MPH_TO_KPH)
+    assert self.arb.state == SpeedLimitAssistState.active

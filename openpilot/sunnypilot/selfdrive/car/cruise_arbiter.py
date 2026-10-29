@@ -93,8 +93,8 @@ class CruiseArbiter:
 
     # longitudinalPlanSP updates these at the planning rate.
     self._speed_limit = 0.
-    self._speed_limit_prev = 0.
     self._slf = 0.  # speedLimitFinalLast, m/s
+    self._slf_prev = 0.
     self._has_limit = False
     self._limit_seen = (0., 0., False)  # the resolver's latest (speedLimit, speedLimitFinalLast, valid)
     self._limit_seen_frames = 0
@@ -175,7 +175,8 @@ class CruiseArbiter:
 
   @property
   def _limit_changed(self) -> bool:
-    return self._has_limit and self._speed_limit != self._speed_limit_prev
+    # the target is what a prompt asks for: a source dropping out behind an unchanged last limit asks nothing
+    return self._has_limit and self._slf != self._slf_prev
 
   def _set_state(self, state, announce=False):
     self.state = state
@@ -425,7 +426,7 @@ class CruiseArbiter:
     elif self.state != SessionState.preActive:  # a prompt keeps its frozen hold
       self.v_cap = V_CRUISE_UNSET
 
-    self._speed_limit_prev = self._speed_limit
+    self._slf_prev = self._slf
     self.long_enabled_prev = long_enabled
     return v_cruise_kph
 

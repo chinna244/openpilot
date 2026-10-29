@@ -24,6 +24,12 @@ ALL_SOURCES = tuple(SpeedLimitSource.schema.enumerants.values())
 # A GPS message logged further ahead of now than this is not trusted either.
 MAP_FIX_FUTURE_TOLERANCE = 1.  # s
 
+# The last limit a source dropout falls back to must have held this long: route 00000009 at 220.05 s the camera read 35
+# for 0.72 s turning into a parking lot as the map dropped out, and that 35 stayed the last limit for 47 s ("Press + for 41"
+# twice, no limit anywhere). A reading that ends sooner gives way to the held one it took over from without a gap, if that
+# one is lower; a lower short reading stays (it may be a real sign), and one that began after a dropout stays as before.
+LAST_LIMIT_SETTLE = 2.  # s
+
 # A car (camera) limit below this is a misread sign, not a road limit: route 00000169 t207 and t234 read 5 mph
 # with no map limit, and the assist braked at -1.2 m/s2 toward 6 mph. 9 mph keeps 10 mph and 15 km/h signs.
 CAR_LIMIT_MIN = 9 * CV.MPH_TO_MS  # m/s
@@ -88,13 +94,35 @@ class SpeedLimitResolver:
     self.speed_limit_final = 0.
     self.speed_limit_final_last = 0.
     self.speed_limit_offset = 0.
+    self._reading = 0.  # the current non-zero limit, its final, and how many frames it has held
+    self._reading_final = 0.
+    self._reading_frames = 0
+    self._fallback: tuple[float, float] | None = None  # the held (limit, final) the current reading took over from
 
   def update_speed_limit_states(self) -> None:
     self.speed_limit_final = self.speed_limit + self.speed_limit_offset
 
+    settle = int(LAST_LIMIT_SETTLE / DT_MDL)
     if self.speed_limit > 0.:
+      if self.speed_limit != self._reading:
+        # only a reading that took over from a held one, with no dropout between, can give way to it
+        if self._reading_frames >= settle:
+          self._fallback = (self._reading, self._reading_final)
+        elif self._reading <= 0.:
+          self._fallback = None
+        self._reading = self.speed_limit
+        self._reading_frames = 0
+      self._reading_frames += 1
+      self._reading_final = self.speed_limit_final
       self.speed_limit_last = self.speed_limit
       self.speed_limit_final_last = self.speed_limit_final
+    elif self._reading > 0.:
+      # every source dropped out: a reading that never held does not raise the last limit
+      if self._reading_frames < settle and self._fallback is not None and self._fallback[0] < self._reading:
+        self.speed_limit_last, self.speed_limit_final_last = self._fallback
+      self._reading = 0.
+      self._reading_frames = 0
+      self._fallback = None
 
   @property
   def speed_limit_valid(self) -> bool:

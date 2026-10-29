@@ -62,7 +62,7 @@ class TestSetpointReconcile:
     arb = self.v_cruise_helper.cruise_arbiter
     arb.enabled = True
     arb.state = getattr(custom.LongitudinalPlanSP.SpeedLimit.AssistState, sla_state)
-    arb._speed_limit_prev = arb._speed_limit  # regime setup is not a limit-change edge
+    arb._slf_prev = arb._slf  # regime setup is not a limit-change edge
 
   def run_frames(self, CS, n=1, enabled=True):
     for _ in range(n):
