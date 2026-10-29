@@ -856,7 +856,7 @@ class FeatureSettingsOwner:
         row = self._bool_row("MazdaTjaButton", "Mazda TJA Button",
                              parked and self.authority("parked_preferences") and self.authority("preferences"),
                              "Use the physical TJA button for steering assistance independently of cruise. " +
-                             "Requires Always On Lateral and stock longitudinal; applies after the next startup.")
+                             "Requires Always On Lateral; applies after the next startup.")
         rows.append(replace(row, available=row.available and self._readable("MazdaTjaButton"), capability=mazda_tja))
         from openpilot.starpilot.car.mazda.radar_status import read as read_radar_status, status_text
         import time

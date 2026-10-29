@@ -14,7 +14,7 @@ def confirmation_question(request):
   if request.key in LABELS:
     return f"{verb} {LABELS[request.key][0].lower()}? This changes Panda firmware after the next device restart."
   if request.key == "MazdaTjaButton":
-    return f"{verb} the physical Mazda TJA button for steering assistance independently of cruise after the next startup? Requires Always On Lateral and stock longitudinal."
+    return f"{verb} the physical Mazda TJA button for steering assistance independently of cruise after the next startup? Requires Always On Lateral."
   if request.key == "AlphaLongitudinalEnabled":
     return (f"{verb} Alpha Longitudinal after the next startup? StarPilot will request speed control instead of factory ACC. " +
             "Automatic Emergency Braking may be disabled; exact startup checks still apply.")

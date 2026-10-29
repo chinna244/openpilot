@@ -380,10 +380,12 @@ static void mazda_port_fwd_modify(int bus_num, CANPacket_t *msg) {
 
 static safety_config mazda_port_init(uint16_t param) {
   mazda_aol_reset();
+  mazda_aol_alpha_long = false;
   if (((param & ~11U) != 0U) || ((param & MAZDA_PARAM_EPS_HW) == 0U)) {
     return (safety_config){0};
   }
   mazda_aol_enabled = (unsigned int)alternative_experience == 32U;
+  mazda_aol_alpha_long = mazda_aol_enabled && GET_FLAG(param, MAZDA_PARAM_LONGITUDINAL);
   if (mazda_aol_enabled) {
     static const AolSafetyPolicy policy = {
       .reset = mazda_aol_reset,

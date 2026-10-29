@@ -7,7 +7,7 @@ from openpilot.starpilot.ui.long_profile_feature import CATEGORY_HELP, VALUE_HEL
 
 DESCRIPTIONS = {
   "MazdaTjaButton": ("Uses the physical Mazda TJA button to toggle steering assistance independently of cruise. " +
-                     "Requires Always On Lateral and stock longitudinal; applies after the next startup."),
+                     "Requires Always On Lateral; applies after the next startup."),
   'FordPrefSteerAngleCurvature': 'Uses steering pinion angle instead of yaw rate to estimate Ford steering curvature. Applies at the next vehicle startup.',
   'lane_change:turn_signal_guidance': 'Uses your turn signal to help the model choose a turning path at intersections.',
   'AlphaLongitudinalEnabled': ('Requests StarPilot speed control instead of factory ACC. May disable Automatic Emergency Braking. ' +

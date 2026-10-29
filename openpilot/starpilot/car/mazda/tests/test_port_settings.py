@@ -16,20 +16,13 @@ def params_cp(alpha=False):
 
 
 def test_tja_preference_is_bound_before_controller_construction():
-  configured = VehicleStartupPreferences(mazda_tja=True).prepare(params_cp())
-  assert configured.safetyConfigs[0].safetyParam == 10
+  cp = params_cp(True)
+  configured = VehicleStartupPreferences(mazda_tja=True).prepare(cp)
+  assert configured.safetyConfigs[0].safetyParam == 11
   ci = CarInterface(configured)
   assert ci.CP_SP.flags & 1
   assert policy_for(configured).runtime_supported
   assert not policy_for(configured).cruise_main_required
-
-
-def test_alpha_long_admits_neither_aol_nor_tja():
-  # AOL's native long bit needs vehicle_moving, so alpha long's standstill hold would be refused
-  configured = VehicleStartupPreferences(mazda_tja=True).prepare(params_cp(True))
-  assert configured.openpilotLongitudinalControl and configured.safetyConfigs[0].safetyParam == 3
-  assert not CarInterface(configured).CP_SP.flags & 1
-  assert not policy_for(configured).runtime_supported
 
 
 def test_tja_switch_owns_lateral_without_arming_mrcc():

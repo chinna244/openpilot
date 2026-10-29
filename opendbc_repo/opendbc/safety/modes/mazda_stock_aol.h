@@ -1,6 +1,8 @@
 #pragma once
 
 static bool mazda_aol_enabled = false;
+// set by each init, never by the AOL policy's runtime reset: openpilot longitudinal (word bit 1) under AOL
+static bool mazda_aol_alpha_long = false;
 static bool mazda_aol_startup_pending = true;
 static bool mazda_aol_token = false;
 static bool mazda_aol_neutral = false;
@@ -92,6 +94,15 @@ static uint8_t mazda_aol_request_mask(void) {
   return request;
 }
 
+// Alpha long's axis under AOL: as without AOL it follows the cruise engagement alone, so its standstill hold
+// survives the stop and the lateral sources (motion, gear D, LKAS_BLOCK, camera) never withdraw it. A current
+// host long request, the engaged heartbeat, healthy RX and no relay malfunction still gate it.
+static bool mazda_aol_alpha_long_allowed(void) {
+  return mazda_aol_alpha_long && controls_allowed && ((aol_host_axis_mask & 2U) != 0U) && heartbeat_engaged &&
+    (safety_get_ts_elapsed(microsecond_timer_get(), aol_host_request_ts) <= AOL_HOST_REQUEST_TIMEOUT_US) &&
+    !relay_malfunction && !safety_rx_checks_invalid && aol_rx_healthy();
+}
+
 static uint8_t mazda_aol_permission(void) {
   const uint8_t request = mazda_aol_request_mask();
   uint8_t permission = 0U;
@@ -99,9 +110,12 @@ static uint8_t mazda_aol_permission(void) {
     if (controls_allowed || mazda_aol_token) {
       permission = request & 1U;
     }
-    if (controls_allowed) {
+    if (controls_allowed && !mazda_aol_alpha_long) {
       permission |= request & 2U;
     }
+  }
+  if (mazda_aol_alpha_long_allowed()) {
+    permission |= 2U;
   }
   return permission;
 }

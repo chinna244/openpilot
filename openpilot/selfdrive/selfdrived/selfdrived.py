@@ -13,6 +13,7 @@ from openpilot.cereal import log
 from opendbc.car.structs import car
 from opendbc.car.hyundai.ev6_aol import qualified as ev6_aol_qualified
 from opendbc.car.honda.stock_aol import qualified as honda_aol_qualified, temporary_restriction as honda_temporary_restriction
+from opendbc.car.mazda.stock_aol import qualified as mazda_aol_qualified
 from openpilot.cereal.visionipc import VisionStreamType
 from msgq.visionipc import VisionIpcClient
 
@@ -1820,6 +1821,42 @@ class SelfdriveD:
                 not native.pandaInventory[owners[0]].controlsAllowed and
                 not self.sm['pandaStates'][owners[0]].controlsAllowed)
 
+  def mazda_alpha_long_withdrawal(self, CS, native, previous, requested, intent, *, source_current, now_ns):
+    """Mazda AOL with alpha long: the native LONG bit follows cruise alone (mazda_aol_alpha_long_allowed),
+    so a brake or cancel drops it with controls_allowed, possibly before Card parses the edge. Mazda grants
+    no LAT at a stop or with the TJA latch off, so the LAT-anchored withdrawal above never excuses it there.
+    Withdraw LONG only while every Panda reports controls_allowed false; all proof and health checks remain."""
+    from openpilot.starpilot.aol.transport_pause import _configured_transport_native
+    proof = getattr(self, 'aol_published_input_proof', None)
+    prior = getattr(self, 'aol_published_input_native', None)
+    companion = getattr(self, 'aol_intent_companion', None)
+    if (not self.CP.openpilotLongitudinalControl or not mazda_aol_qualified(self.CP, marked_only=True) or
+        not self.enabled or not self.active or not previous.longitudinal_active or not requested.desired_longitudinal or
+        not source_current or not self.conditional_car_state_valid or not 0 < self.aol_car_state_log_ns <= now_ns or
+        now_ns - self.aol_car_state_log_ns > INTENT_MAX_AGE_NS or
+        native is None or prior is None or proof is None or proof[0] != self.aol_session_id or not proof[9] or
+        not 0 < proof[2] <= now_ns <= proof[3] or intent is None or companion is None or
+        proof[4] != intent.producerSessionId or proof[5] != companion.integrity_epoch or
+        not native.requestedLongitudinal or native.longitudinalAllowed or not native.pandaInventory or
+        CS.brakePressed or CS.gasPressed or
+        any(self.events.contains(kind) for kind in (ET.IMMEDIATE_DISABLE, ET.SOFT_DISABLE, ET.USER_DISABLE,
+                                                  ET.OVERRIDE_LONGITUDINAL))):
+      return False
+    def identity(state):
+      return (state.axisSessionId, state.pandaSerial, state.safetyModel, state.safetyParam,
+              tuple((slot.slotIndex, slot.hardwareSerial, slot.safetyModel, slot.safetyParam,
+                     slot.alternativeExperience) for slot in state.pandaInventory))
+    if (identity(prior) != identity(native) or
+        not 0 < prior.observedMonoTime <= native.observedMonoTime <= now_ns <= prior.validUntilMonoTime or
+        not CS.canValid or CS.canTimeout or
+        _configured_transport_native(self.sm, self.CP, self.aol_session_id, now_ns, native,
+                                     require_longitudinal=False, allow_restricted_lateral=True) != native):
+      return False
+    owners = [index for index, config in enumerate(self.CP.safetyConfigs)
+              if str(config.safetyModel) not in ('silent', 'noOutput')]
+    return bool(len(owners) == 1 and not native.pandaInventory[owners[0]].controlsAllowed and
+                not self.sm['pandaStates'][owners[0]].controlsAllowed)
+
   def honda_native_lateral_grant_lost(self, CS, native, previous, requested, *, source_current, previous_intent, intent, now_ns):
     """An established host LAT request lost its native grant, not a cold wait."""
     pause = getattr(self, 'aol_transport_pause', None)
@@ -1944,9 +1981,11 @@ class SelfdriveD:
       lost_honda_lateral_grant = self.honda_native_lateral_grant_lost(
         CS, native, previous, requested, source_current=source_current,
         previous_intent=previous_intent, intent=intent, now_ns=now_ns)
-      ordinary_long_withdrawal = bool(native is not None and not native.longitudinalAllowed and
+      ordinary_long_withdrawal = bool(native is not None and not native.longitudinalAllowed and (
         self.ordinary_native_long_withdrawal(
-          CS, native, previous, requested, intent, source_current=source_current, now_ns=now_ns))
+          CS, native, previous, requested, intent, source_current=source_current, now_ns=now_ns) or
+        self.mazda_alpha_long_withdrawal(
+          CS, native, previous, requested, intent, source_current=source_current, now_ns=now_ns)))
       from openpilot.starpilot.car.hyundai.aol import expected_stopped_lateral_denial
       stopped_lateral_withdrawal = bool(source_current and requested.desired_lateral and
         expected_stopped_lateral_denial(self.CP, CS, native, sm=self.sm,

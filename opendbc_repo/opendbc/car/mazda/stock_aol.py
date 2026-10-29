@@ -14,12 +14,11 @@ def qualified(cp, *, marked_only=False):
   flags, word = int(cp.flags), int(cp.safetyConfigs[0].safetyParam)
   legacy = flags == int(MazdaFlags.GEN1) and word == 0 and not cp.openpilotLongitudinalControl
   known = int(MazdaFlags.GEN1 | MazdaFlags.EPS_HW | MazdaFlags.G46L_RADAR | MazdaFlags.HAS_BSM)
-  # As in base StarPilot, AOL is never admitted with openpilot longitudinal: its native long bit needs
-  # vehicle_moving, gear D and no LKAS_BLOCK (mazda_stock_aol.h), so alpha long's standstill hold would
-  # be refused at every stop. Alpha-long cars run ordinary cruise-coupled lateral.
   measured = (flags & ~known == 0 and flags & int(MazdaFlags.GEN1) and
               flags & int(MazdaFlags.EPS_HW) in (int(MazdaFlags.STEER_TO_ZERO_EPS), int(MazdaFlags.LEGACY_FW_EPS)) and
-              word in (2, 10) and not cp.openpilotLongitudinalControl)
+              word in (2, 3, 10, 11) and bool(word & 1) == bool(cp.openpilotLongitudinalControl) and
+              (not cp.openpilotLongitudinalControl or
+               cp.carFingerprint == CAR.MAZDA_CX5_2022 and bool(flags & int(MazdaFlags.STEER_TO_ZERO_EPS)) and cp.alphaLongitudinalAvailable))
   return bool(legacy or measured)
 
 

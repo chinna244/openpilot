@@ -46,9 +46,7 @@ def exercise_startup(identity, alpha, release, aol, monkeypatch, mapping=(0, 0),
     explicit_owner = True
     assert initial.openpilotLongitudinalControl is (alpha and initial.alphaLongitudinalAvailable and not release)
     assert initial.pcmCruise and not initial.dashcamOnly
-    # AOL is never admitted with alpha long (stock_aol.qualified): its native long bit needs vehicle_moving
-    admitted = aol and not initial.openpilotLongitudinalControl
-    expected["alternativeExperience"] = 32 if admitted and explicit_owner else 0
+    expected["alternativeExperience"] = 32 if aol and explicit_owner else 0
     subscriber = messaging.sub_sock("carParams", timeout=100, conflate=True)
     intent_subscriber = messaging.sub_sock("aolIntentWire", timeout=100, conflate=True)
     card = ci = controls = None
@@ -63,8 +61,8 @@ def exercise_startup(identity, alpha, release, aol, monkeypatch, mapping=(0, 0),
       ci = card.CI
       assert card.CP.to_dict() == expected
       assert ci.CP is card.CP and ci.CC is not None
-      assert card.aol_qualified is admitted
-      if admitted:
+      assert card.aol_qualified is aol
+      if aol:
         assert card.aol_card_intent.explicit_latch is explicit_owner
         assert not card.aol_card_intent.allowed_latch
         assert card.aol_card_intent.settings.main_action == mapping[0]
@@ -88,10 +86,10 @@ def exercise_startup(identity, alpha, release, aol, monkeypatch, mapping=(0, 0),
       assert intent.producerSessionId == card.slc_producer_session
       controls = Controls()
       assert controls.CP.to_dict() == expected
-      assert controls.ordinary_axis_ack_required is (admitted and explicit_owner)
+      assert controls.ordinary_axis_ack_required is (aol and explicit_owner)
       now = 1_000_000_000
       feed(controls, now, 0, active=False, enabled=False, can_valid=False, can_timeout=True)
-      if admitted:
+      if aol:
         receipt = messaging.new_message("aolSafetyWire", 0, valid=True, logMonoTime=now)
         receipt.aolSafetyWire = encode_safety(SafetyState(
           1, True, now, now + 200_000_000, int(card.CP.safetyConfigs[0].safetyModel.raw),

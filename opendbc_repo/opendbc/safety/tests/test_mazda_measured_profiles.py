@@ -640,7 +640,7 @@ class MazdaAolHarness:
     self.time += us
     self.safety.set_timer(self.time)
 
-  def feed(self, main=True, speed=80, brake=False, gear=4, lkas_block=0, cam_err=0, btns=None, omit=(), request=None):
+  def feed(self, main=True, speed=80, brake=False, gear=4, lkas_block=0, cam_err=0, btns=None, omit=(), request=None, refresh=True):
     long = _is_long(self.word)
     frames = (
       ("CRZ_CTRL", 0, {"CRZ_AVAILABLE": int(main), "CRZ_ACTIVE": int(self.cruise and not long)}),
@@ -656,7 +656,8 @@ class MazdaAolHarness:
       if name not in omit:
         self.safety.safety_rx_hook(self.msg(name, fields, bus))
     self.safety.safety_tick()
-    self.safety.aol_set_host_request(self.request if request is None else request)
+    if refresh:
+      self.safety.aol_set_host_request(self.request if request is None else request)
 
   def prime(self, **kwargs):
     # two rounds: a frame heard before the optional sources are current can neither grant nor go neutral
@@ -1010,13 +1011,11 @@ class TestMazdaMeasuredAol(unittest.TestCase):
           self.assertEqual(-1, h.safety.safety_fwd_hook(2, addr))
           self.assertEqual(-1, h.safety.safety_fwd_hook(0, addr))
 
-  def test_aol_long_accel_follows_the_aol_long_bit(self):
-    # CHARACTERIZATION of a reported port difference (see the remediation report). Under AOL the port's
-    # longitudinal_accel_checks (mazda_port.h:299) read longitudinal_controls_allowed() (safety.h:115-121), the
-    # AOL permission bit 1, which mazda_aol_permission gates on vehicle_moving, gear D, no LKAS_BLOCK and no
-    # camera fault (mazda_stock_aol.h:98). The source gates accel on controls_allowed only. So with cruise
-    # engaged a nonzero CRZ_INFO accel is refused at standstill, during an EPS LKAS_BLOCK and out of D under
-    # AOL, while alternative_experience 0 sends it. ACC_ACTIVE and CRZ_CTRL stay controls_allowed-gated.
+  def test_aol_alpha_long_accel_holds_through_lateral_restrictions(self):
+    # Under AOL the port's longitudinal_accel_checks read longitudinal_controls_allowed() (safety.h), the AOL
+    # permission bit 1. With alpha long that bit follows the cruise engagement alone, as alternative_experience 0
+    # does (mazda_aol_alpha_long_allowed): the -1.0 standstill hold, an EPS LKAS_BLOCK and out of D keep the accel
+    # while the lateral bit is withheld there.
     for word in (LONG, TJA_LONG):
       for experience in (0, AOL):
         with self.subTest(word=word, experience=experience):
@@ -1032,11 +1031,62 @@ class TestMazdaMeasuredAol(unittest.TestCase):
           for fault in ({"speed": 0}, {"lkas_block": 1}, {"gear": 2}):
             h.feed(**fault)
             self.assertTrue(h.safety.get_controls_allowed(), fault)
-            self.assertEqual(experience == 0, h.safety.safety_tx_hook(accel), fault)
+            self.assertTrue(h.safety.safety_tx_hook(accel), fault)
+            if experience == AOL:
+              self.assertEqual(0, h.lat(), fault)
+              self.assertEqual(2, h.safety.aol_get_permission_mask() & 2, fault)
             self.assertTrue(h.safety.safety_tx_hook(zero))
             self.assertTrue(h.safety.safety_tx_hook(h.msg("CRZ_CTRL", {"CRZ_ACTIVE": 1})))
             h.feed()
             self.assertTrue(h.safety.safety_tx_hook(accel), fault)
+
+  def test_aol_alpha_long_bit_needs_cruise_request_and_heartbeat(self):
+    # Only the lateral restrictions are lifted: no cruise engagement, no host long request, a stale request,
+    # a lost heartbeat or a relay malfunction each refuse the nonzero accel, at a stop and moving.
+    for word in (LONG, TJA_LONG):
+      for speed in (0, 80):
+        for fault in ("cruise", "no_request", "stale", "heartbeat", "relay"):
+          with self.subTest(word=word, speed=speed, fault=fault):
+            h = MazdaAolHarness(self, word)
+            h.prime()
+            h.engage_cruise()
+            h.request = 3
+            h.feed(speed=speed)
+            accel = h.msg("CRZ_INFO", {"ACCEL_CMD": -1.0, "ACC_ACTIVE": 1})
+            self.assertTrue(h.safety.safety_tx_hook(accel))
+            if fault == "cruise":
+              h.cruise = False
+              h.safety.safety_rx_hook(h.msg("PEDALS", {"ACC_OFF": 1, "ACC_ACTIVE": 0}))
+              self.assertFalse(h.safety.get_controls_allowed())
+            elif fault == "no_request":
+              h.safety.aol_set_host_request(1)
+            elif fault == "stale":
+              # CAN stays current (RX healthy), only the host request ages past AOL_HOST_REQUEST_TIMEOUT_US
+              for _ in range(31):
+                h.tick()
+                h.feed(speed=speed, refresh=False)
+            elif fault == "heartbeat":
+              h.safety.set_aol_test_heartbeat(False)
+            else:
+              h.safety.set_relay_malfunction(True)
+            self.assertEqual(0, h.safety.aol_get_permission_mask() & 2)
+            self.assertFalse(h.safety.safety_tx_hook(accel))
+            if fault == "stale":
+              h.feed(speed=speed)  # a fresh request alone restores it: the request age was the only gate
+              self.assertEqual(2, h.safety.aol_get_permission_mask() & 2)
+
+  def test_stock_long_aol_keeps_the_long_bit_on_the_lateral_gate(self):
+    # Stock-long words are unchanged: their long bit still needs motion, gear D and no LKAS_BLOCK.
+    for word in (EPS, TJA):
+      with self.subTest(word=word):
+        h = MazdaAolHarness(self, word)
+        h.prime()
+        h.engage_cruise()
+        h.request = 3
+        h.feed()
+        self.assertEqual(3, h.safety.aol_get_permission_mask())
+        h.feed(speed=0)
+        self.assertEqual(0, h.safety.aol_get_permission_mask())
 
 
 class TestMazdaMeasuredTjaForwardCopy(unittest.TestCase):
