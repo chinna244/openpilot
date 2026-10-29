@@ -109,11 +109,11 @@ class TestSlaSession:
 
   @pytest.mark.parametrize("is_metric", [False, True], ids=["mph", "kph"])
   def test_mid_move_minus_dismiss_never_restores_upward(self, is_metric):
-    """- while ICBM is still walking down: the driver asked for slower. The session ends
-    and the ECU's own -1 lands, and from there the dash must never climb: the
-    in-transit dash failed the reconciler's agreement checks, nothing re-anchored, and
-    3 s later the servo walked 51 -> 60 inside the 45 zone. The setpoint floors to the
-    dash once the press settles and the servo has nothing to restore."""
+    """- while ICBM is still walking down: the driver asked for slower, toward the limit just
+    confirmed, so the session stands (CONFIRM_FOLLOW_PERIOD) and the walk lands the limit. From
+    the press on the dash must never climb: the in-transit dash once failed the reconciler's
+    agreement checks, nothing re-anchored, and 3 s later the servo walked 51 -> 60 inside the
+    45 zone."""
     loop = Loop(baseline_mph=60, seed=5, is_metric=is_metric)
     confirm_lower(loop, limit=45)
 
@@ -127,9 +127,8 @@ class TestSlaSession:
     def never_up(lo, ceiling=dash_after_press, m=is_metric):
       assert lo.ecu.dash <= ceiling, f"metric={m}: servo restored upward at {lo.tick_n / 100.:.2f}s: {lo.ecu.dash} > {ceiling}"
     loop.run(14.0, assert_each=never_up)  # grace + quiet window + whatever restore would follow
-    assert loop.sla.state == SlaState.inactive
-    assert loop.v_cruise_mph == loop.ecu.dash, \
-      f"metric={is_metric}: setpoint {loop.v_cruise_mph} left off the dash {loop.ecu.dash}"
+    assert loop.sla.state == SlaState.active
+    assert loop.ecu.dash == 45, f"metric={is_metric}: the walk stopped at {loop.ecu.dash}"
 
   @pytest.mark.parametrize("forged_mode, seed", [('taps', 6), ('ignored', 7)])
   def test_synthesized_holds_still_reach_limit(self, forged_mode, seed):

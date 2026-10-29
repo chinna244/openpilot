@@ -36,7 +36,13 @@ same frame as the button events and the setpoint writer. It reuses the upstream
   is held (latching mid-hold would cap a driver dialing past the limit), only within
   `DRIVER_DIAL_PERIOD` of a wheel press edge (a dash the ICBM servo walks onto the limit
   is not a dial), and only if the driver has not dismissed since the last limit change.
-- `preActive`: resolved by a press (below) or by the 5 s timeout (`inactive`). A prompt
+- `preActive`: resolved by a press (below) or by the 5 s timeout (`inactive`). A press in
+  the prompt's direction within `LATE_ANSWER_PERIOD` (1.5 s) after the timeout, with the limit
+  unchanged, still confirms (route 00000009: + came 0.53 s late). An unanswered prompt asks
+  again while the set speed stands more than `REPROMPT_MARGIN` over or under the target and the
+  car is near the lower of the two, at most `REPROMPT_MAX` times per limit. On ICBM cars a
+  press toward the target within `CONFIRM_FOLLOW_PERIOD` (5 s) of a confirm, while the servo is
+  still walking the dash there, keeps the session instead of dismissing it. A prompt
   is not opened when the dash already shows the limit (`_enter_prompt` activates). The
   dash reaching the limit resolves nothing here: on ICBM cars the servo moves it.
 - `active`: a limit change prompts when `confirm_needed_for_change` says so (below the

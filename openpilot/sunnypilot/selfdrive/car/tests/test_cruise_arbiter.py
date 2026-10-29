@@ -18,7 +18,8 @@ from openpilot.common.params import Params
 from openpilot.common.realtime import DT_CTRL
 from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.helpers import pcm_machine_owns_sla
 from openpilot.sunnypilot.selfdrive.car import cruise_arbiter
-from openpilot.sunnypilot.selfdrive.car.cruise_arbiter import CruiseArbiter, REPROMPT_COOLDOWN, REPROMPT_HOLD, REPROMPT_MAX, \
+from openpilot.sunnypilot.selfdrive.car.cruise_arbiter import CruiseArbiter, CONFIRM_FOLLOW_PERIOD, LATE_ANSWER_PERIOD, REPROMPT_COOLDOWN, \
+  REPROMPT_HOLD, REPROMPT_MAX, \
   PRE_ACTIVE_GUARD_PERIOD as ARBITER_PROMPT_PERIOD, DISABLED_GUARD_PERIOD as ARBITER_GUARD_PERIOD
 from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.common import Mode
 
@@ -392,6 +393,7 @@ class TestCruiseArbiterNonPcm:
 
   def test_any_press_is_an_answer(self):
     self.ignored_prompt()
+    self.run(LATE_ANSWER_PERIOD, 63, 30, 30.)  # past the window in which a - would still confirm
     self.press(ButtonType.decelCruise, 63, 30)  # the driver steps the set speed down by hand
     self.run(REPROMPT_COOLDOWN + 2 * REPROMPT_HOLD, 62, 30, 30.)
     assert self.arb.state == SpeedLimitAssistState.inactive
@@ -425,4 +427,124 @@ class TestCruiseArbiterNonPcm:
     for _ in range(3):  # then over for less than the hold, dropping back below the near band each time
       self.run(REPROMPT_HOLD - 0.5, 63, 30, 30.)
       self.run(0.1, 63, 30, 10.)
+    assert self.arb.state == SpeedLimitAssistState.inactive
+
+  # the same for a set speed under the limit: route 00000009 + for 35 from a set speed of 19 went unanswered
+
+  def test_an_unanswered_plus_prompt_asks_again(self):
+    self.v_cruise_kph = 25 * CV.MPH_TO_KPH
+    self.ignored_prompt(cluster_mph=25, limit_mph=35, v_mph=25.)
+    self.run(REPROMPT_COOLDOWN + REPROMPT_HOLD + 0.1, 25, 35, 25.)
+    assert self.arb.state == SpeedLimitAssistState.preActive
+    self.press(ButtonType.accelCruise, 25, 35)
+    assert self.arb.state == SpeedLimitAssistState.active
+    assert round(self.v_cruise_kph * CV.KPH_TO_MPH) == 35
+
+  @pytest.mark.parametrize("cluster_mph, v_mph, gas", [
+    (33, 33., False),   # the set speed is within the margin of the 35 mph target
+    (25, 15., False),   # still pulling away: the set speed is not yet what holds the car
+    (25, 25., True),    # the driver is on the throttle
+    (25, 0., False),    # stopped
+  ])
+  def test_no_plus_reprompt_when_there_is_nothing_to_ask(self, cluster_mph, v_mph, gas):
+    self.ignored_prompt(cluster_mph=cluster_mph, limit_mph=35, v_mph=v_mph)
+    self.run(REPROMPT_COOLDOWN + 2 * REPROMPT_HOLD, cluster_mph, 35, v_mph, gas=gas)
+    assert self.arb.state == SpeedLimitAssistState.inactive
+
+  # a press in the prompt's direction just after it closed unanswered still answers it, either way
+
+  @pytest.mark.parametrize("cluster_mph, limit_mph, button", [
+    (19, 35, ButtonType.accelCruise),   # route 00000009: + 0.53 s after the window
+    (63, 30, ButtonType.decelCruise),
+  ], ids=["plus", "minus"])
+  def test_a_late_answer_confirms(self, cluster_mph, limit_mph, button):
+    self.v_cruise_kph = cluster_mph * CV.MPH_TO_KPH
+    self.ignored_prompt(cluster_mph, limit_mph, v_mph=18.)
+    self.press(button, cluster_mph, limit_mph)
+    assert self.arb.state == SpeedLimitAssistState.active
+    assert self.arb.press_owned(button) or not self.arb._press  # the confirm press itself does not step the setpoint
+    assert abs(self.arb.v_cap - limit_mph * self.MPH) < 0.1
+    expected = max(cluster_mph, limit_mph)  # + raises the baseline to the limit; - leaves it and caps
+    assert round(self.v_cruise_kph * CV.KPH_TO_MPH) == expected
+
+  @pytest.mark.parametrize("cluster_mph, limit_mph, button", [
+    (19, 35, ButtonType.decelCruise),
+    (63, 30, ButtonType.accelCruise),
+  ], ids=["minus_on_plus_prompt", "plus_on_minus_prompt"])
+  def test_a_late_press_the_other_way_is_a_plain_press(self, cluster_mph, limit_mph, button):
+    self.ignored_prompt(cluster_mph, limit_mph, v_mph=18.)
+    self.press(button, cluster_mph, limit_mph)
+    assert self.arb.state == SpeedLimitAssistState.inactive
+    assert not self.arb.press_owned(button)
+
+  def test_a_press_after_the_late_window_is_a_plain_press(self):
+    self.ignored_prompt(cluster_mph=19, limit_mph=35, v_mph=18.)
+    self.run(LATE_ANSWER_PERIOD, 19, 35, 18.)
+    self.press(ButtonType.accelCruise, 19, 35)
+    assert self.arb.state == SpeedLimitAssistState.inactive
+    assert not self.arb.press_owned(ButtonType.accelCruise)
+
+  def test_a_late_answer_needs_the_same_limit(self):
+    self.ignored_prompt(cluster_mph=19, limit_mph=35, v_mph=18.)
+    self.frame(19, 40, v_mph=18.)  # a new limit opens its own prompt
+    assert self.arb.state == SpeedLimitAssistState.preActive
+    assert self.arb._late_answer_timer == 0
+
+  def test_a_late_press_held_into_a_new_limit_does_not_confirm_it(self):
+    self.ignored_prompt(cluster_mph=19, limit_mph=35, v_mph=18.)
+    self.frame(19, 35, events=[car_struct.CarState.ButtonEvent(type=ButtonType.accelCruise, pressed=True)], v_mph=18.)
+    self.frame(19, 45, v_mph=18.)  # a new limit prompts while + is still held
+    assert self.arb.state == SpeedLimitAssistState.preActive
+    self.frame(19, 45, events=[car_struct.CarState.ButtonEvent(type=ButtonType.accelCruise, pressed=False)], v_mph=18.)
+    assert self.arb.state == SpeedLimitAssistState.preActive
+    assert not self.arb.press_owned(ButtonType.accelCruise)
+
+  def test_a_press_held_across_the_timeout_answers_the_prompt(self):
+    self.v_cruise_kph = 19 * CV.MPH_TO_KPH
+    self.go_pre_active(19, 35)
+    self.run(ARBITER_PROMPT_PERIOD - 0.1, 19, 35, 18.)
+    self.frame(19, 35, events=[car_struct.CarState.ButtonEvent(type=ButtonType.accelCruise, pressed=True)], v_mph=18.)
+    self.run(0.2, 19, 35, 18.)  # the window closes under the held press
+    self.frame(19, 35, events=[car_struct.CarState.ButtonEvent(type=ButtonType.accelCruise, pressed=False)], v_mph=18.)
+    assert self.arb.state == SpeedLimitAssistState.active
+    assert self.arb.press_owned(ButtonType.accelCruise)
+    assert round(self.v_cruise_kph * CV.KPH_TO_MPH) == 35
+
+  def test_no_reprompt_without_a_dash_speed(self):
+    self.ignored_prompt(cluster_mph=19, limit_mph=35, v_mph=18.)
+    self.run(REPROMPT_COOLDOWN + 2 * REPROMPT_HOLD, 0, 35, 3.)
+    assert self.arb.state == SpeedLimitAssistState.inactive
+
+  # after a confirm the dash walks to the target; a further press the same way does not end the session
+
+  @pytest.mark.parametrize("cluster_mph, limit_mph, button", [
+    (19, 35, ButtonType.accelCruise),
+    (63, 30, ButtonType.decelCruise),
+  ], ids=["plus", "minus"])
+  def test_a_follow_up_press_toward_the_target_keeps_the_session(self, cluster_mph, limit_mph, button):
+    self.go_pre_active(cluster_mph, limit_mph)
+    self.press(button, cluster_mph, limit_mph)
+    assert self.arb.state == SpeedLimitAssistState.active
+    step = 1 if button == ButtonType.accelCruise else -1
+    self.run(2., cluster_mph + step, limit_mph, 18.)
+    self.press(button, cluster_mph + step, limit_mph)
+    assert self.arb.state == SpeedLimitAssistState.active
+    assert self.arb.press_owned(button) or not self.arb._press
+
+  def test_a_follow_up_press_the_other_way_dismisses(self):
+    self.go_pre_active(19, 35)
+    self.press(ButtonType.accelCruise, 19, 35)
+    self.press(ButtonType.decelCruise, 20, 35)
+    assert self.arb.state == SpeedLimitAssistState.inactive
+
+  def test_a_press_past_the_target_or_after_the_window_dismisses(self):
+    self.go_pre_active(19, 35)
+    self.press(ButtonType.accelCruise, 19, 35)
+    self.press(ButtonType.accelCruise, 35, 35)  # the dash is at the target: + now asks for more
+    assert self.arb.state == SpeedLimitAssistState.inactive
+    self.frame(35, 40)
+    self.press(ButtonType.accelCruise, 35, 40)
+    assert self.arb.state == SpeedLimitAssistState.active
+    self.run(CONFIRM_FOLLOW_PERIOD, 36, 40, 30.)
+    self.press(ButtonType.accelCruise, 36, 40)
     assert self.arb.state == SpeedLimitAssistState.inactive
