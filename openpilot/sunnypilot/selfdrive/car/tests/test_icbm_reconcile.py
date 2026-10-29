@@ -254,3 +254,35 @@ class TestSetpointReconcile:
     self.press(ButtonType.decelCruise, dash_kph=20 * MPH)
     self.run_frames(make_car_state(dash_kph=dash_kph), n=20)
     assert self.v_cruise_helper.v_cruise_kph == pytest.approx(expected_kph, abs=0.1)
+
+  def test_engage_tap_released_before_the_ecu_reports_adopts_the_dash(self):
+    """Route 0000000b 25.3 s: SET+ released at 25.32 s, the ECU's 19 mph landed at 25.35 s. Engaged without a
+    baseline, nothing adopted one; once an SLA cap let go the plan targeted V_CRUISE_MAX and ICBM walked 35 -> 55."""
+    def cs(dash_kph, events=None):
+      CS = make_car_state(dash_kph=dash_kph, button_events=events)
+      CS.cruiseState.enabled = dash_kph > 0
+      return CS
+    self.run_frames(cs(0.), n=5, enabled=False)
+    self.run_frames(cs(0., [ButtonEvent(type=ButtonType.accelCruise, pressed=True)]), n=1, enabled=False)
+    self.run_frames(cs(0., [ButtonEvent(type=ButtonType.accelCruise, pressed=False)]), n=1, enabled=True)
+    assert self.v_cruise_helper.v_cruise_kph == 255  # engaged, the ECU has not reported yet
+    self.run_frames(cs(25 * MPH), n=1, enabled=True)  # the ECU's set speed lands (19 on the car; this floor is 20)
+    assert self.v_cruise_helper.v_cruise_kph == pytest.approx(25 * MPH, abs=0.1)
+    # and it is an ordinary baseline from there: the dash moving without a press is not adopted
+    self.run_frames(cs(35 * MPH), n=200, enabled=True)
+    assert self.v_cruise_helper.v_cruise_kph == pytest.approx(25 * MPH, abs=0.1)
+
+  def test_no_adoption_without_a_set_speed(self):
+    CS = make_car_state(dash_kph=0.)
+    self.run_frames(CS, n=10, enabled=True)
+    assert self.v_cruise_helper.v_cruise_kph == 255
+
+  @pytest.mark.parametrize("button", [ButtonType.accelCruise, ButtonType.decelCruise])
+  def test_a_press_before_the_ecu_reports_does_not_invent_a_setpoint(self, button):
+    """Stepping an unset baseline clipped it to V_CRUISE_MAX (90 mph) for good; the press waits for the dash."""
+    self.run_frames(make_car_state(dash_kph=0.), n=5, enabled=False)
+    self.run_frames(make_car_state(dash_kph=0.), n=5, enabled=True)
+    self.press(button, dash_kph=0.)
+    assert self.v_cruise_helper.v_cruise_kph == 255
+    self.run_frames(make_car_state(dash_kph=30 * MPH), n=1)  # the ECU reports, cruise not yet enabled (radar guard)
+    assert self.v_cruise_helper.v_cruise_kph == pytest.approx(30 * MPH, abs=0.1)

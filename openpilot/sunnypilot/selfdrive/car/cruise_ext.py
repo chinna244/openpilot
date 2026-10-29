@@ -180,6 +180,14 @@ class VCruiseHelperSP:
     if self.pcm_cruise_speed or not self.CP.pcmCruise:
       return
 
+    if self.v_cruise_kph == V_CRUISE_UNSET and CS.cruiseState.available and CS.cruiseState.speed > 0 \
+       and CS.cruiseState.speedCluster > 0:
+      # An engage tap released before the ECU reported its new set speed (route 0000000b 25.3 s: released at 25.32,
+      # the ECU's 19 mph landed at 25.35) leaves no baseline, and nothing else adopts one: the plan then targets
+      # V_CRUISE_MAX and ICBM walked the dash 35 -> 55 in a 30 zone once an SLA cap let go. The dash is the setpoint.
+      self.v_cruise_kph = float(np.clip(round(CS.cruiseState.speedCluster * CV.MS_TO_KPH, 1), self.v_cruise_min, V_CRUISE_MAX))
+      self.v_cruise_cluster_kph = self.v_cruise_kph
+
     if not CS.cruiseState.available or self.v_cruise_kph in (V_CRUISE_UNSET, -1):
       self.reconcile_frames = 0
       self.reconcile_floor = False

@@ -86,6 +86,7 @@ class IntelligentCruiseButtonManagement:
     self.restore_quiet_timer = 0
     self.v_target_raw = 0
     self.v_target_raw_prev = 0
+    self.setpoint_unset = False
     self.react_deadband = REACT_DEADBAND
     self.lookahead_valid = False
     self.dip_ahead = False
@@ -169,6 +170,8 @@ class IntelligentCruiseButtonManagement:
       v_target_ms = min(v_command, max(CS.cruiseState.speedCluster, v_plan))
 
     self.v_target = round(v_target_ms * speed_conv)
+    # no baseline means no driver setpoint to restore toward: never raise the dash on one (route 0000000b)
+    self.setpoint_unset = CS.vCruise >= V_CRUISE_UNSET
     # Judge restore intent against the unmodified plan target.
     self.v_target_raw_prev = self.v_target_raw
     self.v_target_raw = round(LP_SP.vTarget * speed_conv)
@@ -236,7 +239,7 @@ class IntelligentCruiseButtonManagement:
           up_allowed = ((self.overshoot_mph > 0 and self.limiter_active)
                         or not self.profile.decel_needs_stable_setpoint
                         or self.restore_quiet_timer >= RESTORE_QUIET_FRAMES)
-        up_allowed = up_allowed and self.up_grace_timer <= 0
+        up_allowed = up_allowed and self.up_grace_timer <= 0 and not self.setpoint_unset
 
         # Live limiters may decrease immediately. Residual overshoot after returning to cruise
         # may only release, while ordinary setpoint corrections remain unconditional.
@@ -263,7 +266,7 @@ class IntelligentCruiseButtonManagement:
 
         elif self.state == State.increasing:
           # Abort restoration when a lower target enters the lookahead.
-          if self.v_target <= self.v_cruise_cluster or self.dip_ahead:
+          if self.v_target <= self.v_cruise_cluster or self.dip_ahead or self.setpoint_unset:
             self.state = State.holding
 
         elif self.state == State.decreasing:

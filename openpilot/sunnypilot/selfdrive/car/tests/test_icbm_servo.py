@@ -331,3 +331,22 @@ class TestOpenpilotLongitudinal:
     run_frames(icbm, 45, 45, n=60, v_cruise_mph=45)
     run_frames(icbm, 35, 45, n=100, source='speedLimitAssist', v_cruise_mph=35, v_ego_mph=45, a_target=-0.5)
     assert icbm.overshoot_mph == 0.
+
+  def test_never_raises_the_dash_without_a_baseline(self):
+    """Route 0000000b: v_cruise left unset while engaged made the plan target V_CRUISE_MAX, and ICBM walked the
+    dash 35 -> 55 in a 30 zone. With no baseline there is no setpoint to restore toward: down moves only."""
+    unset_mph = 160  # 257 kph: at or above V_CRUISE_UNSET
+    icbm = make_icbm(brand='mazda')
+    run_frames(icbm, 35, 35, n=60, source='cruise', v_cruise_mph=unset_mph)
+    sends = run_frames(icbm, 90, 35, n=600, source='cruise', v_cruise_mph=unset_mph)
+    assert SendButtonState.increase not in sends
+    sends = run_frames(icbm, 25, 35, n=200, source='sccVision', v_cruise_mph=unset_mph)
+    assert SendButtonState.decrease in sends
+
+  def test_a_lost_baseline_mid_restore_stops_it(self):
+    icbm = make_icbm(brand='mazda')
+    run_frames(icbm, 35, 35, n=60, source='cruise', v_cruise_mph=35)
+    run_frames(icbm, 55, 35, n=300, source='cruise', v_cruise_mph=55)
+    assert icbm.state == State.increasing
+    run_frames(icbm, 90, 36, n=2, source='cruise', v_cruise_mph=160)
+    assert icbm.state == State.holding
