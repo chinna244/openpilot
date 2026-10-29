@@ -42,7 +42,6 @@
 
 static bool mazda_port_longitudinal = false;
 // Declared by the driver: the TJA button owns lateral and MRCC no longer drives the main edge.
-static bool mazda_port_tja_button = false;
 static bool mazda_port_eps_hw = false;
 // Live cruise arming from PEDALS, both longitudinal modes (carstate mrcc_armed_raw).
 static bool mazda_port_acc_armed = false;
@@ -381,13 +380,11 @@ static void mazda_port_fwd_modify(int bus_num, CANPacket_t *msg) {
 static safety_config mazda_port_init(uint16_t param) {
   mazda_aol_reset();
   mazda_aol_alpha_long = false;
-  mazda_aol_tja = false;
   if (((param & ~11U) != 0U) || ((param & MAZDA_PARAM_EPS_HW) == 0U)) {
     return (safety_config){0};
   }
   mazda_aol_enabled = (unsigned int)alternative_experience == 32U;
   mazda_aol_alpha_long = mazda_aol_enabled && GET_FLAG(param, MAZDA_PARAM_LONGITUDINAL);
-  mazda_aol_tja = mazda_aol_enabled && GET_FLAG(param, MAZDA_PARAM_TJA_BUTTON);
   if (mazda_aol_enabled) {
     static const AolSafetyPolicy policy = {
       .reset = mazda_aol_reset,

@@ -3,8 +3,9 @@
 static bool mazda_aol_enabled = false;
 // set by each init, never by the AOL policy's runtime reset: openpilot longitudinal (word bit 1) under AOL
 static bool mazda_aol_alpha_long = false;
-// set by each init: the declared TJA button (word bit 3), whose token a camera fault pauses rather than consumes
-static bool mazda_aol_tja = false;
+// The declared TJA button (word bit 3), set by mazda_port_init; under AOL a camera fault pauses its token rather
+// than consuming it. Declared here, ahead of mazda_port.h, so the AOL policy adds no RAM (body_h7 DTCMRAM is full).
+static bool mazda_port_tja_button = false;
 static bool mazda_aol_startup_pending = true;
 static bool mazda_aol_token = false;
 static bool mazda_aol_neutral = false;
@@ -143,7 +144,7 @@ static void mazda_aol_optional_rx(const CANPacket_t *msg) {
       // button it keeps the driver's token, as develop's MADS pauses and resumes on it: glare or a blocked windshield
       // clears mid-drive. Otherwise it consumes the token.
       mazda_aol_sources = (mazda_aol_sources & 3U) | (GET_BIT(msg, 16U) ? 4U : 0U);
-      if (((mazda_aol_sources & 4U) != 0U) && !mazda_aol_tja) {
+      if (((mazda_aol_sources & 4U) != 0U) && !(mazda_port_tja_button && mazda_aol_enabled)) {
         mazda_aol_clear();
         mazda_aol_startup_pending = false;
       }
@@ -158,7 +159,7 @@ static void mazda_aol_rx(const CANPacket_t *msg) {
       mazda_aol_seen |= 1U;
       mazda_aol_main_ts = microsecond_timer_get();
       acc_main_on = GET_BIT(msg, 17U);
-      if ((mazda_aol_session && !heartbeat_engaged) || !aol_rx_healthy() || !mazda_aol_current() || safety_rx_checks_invalid || (((mazda_aol_sources & 4U) != 0U) && !mazda_aol_tja)) {
+      if ((mazda_aol_session && !heartbeat_engaged) || !aol_rx_healthy() || !mazda_aol_current() || safety_rx_checks_invalid || (((mazda_aol_sources & 4U) != 0U) && !(mazda_port_tja_button && mazda_aol_enabled))) {
         mazda_aol_clear();
       } else if (!acc_main_on) {
         mazda_aol_clear();
@@ -184,7 +185,7 @@ static void mazda_aol_rx(const CANPacket_t *msg) {
       // Mapped Cancel can request LAT only after the same fresh physical edge
       // and current host acknowledgment used by the other cruise buttons.
       const bool press = (msg->data[0] & 0x35U) != 0U;
-      if ((mazda_aol_session && !heartbeat_engaged) || !aol_rx_healthy() || !mazda_aol_current() || safety_rx_checks_invalid || (((mazda_aol_sources & 4U) != 0U) && !mazda_aol_tja)) {
+      if ((mazda_aol_session && !heartbeat_engaged) || !aol_rx_healthy() || !mazda_aol_current() || safety_rx_checks_invalid || (((mazda_aol_sources & 4U) != 0U) && !(mazda_port_tja_button && mazda_aol_enabled))) {
         mazda_aol_clear();
       } else if (!press) {
         mazda_aol_buttons_neutral = true;
