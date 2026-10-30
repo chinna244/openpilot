@@ -17,6 +17,7 @@ from openpilot.selfdrive.ui.sunnypilot.accelerator_link import big_model_note, b
 from openpilot.selfdrive.ui.sunnypilot.model_info import (active_source, big_model_state, bundles_for_source, carrying_model,
                                                            default_model_name, model_cache_size_mb, model_info, queued_name,
                                                            refresh_in_progress, refresh_model_list)
+from openpilot.selfdrive.ui.sunnypilot.mici.layouts.models_zp import ModelOptions
 from openpilot.selfdrive.ui.sunnypilot.mici.widgets.button import BigMultiParamToggleSP
 from openpilot.sunnypilot.jetlink_adapter import KEYS, MODES
 from openpilot.system.ui.lib.application import FontWeight, gui_app
@@ -127,8 +128,11 @@ class ModelsLayoutMici(NavScroller):
     self.clear_cache_btn.set_click_callback(self._confirm_clear_cache)
     self._cache_size_time = 0.0
 
-    self.main_items = [self.current_model_info, self.select_model_btn, self.cancel_download_btn, self.link_toggle, self.refresh_btn,
-                       self.clear_cache_btn]
+    self._options = ModelOptions()
+    self.blendful_toggle = self._options.lane_center
+
+    self.main_items = [self.current_model_info, self.select_model_btn, self.cancel_download_btn, self.blendful_toggle, self.link_toggle,
+                       *self._options.items, self.refresh_btn, self.clear_cache_btn]
     self._scroller.add_widgets(self.main_items)
 
   @property
@@ -238,6 +242,11 @@ class ModelsLayoutMici(NavScroller):
     if self._was_downloading:
       device.set_override_interactive_timeout(None)
       self._was_downloading = False
+
+  def show_event(self):
+    super().show_event()
+    self.blendful_toggle.refresh()
+    self._options.refresh()
 
   def _update_state(self):
     super()._update_state()
