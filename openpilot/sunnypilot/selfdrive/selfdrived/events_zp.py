@@ -70,7 +70,7 @@ def stock_ecu_not_ready_alert(CP: car.CarParams, CS: car.CarState, sm: messaging
   state = str(sm['carStateSP'].zoompilot.stockEcu)
   title, line = STOCK_ECU_ALERT_TEXT.get(state, STOCK_ECU_ALERT_TEXT[StockEcuState.STARTING])
   if state == StockEcuState.STARTING and not CS.standstill:
-    line = "Stop to finish"  # rolling with the takeover in flight
+    line = "Wait"  # rolling with the moving takeover in flight
   return NoEntryAlert(line, alert_text_1=title)
 
 
@@ -266,7 +266,8 @@ EVENTS_ZP: dict[int, dict[str, Alert | AlertCallbackType]] = {
                         Priority.LOW, VisualAlert.none, AudibleAlert.prompt, 3.),
   },
 
-  # RES registered as a request for alpha long; the radar is taken at the next 2 s stop.
+  # RES registered as a request for alpha long after the radar refused a moving takeover: the
+  # radar is taken at the next 2 s stop.
   EventNameZP.alphaLongNextStop: {
     ET.PERMANENT: Alert("Alpha long", "next stop, 2 s", AlertStatus.normal, AlertSize.mid,
                         Priority.LOW, VisualAlert.none, AudibleAlert.prompt, 3.),

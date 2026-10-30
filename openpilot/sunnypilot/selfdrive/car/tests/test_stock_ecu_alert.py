@@ -102,7 +102,7 @@ class TestStockEcuNotReady:
 
   @pytest.mark.parametrize("state, standstill, expected", [
     ("starting", True, {"AEB turning off", "Stay still"}),
-    ("starting", False, {"AEB turning off", "Stop to finish"}),
+    ("starting", False, {"AEB turning off", "Wait"}),
     ("parkToTakeOver", False, {"openpilot cruise at stop", "Stop first"}),
     ("stockCruiseOn", False, {"car cruise is on", "Cancel first"}),
     ("restoring", False, {"car cruise restarting", "Wait ~12 s"}),
