@@ -291,6 +291,7 @@ struct LongitudinalPlanSP @0xf35cc4560bbf6ec2 {
       none @0;
       car @1;
       map @2;
+      vision @3;
     }
 
     enum AssistState {
@@ -490,7 +491,16 @@ struct ModelDataV2SP @0xa1680744031fdb2d {
   }
 }
 
+# chinna244: the speed-limit sign the road camera reads (sunnypilot/speed_limit_vision, StarPilot's reader). Display only.
 struct CustomReserved10 @0xcb9fd56c7057593a {
+  speedLimit @0 :Float32;            # m/s, the confirmed sign; 0 when none is held
+  confidence @1 :Float32;            # of speedLimit, 0 to 1
+  candidateSpeedLimit @2 :Float32;   # m/s, the latest single read, confirmed or not
+  candidateConfidence @3 :Float32;
+  supportCount @4 :Int32;            # reads in the last 2 s that agree with speedLimit
+  status @5 :Text;                   # StarPilot's status line: Scanning, Candidate, Holding, Idle, a missing model
+  frameProcessTime @6 :Float32;      # s, the last inference pass
+  inferenceInterval @7 :Float32;     # s, the wait the reader picked between passes
 }
 
 struct CustomReserved11 @0xc2243c65e0340384 {

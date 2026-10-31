@@ -70,6 +70,9 @@ def navigation(started: bool, params: Params, CP: car.CarParams) -> bool:
 def only_offroad(started: bool, params: Params, CP: car.CarParams) -> bool:
   return not started
 
+def speed_limit_vision(started: bool, params: Params, CP: car.CarParams) -> bool:
+  return started and params.get_bool("SpeedLimitVision")
+
 def livestream(started: bool, params: Params, CP: car.CarParams) -> bool:
   return params.get_bool("IsLiveStreaming")
 
@@ -195,6 +198,8 @@ procs += [
   # mapd
   NativeProcess("mapd", Paths.mapd_root(), ["bash", "-c", f"{MAPD_PATH} > /dev/null 2>&1"], mapd_ready),
   PythonProcess("mapd_manager", "openpilot.sunnypilot.mapd.mapd_manager", always_run),
+  # display only, selfdrived ignores it not running
+  PythonProcess("speed_limit_vision", "openpilot.sunnypilot.speed_limit_vision.speed_limit_vision", speed_limit_vision),
 
   # locationd
   NativeProcess("locationd_llk", "openpilot/sunnypilot/selfdrive/locationd", ["./locationd"], only_onroad),

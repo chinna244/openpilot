@@ -50,14 +50,19 @@ def setup_sm_mock(mocker):
   gps_data = create_mock({
     'hasFix': True,
   }, mocker)
+  vision = create_mock({
+    'speedLimit': 0.,
+  }, mocker)
   sm_mock = mocker.MagicMock()
   sm_mock.__getitem__.side_effect = lambda key: {
     'carState': car_state,
     'liveMapDataSP': live_map_data,
     'carStateSP': car_state_sp,
     'gpsLocation': gps_data,
+    'customReserved10': vision,
   }[key]
-  sm_mock.logMonoTime = {'gpsLocation': int(time.monotonic() * 1e9), 'liveMapDataSP': int(time.monotonic() * 1e9)}
+  sm_mock.logMonoTime = {'gpsLocation': int(time.monotonic() * 1e9), 'liveMapDataSP': int(time.monotonic() * 1e9),
+                         'customReserved10': int(time.monotonic() * 1e9)}
   return sm_mock
 
 
@@ -171,9 +176,11 @@ def gps_sm(mocker, car_limit, map_limit, has_fix=True, fix_age=0., ahead_limit=0
     'carStateSP': car_state_sp,
     'liveMapDataSP': live_map_data,
     'gpsLocation': gps_data,
+    'customReserved10': create_mock({'speedLimit': 0.}, mocker),
   }[key]
   sm_mock.logMonoTime = {'gpsLocation': int((time.monotonic() - fix_age) * 1e9),
-                         'liveMapDataSP': int((time.monotonic() - map_age) * 1e9)}
+                         'liveMapDataSP': int((time.monotonic() - map_age) * 1e9),
+                         'customReserved10': int(time.monotonic() * 1e9)}
   return sm_mock
 
 
@@ -374,3 +381,51 @@ class TestSpeedLimitResolverGpsFix(OpenpilotTestCase):
     self._feed(resolver, mocker, 35 * MPH, 0., 0.5)
     self._feed(resolver, mocker, 0., 0., 1.)
     assert resolver.speed_limit_last == 25 * MPH
+
+
+class TestSpeedLimitResolverVision(OpenpilotTestCase):
+  """A camera-read sign comes first in combined and vision_priority, and only there."""
+
+  def _sm(self, mocker, car, map_limit, vision, vision_age=0.):
+    sm_mock = setup_sm_mock(mocker)
+    sm_mock['carStateSP'].speedLimit = car
+    sm_mock['liveMapDataSP'].speedLimit = map_limit
+    sm_mock['customReserved10'].speedLimit = vision
+    sm_mock.logMonoTime['customReserved10'] = int((time.monotonic() - vision_age) * 1e9)
+    return sm_mock
+
+  def _resolve(self, mocker, policy, car, map_limit, vision, vision_age=0.):
+    resolver = SpeedLimitResolver()
+    resolver.policy = policy
+    resolver.update(10., self._sm(mocker, car, map_limit, vision, vision_age))
+    return resolver
+
+  @parameterized.expand([(Policy.combined,), (Policy.vision_priority,)], names=["policy"])
+  def test_vision_wins_higher_or_lower(self, policy, mocker):
+    for vision in (11., 25.):
+      resolver = self._resolve(mocker, policy, 15., 20., vision)
+      assert resolver.source == SpeedLimitSource.vision
+      assert resolver.speed_limit == vision
+
+  def test_combined_falls_back_to_lower_of_car_and_map(self, mocker):
+    resolver = self._resolve(mocker, Policy.combined, 15., 20., 0.)
+    assert resolver.source == SpeedLimitSource.car and resolver.speed_limit == 15.
+
+  def test_vision_priority_falls_back_to_map_then_car(self, mocker):
+    assert self._resolve(mocker, Policy.vision_priority, 15., 20., 0.).source == SpeedLimitSource.map
+    resolver = self._resolve(mocker, Policy.vision_priority, 15., 0., 0.)
+    assert resolver.source == SpeedLimitSource.car and resolver.speed_limit == 15.
+
+  @parameterized.expand([(Policy.combined,), (Policy.vision_priority,)], names=["policy"])
+  def test_stale_vision_ignored(self, policy, mocker):
+    resolver = self._resolve(mocker, policy, 15., 20., 25., vision_age=2.)
+    assert resolver.source != SpeedLimitSource.vision
+
+  def test_vision_below_min_ignored(self, mocker):
+    resolver = self._resolve(mocker, Policy.combined, 15., 20., CAR_LIMIT_MIN - 0.1)
+    assert resolver.source == SpeedLimitSource.car
+
+  @parameterized.expand([(p,) for p in Policy if p not in (Policy.combined, Policy.vision_priority)], names=["policy"])
+  def test_other_policies_ignore_vision(self, policy, mocker):
+    resolver = self._resolve(mocker, policy, 15., 20., 25.)
+    assert resolver.source != SpeedLimitSource.vision

@@ -21,7 +21,7 @@ from openpilot.system.ui.lib.application import gui_app
 from openpilot.sunnypilot.selfdrive.car.intelligent_cruise_button_management.helpers import icbm_moves_speed_limits
 
 SL_MODE_LABELS = [tr("off"), tr("info"), tr("warn"), tr("assist")]
-SL_SOURCE_LABELS = [tr("car"), tr("map"), tr("car-first"), tr("map-first"), tr("combined")]
+SL_SOURCE_LABELS = [tr("car"), tr("map"), tr("car-first"), tr("map-first"), tr("combined"), tr("vision-first")]
 SL_MODE_OFF = 0
 SL_MODE_WARN = 2
 SL_MODE_ASSIST = 3
@@ -99,15 +99,19 @@ class CruiseLayoutMici(NavScroller):
     self._sl_source = BigMultiParamToggleSP(tr("source"), "SpeedLimitPolicy", SL_SOURCE_LABELS,
                                             description=tr("Car uses the signs your car reads. Map uses downloaded maps.\n" +
                                                            "Car-first and map-first use the other when the first has none.\n" +
-                                                           "Combined uses the lower of the two.\n" +
+                                                           "Combined uses the camera sign, else the lower of car and map.\n" +
+                                                           "Vision-first uses the camera sign, else map, else car.\n" +
                                                            "On a Mazda, car needs a nav SD card."))
+    self._sl_vision = BigParamControlSP(tr("camera signs"), "SpeedLimitVision",
+                                        description=tr("Reads speed limit signs with the road camera.\n" +
+                                                       "Combined and vision-first use it. Off: car and map only."))
     self._sl_offset_type = BigMultiParamToggleSP(tr("offset type"), "SpeedLimitOffsetType", [tr("none"), tr("fixed"), "%"],
                                                  description=tr("Adds an offset to the speed limit.\n" +
                                                                 "Fixed adds a set amount of speed. % adds a percentage of the limit."))
     self._sl_offset_value = BigParamOption(tr("offset value"), "SpeedLimitValueOffset",
                                            min_value=-30, max_value=30, label_callback=_offset_label, picker_unit=_offset_unit,
                                            description=tr("The amount added to the speed limit. Negative values go below it."))
-    self._sl_view = self._speed_limit_btn.link_sub_panel([self._sl_mode, self._sl_source, self._sl_offset_type, self._sl_offset_value])
+    self._sl_view = self._speed_limit_btn.link_sub_panel([self._sl_mode, self._sl_source, self._sl_vision, self._sl_offset_type, self._sl_offset_value])
 
   def _update_state(self):
     super()._update_state()

@@ -145,7 +145,8 @@ class Plant:
           'modelV2': model.modelV2,
           'carStateSP': car_state_sp.carStateSP,
           'liveMapDataSP': live_map_data_sp.liveMapDataSP,
-          'gpsLocation': gps_data.gpsLocation}
+          'gpsLocation': gps_data.gpsLocation,
+          'customReserved10': messaging.new_message('customReserved10').customReserved10}
     self.planner.update(PlantSM(sm))
     self.acceleration = self.planner.output_a_target
     if self.planner.output_should_stop:

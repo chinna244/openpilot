@@ -985,10 +985,20 @@
                       "label": "Map Data Priority"
                     },
                     {
+                      "value": 5,
+                      "label": "Vision Priority"
+                    },
+                    {
                       "value": 4,
                       "label": "Combined"
                     }
                   ]
+                },
+                {
+                  "key": "SpeedLimitVision",
+                  "widget": "toggle",
+                  "title": "Camera Sign Reading",
+                  "description": "Read speed limit signs with the road camera. Vision Priority and Combined use the camera sign first."
                 },
                 {
                   "key": "SpeedLimitOffsetType",

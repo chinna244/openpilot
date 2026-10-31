@@ -15,14 +15,15 @@ from openpilot.system.ui.widgets.scroller_tici import Scroller
 from openpilot.system.ui.widgets import Widget
 from openpilot.system.ui.sunnypilot.widgets import get_highlighted_description
 
-SPEED_LIMIT_POLICY_BUTTONS = [tr("Car Only"), tr("Map Only"), tr("Car First"), tr("Map First"), tr("Combined")]
+SPEED_LIMIT_POLICY_BUTTONS = [tr("Car Only"), tr("Map Only"), tr("Car First"), tr("Map First"), tr("Combined"), tr("Vision First")]
 
 SPEED_LIMIT_POLICY_DESCRIPTIONS = [
   tr("Car Only: Use Speed Limit data only from Car"),
   tr("Map Only: Use Speed Limit data only from OpenStreetMaps"),
   tr("Car First: Use Speed Limit data from Car if available, else use from OpenStreetMaps"),
   tr("Map First: Use Speed Limit data from OpenStreetMaps if available, else use from Car"),
-  tr("Combined: Use combined Speed Limit data from Car & OpenStreetMaps")
+  tr("Combined: Use the camera-read sign if available, else the lower of Car & OpenStreetMaps"),
+  tr("Vision First: Use the camera-read sign if available, else OpenStreetMaps, else Car")
 ]
 
 
@@ -41,7 +42,7 @@ class SpeedLimitPolicyLayout(Widget):
       description=self._get_policy_description,
       buttons=SPEED_LIMIT_POLICY_BUTTONS,
       param="SpeedLimitPolicy",
-      button_width=250,
+      button_width=210,
     )
 
     items = [

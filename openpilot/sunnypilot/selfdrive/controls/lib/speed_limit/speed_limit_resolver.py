@@ -34,6 +34,9 @@ LAST_LIMIT_SETTLE = 2.  # s
 # with no map limit, and the assist braked at -1.2 m/s2 toward 6 mph. 9 mph keeps 10 mph and 15 km/h signs.
 CAR_LIMIT_MIN = 9 * CV.MPH_TO_MS  # m/s
 
+# speed_limit_vision publishes at 5 Hz; a reading older than this means the process stopped or the toggle is off.
+VISION_MAX_AGE = 1.  # s
+
 
 class SpeedLimitResolver:
   limit_solutions: dict[custom.LongitudinalPlanSP.SpeedLimit.Source, float]
@@ -74,7 +77,8 @@ class SpeedLimitResolver:
       Policy.map_data_only: [SpeedLimitSource.map],
       Policy.car_state_priority: [SpeedLimitSource.car, SpeedLimitSource.map],
       Policy.map_data_priority: [SpeedLimitSource.map, SpeedLimitSource.car],
-      Policy.combined: [SpeedLimitSource.car, SpeedLimitSource.map],
+      Policy.combined: [SpeedLimitSource.vision, SpeedLimitSource.car, SpeedLimitSource.map],
+      Policy.vision_priority: [SpeedLimitSource.vision, SpeedLimitSource.map, SpeedLimitSource.car],
     }
     self.source = SpeedLimitSource.none
     for source in ALL_SOURCES:
@@ -159,6 +163,15 @@ class SpeedLimitResolver:
     self.limit_solutions[SpeedLimitSource.car] = speed_limit if speed_limit >= CAR_LIMIT_MIN else 0.
     self.distance_solutions[SpeedLimitSource.car] = 0.
 
+  def _get_from_vision(self, sm: messaging.SubMaster) -> None:
+    self._reset_limit_sources(SpeedLimitSource.vision)
+    speed_limit = sm['customReserved10'].speedLimit
+    if speed_limit < CAR_LIMIT_MIN:
+      return
+    age = time.monotonic() - sm.logMonoTime['customReserved10'] * 1e-9
+    if -MAP_FIX_FUTURE_TOLERANCE <= age <= VISION_MAX_AGE:
+      self.limit_solutions[SpeedLimitSource.vision] = speed_limit
+
   def _get_from_map_data(self, sm: messaging.SubMaster) -> None:
     self._reset_limit_sources(SpeedLimitSource.map)
     self._process_map_data(sm)
@@ -227,7 +240,11 @@ class SpeedLimitResolver:
           return source
       return SpeedLimitSource.none
 
-    sources_with_limits = [(s, limit) for s, limit in [(s, self.limit_solutions[s]) for s in sources_for_policy] if limit > 0.]
+    # a camera-read sign comes first; without one, the lower of car and map
+    if self.limit_solutions[SpeedLimitSource.vision] > 0.:
+      return SpeedLimitSource.vision
+
+    sources_with_limits = [(s, limit) for s, limit in [(s, self.limit_solutions[s]) for s in sources_for_policy[1:]] if limit > 0.]
     if sources_with_limits:
       return min(sources_with_limits, key=lambda x: x[1])[0]
 
@@ -237,6 +254,7 @@ class SpeedLimitResolver:
     """Get limit solutions from each data source"""
     self._get_from_car_state(sm)
     self._get_from_map_data(sm)
+    self._get_from_vision(sm)
 
     source = self._get_source_solution_according_to_policy()
     speed_limit = self.limit_solutions[source] if source else 0.
