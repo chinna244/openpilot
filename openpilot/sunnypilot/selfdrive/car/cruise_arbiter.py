@@ -109,6 +109,7 @@ class CruiseArbiter:
     self._reprompt_hold = 0
     self._late_answer_timer = 0  # frames since a prompt closed unanswered in which its direction still confirms
     self._confirm_follow_timer = 0  # frames after a confirm in which a press toward the target is still the confirm
+    self._adopted_dir = 0  # +1/-1: the last confirm moved the setpoint onto the limit, so the dash walks that way
     self._cluster_conv = 0
     self._cluster_conv_prev = 0
     self._driver_dial_timer = 0  # frames since a wheel press edge: a cluster match is the driver's
@@ -228,7 +229,7 @@ class CruiseArbiter:
         self._ignored_prompt = False  # a press is an answer, even a no
 
       if b.pressed:
-        if self.state_prev_frame in ACTIVE_STATES and self._toward_target(btn, self._confirm_follow_timer):
+        if self.state_prev_frame in ACTIVE_STATES and self._toward_target(btn, self._confirm_follow_timer, follow=True):
           self._press[btn] = _Press(_PRESS_PROMPT, resolved=True)  # owned: the confirm stands, no step
         elif self.state_prev_frame in ACTIVE_STATES:
           # A press dismisses an active session. Re-anchor openpilot-owned setpoints to the
@@ -269,11 +270,14 @@ class CruiseArbiter:
 
     return v_cruise_kph
 
-  def _toward_target(self, button: int, window: int) -> bool:
+  def _toward_target(self, button: int, window: int, follow: bool = False) -> bool:
     """Inside the window, with a limit, a press in the direction the dash still has to move to reach the target."""
     if window <= 0 or not self._has_limit or self._cluster_conv <= 0:
       return False
     req_plus, req_minus = compare_cluster_target(self._cluster_conv / self._conv, self._slf, self.is_metric)
+    if follow and not (req_plus or req_minus):
+      # the confirm already moved the setpoint onto the limit; the dash may still be walking there
+      req_plus, req_minus = self._adopted_dir > 0, self._adopted_dir < 0
     return (req_plus and button in PLUS_BUTTONS) or (req_minus and button in MINUS_BUTTONS)
 
   def _late_answer(self, button: int) -> bool:
@@ -289,9 +293,7 @@ class CruiseArbiter:
       # the prompt it answers already closed: confirm in its direction, as the open prompt would
       press.resolved = True
       self.last_intent = CruiseIntent.confirm
-      if button in PLUS_BUTTONS and self.target_kph > v_cruise_kph:
-        v_cruise_kph = self.target_kph
-        self.adopted_this_frame = True
+      v_cruise_kph = self._adopt_target(button in PLUS_BUTTONS, v_cruise_kph)
       self._activate(from_prompt=True)
       return v_cruise_kph
 
@@ -304,12 +306,9 @@ class CruiseArbiter:
     is_plus = button in PLUS_BUTTONS
 
     if (req_plus and is_plus) or (req_minus and not is_plus):
-      # An upward confirmation may raise the baseline; the active cap handles lower limits.
       press.resolved = True
       self.last_intent = CruiseIntent.confirm
-      if is_plus and self.target_kph > v_cruise_kph:
-        v_cruise_kph = self.target_kph
-        self.adopted_this_frame = True
+      v_cruise_kph = self._adopt_target(is_plus, v_cruise_kph)
       self._activate(from_prompt=True)
     else:
       # A press in the opposite direction declines and resumes normal setpoint handling.
@@ -317,6 +316,19 @@ class CruiseArbiter:
       self.last_intent = CruiseIntent.decline
       self._set_state(SessionState.inactive)
 
+    return v_cruise_kph
+
+  def _adopt_target(self, is_plus: bool, v_cruise_kph: float) -> float:
+    """A confirmation moves the baseline to the limit, + up and - down. A - that only capped left the baseline
+    above it, and whatever ended or raised the cap next walked the car back up to it unasked: routes 00000017 15:59
+    and 00000019 25:53 confirmed 35 off a 60 mph highway, the map limit dropped out on the ramp, and ICBM pressed +
+    toward the old set speed at 27 mph."""
+    # an openpilot-owned setpoint re-anchors to the cap when the session ends, so only ICBM adopts a - here
+    if (self.target_kph > v_cruise_kph) if is_plus else (not self.op_owns_setpoint and self.target_kph < v_cruise_kph):
+      self.adopted_this_frame = True
+      self._adopted_dir = 1 if is_plus else -1
+      return self.target_kph
+    self._adopted_dir = 0
     return v_cruise_kph
 
   def press_owned(self, button_type: int) -> bool:
@@ -371,12 +383,20 @@ class CruiseArbiter:
         self._late_answer_timer = 0
 
       elif self.state in ACTIVE_STATES:
-        if self._limit_changed and confirm_needed_for_change(self._cluster_conv, self._target_conv(), self.is_metric):
+        # a target above the speed the session holds asks first, at any speed: route 00000018 14:26 raised a
+        # confirmed 58 to 64 unasked
+        held_conv = round(self.v_cap * self._conv) if self.v_cap < V_CRUISE_UNSET else self._cluster_conv
+        raises = self._target_conv() > held_conv
+        if self._limit_changed and (raises or confirm_needed_for_change(self._cluster_conv, self._target_conv(), self.is_metric)):
           self._enter_prompt()
         elif self._limit_changed and self._speed_moves:
           # Auto-apply target changes that do not require confirmation; a limit above the
           # setpoint the car already holds changes nothing to announce.
           self.announce_counter += 1
+        if self._limit_changed and self.state in ACTIVE_STATES and not self.op_owns_setpoint and self.target_kph < v_cruise_kph:
+          # an unasked drop lowers the ICBM setpoint too, or a later rise walks the car back up to it unasked
+          v_cruise_kph = self.target_kph
+          self.adopted_this_frame = True
 
       elif self.state == SessionState.preActive:
         # a press resolves the prompt (above); the ICBM servo may walk the dash through the

@@ -411,10 +411,10 @@ class TestSpeedLimitResolverVision(OpenpilotTestCase):
     resolver = self._resolve(mocker, Policy.combined, 15., 20., 0.)
     assert resolver.source == SpeedLimitSource.car and resolver.speed_limit == 15.
 
-  def test_vision_priority_falls_back_to_map_then_car(self, mocker):
-    assert self._resolve(mocker, Policy.vision_priority, 15., 20., 0.).source == SpeedLimitSource.map
-    resolver = self._resolve(mocker, Policy.vision_priority, 15., 0., 0.)
-    assert resolver.source == SpeedLimitSource.car and resolver.speed_limit == 15.
+  def test_vision_priority_falls_back_to_car_then_map(self, mocker):
+    assert self._resolve(mocker, Policy.vision_priority, 15., 20., 0.).source == SpeedLimitSource.car
+    resolver = self._resolve(mocker, Policy.vision_priority, 0., 20., 0.)
+    assert resolver.source == SpeedLimitSource.map and resolver.speed_limit == 20.
 
   @parameterized.expand([(Policy.combined,), (Policy.vision_priority,)], names=["policy"])
   def test_stale_vision_ignored(self, policy, mocker):

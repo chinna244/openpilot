@@ -100,7 +100,7 @@ class CruiseLayoutMici(NavScroller):
                                             description=tr("Car uses the signs your car reads. Map uses downloaded maps.\n" +
                                                            "Car-first and map-first use the other when the first has none.\n" +
                                                            "Combined uses the camera sign, else the lower of car and map.\n" +
-                                                           "Vision-first uses the camera sign, else map, else car.\n" +
+                                                           "Vision-first uses the camera sign, else car, else map.\n" +
                                                            "On a Mazda, car needs a nav SD card."))
     self._sl_vision = BigParamControlSP(tr("camera signs"), "SpeedLimitVision",
                                         description=tr("Reads speed limit signs with the road camera.\n" +

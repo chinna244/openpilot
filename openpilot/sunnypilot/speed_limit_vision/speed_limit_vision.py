@@ -8,8 +8,9 @@ ported with its tuning unchanged. What this fork changed, all at the edges:
   AGNOS's venv has no cv2. Without them the process says so in its status and reads nothing.
 - Inputs: liveMapDataSP for mapdOut, carState's park gear for starpilotCarState.isParked.
 - StarPilot's VisionSpeedLimit* memory params live in this process (MemoryParams), and the reading
-  goes out as customReserved10 (speed limit sign vision) for the UI and the logs. Display only:
-  nothing in the planner reads it.
+  goes out as customReserved10 (speed limit sign vision), which the speed limit resolver uses first
+  under Vision Priority and Combined.
+- A sign holds until the road changes (RoadChange), not for StarPilot's fixed 5 min.
 - Auto bookmarks, segment preserve, the training collector and VASM coexistence are off.
 """
 from __future__ import annotations
@@ -41,6 +42,50 @@ SERVICE = "customReserved10"
 SEND_INTERVAL = 0.2  # s, customReserved10 at 5 Hz
 OFF_PARAMS = ("VASMEnabled", "VisionSpeedLimitAutoBookmark", "VisionSpeedLimitAutoPreserveSegment",
               "VisionSpeedLimitTrainingCollector")
+
+
+# fork: a sign holds until the road changes, not for a fixed time. Out of view is not out of force: StarPilot's 5 min
+# hold kept a 25 through a turn onto a 45 road, and dropped a still-valid sign on a long road with no repeats.
+ROAD_TURN_DEG = 60.  # net heading change since the sign: a turn or a ramp loop, not a lane change or a bend
+ROAD_TURN_MIN_SPEED = 1.  # m/s, a car turns only while it moves
+ROAD_TURNING_RATE = 5.  # deg/s: a sign read mid-turn stands on the new road (route 12 t=156, read 18 deg into the turn)
+ROAD_LIMIT_HOLD_S = 10.  # the car or map limit moved to a new value and held: a road boundary, not a glitch
+ROAD_MAX_DISTANCE_M = 5000.  # backstop: no repeat sign this far
+
+
+class RoadChange:
+  """Since the camera last saw its sign: the turn, the distance, and the car and map limits it began with."""
+
+  def __init__(self):
+    self.reset(0, 0)
+
+  def reset(self, car, map_limit, yaw_rate=0.):
+    self.heading_deg = 0.
+    self.in_turn = abs(math.degrees(yaw_rate)) > ROAD_TURNING_RATE  # count only turns after this one
+    self.distance_m = 0.
+    self.start = {"car": car, "map": map_limit}
+    self.moved = {}  # source -> (new value, seconds held)
+
+  def update(self, dt, v_ego, yaw_rate, car, map_limit, sign):
+    """Returns why the road changed, or None. Limits are whole display units, 0 = none."""
+    self.in_turn = self.in_turn and abs(math.degrees(yaw_rate)) > ROAD_TURNING_RATE
+    if v_ego > ROAD_TURN_MIN_SPEED and not self.in_turn:  # the gyro drifts while stopped: route 0f read 60 deg over 90 s
+      self.heading_deg += math.degrees(yaw_rate) * dt
+    self.distance_m += max(v_ego, 0.) * dt
+    if abs(self.heading_deg) > ROAD_TURN_DEG:
+      return "turn"
+    if self.distance_m > ROAD_MAX_DISTANCE_M:
+      return "distance"
+    for source, value in (("car", car), ("map", map_limit)):
+      if value <= 0 or value == self.start[source] or value == sign:
+        self.moved.pop(source, None)
+        continue
+      prev_value, held = self.moved.get(source, (value, 0.))
+      held = held + dt if prev_value == value else 0.
+      self.moved[source] = (value, held)
+      if held >= ROAD_LIMIT_HOLD_S:
+        return f"{source}_limit"
+    return None
 
 
 def device_cpu_throttle_factor(cpu_usage, name="", cores=None):
@@ -136,7 +181,6 @@ LOW_SPEED_CHANGE_CONSISTENT_DETECTIONS = 2
 LOW_SPEED_CHANGE_MIN_CONFIDENCE = 0.90
 LOW_SPEED_CHANGE_ALLOW_STRONG_CONSENSUS = True
 MODEL_DETECTION_SHORT_CIRCUIT_CONFIDENCE = 0.65
-PUBLISHED_HOLD_SECONDS = 300.0
 PUBLISHED_CHANGE_COOLDOWN_SECONDS = 1.4
 PUBLISHED_REVERT_CONFIDENCE = 0.97
 AUTO_BOOKMARK_CONFIRM_DELAY_SECONDS = 0.9
@@ -401,8 +445,9 @@ class SpeedLimitVisionDaemon:
     self.is_metric = False
 
     if self.use_runtime:
-      from cereal import messaging
-      from msgq.visionipc import VisionIpcClient, VisionStreamType
+      from openpilot.cereal import messaging
+      from msgq.visionipc import VisionIpcClient
+      from openpilot.cereal.visionipc import VisionStreamType
       from openpilot.common.params import Params
       from openpilot.common.realtime import Ratekeeper
 
@@ -414,7 +459,7 @@ class SpeedLimitVisionDaemon:
       self.Ratekeeper = Ratekeeper
       self.VisionIpcClient = VisionIpcClient
       self.VisionStreamType = VisionStreamType
-      self.sm = messaging.SubMaster(["deviceState", "liveMapDataSP", "procLog", "userBookmark", "livePose", "carState"])
+      self.sm = messaging.SubMaster(["deviceState", "liveMapDataSP", "procLog", "userBookmark", "deviceMotion", "carState", "carStateSP"])
       self.last_sent_at = -float("inf")
 
     self.client = None
@@ -447,6 +492,9 @@ class SpeedLimitVisionDaemon:
     self.previous_published_speed_limit_mph = 0
     self.last_publish_change_at = 0.0
     self.last_published_support_at = 0.0
+    self.road_change = RoadChange()
+    self.road_change_key = None
+    self.road_change_at = 0.0
     self.last_candidate_speed_limit_mph = 0
     self.last_candidate_confidence = 0.0
     self.last_candidate_at = 0.0
@@ -945,8 +993,30 @@ class SpeedLimitVisionDaemon:
     self._record_map_transition_miss(current_speed_limit_mph, previous_speed_limit_mph)
 
   def _published_detection_stale(self, now):
-    support_at = self.last_published_support_at or self.last_detection_at
-    return self.published_speed_limit_mph > 0 and now - support_at > PUBLISHED_HOLD_SECONDS
+    # fork: RoadChange ends a sign (_update_road_change), not time
+    return False
+
+  def _update_road_change(self, now):
+    """Drop the published sign once the road it was on has ended."""
+    dt = min(now - self.road_change_at, 1.) if self.road_change_at else 0.  # a pause (parked, paused) is not a turn
+    self.road_change_at = now
+    if self.published_speed_limit_mph <= 0:
+      self.road_change_key = None
+      return
+    car = self._speed_value_from_ms(self.sm["carStateSP"].speedLimit)
+    map_data = self.sm["liveMapDataSP"]
+    map_limit = self._speed_value_from_ms(map_data.speedLimit) if map_data.speedLimitValid else 0
+    yaw_rate = self.sm["deviceMotion"].angularVelocityDevice.z
+    key = (self.published_speed_limit_mph, self.last_published_support_at)
+    if key != self.road_change_key:  # a new sign, or the same one seen again
+      self.road_change_key = key
+      self.road_change.reset(car, map_limit, yaw_rate)
+      return
+    reason = self.road_change.update(dt, self.sm["carState"].vEgo, yaw_rate, car, map_limit, self.published_speed_limit_mph)
+    if reason:
+      self._write_debug_event("road_change", reason=reason, speedLimitMph=self.published_speed_limit_mph)
+      self._clear_detection()
+      self.road_change_key = None
 
   def _clear_published_detection_if_stale(self, now, reason):
     if not self._published_detection_stale(now):
@@ -1239,8 +1309,8 @@ class SpeedLimitVisionDaemon:
 
     desired_stream = None
     stream_name = ""
-    if self.VisionStreamType.VISION_STREAM_ROAD in available_streams:
-      desired_stream = self.VisionStreamType.VISION_STREAM_ROAD
+    if self.VisionStreamType.VISION_STREAM_NARROW_ROAD in available_streams:
+      desired_stream = self.VisionStreamType.VISION_STREAM_NARROW_ROAD
       stream_name = "road camera"
     elif self.VisionStreamType.VISION_STREAM_WIDE_ROAD in available_streams:
       desired_stream = self.VisionStreamType.VISION_STREAM_WIDE_ROAD
@@ -1279,12 +1349,15 @@ class SpeedLimitVisionDaemon:
     if buffer is None:
       return None
 
-    data = buffer.data
+    data = np.frombuffer(buffer.data, dtype=np.uint8)  # this fork's msgq hands out a memoryview
     if not data.any():
       return None
 
-    image = np.frombuffer(data, dtype=np.uint8).reshape((len(data) // client.stride, client.stride))
-    return cv2.cvtColor(image[:client.height * 3 // 2, :client.width], cv2.COLOR_YUV2BGR_NV12)
+    # the Y and UV planes are padded apart (uv_offset), not one stride-wide block
+    width, height, stride, uv_offset = client.width, client.height, client.stride, buffer.uv_offset
+    y = data[:stride * height].reshape((height, stride))[:, :width]
+    uv = data[uv_offset:uv_offset + stride * (height // 2)].reshape((height // 2, stride))[:, :width]
+    return cv2.cvtColor(np.vstack((y, uv)), cv2.COLOR_YUV2BGR_NV12)
 
   @staticmethod
   def _letterbox(image, shape=(640, 640), color=(114, 114, 114)):
@@ -2598,7 +2671,7 @@ class SpeedLimitVisionDaemon:
           started = False
           cpu_usage = []
         try:
-          live_pose_inputs_ok = bool(self.sm["livePose"].inputsOK)
+          live_pose_inputs_ok = bool(self.sm["deviceMotion"].inputsOK)
         except Exception:
           live_pose_inputs_ok = True
 
@@ -2825,7 +2898,7 @@ class SpeedLimitVisionDaemon:
         ratekeeper.keep_time()
         continue
 
-      if self.sm.updated["livePose"] and not self.sm["livePose"].inputsOK:
+      if self.sm.updated["deviceMotion"] and not self.sm["deviceMotion"].inputsOK:
         self.last_live_pose_inputs_not_ok_at = now
 
       if not self.started_prev:
@@ -2855,6 +2928,7 @@ class SpeedLimitVisionDaemon:
         self._write_debug_event("road_change", previousRoadName=self.last_road_name, roadName=road_name)
         self._clear_detection()
       self.last_road_name = road_name or self.last_road_name
+      self._update_road_change(now)
 
       if self.memory_pressure_state == "critical":
         self.memory_skip_count += 1

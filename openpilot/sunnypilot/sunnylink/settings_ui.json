@@ -998,7 +998,7 @@
                   "key": "SpeedLimitVision",
                   "widget": "toggle",
                   "title": "Camera Sign Reading",
-                  "description": "Read speed limit signs with the road camera. Vision Priority and Combined use the camera sign first."
+                  "description": "Read speed limit signs with the road camera; a sign holds until the road changes. Vision Priority uses the camera sign, else Car, else Map. Combined uses the camera sign, else the lower of Car and Map."
                 },
                 {
                   "key": "SpeedLimitOffsetType",

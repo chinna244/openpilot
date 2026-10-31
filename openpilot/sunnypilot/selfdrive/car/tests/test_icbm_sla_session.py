@@ -69,7 +69,7 @@ class TestSlaSession:
   @pytest.mark.parametrize("op_long", [False, True], ids=["stock_acc", "alpha_long"])
   def test_confirm_sticks_and_dash_reaches_limit(self, op_long):
     """F1 end-to-end: one - press confirms; SLA must stay active while ICBM walks the
-    dash all the way to the limit (hold + taps), and the baseline must survive. Under
+    dash all the way to the limit (hold + taps), and the baseline moves to the limit. Under
     Mazda alpha long the body keeps the setpoint, so the session walks it the same way."""
     loop = Loop(baseline_mph=60, seed=3, op_long=op_long)
     confirm_lower(loop, limit=45)
@@ -78,7 +78,7 @@ class TestSlaSession:
     loop.run(10.0, assert_each=lambda lo: states.add(lo.sla.state))
     assert loop.ecu.dash == 45, f"dash never reached the limit: {loop.ecu.dash}"
     assert states == {SlaState.active}, f"SLA flickered: {states}"
-    assert loop.v_cruise_mph == 60, f"baseline corrupted: {loop.v_cruise_mph}"
+    assert loop.v_cruise_mph == 45, f"baseline not lowered: {loop.v_cruise_mph}"
 
   def test_settled_press_reanchors(self):
     """Settled at the limit, one + press: SLA steps aside, the ECU's +1 becomes the new
@@ -93,9 +93,9 @@ class TestSlaSession:
     assert round(loop.v_cruise_mph) == 46, f"setpoint must re-anchor to 46: {loop.v_cruise_mph}"
 
   @pytest.mark.parametrize("is_metric", [False, True], ids=["mph", "kph"])
-  def test_mid_move_abort_restores_baseline(self, is_metric):
-    """+ while ICBM is still walking down: session aborts and the servo restores the
-    exact baseline; the driver is never stranded mid-way (the upstream failure mode)."""
+  def test_mid_move_abort_lands_the_limit(self, is_metric):
+    """+ while ICBM is still walking down: the session ends, and the - confirm already moved the
+    setpoint to the limit, so the walk lands there and nothing climbs back to the old 60."""
     loop = Loop(baseline_mph=60, seed=5, is_metric=is_metric)
     confirm_lower(loop, limit=45)
 
@@ -104,8 +104,8 @@ class TestSlaSession:
     loop.driver_press(ButtonType.accelCruise, in_seconds=0.05)
     loop.run(14.0)  # abort + quiet window + restore
     assert loop.sla.state == SlaState.inactive
-    assert loop.ecu.dash == 60, f"metric={is_metric}: baseline not restored: {loop.ecu.dash}"
-    assert loop.v_cruise_mph == 60, f"metric={is_metric}: setpoint corrupted: {loop.v_cruise_mph}"
+    assert loop.ecu.dash == 45, f"metric={is_metric}: dash: {loop.ecu.dash}"
+    assert loop.v_cruise_mph == 45, f"metric={is_metric}: setpoint: {loop.v_cruise_mph}"
 
   @pytest.mark.parametrize("is_metric", [False, True], ids=["mph", "kph"])
   def test_mid_move_minus_dismiss_never_restores_upward(self, is_metric):
@@ -187,26 +187,25 @@ class TestDriverInteractions:
     assert loop.sla.state == SlaState.active
     assert loop.v_cruise_mph == 45
 
-  def test_up_confirm_keeps_higher_baseline(self):
-    """Zone reopens mid-session: settled at 40 under a 48 baseline, limit rises to 45,
-    the confirm walks the dash up to 45 but the 48 baseline survives (the session caps
-    the plan; the setpoint is only ever raised toward the limit, never lowered by it)."""
+  def test_rising_limit_after_a_minus_confirm_asks_plus(self):
+    """Zone reopens mid-session: settled at 40 (the - confirm lowered the 48 setpoint), the limit
+    rises to 45 and asks +; the confirm walks the dash up to 45."""
     loop = Loop(baseline_mph=48, seed=21)
     settle_in_zone(loop, limit=40)
 
     loop.limit_mph = 45
     loop.run(1.0)
     assert loop.sla.state == SlaState.preActive
-    loop.driver_press(ButtonType.decelCruise, in_seconds=0.1)  # cluster 48 > 45: confirm is -
+    loop.driver_press(ButtonType.accelCruise, in_seconds=0.1)  # setpoint 40 < 45: confirm is +
     loop.run(12.0)
     assert loop.sla.state == SlaState.active, loop.sla.state
     assert loop.ecu.dash == 45, f"dash: {loop.ecu.dash}"
-    assert loop.v_cruise_mph == 48, f"baseline corrupted: {loop.v_cruise_mph}"
+    assert loop.v_cruise_mph == 45, f"setpoint: {loop.v_cruise_mph}"
 
   def test_pre_active_holds_dash_until_answered(self):
     """Drive 0000000b t=180.8: limit rises mid-session and ICBM restored the dash toward
     the baseline while the confirm prompt was still showing. The prompt must freeze the
-    plan: no un-confirmed acceleration; the restore may only run after the timeout."""
+    plan: no un-confirmed acceleration, during the prompt or after it times out."""
     loop = Loop(baseline_mph=48, seed=22)
     settle_in_zone(loop, limit=40)
 
@@ -216,9 +215,41 @@ class TestDriverInteractions:
         assert lo.ecu.dash <= 41, f"dash restored during the prompt: {lo.ecu.dash}"
     loop.run(4.9, assert_each=frozen)
     assert loop.sla.state == SlaState.preActive, loop.sla.state
-    loop.run(12.0)  # timeout -> inactive -> quiet window -> restore to baseline
+    loop.run(12.0)  # timeout -> inactive: the - confirm left the setpoint at 40
     assert loop.sla.state == SlaState.inactive
-    assert loop.ecu.dash == 48, f"restore after timeout stopped short: {loop.ecu.dash}"
+    assert loop.ecu.dash == 40, f"the dash rose without a confirm: {loop.ecu.dash}"
+
+  @pytest.mark.parametrize("op_long", [False, True], ids=["stock_acc", "alpha_long"])
+  def test_exit_ramp_limit_rise_never_walks_up_unasked(self, op_long):
+    """Routes 00000017 15:59 and 00000019 25:53: - confirmed 35 off a 61 highway setpoint, then the map limit dropped
+    out on the ramp and the car's 64 took over. The session raised its cap unasked and ICBM pressed + at 27 mph. Now
+    the rise asks, and an unanswered prompt leaves the dash at 35."""
+    loop = Loop(baseline_mph=61, seed=31, op_long=op_long)
+    settle_in_zone(loop, limit=35)
+
+    loop.limit_mph = 64
+    def never_up(lo):
+      assert lo.ecu.dash <= 35, f"dash rose unasked at {lo.tick_n / 100.:.2f}s: {lo.ecu.dash}"
+    loop.run(3.0, assert_each=never_up)
+    assert loop.sla.state == SlaState.preActive, loop.sla.state
+    loop.run(20.0, assert_each=never_up)  # prompt times out, quiet window, any restore
+    assert loop.v_cruise_mph == 35, f"setpoint: {loop.v_cruise_mph}"
+
+  @pytest.mark.parametrize("op_long", [False, True], ids=["stock_acc", "alpha_long"])
+  @pytest.mark.parametrize("rise", [64, 75])
+  def test_unasked_drop_then_rise_never_walks_up(self, op_long, rise):
+    """A drop at highway speed applies unasked; it must lower the setpoint too, or the next rise (back to the
+    confirmed limit, or past it with the prompt ignored) walks the dash up from the drop unasked."""
+    loop = Loop(baseline_mph=70, seed=32, op_long=op_long)
+    settle_in_zone(loop, limit=64)
+    loop.limit_mph = 55
+    loop.run(10.0)
+    assert loop.ecu.dash == 55 and loop.v_cruise_mph == 55, (loop.ecu.dash, loop.v_cruise_mph)
+
+    loop.limit_mph = rise
+    def never_up(lo):
+      assert lo.ecu.dash <= 55, f"dash rose unasked at {lo.tick_n / 100.:.2f}s: {lo.ecu.dash}"
+    loop.run(25.0, assert_each=never_up)
 
   def test_pre_active_decline_by_opposite_press(self):
     """A release against the confirm direction declines the prompt: the session ends at
@@ -278,17 +309,17 @@ class TestDriverInteractions:
     loop.limit_mph = 45
     loop.run(1.0)
     assert loop.sla.state == SlaState.preActive
-    loop.driver_press(ButtonType.accelCruise, in_seconds=0.1)  # against the - confirm: decline
+    loop.driver_press(ButtonType.decelCruise, in_seconds=0.1)  # against the + confirm: decline
     loop.run(0.5)
     assert loop.sla.state == SlaState.inactive, loop.sla.state
-    assert loop.v_cruise_mph == 49, f"declining press must still increment: {loop.v_cruise_mph}"
+    assert loop.v_cruise_mph == 39, f"declining press must still decrement: {loop.v_cruise_mph}"
 
     dash_at_decline = loop.ecu.dash
     loop.run(0.3)  # still inside the quiet window (1 s, counted from the decline)
     assert loop.ecu.dash <= dash_at_decline + 1, \
       f"restore began inside the quiet window: {loop.ecu.dash} from {dash_at_decline}"
     loop.run(12.0)
-    assert loop.ecu.dash == 49, f"restore never completed: {loop.ecu.dash}"
+    assert loop.ecu.dash == 39, f"restore never completed: {loop.ecu.dash}"
 
   def test_no_emission_escapes_at_prompt_onset(self):
     """The servo's own freeze is one hop stale; card's same-frame veto must stop any
@@ -306,8 +337,7 @@ class TestDriverInteractions:
   def test_press_during_scc_dip_with_sla_session(self):
     """Two limiters overlapping: settled SLA session, then a curve dips below it. A +
     press dismisses the SLA session but must NOT lift the curve limit or corrupt the
-    baseline; once the dip clears, the restore goes all the way to the baseline (the
-    dismissed session must not re-grab at 45)."""
+    setpoint, which the - confirm lowered to 45; once the dip clears, the dash returns to 45."""
     loop = Loop(baseline_mph=60, seed=13)
     settle_in_zone(loop, limit=45)
 
@@ -319,12 +349,12 @@ class TestDriverInteractions:
     loop.run(2.0)
     assert loop.sla.state == SlaState.inactive
     assert loop.ecu.dash <= 42, "the press must not lift the still-active curve limit"
-    assert loop.v_cruise_mph == 60, f"baseline corrupted: {loop.v_cruise_mph}"
+    assert loop.v_cruise_mph == 45, f"setpoint: {loop.v_cruise_mph}"
 
     loop.scc_dip_mph = 0.
     loop.run(14.0)
-    assert loop.ecu.dash == 60, f"restore stopped short: {loop.ecu.dash}"
-    assert loop.v_cruise_mph == 60
+    assert loop.ecu.dash == 45, f"restore stopped short: {loop.ecu.dash}"
+    assert loop.v_cruise_mph == 45
 
 
 class TestPressTimingSweeps:
@@ -346,10 +376,8 @@ class TestPressTimingSweeps:
 
   @pytest.mark.parametrize("offset", PRESS_OFFSETS_S, ids=lambda o: f"{o:.2f}s")
   def test_mid_move_press_at_any_phase_converges(self, offset):
-    """Abort mid-walk at every phase. Deep in the walk the baseline must survive and
-    restore exactly; within the 2 mph agreement band of the limit the press counts as
-    settled and re-anchors; either way the system converges (setpoint == dash) and the
-    baseline is never left corrupted at some in-between value."""
+    """Abort mid-walk at every phase: the - confirm already moved the setpoint to the limit, so
+    the system converges (setpoint == dash) on it and never climbs back to the old 60."""
     loop = Loop(baseline_mph=60, seed=11)
     confirm_lower(loop, limit=45)
 
@@ -362,7 +390,7 @@ class TestPressTimingSweeps:
     assert loop.v_cruise_mph == loop.ecu.dash, \
       f"offset {offset}: diverged (dash {loop.ecu.dash}, setpoint {loop.v_cruise_mph})"
     if abs(dash_at_press - 45) > 3:
-      assert loop.ecu.dash == 60, f"offset {offset}: baseline not restored from {dash_at_press}: {loop.ecu.dash}"
+      assert loop.ecu.dash == 45, f"offset {offset}: from {dash_at_press}: {loop.ecu.dash}"
 
   @pytest.mark.parametrize("offset", PRESS_OFFSETS_S, ids=lambda o: f"{o:.2f}s")
   def test_up_confirm_press_at_any_phase_converges(self, offset):
@@ -408,7 +436,7 @@ class TestAlphaLong:
     loop.lookahead_mph = None
     loop.run(4.0)
     assert loop.ecu.dash == 45
-    assert loop.v_cruise_mph == 60
+    assert loop.v_cruise_mph == 45
 
 
 class TestPromptFreezeOvershoot:

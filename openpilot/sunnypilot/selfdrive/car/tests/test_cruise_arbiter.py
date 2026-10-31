@@ -110,11 +110,12 @@ class TestCruiseArbiterNonPcm:
     assert self.arb.state == SpeedLimitAssistState.active
     assert round(self.v_cruise_kph * CV.KPH_TO_MPH) == 45
 
-  def test_down_confirm_keeps_baseline(self):
+  def test_down_confirm_lowers_baseline(self):
+    """- lowers the setpoint to the limit, as + raises it: nothing that later lifts the cap walks the car back up."""
     self.go_pre_active(cluster_mph=60, limit_mph=45)
     self.press(ButtonType.decelCruise, 60, 45)
     assert self.arb.state == SpeedLimitAssistState.active
-    assert round(self.v_cruise_kph * CV.KPH_TO_MPH) == 60
+    assert round(self.v_cruise_kph * CV.KPH_TO_MPH) == 45
 
   def test_wrong_direction_press_declines(self):
     """A release against the confirm direction is a decline: the session ends right away
@@ -320,16 +321,18 @@ class TestCruiseArbiterNonPcm:
     self.press(ButtonType.decelCruise, 60, 45)
     assert self.arb.announce_counter == before + 1
 
-  def test_limit_above_the_held_setpoint_is_silent(self):
-    """Holding the 60 setpoint under a 60 limit, a 65 limit changes nothing the car does."""
+  def test_limit_above_the_held_setpoint_asks(self):
+    """Holding 60 under a 60 limit, a 65 limit asks before it raises anything (route 00000018 14:26)."""
     self.active_at(60, 60)
-    assert not self.announces(60, 65)
-    assert self.arb.state == SpeedLimitAssistState.active
+    self.frame(60, 65)
+    assert self.arb.state == SpeedLimitAssistState.preActive
 
-  def test_limit_rising_past_the_setpoint_announces_the_release(self):
-    """Capped at 55 under a 60 setpoint, a 65 limit lets the car back up to 60."""
+  def test_limit_rising_past_the_cap_asks(self):
+    """Capped at 55, a 65 limit asks and holds 55 meanwhile (routes 00000017 15:59, 00000019 25:53 raised 35 to 64)."""
     self.active_at(60, 55)
-    assert self.announces(60, 65)
+    self.frame(60, 65)
+    assert self.arb.state == SpeedLimitAssistState.preActive
+    assert abs(self.arb.v_cap - 55 * self.MPH) < 0.1
 
   def test_limit_falling_announces(self):
     self.active_at(70, 65)
@@ -464,7 +467,7 @@ class TestCruiseArbiterNonPcm:
     assert self.arb.state == SpeedLimitAssistState.active
     assert self.arb.press_owned(button) or not self.arb._press  # the confirm press itself does not step the setpoint
     assert abs(self.arb.v_cap - limit_mph * self.MPH) < 0.1
-    expected = max(cluster_mph, limit_mph)  # + raises the baseline to the limit; - leaves it and caps
+    expected = limit_mph  # + raises the baseline to the limit, - lowers it
     assert round(self.v_cruise_kph * CV.KPH_TO_MPH) == expected
 
   @pytest.mark.parametrize("cluster_mph, limit_mph, button", [

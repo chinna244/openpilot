@@ -217,6 +217,7 @@ def test_receive_frame_does_not_retain_vision_buffer(monkeypatch):
   class FakeBuffer:
     def __init__(self):
       self.data = np.ones(6, dtype=np.uint8)
+      self.uv_offset = 4  # stride * height, as msgq reports it
 
   class FakeClient:
     width = 2
@@ -245,12 +246,12 @@ def test_run_releases_local_frame_after_offroad_cleanup():
 
   class FakeSubMaster:
     def __init__(self):
-      self.updated = {"userBookmark": False, "livePose": False}
+      self.updated = {"userBookmark": False, "deviceMotion": False}
       self.valid = {"carState": True}
       self.states = {
         "deviceState": SimpleNamespace(started=False),
         "liveMapDataSP": SimpleNamespace(roadName=""),
-        "livePose": SimpleNamespace(inputsOK=True),
+        "deviceMotion": SimpleNamespace(inputsOK=True),
         "carState": SimpleNamespace(gearShifter="drive"),
       }
       self.update_count = 0
@@ -289,6 +290,7 @@ def test_run_releases_local_frame_after_offroad_cleanup():
   daemon.last_inference_at = -float("inf")
   daemon.stream_name = "road camera"
   daemon.published_speed_limit_mph = 0
+  daemon.road_change, daemon.road_change_key, daemon.road_change_at = slv.RoadChange(), None, 0.0
   daemon.published_confidence = 0.0
   daemon.pending_auto_bookmark = None
   daemon.memory_pressure_state = "normal"

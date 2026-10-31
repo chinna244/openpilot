@@ -45,9 +45,9 @@ same frame as the button events and the setpoint writer. It reuses the upstream
   still walking the dash there, keeps the session instead of dismissing it. A prompt
   is not opened when the dash already shows the limit (`_enter_prompt` activates). The
   dash reaching the limit resolves nothing here: on ICBM cars the servo moves it.
-- `active`: a limit change prompts when `confirm_needed_for_change` says so (below the
-  confirm speed threshold every change prompts; at or above it a new target above the
-  threshold auto-applies and only announces).
+- `active`: a limit change prompts when it raises the target above the held cap, or when
+  `confirm_needed_for_change` says so (below the confirm speed threshold every change prompts;
+  at or above it a lower target above the threshold auto-applies and only announces).
 
 The published surface is `carStateSP.zoompilot.cruiseSession`: `state`, `vCap`, `lastIntent`,
 `announceCounter`. `vCap` is the plan cap in m/s: the session target while active, the
@@ -101,9 +101,12 @@ published session instead of re-interpreting buttons.
 | otherwise | normal | n/a | plain increment |
 
 A prompt press confirms when it points the way the cluster has to move
-(`compare_cluster_target`). An upward confirm raises `v_cruise` to the limit
-(`adopted_this_frame`); a downward confirm leaves a baseline above the limit alone,
-the active session caps the plan instead. A press against the confirm direction
+(`compare_cluster_target`). A confirm moves `v_cruise` to the limit (`adopted_this_frame`),
+up or down; on an openpilot-owned setpoint a downward confirm leaves it and the session caps
+the plan, as a dismiss re-anchors there. Under ICBM a - that only capped left the baseline above
+the limit, and whatever lifted the cap next (a silent rise, an ignored prompt) walked the car back
+up unasked (routes 00000017, 00000019 exit ramps). A target above the cap an active session holds
+always prompts, at any speed. A press against the confirm direction
 declines: the session ends at once so the frozen hold releases, and the press still
 counts as a normal increment. A prompt press that reaches long-press duration resolves
 at the first tick instead of release, one frame before `cruise.py`'s first repeat tick

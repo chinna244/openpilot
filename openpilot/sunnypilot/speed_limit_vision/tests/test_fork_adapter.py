@@ -140,3 +140,118 @@ def test_blue_symbol_where_the_number_goes_is_not_read():
 def test_black_number_is_not_blue():
   assert SpeedLimitVisionDaemon._center_blue_ratio(sign((10, 10, 10))) == 0.0
   assert SpeedLimitVisionDaemon._center_blue_ratio(sign((170, 60, 20))) > slv.SIGN_CENTER_BLUE_MAX
+
+
+def test_runtime_daemon_starts():
+  """The process as manager starts it: on 45ae07ae3f it died at start on every drive (cereal, VisionStreamType and
+  livePose are openpilot.cereal, openpilot.cereal.visionipc and deviceMotion in this fork)."""
+  d = SpeedLimitVisionDaemon()
+  assert d.sm is not None and d.pm is not None and d.VisionStreamType is not None
+  d.sm.update(0)
+  d._send_state()
+
+
+def test_padded_nv12_frame_reads_as_the_image():
+  """camerad pads the NV12 planes apart (stride, uv_offset) and msgq hands out a memoryview."""
+  from openpilot.system.camerad.cameras.nv12_info import get_nv12_info
+  width, height = 1344, 760
+  stride, y_height, _, size = get_nv12_info(width, height)
+  raw = np.zeros(size, np.uint8)
+  raw[:stride * height].reshape(height, stride)[:, :width] = 120
+  raw[stride * y_height:stride * y_height + stride * height // 2].reshape(height // 2, stride)[:, :width] = 128
+  d = SpeedLimitVisionDaemon.__new__(SpeedLimitVisionDaemon)
+  buf = SimpleNamespace(data=memoryview(raw), uv_offset=stride * y_height)
+  d.client = SimpleNamespace(recv=lambda: buf, width=width, height=height, stride=stride)
+  frame = d._receive_frame_bgr()
+  assert frame.shape == (height, width, 3)
+  assert abs(int(frame.mean()) - 120) <= 6  # flat grey, no stripes from a misread plane
+
+
+def drive(rc, seconds, v=12., yaw=0., car=35, map_limit=0, sign=25, dt=0.1):
+  for _ in range(int(seconds / dt)):
+    reason = rc.update(dt, v, yaw, car, map_limit, sign)
+    if reason:
+      return reason
+  return None
+
+
+def test_sign_holds_on_the_same_road():
+  """Car 35 on a 25 road (routes 0f/10/12): the camera's 25 stands while nothing says the road changed."""
+  rc = slv.RoadChange()
+  rc.reset(35, 30)
+  assert drive(rc, 300., car=35, map_limit=30) is None  # 3.6 km: longer than the old 5 min would not matter here
+
+
+def test_a_turn_ends_the_sign():
+  rc = slv.RoadChange()
+  rc.reset(35, 0)
+  assert drive(rc, 2., yaw=0.1) is None  # a lane change or a bend: ~11 deg
+  assert drive(rc, 10., yaw=0.2) == "turn"  # route 18 0:39 right turn read 80 deg
+
+
+def test_a_held_limit_change_ends_the_sign_but_a_glitch_does_not():
+  rc = slv.RoadChange()
+  rc.reset(40, 0)
+  assert drive(rc, 5., car=70, sign=40) is None  # route 17 5:14: the car read 70 on a 40 road for ~5 s
+  assert drive(rc, 5., car=40, sign=40) is None
+  assert drive(rc, 9., car=55, sign=40) is None
+  assert drive(rc, 2., car=55, sign=40) == "car_limit"
+
+
+def test_a_limit_moving_to_the_signs_value_is_agreement_not_a_new_road():
+  rc = slv.RoadChange()
+  rc.reset(35, 30)
+  assert drive(rc, 30., car=25, map_limit=25, sign=25) is None
+
+
+def test_distance_backstop():
+  rc = slv.RoadChange()
+  rc.reset(55, 55)
+  assert drive(rc, 300., v=30., car=55, map_limit=55, sign=55) == "distance"  # 5 km with no repeat sign
+
+
+def test_road_change_resets_on_a_repeat_sighting():
+  d = SpeedLimitVisionDaemon.__new__(SpeedLimitVisionDaemon)
+  d.is_metric = False
+  d.road_change, d.road_change_key, d.road_change_at = slv.RoadChange(), None, 0.
+  d.published_speed_limit_mph, d.last_published_support_at = 25, 1.
+  gyro = SimpleNamespace(z=0.)
+  d.sm = {"carStateSP": SimpleNamespace(speedLimit=35 * CV.MPH_TO_MS), "carState": SimpleNamespace(vEgo=10.),
+          "liveMapDataSP": SimpleNamespace(speedLimit=0., speedLimitValid=False),
+          "deviceMotion": SimpleNamespace(angularVelocityDevice=gyro)}
+  cleared = []
+  d._write_debug_event = lambda *a, **k: None
+  d._clear_detection = lambda: cleared.append(True)
+  t = [100.]
+
+  def run(seconds, z):
+    gyro.z = z
+    for _ in range(int(seconds * 10)):
+      t[0] += 0.1
+      d._update_road_change(t[0])
+
+  run(1., 0.)
+  run(2.5, 0.3)  # 43 deg
+  run(1., 0.)
+  d.last_published_support_at = t[0]  # seen again on the straight: the count starts over
+  run(1., 0.)
+  run(2.5, 0.3)  # 43 deg since the repeat
+  assert not cleared
+  run(1.5, 0.3)  # 69 deg
+  assert cleared
+
+
+def test_a_sign_read_mid_turn_survives_that_turn():
+  """Route 12 t=156: a 30 read 18 deg into a right turn stands on the new road; finishing the turn must not drop it,
+  the next turn does."""
+  rc = slv.RoadChange()
+  rc.reset(0, 0, yaw_rate=0.35)  # 20 deg/s
+  assert drive(rc, 4., yaw=0.35, car=0) is None  # the rest of the same turn
+  assert drive(rc, 20., car=0) is None
+  assert drive(rc, 6., yaw=0.3, car=0) == "turn"
+
+
+def test_stopped_gyro_drift_is_not_a_turn():
+  rc = slv.RoadChange()
+  rc.reset(0, 0)
+  assert drive(rc, 120., v=0., yaw=0.02, car=0) is None  # ~140 deg of drift at a light

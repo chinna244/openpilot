@@ -78,7 +78,7 @@ class SpeedLimitResolver:
       Policy.car_state_priority: [SpeedLimitSource.car, SpeedLimitSource.map],
       Policy.map_data_priority: [SpeedLimitSource.map, SpeedLimitSource.car],
       Policy.combined: [SpeedLimitSource.vision, SpeedLimitSource.car, SpeedLimitSource.map],
-      Policy.vision_priority: [SpeedLimitSource.vision, SpeedLimitSource.map, SpeedLimitSource.car],
+      Policy.vision_priority: [SpeedLimitSource.vision, SpeedLimitSource.car, SpeedLimitSource.map],
     }
     self.source = SpeedLimitSource.none
     for source in ALL_SOURCES:
