@@ -78,6 +78,16 @@ def get_T_FOLLOW(personality=log.LongitudinalPersonality.standard):
   else:
     raise NotImplementedError("Longitudinal personality not supported")
 
+# City following: up to 25 mph the time gap is CITY_T_FOLLOW_FACTOR of the personality's (1.0 s on aggressive), back to the
+# full gap by 35 mph; STOP_DISTANCE is unchanged. Routes 00000184-0000019c and 00000008-00000014 at 20-30 mph: the driver
+# followed at 1.66 s (median), alpha long at 2.15 s. Closed-loop MPC on 36 logged city stretches: 1.92 -> 1.77 s; a lead
+# braking at -3.5 to a stop left 1.2 -> 1.1 m. Set Speed Assist lifts the model toward this MPC's answer while following.
+CITY_T_FOLLOW_BP = [11.2, 15.6]  # m/s, 25 to 35 mph
+CITY_T_FOLLOW_FACTOR = 0.8
+
+def get_city_T_FOLLOW(t_follow, v_ego):
+  return t_follow * float(np.interp(v_ego, CITY_T_FOLLOW_BP, [CITY_T_FOLLOW_FACTOR, 1.]))
+
 def get_stopped_equivalence_factor(v_lead):
   return (v_lead**2) / (2 * COMFORT_BRAKE)
 
@@ -308,7 +318,7 @@ class LongitudinalMpc:
     return lead_xv
 
   def update(self, radarstate, personality=log.LongitudinalPersonality.standard):
-    t_follow = get_T_FOLLOW(personality)
+    t_follow = get_city_T_FOLLOW(get_T_FOLLOW(personality), self.x0[1])
 
     lead_xv_0 = self.process_lead(radarstate.leadOne)
     lead_xv_1 = self.process_lead(radarstate.leadTwo)
