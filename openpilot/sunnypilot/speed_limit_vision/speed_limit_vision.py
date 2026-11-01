@@ -4,8 +4,9 @@ Copyright (c) 2026, firestar5683 and StarPilot contributors. MIT License.
 
 StarPilot's speed-limit sign reader (starpilot/system/speed_limit_vision.py at StarPilot 98f8443),
 ported with its tuning unchanged. What this fork changed, all at the edges:
-- OpenCV and the U.S. models come from /data/sign_vision (site-packages/, models/), installed by hand:
-  AGNOS's venv has no cv2. Without them the process says so in its status and reads nothing.
+- No OpenCV (AGNOS's venv has none): the U.S. detector and value classifier ship in models/ and are compiled at
+  build into tinygrad JITs that read the NV12 camera frame on the GPU (compile_sign_models.py); the few CPU image
+  steps are numpy (image_ops.py). StarPilot's OCR, tracking and single-model paths are off and still need cv2.
 - Inputs: liveMapDataSP for mapdOut, carState's park gear for starpilotCarState.isParked.
 - StarPilot's VisionSpeedLimit* memory params live in this process (MemoryParams), and the reading
   goes out as customReserved10 (speed limit sign vision), which the speed limit resolver uses first
@@ -18,7 +19,6 @@ from __future__ import annotations
 import json
 import math
 import os
-import sys
 import time
 
 from collections import Counter, deque
@@ -26,17 +26,19 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
-SIGN_VISION_DIR = Path(os.environ.get("SIGN_VISION_DIR", "/data/sign_vision"))
-if (SIGN_VISION_DIR / "site-packages").is_dir():
-  sys.path.insert(0, str(SIGN_VISION_DIR / "site-packages"))
-
-import cv2
 import numpy as np
+
+try:
+  import cv2  # fork: only StarPilot's switched-off OCR, tracking and single-model paths need it; AGNOS has none
+except ImportError:
+  cv2 = None
 
 from openpilot.common.constants import CV
 from openpilot.common.hardware import PC
 from openpilot.common.realtime import set_core_affinity
 from openpilot.common.swaglog import cloudlog
+from openpilot.sunnypilot.speed_limit_vision import image_ops
+from openpilot.sunnypilot.speed_limit_vision.sign_models import MODEL_DIR, SignModels
 
 SERVICE = "customReserved10"
 SEND_INTERVAL = 0.2  # s, customReserved10 at 5 Hz
@@ -290,7 +292,6 @@ SPEED_LIMIT_CLASSES = {
 VALID_SPEED_LIMITS_MPH = set(range(5, 125, 5))
 MIN_PUBLISHABLE_SPEED_LIMIT_MPH = 5
 MAX_IMPERIAL_PUBLISHABLE_SPEED_LIMIT_MPH = 80
-MODEL_DIR = SIGN_VISION_DIR / "models"
 LEGACY_MODEL_PATH = MODEL_DIR / "speed_limit_vision.onnx"
 US_DETECTOR_MODEL_PATH = MODEL_DIR / "speed_limit_us_detector.onnx"
 US_CLASSIFIER_MODEL_PATH = MODEL_DIR / "speed_limit_us_value_classifier.onnx"
@@ -559,8 +560,8 @@ class SpeedLimitVisionDaemon:
     self.last_classifier_forward_count = 0
     self.last_classifier_forward_duration_s = 0.0
 
-    self.digit_templates = self._build_digit_templates()
-    self.speed_value_templates = self._build_speed_value_templates()
+    self.digit_templates = self._build_digit_templates() if cv2 is not None else {}
+    self.speed_value_templates = self._build_speed_value_templates() if cv2 is not None else {}
     self._load_model()
 
   def _start_debug_session(self) -> bool:
@@ -776,7 +777,8 @@ class SpeedLimitVisionDaemon:
       snapshot_name = f"{wall_time_ns}_{snapshot_prefix}.jpg"
       snapshot_path = self.debug_capture_dir / snapshot_name
       try:
-        cv2.imwrite(str(snapshot_path), frame_bgr, [cv2.IMWRITE_JPEG_QUALITY, SNAPSHOT_JPEG_QUALITY])
+        from PIL import Image
+        Image.fromarray(frame_bgr[:, :][:, :, ::-1]).save(snapshot_path, quality=SNAPSHOT_JPEG_QUALITY)
         event["snapshot"] = f"{DEBUG_CAPTURE_DIRNAME}/{snapshot_name}"
       except Exception:
         pass
@@ -1191,6 +1193,19 @@ class SpeedLimitVisionDaemon:
     self.model_mode = "legacy"
     self.detector_input_size = DEFAULT_DETECTOR_INPUT_SIZE
     self.classifier_input_size = DEFAULT_CLASSIFIER_INPUT_SIZE
+    self.sign_models = None
+
+    # fork: the detector and classifier run as tinygrad JITs compiled at build (SConscript), loaded for the camera's
+    # frame size once it connects
+    if any(MODEL_DIR.glob("speed_limit_us_detector_*_tinygrad.pkl")):
+      self.model_mode = "detector_classifier"
+      self.last_error = ""
+      return
+
+    if cv2 is None:
+      self.last_error = "Missing compiled vision models"
+      self._publish_status(self.last_error, clear_speed=True)
+      return
 
     if US_DETECTOR_MODEL_PATH.is_file() and US_CLASSIFIER_MODEL_PATH.is_file():
       try:
@@ -1338,7 +1353,30 @@ class SpeedLimitVisionDaemon:
     if not self.client.is_connected():
       self.client.connect(True)
 
+    if self.client.is_connected() and self.model_mode == "detector_classifier":
+      self._load_sign_models()
     return self.client.is_connected()
+
+  def _load_sign_models(self):
+    from openpilot.system.camerad.cameras.nv12_info import get_nv12_info
+    width, height = self.client.width, self.client.height
+    stride, y_height, _, frame_size = get_nv12_info(width, height)
+    geometry = (width, height, stride, stride * y_height, frame_size)
+    if self.sign_models is not None and self.sign_models.geometry + (self.sign_models.frame_size,) == geometry:
+      return
+    self.net = self.classifier_net = self.sign_models = None
+    try:
+      if stride != self.client.stride:
+        raise ValueError(f"camera stride {self.client.stride}, expected {stride}")
+      self.sign_models = SignModels(*geometry)
+      self.net = self.classifier_net = self.sign_models
+      self.detector_input_size = self.sign_models.detector_input_size
+      self.classifier_input_size = self.sign_models.classifier_input_size
+      self.last_error = ""
+    except Exception as exc:
+      self.model_mode = "unavailable"
+      self.last_error = f"Failed to load vision models for {width}x{height}: {exc}"
+      cloudlog.exception("speed_limit_vision: model load failed")
 
   def _disconnect_camera(self):
     # Dropping the client closes its imported VisionIPC buffer FDs. Keeping the
@@ -1361,6 +1399,10 @@ class SpeedLimitVisionDaemon:
 
     data = np.frombuffer(buffer.data, dtype=np.uint8)  # this fork's msgq hands out a memoryview
     if not data.any():
+      return None
+    if self.sign_models is not None:
+      return self.sign_models.receive(data)  # fork: converted to BGR per crop, never as a whole frame
+    if cv2 is None:
       return None
 
     # the Y and UV planes are padded apart (uv_offset), not one stride-wide block
@@ -1569,7 +1611,7 @@ class SpeedLimitVisionDaemon:
       self._clear_proposal_track(failed=True)
       return None
 
-    read_result = self._classify_speed_limit_from_model(sign_crop)
+    read_result = self._classify_speed_limit_from_model(sign_crop, (crop_x1, crop_y1))
     if read_result is None:
       track.consecutive_failed_reads += 1
       track.last_speed_limit_mph = 0
@@ -1649,7 +1691,7 @@ class SpeedLimitVisionDaemon:
     if crop_area <= 0:
       return False
 
-    hsv = cv2.cvtColor(sign_crop, cv2.COLOR_BGR2HSV)
+    hsv = image_ops.bgr_to_hsv(sign_crop)
     hue = hsv[:, :, 0]
     saturation = hsv[:, :, 1]
     value = hsv[:, :, 2]
@@ -1698,16 +1740,12 @@ class SpeedLimitVisionDaemon:
     if blue_ratio > REGULATORY_MAX_BLUE_RATIO and blue_ratio > white_ratio * 0.60:
       return False
 
-    white_binary = (white_mask * 255).astype(np.uint8)
-    contours, _ = cv2.findContours(white_binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     min_component_area = crop_area * REGULATORY_MIN_WHITE_COMPONENT_RATIO
 
-    for contour in contours:
-      area = cv2.contourArea(contour)
+    for area, _x, _y, width, height in image_ops.external_contours(white_mask, min_component_area):
       if area < min_component_area:
         continue
 
-      x, y, width, height = cv2.boundingRect(contour)
       if height < crop_height * REGULATORY_MIN_COMPONENT_HEIGHT_RATIO:
         continue
       if width < crop_width * REGULATORY_MIN_COMPONENT_WIDTH_RATIO:
@@ -1777,6 +1815,7 @@ class SpeedLimitVisionDaemon:
 
   def _iter_school_zone_read_crops(self, sign_crop):
     yielded = set()
+    image_height, image_width = sign_crop.shape[:2]
     for left_ratio, top_ratio, right_ratio, bottom_ratio, weight in SCHOOL_ZONE_READ_VARIANTS:
       crop = self._crop_by_ratio(sign_crop, left_ratio, top_ratio, right_ratio, bottom_ratio)
       if crop is None:
@@ -1785,7 +1824,7 @@ class SpeedLimitVisionDaemon:
       if key in yielded:
         continue
       yielded.add(key)
-      yield crop, weight
+      yield crop, (max(int(image_width * left_ratio), 0), max(int(image_height * top_ratio), 0)), weight
 
   def _collect_model_proposals(self, frame_bgr):
     if self.net is None:
@@ -1837,18 +1876,14 @@ class SpeedLimitVisionDaemon:
 
     return sorted(candidates, reverse=True)[:MODEL_PROPOSAL_MAX_COUNT]
 
-  def _collect_detector_classifier_proposals_from_region(self, frame_bgr, origin_x, origin_y, full_frame_width, full_frame_height, min_confidence):
+  def _collect_detector_classifier_proposals_from_region(self, frame_bgr, origin_x, origin_y, region_width, region_height,
+                                                         full_frame_width, full_frame_height, min_confidence):
     if self.net is None:
       return []
 
-    region_height, region_width = frame_bgr.shape[:2]
-    detector_shape = (self.detector_input_size, self.detector_input_size)
-    letterboxed, ratio, pad_width, pad_height = self._letterbox(frame_bgr, shape=detector_shape)
-    blob = cv2.dnn.blobFromImage(letterboxed, scalefactor=1 / 255.0, size=detector_shape, swapRB=True, crop=False)
-    self.net.setInput(blob)
-
     forward_started_at = time.monotonic()
-    predictions = np.squeeze(self.net.forward())
+    predictions, ratio, pad_width, pad_height = self.sign_models.detect(frame_bgr, origin_x, origin_y, region_width, region_height)
+    predictions = np.squeeze(predictions)
     self.last_detector_forward_count += 1
     self.last_detector_forward_duration_s += time.monotonic() - forward_started_at
     if predictions.ndim != 2:
@@ -1907,6 +1942,8 @@ class SpeedLimitVisionDaemon:
         0,
         frame_width,
         frame_height,
+        frame_width,
+        frame_height,
         US_DETECTOR_MIN_CONFIDENCE,
       ))
 
@@ -1917,12 +1954,13 @@ class SpeedLimitVisionDaemon:
       top = int(frame_height * top_ratio)
       right = int(frame_width * right_ratio)
       bottom = int(frame_height * bottom_ratio)
-      roi = frame_bgr[top:bottom, left:right]
-      if roi.size > 0:
+      if bottom > top and right > left:
         candidates.extend(self._collect_detector_classifier_proposals_from_region(
-          roi,
+          frame_bgr,
           left,
           top,
+          right - left,
+          bottom - top,
           frame_width,
           frame_height,
           max(float(ROI_WINDOWS[-1]["min_confidence"]), US_DETECTOR_MIN_CONFIDENCE),
@@ -1937,7 +1975,7 @@ class SpeedLimitVisionDaemon:
     center = sign_crop[int(height * 0.30):int(height * 0.85), int(width * 0.20):int(width * 0.80)]
     if center.size == 0:
       return 0.0
-    hsv = cv2.cvtColor(center, cv2.COLOR_BGR2HSV)
+    hsv = image_ops.bgr_to_hsv(center)
     return float((
       (hsv[:, :, 0] >= REGULATORY_BLUE_HUE_MIN) &
       (hsv[:, :, 0] <= REGULATORY_BLUE_HUE_MAX) &
@@ -1955,13 +1993,14 @@ class SpeedLimitVisionDaemon:
       return False
 
     def yellow(region):
-      hsv = cv2.cvtColor(region, cv2.COLOR_BGR2HSV)
+      hsv = image_ops.bgr_to_hsv(region)
       return ((hsv[:, :, 0] >= REGULATORY_YELLOW_HUE_MIN) & (hsv[:, :, 0] <= REGULATORY_YELLOW_HUE_MAX) &
               (hsv[:, :, 1] >= 90) & (hsv[:, :, 2] >= 60))
     band_rows = float((yellow(top).mean(axis=1) >= SCHOOL_BAND_ROW_YELLOW).mean())
     return band_rows >= SCHOOL_BAND_MIN_ROWS and float(yellow(body).mean()) <= SCHOOL_BODY_YELLOW_MAX
 
-  def _classify_speed_limit_from_model(self, sign_crop):
+  def _classify_speed_limit_from_model(self, sign_crop, origin):
+    """sign_crop is the frame at origin (x, y): the classifier samples that box from the camera frame on the GPU."""
     if self.classifier_net is None or sign_crop.size == 0:
       return None
     if self._center_blue_ratio(sign_crop) > SIGN_CENTER_BLUE_MAX:
@@ -1984,13 +2023,9 @@ class SpeedLimitVisionDaemon:
           if float(reject_probabilities[speed_class_count]) >= US_REJECT_CLASSIFIER_MIN_CONFIDENCE:
             return None
 
-    input_size = self.classifier_input_size
-    padded_crop = self._square_resize(sign_crop, size=input_size)
-    blob = cv2.dnn.blobFromImage(padded_crop, scalefactor=1 / 255.0, size=(input_size, input_size), swapRB=True, crop=False)
-    self.classifier_net.setInput(blob)
-
     forward_started_at = time.monotonic()
-    scores = np.array(self.classifier_net.forward()).reshape(-1)
+    crop_height, crop_width = sign_crop.shape[:2]
+    scores = self.sign_models.classify(self.current_frame_bgr, origin[0], origin[1], crop_width, crop_height)
     self.last_classifier_forward_count += 1
     self.last_classifier_forward_duration_s += time.monotonic() - forward_started_at
     has_reject_class = scores.size == speed_class_count + 1
@@ -2069,8 +2104,8 @@ class SpeedLimitVisionDaemon:
           if sign_crop.size == 0:
             continue
 
-          for school_crop, crop_weight in self._iter_school_zone_read_crops(sign_crop):
-            read_result = self._classify_speed_limit_from_model(school_crop)
+          for school_crop, (crop_x, crop_y), crop_weight in self._iter_school_zone_read_crops(sign_crop):
+            read_result = self._classify_speed_limit_from_model(school_crop, (expanded_x1 + crop_x, expanded_y1 + crop_y))
             if read_result is None and DETECTOR_CLASSIFIER_CROP_OCR_ENABLED:
               read_result = self._read_speed_limit_from_crop(school_crop)
             if read_result is None:
@@ -2137,7 +2172,7 @@ class SpeedLimitVisionDaemon:
         if class_id == 2:
           is_regulatory = True
 
-        model_read = self._classify_speed_limit_from_model(sign_crop)
+        model_read = self._classify_speed_limit_from_model(sign_crop, (expanded_x1, expanded_y1))
         ocr_read = None
         trusted_model_read = (
           class_id == 0 and
@@ -2919,7 +2954,7 @@ class SpeedLimitVisionDaemon:
         else:
           self._record_bookmark()
 
-      if self.net is None:
+      if self.net is None and self.model_mode != "detector_classifier":
         self._publish_status(self.last_error or "Vision model unavailable", clear_speed=True)
         self._publish_runtime_telemetry(now, "model_unavailable")
         ratekeeper.keep_time()
@@ -3069,9 +3104,10 @@ def main():
     set_core_affinity(SPEED_LIMIT_VISION_AFFINITY_CORES)
     os.nice(19)  # StarPilot's manager entry sets nice=19; this fork's PythonProcess has no nice
 
-  # OpenCV may otherwise fan out across many worker threads and starve more
-  # important daemons during detection bursts.
-  cv2.setNumThreads(1)
+  if cv2 is not None:
+    # OpenCV may otherwise fan out across many worker threads and starve more
+    # important daemons during detection bursts.
+    cv2.setNumThreads(1)
 
   daemon = SpeedLimitVisionDaemon()
   daemon.run()

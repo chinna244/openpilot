@@ -7,6 +7,7 @@ import numpy as np
 import pytest
 
 import openpilot.sunnypilot.speed_limit_vision.speed_limit_vision as slv
+from openpilot.sunnypilot.speed_limit_vision.sign_models import SignModels
 from openpilot.sunnypilot.speed_limit_vision.speed_limit_vision import DetectorProposal, HistoryEntry, ProposalTrack, SpeedLimitVisionDaemon
 
 
@@ -30,17 +31,6 @@ class MemoryParams:
   def remove(self, key):
     self.write_count += 1
     self.values.pop(key, None)
-
-
-class StaticClassifierNet:
-  def __init__(self, probabilities):
-    self.probabilities = np.array(probabilities, dtype=np.float32)
-
-  def setInput(self, _blob):
-    pass
-
-  def forward(self):
-    return self.probabilities
 
 
 class ToggleParams:
@@ -211,7 +201,7 @@ def test_enter_parked_preserves_published_limit_and_clears_transient_work():
   assert telemetry == [(10.0, "parked", True)]
 
 
-def test_receive_frame_does_not_retain_vision_buffer(monkeypatch):
+def test_receive_frame_does_not_retain_vision_buffer():
   buffer_refs = []
 
   class FakeBuffer:
@@ -231,12 +221,13 @@ def test_receive_frame_does_not_retain_vision_buffer(monkeypatch):
 
   daemon = SpeedLimitVisionDaemon.__new__(SpeedLimitVisionDaemon)
   daemon.client = FakeClient()
-  monkeypatch.setattr(slv.cv2, "cvtColor", lambda image, _conversion: np.array(image, copy=True))
+  daemon.sign_models = SignModels.__new__(SignModels)
+  daemon.sign_models.geometry, daemon.sign_models.frame_size = (2, 2, 2, 4), 6
 
   frame = daemon._receive_frame_bgr()
   gc.collect()
 
-  assert frame.shape == (3, 2)
+  assert frame[:, :].shape == (2, 2, 3)
   assert buffer_refs[0]() is None
 
 
@@ -383,13 +374,14 @@ def test_extended_classifier_values_require_high_confidence(monkeypatch, confide
   monkeypatch.setitem(method_globals, "EXTENDED_CLASSIFIER_MIN_CONFIDENCE", 0.90)
 
   daemon = slv.SpeedLimitVisionDaemon.__new__(slv.SpeedLimitVisionDaemon)
-  daemon.classifier_net = StaticClassifierNet(probabilities)
+  daemon.classifier_net = daemon.sign_models = SimpleNamespace(classify=lambda *_args: probabilities)
+  daemon.current_frame_bgr = None
   daemon.reject_classifier_net = None
   daemon.classifier_input_size = 128
   daemon.last_classifier_forward_count = 0
   daemon.last_classifier_forward_duration_s = 0.0
 
-  result = daemon._classify_speed_limit_from_model(np.ones((64, 48, 3), dtype=np.uint8))
+  result = daemon._classify_speed_limit_from_model(np.ones((64, 48, 3), dtype=np.uint8), (0, 0))
 
   if expected is None:
     assert result is None
@@ -526,7 +518,7 @@ def test_temporal_track_boosts_two_consistent_model_reads():
   daemon.track_failure_count = 0
   daemon.last_classifier_forward_count = 0
   daemon.last_classifier_forward_duration_s = 0.0
-  daemon._classify_speed_limit_from_model = lambda _crop: (55, 0.90)
+  daemon._classify_speed_limit_from_model = lambda _crop, _origin: (55, 0.90)
   daemon._is_regulatory_speed_sign = lambda _crop: True
 
   first = daemon._classify_proposal_track(frame, 0.2)
@@ -543,7 +535,7 @@ def detector_classifier_daemon(*, regulatory: bool, model_read, bbox=(700, 100, 
   daemon = SpeedLimitVisionDaemon.__new__(SpeedLimitVisionDaemon)
   daemon._collect_detector_classifier_proposals = lambda _frame: [(proposal_confidence, 0, bbox)]
   daemon._is_regulatory_speed_sign = lambda _crop: regulatory
-  daemon._classify_speed_limit_from_model = model_read if callable(model_read) else lambda _crop: model_read
+  daemon._classify_speed_limit_from_model = model_read if callable(model_read) else lambda _crop, _origin: model_read
   daemon._read_speed_limit_from_crop = lambda _crop: pytest.fail("detector/classifier runtime must not call OCR")
   return daemon
 
@@ -563,7 +555,7 @@ def test_detector_classifier_runtime_reads_regulatory_sign_without_ocr(model_onl
 
 def test_detector_classifier_marks_two_strong_model_crops_as_consensus(model_only_runtime):
   reads = iter(((20, 0.96), (20, 0.97), None))
-  daemon = detector_classifier_daemon(regulatory=True, model_read=lambda _crop: next(reads), proposal_confidence=0.80)
+  daemon = detector_classifier_daemon(regulatory=True, model_read=lambda _crop, _origin: next(reads), proposal_confidence=0.80)
   detection = daemon._detect_sign_from_detector_classifier(np.zeros((480, 960, 3), dtype=np.uint8))
 
   assert detection is not None
@@ -573,7 +565,7 @@ def test_detector_classifier_marks_two_strong_model_crops_as_consensus(model_onl
 
 def test_detector_classifier_runtime_rejects_single_untrusted_non_regulatory_model_read_without_ocr(model_only_runtime):
   reads = iter(((55, 0.99), None, None, None))
-  daemon = detector_classifier_daemon(regulatory=False, model_read=lambda _crop: next(reads))
+  daemon = detector_classifier_daemon(regulatory=False, model_read=lambda _crop, _origin: next(reads))
   detection = daemon._detect_sign_from_detector_classifier(np.zeros((480, 960, 3), dtype=np.uint8))
 
   assert detection is None

@@ -1,10 +1,12 @@
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
 from openpilot.cereal import messaging
 from openpilot.common.constants import CV
 import openpilot.sunnypilot.speed_limit_vision.speed_limit_vision as slv
+from openpilot.sunnypilot.speed_limit_vision.sign_models import SignModels, model_pkl_path
 from openpilot.sunnypilot.speed_limit_vision.speed_limit_vision import ForkParams, MemoryParams, SpeedLimitVisionDaemon
 from openpilot.system.manager.process_config import speed_limit_vision
 
@@ -105,21 +107,31 @@ class SizedNet:
       raise slv.cv2.error("wrong size")
 
 
+needs_cv2 = pytest.mark.skipif(slv.cv2 is None, reason="the probe only serves StarPilot's cv2 single-model path")
+
+
+@needs_cv2
 def test_probe_finds_the_size_the_model_runs_at():
   net = SizedNet(256)
   assert SpeedLimitVisionDaemon._probe_input_size(net, 640, slv.DETECTOR_INPUT_SIZE_CANDIDATES) == 256
   assert net.tried == [640, 512, 448, 416, 384, 320, 288, 256]
 
 
+@needs_cv2
 def test_probe_keeps_a_size_that_runs():
   net = SizedNet(128)
   assert SpeedLimitVisionDaemon._probe_input_size(net, 128, slv.CLASSIFIER_INPUT_SIZE_CANDIDATES) == 128
   assert net.tried == [128]
 
 
+@pytest.mark.skipif(not model_pkl_path("speed_limit_us_detector", 1344, 760).is_file(), reason="models not compiled (scons)")
 def test_loaded_models_get_their_real_input_sizes():
+  from openpilot.system.camerad.cameras.nv12_info import get_nv12_info
   d = SpeedLimitVisionDaemon(use_runtime=False)
-  assert (d.model_mode, d.detector_input_size, d.classifier_input_size) == ("detector_classifier", 256, 128), d.last_error
+  assert d.model_mode == "detector_classifier", d.last_error
+  d.client = SimpleNamespace(width=1344, height=760, stride=get_nv12_info(1344, 760)[0])
+  d._load_sign_models()
+  assert (d.detector_input_size, d.classifier_input_size) == (256, 128), d.last_error
 
 
 def sign(center_bgr):
@@ -134,7 +146,7 @@ def test_blue_symbol_where_the_number_goes_is_not_read():
   # route 12 t=80: a disabled-parking sign (blue wheelchair square) read as 65 at 0.93
   d = SpeedLimitVisionDaemon.__new__(SpeedLimitVisionDaemon)
   d.classifier_net = object()  # never reached
-  assert d._classify_speed_limit_from_model(sign((170, 60, 20))) is None
+  assert d._classify_speed_limit_from_model(sign((170, 60, 20)), (0, 0)) is None
 
 
 def test_black_number_is_not_blue():
@@ -159,12 +171,17 @@ def test_padded_nv12_frame_reads_as_the_image():
   raw = np.zeros(size, np.uint8)
   raw[:stride * height].reshape(height, stride)[:, :width] = 120
   raw[stride * y_height:stride * y_height + stride * height // 2].reshape(height // 2, stride)[:, :width] = 128
+  raw[:stride * height].reshape(height, stride)[100:107, 301:310] = 200  # an odd sized box at odd bounds
   d = SpeedLimitVisionDaemon.__new__(SpeedLimitVisionDaemon)
+  d.sign_models = SignModels.__new__(SignModels)
+  d.sign_models.geometry, d.sign_models.frame_size = (width, height, stride, stride * y_height), size
   buf = SimpleNamespace(data=memoryview(raw), uv_offset=stride * y_height)
   d.client = SimpleNamespace(recv=lambda: buf, width=width, height=height, stride=stride)
   frame = d._receive_frame_bgr()
   assert frame.shape == (height, width, 3)
-  assert abs(int(frame.mean()) - 120) <= 6  # flat grey, no stripes from a misread plane
+  full = frame[:, :]
+  assert abs(int(full[:50].mean()) - 120) <= 6  # flat grey, no stripes from a misread plane
+  np.testing.assert_array_equal(frame[101:106, 303:309], full[101:106, 303:309])  # a crop converts like the frame
 
 
 def drive(rc, seconds, v=12., yaw=0., car=35, map_limit=0, sign=25, dt=0.1):
