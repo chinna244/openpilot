@@ -92,7 +92,7 @@ class CruiseLayoutMici(NavScroller):
                                     description=tr("How far holding + or - moves your set speed at each step."))
     self._acc_view = self._custom_acc_btn.link_sub_panel([self._custom_acc_toggle, self._acc_short, self._acc_long])
 
-    self._sl_mode = BigMultiParamToggleSP(tr("speed limit mode"), "SpeedLimitMode", SL_MODE_LABELS,
+    self._sl_mode = BigMultiParamToggleSP(tr("speed limit mode"), "SpeedLimitMode", SL_MODE_LABELS, off_index=0,
                                           description=tr("Assist: when the limit changes, press - or + to set your speed to match.\n" +
                                                          "Info and warn show the sign on a comma 3X only."))
     self._sl_mode.set_blocked_options(lambda: set() if ui_state.icbm_turn_on_allowed("SpeedLimitMode", True) else {SL_MODE_ASSIST})
@@ -105,7 +105,7 @@ class CruiseLayoutMici(NavScroller):
     self._sl_vision = BigParamControlSP(tr("camera signs"), "SpeedLimitVision",
                                         description=tr("Reads speed limit signs with the road camera.\n" +
                                                        "Combined and vision-first use it. Off: car and map only."))
-    self._sl_offset_type = BigMultiParamToggleSP(tr("offset type"), "SpeedLimitOffsetType", [tr("none"), tr("fixed"), "%"],
+    self._sl_offset_type = BigMultiParamToggleSP(tr("offset type"), "SpeedLimitOffsetType", [tr("none"), tr("fixed"), "%"], off_index=0,
                                                  description=tr("Adds an offset to the speed limit.\n" +
                                                                 "Fixed adds a set amount of speed. % adds a percentage of the limit."))
     self._sl_offset_value = BigParamOption(tr("offset value"), "SpeedLimitValueOffset",
