@@ -255,3 +255,36 @@ def test_stopped_gyro_drift_is_not_a_turn():
   rc = slv.RoadChange()
   rc.reset(0, 0)
   assert drive(rc, 120., v=0., yaw=0.02, car=0) is None  # ~140 deg of drift at a light
+
+
+def plaque_sign(top_bgr, body_bgr, patchy=False):
+  """A 60x40 sign: the top 12 rows in top_bgr (every other 4-px block if patchy), the rest in body_bgr."""
+  img = np.zeros((60, 40, 3), np.uint8)
+  img[:] = body_bgr
+  if patchy:
+    for x in range(0, 40, 8):
+      img[:12, x:x + 4] = top_bgr
+  else:
+    img[:12] = top_bgr
+  return img
+
+
+YELLOW, WHITE, SODIUM = (0, 220, 240), (235, 235, 235), (40, 170, 220)
+
+
+def test_school_plaque_is_a_school_zone_sign():
+  assert SpeedLimitVisionDaemon._is_school_zone_sign(plaque_sign(YELLOW, WHITE))  # routes 0f/10/12 by day, 1b at night
+
+
+def test_a_plain_sign_is_not():
+  assert not SpeedLimitVisionDaemon._is_school_zone_sign(plaque_sign(WHITE, WHITE))
+
+
+def test_street_light_tint_is_not_a_plaque():
+  """Route 1b 16:08: orange street light turns the whole 30 sign yellow."""
+  assert not SpeedLimitVisionDaemon._is_school_zone_sign(plaque_sign(SODIUM, SODIUM))
+
+
+def test_leaves_behind_a_sign_are_not_a_plaque():
+  """Route 10 249 s: a 25 with autumn leaves above it."""
+  assert not SpeedLimitVisionDaemon._is_school_zone_sign(plaque_sign(YELLOW, WHITE, patchy=True))

@@ -249,6 +249,16 @@ REGULATORY_COLORED_VALUE_MIN = 70
 # fork: blue covering this much of where the number goes is a symbol (disabled parking, info), not a speed limit.
 # Route 12 t=80: a disabled-parking sign read as 65 had 0.23 to 0.34 there; the speed signs on that route 0 to 0.08.
 SIGN_CENTER_BLUE_MAX = 0.15
+# fork: a "SCHOOL" plaque (solid yellow band across the top over a pale sign) marks a school zone limit, which holds only
+# "when children present" or when flashing: route 1b read SCHOOL 20 at night and SLA asked for 23. The detector calls
+# these regulatory (class 0). Rows of the top third that are mostly yellow, and a middle that is not: orange street
+# light tints the whole sign (1b 16:08 30s), leaves behind a sign are patchy (route 10 249 s 25). Routes 0f/10/12/1b
+# every 4th frame: every school sighting flagged, 0 of 955 confident 15/20/25 reads of other signs.
+SCHOOL_BAND_ROW_YELLOW = 0.7
+SCHOOL_BAND_MIN_ROWS = 0.2
+SCHOOL_BODY_YELLOW_MAX = 0.35
+SCHOOL_ZONE_IGNORE_S = 10.  # that number, a while: some crops of the same sign cut the plaque off. Only that number: the
+# regular 25 just past a school zone (routes 0f 127 s, 10 129 s) is a real limit
 REGULATORY_MIN_WHITE_RATIO = 0.08
 REGULATORY_MIN_DARK_RATIO = 0.01
 REGULATORY_MAX_YELLOW_RATIO = 0.12
@@ -1935,11 +1945,29 @@ class SpeedLimitVisionDaemon:
       (hsv[:, :, 2] >= REGULATORY_COLORED_VALUE_MIN)
     ).mean())
 
+  @staticmethod
+  def _is_school_zone_sign(sign_crop):
+    """A solid yellow band across the top of a pale sign: the SCHOOL plaque."""
+    height, width = sign_crop.shape[:2]
+    x1, x2 = int(width * 0.15), int(width * 0.85)
+    top, body = sign_crop[:max(2, int(height * 0.35)), x1:x2], sign_crop[int(height * 0.45):int(height * 0.85), x1:x2]
+    if top.size == 0 or body.size == 0:
+      return False
+
+    def yellow(region):
+      hsv = cv2.cvtColor(region, cv2.COLOR_BGR2HSV)
+      return ((hsv[:, :, 0] >= REGULATORY_YELLOW_HUE_MIN) & (hsv[:, :, 0] <= REGULATORY_YELLOW_HUE_MAX) &
+              (hsv[:, :, 1] >= 90) & (hsv[:, :, 2] >= 60))
+    band_rows = float((yellow(top).mean(axis=1) >= SCHOOL_BAND_ROW_YELLOW).mean())
+    return band_rows >= SCHOOL_BAND_MIN_ROWS and float(yellow(body).mean()) <= SCHOOL_BODY_YELLOW_MAX
+
   def _classify_speed_limit_from_model(self, sign_crop):
     if self.classifier_net is None or sign_crop.size == 0:
       return None
     if self._center_blue_ratio(sign_crop) > SIGN_CENTER_BLUE_MAX:
       return None
+    now = time.monotonic()
+    school_zone = self._is_school_zone_sign(sign_crop)
 
     speed_class_count = len(US_CLASSIFIER_SPEED_VALUES)
 
@@ -1981,6 +2009,17 @@ class SpeedLimitVisionDaemon:
     )
     if confidence < minimum_confidence:
       return None
+    if school_zone and speed_limit in SCHOOL_ZONE_SPEED_VALUES:  # school limits are 15-25: leaves can fool the band test
+      self.school_zone_read = (speed_limit, now + SCHOOL_ZONE_IGNORE_S)  # on any sign (route 12 156 s, a real 30)
+      if self.published_speed_limit_mph == speed_limit and now - self.last_publish_change_at < SCHOOL_ZONE_IGNORE_S:
+        # the box cut the plaque off until the sign was close: route 12 484 s published 20 1.5 s before the plaque
+        # showed. Withdrawn inside the resolver's 2 s settle, SLA never acts on it.
+        self._write_debug_event("school_zone_withdraw", speedLimitMph=speed_limit)
+        self._clear_detection()
+      return None
+    school_value, school_until = getattr(self, "school_zone_read", (0, 0.))
+    if speed_limit == school_value and now < school_until:
+      return None  # the same school sign with its plaque cropped off
 
     return speed_limit, confidence
 
@@ -2763,6 +2802,9 @@ class SpeedLimitVisionDaemon:
       self._write_debug_event("heartbeat", runtime=telemetry)
 
   def _publish_detection(self, speed_limit_mph, confidence, status_prefix):
+    school_value, school_until = getattr(self, "school_zone_read", (0, 0.))
+    if speed_limit_mph == school_value and time.monotonic() < school_until:
+      return  # fork: a read of this frame from a crop that missed the plaque
     if speed_limit_mph != self.published_speed_limit_mph or abs(confidence - self.published_confidence) >= 0.05:
       published_changed = speed_limit_mph != self.published_speed_limit_mph
       if speed_limit_mph != self.published_speed_limit_mph:
