@@ -3,8 +3,6 @@
 # to move existing files into LFS:
 # git add --renormalize .
 *.onnx filter=lfs diff=lfs merge=lfs -text
-# sign vision models ship as plain git files: pushes skip LFS uploads
-openpilot/sunnypilot/speed_limit_vision/models/*.onnx !filter !diff !merge -text
 openpilot/selfdrive/modeld/models/big_*_tinygrad.pkl filter=lfs diff=lfs merge=lfs -text
 openpilot/sunnypilot/modeld_v2/models/*.pkl filter=lfs diff=lfs merge=lfs -text
 *.svg filter=lfs diff=lfs merge=lfs -text
