@@ -24,7 +24,7 @@ class MockSubMaster(dict):
     return True
 
 
-def build_sm(v_cruise_kph=FAST, a_ego=-0.6, gas=False, brake=False, enabled=True, override=False, model_a=0.2, lead=None, e2e=True,
+def build_sm(v_cruise_kph=FAST, a_ego=-0.6, gas=False, brake=False, enabled=True, override=False, model_a=0.2, lead=None,
              force_decel=False):
   services = {s: getattr(messaging.new_message(s), s) for s in ("vehicleParameters", "carStateSP", "liveMapDataSP",
                                                                 "gpsLocationExternal", "gpsLocation", "customReserved10")}
@@ -39,9 +39,7 @@ def build_sm(v_cruise_kph=FAST, a_ego=-0.6, gas=False, brake=False, enabled=True
   sd = messaging.new_message('selfdriveState')
   sd.selfdriveState.enabled = enabled
   services['selfdriveState'] = sd.selfdriveState.as_reader()
-  sd_sp = messaging.new_message('selfdriveStateSP')
-  sd_sp.selfdriveStateSP.zoompilot.experimentalMode = e2e
-  services['selfdriveStateSP'] = sd_sp.selfdriveStateSP.as_reader()
+  services['selfdriveStateSP'] = messaging.new_message('selfdriveStateSP').selfdriveStateSP.as_reader()
   cc = messaging.new_message('carControl')
   cc.carControl.enabled = enabled
   cc.carControl.orientationNED = [0., 0., 0.]  # flat: the coast accel is -0.3
@@ -180,15 +178,6 @@ def test_the_committed_braking_is_kept_one_cycle_after_release():
   p.update(build_sm(a_ego=-0.6))
   p.update(build_sm(v_cruise_kph=(V_EGO - 1.0) * 3.6, a_ego=-0.6))
   assert sent(p) <= -0.5
-
-
-@pytest.mark.parametrize("a_ego", [-0.1, -0.8])
-def test_acc_mode_hands_over_clean(a_ego):
-  # upstream's cruise accel has no coast cap: in ACC under the set speed the target asks no braking
-  p = planner()
-  press(p, gas=True, a_ego=a_ego, e2e=False)
-  p.update(build_sm(a_ego=a_ego, e2e=False))
-  assert sent(p) >= 0.
 
 
 def test_repeated_short_gas_presses_each_hand_over_clean():

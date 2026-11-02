@@ -7,6 +7,7 @@ See the LICENSE.md file in the root directory for more details.
 The alpha switch and the modes that run on openpilot longitudinal control, at the top of the tizi
 Cruise panel. Developer drops its copy of the alpha switch (DeveloperLayoutSP) so it appears once.
 """
+from openpilot.selfdrive.ui.sunnypilot.longitudinal_mode import longitudinal_reachable
 from openpilot.selfdrive.ui.ui_state import ui_state
 from openpilot.system.ui.lib.application import gui_app
 from openpilot.system.ui.lib.multilang import tr, tr_noop
@@ -23,14 +24,6 @@ ALPHA_LONGITUDINAL_DESCRIPTION = tr_noop(
   "Changing this setting will restart zoompilot if the car is powered on."
 )
 
-# the opt-out from the driving model (UIStateZP.legacy_chill)
-LEGACY_CHILL_DESCRIPTION = tr_noop(
-  "The older way to drive the gas and brakes: hold your set speed and follow the car ahead. " +
-  "It won't stop for red lights or stop signs.<br><br>" +
-  "Off, the default, lets the driving model drive the gas and brakes as it thinks a human would, " +
-  "including stopping for red lights and stop signs. The set speed is then a maximum."
-)
-
 
 class AlphaLongitudinalToggles:
   """Not a panel: CruiseLayout lists `items` in its own scroller and drives the two hooks."""
@@ -43,20 +36,16 @@ class AlphaLongitudinalToggles:
 
     self._set_speed_toggle = toggle_item_sp(
       title=lambda: tr("Set Speed Assist"),
-      description=lambda: tr("Drive toward your set speed and following distance as legacy chill mode does " +
-                             "whenever the driving model holds back. The model still makes every slowdown."),
+      description=lambda: tr("Drive toward your set speed and following distance whenever the driving model " +
+                             "holds back. The model still makes every slowdown. The onroad button and a long press " +
+                             "of the distance button switch it too."),
       param="ExperimentalModeSetSpeed")
-
-    self._chill_toggle = toggle_item_sp(
-      title=lambda: tr("Legacy Chill Mode"),
-      description=lambda: tr(LEGACY_CHILL_DESCRIPTION),
-      callback=ui_state.set_legacy_chill)
 
     self._refresh_toggles = (
       ("AlphaLongitudinalEnabled", self._alpha_long_toggle),
       ("ExperimentalModeSetSpeed", self._set_speed_toggle),
     )
-    self.items = [item for _, item in self._refresh_toggles] + [self._chill_toggle]
+    self.items = [item for _, item in self._refresh_toggles]
 
     ui_state.add_offroad_transition_callback(self.refresh)
     ui_state.add_engaged_transition_callback(self.refresh)
@@ -65,14 +54,13 @@ class AlphaLongitudinalToggles:
     CP = ui_state.CP
     has_long = CP is not None and ui_state.has_longitudinal_control
     self._alpha_long_toggle.set_visible(CP is not None and CP.alphaLongitudinalAvailable)
-    self._chill_toggle.action_item.set_enabled(CP is None or has_long)
-    # only acts on the driving model's gas and brakes: locked in chill, keeping its value
-    self._set_speed_toggle.action_item.set_enabled(has_long and not self._chill_toggle.action_item.get_state())
+    self._set_speed_toggle.set_visible(longitudinal_reachable(ui_state))
+    # alpha off: locked, keeping its value
+    self._set_speed_toggle.action_item.set_enabled(has_long)
 
   def refresh(self):
     for key, item in self._refresh_toggles:
       item.action_item.set_state(ui_state.params.get_bool(key))
-    self._chill_toggle.action_item.set_state(ui_state.legacy_chill)
 
   @staticmethod
   def _confirm(item, callback) -> None:

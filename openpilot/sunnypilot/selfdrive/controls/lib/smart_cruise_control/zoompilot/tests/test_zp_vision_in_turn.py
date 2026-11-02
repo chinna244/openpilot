@@ -124,7 +124,7 @@ def test_planner_cruise_candidate_holds_the_cap_with_actuator_lag():
   p.sla_machine = None
   p.e2e_set_speed.params = FakeParams(ExperimentalModeSetSpeed=False)
   p.v_desired_filter.x = 8.
-  sm = build_sm(False)
+  sm = build_sm()
   cs_ctrl = sm['controlsState'].as_builder()
   cs_ctrl.longControlState, cs_ctrl.curvature = LongCtrlState.pid, kappa
   sm['controlsState'] = cs_ctrl.as_reader()
