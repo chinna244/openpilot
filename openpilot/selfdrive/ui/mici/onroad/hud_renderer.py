@@ -225,6 +225,10 @@ class HudRenderer(Widget):
     rl.draw_texture_ex(icon, pos, 0.0, 1.0, rl.Color(255, 255, 255, int(255 * opacity * alpha)))
     self._model_source_width = (icon.width + 10) * alpha  # slides with the fade, no jump at its end
 
+  def _corner_width(self) -> float:
+    """What the bottom-right corner holds this frame, so the AEB-off marker sits left of it."""
+    return self._model_source_width
+
   def _draw_aeb_off(self, rect: rl.Rectangle) -> None:
     """Amber AEB-off marker for as long as AEB is off or not yet counted as back, or the driver's
     own setting has it off. Bottom right, mirroring the wheel: clear of the torque arc, the turn
@@ -233,7 +237,7 @@ class HudRenderer(Widget):
     if not (zp.stockEcuOff or zp.aebSettingOff):
       return
     w, h = aeb_off_icon.SIZE
-    x = rect.x + rect.width - 10 - w - self._model_source_width
+    x = rect.x + rect.width - 10 - w - self._corner_width()
     y = rect.y + rect.height - 14 - h
     rl.draw_texture_pro(self._txt_aeb_off, rl.Rectangle(0, 0, self._txt_aeb_off.width, self._txt_aeb_off.height),
                         rl.Rectangle(x, y, w, h), rl.Vector2(0, 0), 0.0, rl.WHITE)

@@ -9,7 +9,7 @@ import pyray as rl
 from openpilot.common.filter_simple import FirstOrderFilter
 from openpilot.selfdrive.ui.mici.onroad.hud_renderer import SET_SPEED_PERSISTENCE, HudRenderer
 from openpilot.selfdrive.ui.sunnypilot.onroad.blind_spot_indicators import BlindSpotIndicators
-from openpilot.selfdrive.ui.sunnypilot.onroad.speed_assist_badge import draw_gauge_centered
+from openpilot.selfdrive.ui.sunnypilot.onroad.speed_assist_badge import GAUGE_ASPECT, draw_gauge_centered
 from openpilot.selfdrive.ui.ui_state import ChestnutState, UIStatus, ui_state
 from openpilot.system.ui.lib.application import gui_app
 
@@ -50,6 +50,11 @@ class HudRendererSP(HudRenderer):
     if state not in (ChestnutState.UNCOMPILED, ChestnutState.FAILED, ChestnutState.ACTIVE):
       return False
     return rl.get_time() - self._chestnut_fade_time < SET_SPEED_PERSISTENCE
+
+  def _corner_width(self) -> float:
+    # the gauge's ink from the corner, sliding with its fade (last frame's: it draws after the marker)
+    gauge = 21 + self._txt_wheel.width / 2 + GAUGE_ASPECT * SPEED_ASSIST_HEIGHT / 2
+    return max(super()._corner_width(), gauge * self._speed_assist_alpha_filter.x / SPEED_ASSIST_ALPHA)
 
   def _draw_speed_assist(self, rect: rl.Rectangle) -> None:
     # comes and goes with the wheel, and swaps in once the model icon is done with the shared corner
