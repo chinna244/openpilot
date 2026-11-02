@@ -257,6 +257,90 @@ def test_stopped_gyro_drift_is_not_a_turn():
   assert drive(rc, 120., v=0., yaw=0.02, car=0) is None  # ~140 deg of drift at a light
 
 
+def feed_names(rn, names, start=0., dt=0.5, v=12.):
+  """mapd's road name every 0.5 s; returns (time, previous name) for each change RoadName reports."""
+  changes = []
+  for k, name in enumerate(names):
+    if (previous := rn.update(start + k * dt, name, v)) is not None:
+      changes.append((start + k * dt, previous))
+  return changes
+
+
+def test_cross_street_at_a_crossing_is_not_a_new_road():
+  """Route 23 132 s / 142 s: driving straight on Whitnall, mapd named each cross street for ~2 s."""
+  rn = slv.RoadName()
+  assert feed_names(rn, ["Whitnall"] * 12) == []  # the first name is no change
+  assert rn.name == "Whitnall"
+  assert feed_names(rn, ["Whitnall"] * 4 + ["Kansas"] * 4 + [""] * 4 + ["Ahmedi"] * 4 + ["Whitnall"] * 10, start=6.) == []
+  assert rn.name == "Whitnall"
+
+
+def test_a_new_road_name_that_holds_is_a_new_road():
+  rn = slv.RoadName()
+  feed_names(rn, ["Clement"] * 12)
+  changes = feed_names(rn, ["Whitnall"] * 12, start=6.)
+  assert changes == [(6. + slv.ROAD_NAME_HOLD_S, "Clement")]  # once it has held ROAD_NAME_HOLD_S
+  assert rn.name == "Whitnall"
+
+
+def test_a_name_gap_restarts_the_hold():
+  """An empty name is no news: the new name must hold unbroken."""
+  rn = slv.RoadName()
+  feed_names(rn, ["Clement"] * 12)
+  assert feed_names(rn, (["Brust"] * 8 + [""]) * 3, start=6.) == []  # 4 s at a time, never 5
+  assert rn.name == "Clement"
+
+
+def test_cross_street_while_waiting_at_a_light_is_not_a_new_road():
+  """Stopped on a crossing, mapd can name the cross street for the whole light; only driving time counts."""
+  rn = slv.RoadName()
+  feed_names(rn, ["Whitnall"] * 12)
+  assert feed_names(rn, ["Kansas"] * 60, start=6., v=0.) == []  # 30 s at the light
+  assert feed_names(rn, ["Kansas"] * 4 + ["Whitnall"] * 10, start=36.) == []  # drives on straight
+  assert rn.name == "Whitnall"
+
+
+def test_a_parked_pause_is_not_driving_time():
+  rn = slv.RoadName()
+  feed_names(rn, ["Clement"] * 12)
+  feed_names(rn, ["Whitnall"] * 2, start=6.)  # 0.5 s of Whitnall, then parked (no updates) for 10 min
+  assert feed_names(rn, ["Whitnall"] * 4, start=607.) == []  # the pause adds at most 1 s
+  assert rn.name == "Clement"
+
+
+def name_daemon():
+  d = SpeedLimitVisionDaemon.__new__(SpeedLimitVisionDaemon)
+  d.road_name, d.last_road_name, d.published_speed_limit_mph, d.last_published_support_at = slv.RoadName(), "", 30, 0.
+  d.cleared = []
+  d._write_debug_event = lambda *_args, **_kwargs: None
+  d._clear_detection = lambda: d.cleared.append(True)
+  return d
+
+
+def drive_names(d, names, start, dt=0.5):
+  for k, name in enumerate(names):
+    d.sm = {"liveMapDataSP": SimpleNamespace(roadName=name), "carState": SimpleNamespace(vEgo=12.)}
+    d._update_road_name(start + k * dt)
+
+
+def test_a_new_road_drops_a_sign_from_the_old_one():
+  d = name_daemon()
+  drive_names(d, ["Clement"] * 12, 0.)
+  d.last_published_support_at = 5.  # the 30 seen on Clement
+  drive_names(d, ["Whitnall"] * 12, 6.)
+  assert d.cleared and d.last_road_name == "Whitnall"
+
+
+def test_a_sign_seen_on_the_new_road_survives_the_late_name_change():
+  """The name change lands ROAD_NAME_HOLD_S late: a sign read in between is the new road's."""
+  d = name_daemon()
+  drive_names(d, ["Clement"] * 12, 0.)
+  drive_names(d, ["Whitnall"] * 4, 6.)
+  d.last_published_support_at = 8.  # the new road's sign, 2 s after Whitnall showed
+  drive_names(d, ["Whitnall"] * 10, 8.)
+  assert not d.cleared and d.last_road_name == "Whitnall"
+
+
 def plaque_sign(top_bgr, body_bgr, patchy=False):
   """A 60x40 sign: the top 12 rows in top_bgr (every other 4-px block if patchy), the rest in body_bgr."""
   img = np.zeros((60, 40, 3), np.uint8)

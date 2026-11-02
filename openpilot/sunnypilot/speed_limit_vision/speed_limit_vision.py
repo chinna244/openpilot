@@ -51,6 +51,8 @@ ROAD_TURN_MIN_SPEED = 1.  # m/s, a car turns only while it moves
 ROAD_TURNING_RATE = 5.  # deg/s: a sign read mid-turn stands on the new road (route 12 t=156, read 18 deg into the turn)
 ROAD_LIMIT_HOLD_S = 10.  # the car or map limit moved to a new value and held: a road boundary, not a glitch
 ROAD_MAX_DISTANCE_M = 5000.  # backstop: no repeat sign this far
+ROAD_NAME_HOLD_S = 5.  # a new map road name must hold this long while moving: at a crossing mapd names the cross street
+                       # for ~2 s (route 23 132 s, 142 s), which dropped the 30 and let the map's 25 through to SLA
 
 
 class RoadChange:
@@ -86,6 +88,35 @@ class RoadChange:
       if held >= ROAD_LIMIT_HOLD_S:
         return f"{source}_limit"
     return None
+
+
+class RoadName:
+  """The map road name, changed only once a new name holds ROAD_NAME_HOLD_S of driving. An empty name is no news.
+  Waiting at a light on a crossing, mapd may name the cross street for as long as the light."""
+
+  def __init__(self):
+    self.name = ""
+    self.since = 0.  # when the current name first showed
+    self.pending = ""
+    self.pending_since = 0.
+    self.pending_held = 0.
+    self.last_update = None
+
+  def update(self, now, name, v_ego):
+    """Returns the previous name when the road name changes, else None. The first name is no change."""
+    dt = min(now - self.last_update, 1.) if self.last_update is not None else 0.  # a pause (parked) is not driving
+    self.last_update = now
+    if not name or name == self.name:
+      self.pending = ""
+      return None
+    if name != self.pending:
+      self.pending, self.pending_since, self.pending_held = name, now, 0.
+    elif v_ego > ROAD_TURN_MIN_SPEED:
+      self.pending_held += dt
+    if self.pending_held < ROAD_NAME_HOLD_S:
+      return None
+    previous, self.name, self.since, self.pending = self.name, name, self.pending_since, ""
+    return previous or None
 
 
 def device_cpu_throttle_factor(cpu_usage, name="", cores=None):
@@ -486,6 +517,7 @@ class SpeedLimitVisionDaemon:
     self.last_detection_at = 0.0
     self.last_live_pose_inputs_not_ok_at = -float("inf")
     self.last_road_name = ""
+    self.road_name = RoadName()
     self.followup_until = 0.0
     self.latest_detector_proposal = None
     self.proposal_track = None
@@ -1005,6 +1037,16 @@ class SpeedLimitVisionDaemon:
   def _published_detection_stale(self, now):
     # fork: RoadChange ends a sign (_update_road_change), not time
     return False
+
+  def _update_road_name(self, now):
+    """Drop the published sign when the map's road name changes (StarPilot's rule), once the new name holds."""
+    road_name = self.sm["liveMapDataSP"].roadName
+    previous_road_name = self.road_name.update(now, road_name, self.sm["carState"].vEgo)
+    # a sign seen since the new name showed stands on the new road
+    if previous_road_name is not None and self.last_published_support_at < self.road_name.since:
+      self._write_debug_event("road_change", previousRoadName=previous_road_name, roadName=road_name)
+      self._clear_detection()
+    self.last_road_name = self.road_name.name
 
   def _update_road_change(self, now):
     """Drop the published sign once the road it was on has ended."""
@@ -2931,6 +2973,7 @@ class SpeedLimitVisionDaemon:
           self._close_debug_session()
           self._disconnect_camera()
         self.last_road_name = ""
+        self.road_name = RoadName()
         self.started_prev = False
         self.parked_prev = False
         self.current_frame_bgr = None
@@ -2965,11 +3008,7 @@ class SpeedLimitVisionDaemon:
         self.last_inference_at = -float("inf")
         self._publish_runtime_telemetry(now, "parked_exit", force=True)
 
-      road_name = self.sm["liveMapDataSP"].roadName
-      if self.last_road_name and road_name and road_name != self.last_road_name:
-        self._write_debug_event("road_change", previousRoadName=self.last_road_name, roadName=road_name)
-        self._clear_detection()
-      self.last_road_name = road_name or self.last_road_name
+      self._update_road_name(now)
       self._update_road_change(now)
 
       if self.memory_pressure_state == "critical":

@@ -252,7 +252,7 @@ def test_run_releases_local_frame_after_offroad_cleanup():
         "deviceState": SimpleNamespace(started=False),
         "liveMapDataSP": SimpleNamespace(roadName=""),
         "deviceMotion": SimpleNamespace(inputsOK=True),
-        "carState": SimpleNamespace(gearShifter="drive"),
+        "carState": SimpleNamespace(gearShifter="drive", vEgo=0.),
       }
       self.update_count = 0
 
@@ -287,6 +287,7 @@ def test_run_releases_local_frame_after_offroad_cleanup():
   daemon.started_prev = False
   daemon.parked_prev = False
   daemon.last_road_name = ""
+  daemon.road_name = slv.RoadName()
   daemon.last_inference_at = -float("inf")
   daemon.stream_name = "road camera"
   daemon.published_speed_limit_mph = 0
