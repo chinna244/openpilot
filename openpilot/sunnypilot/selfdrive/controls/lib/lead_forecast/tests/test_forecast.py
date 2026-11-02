@@ -196,6 +196,23 @@ class TestGuards:
     np.testing.assert_allclose(lead_xv[:, 0], lead_xv[0, 0])
     np.testing.assert_allclose(lead_xv[:, 1], 0.)
 
+  def test_pulling_away_lets_a_slow_lead_speed_up(self):
+    np.testing.assert_allclose(forecast_speed(0.5, [0.5, 2., 5., 8., 10., 12.], v_ego=0.), [0.5, 2., 5., 8., 10., 12.])
+    np.testing.assert_allclose(forecast_speed(0.5, [0.5, 2., 5., 8., 10., 12.], v_ego=6.), [0.5, 2., 5., 8., 10., 12.])
+    np.testing.assert_allclose(forecast_speed(0.5, [0.5, 2.5, 4.5, 4.5, 4.5, 4.5], v_ego=7.8), [0.5, 1.5, 2.5, 2.5, 2.5, 2.5])
+    np.testing.assert_allclose(forecast_speed(0.5, [0.5, 2., 5., 8., 10., 12.], v_ego=9.), 0.5)
+
+  def test_pulling_away_braking_lead_may_not_speed_up(self):
+    np.testing.assert_allclose(forecast_speed(1., [1., 3., 5., 5., 5., 5.], a_lead=-1.5, v_ego=0.), 1.)
+
+  def test_stopped_behind_a_predicted_launch_moves_with_it(self):
+    mpc, forecast, _ = build()
+    mpc.set_cur_state(0., 0.)
+    lead_xv = run(forecast, mpc, build_sm(d_rel=6., v_lead=0., model_v=[0., 2., 5., 8., 10., 12.]))
+    assert forecast.inhibits[0] == Inhibit.none
+    assert lead_xv[-1, 1] > 10.
+    assert lead_xv[-1, 0] > lead_xv[0, 0] + 50.
+
   def test_one_model_lead_is_invalid_for_lead_two(self):
     mpc, forecast, _ = build()
     sm = build_sm(model_v=SLOWING)
