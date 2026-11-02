@@ -22,7 +22,7 @@ SPEED_LIMIT_POLICY_DESCRIPTIONS = [
   tr("Map Only: Use Speed Limit data only from OpenStreetMaps"),
   tr("Car First: Use Speed Limit data from Car if available, else use from OpenStreetMaps"),
   tr("Map First: Use Speed Limit data from OpenStreetMaps if available, else use from Car"),
-  tr("Combined: Use the camera-read sign if available, else the lower of Car & OpenStreetMaps"),
+  tr("Combined: Use the camera-read sign if available, else OpenStreetMaps, else Car"),
   tr("Vision First: Use the camera-read sign until the road changes, else Car, else OpenStreetMaps")
 ]
 

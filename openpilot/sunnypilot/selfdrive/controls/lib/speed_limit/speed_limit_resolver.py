@@ -77,7 +77,7 @@ class SpeedLimitResolver:
       Policy.map_data_only: [SpeedLimitSource.map],
       Policy.car_state_priority: [SpeedLimitSource.car, SpeedLimitSource.map],
       Policy.map_data_priority: [SpeedLimitSource.map, SpeedLimitSource.car],
-      Policy.combined: [SpeedLimitSource.vision, SpeedLimitSource.car, SpeedLimitSource.map],
+      Policy.combined: [SpeedLimitSource.vision, SpeedLimitSource.map, SpeedLimitSource.car],
       Policy.vision_priority: [SpeedLimitSource.vision, SpeedLimitSource.car, SpeedLimitSource.map],
     }
     self.source = SpeedLimitSource.none
@@ -231,23 +231,10 @@ class SpeedLimitResolver:
         self.distance_solutions[SpeedLimitSource.map] = distance_to_speed_limit_ahead
 
   def _get_source_solution_according_to_policy(self) -> custom.LongitudinalPlanSP.SpeedLimit.Source:
-    sources_for_policy = self._policy_to_sources_map[Policy(self.policy)]
-
-    if Policy(self.policy) != Policy.combined:
-      # They are ordered in the order of preference, so we pick the first that's non-zero
-      for source in sources_for_policy:
-        if self.limit_solutions[source] > 0.:
-          return source
-      return SpeedLimitSource.none
-
-    # a camera-read sign comes first; without one, the lower of car and map
-    if self.limit_solutions[SpeedLimitSource.vision] > 0.:
-      return SpeedLimitSource.vision
-
-    sources_with_limits = [(s, limit) for s, limit in [(s, self.limit_solutions[s]) for s in sources_for_policy[1:]] if limit > 0.]
-    if sources_with_limits:
-      return min(sources_with_limits, key=lambda x: x[1])[0]
-
+    # They are ordered in the order of preference, so we pick the first that's non-zero
+    for source in self._policy_to_sources_map[Policy(self.policy)]:
+      if self.limit_solutions[source] > 0.:
+        return source
     return SpeedLimitSource.none
 
   def _resolve_limit_sources(self, sm: messaging.SubMaster) -> tuple[float, float, custom.LongitudinalPlanSP.SpeedLimit.Source]:

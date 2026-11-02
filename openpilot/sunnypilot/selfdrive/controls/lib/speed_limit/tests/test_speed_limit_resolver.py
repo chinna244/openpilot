@@ -108,15 +108,12 @@ class TestSpeedLimitResolverValidation(OpenpilotTestCase):
     resolver = resolver_class()
     resolver.policy = Policy.combined
     sm_mock = setup_sm_mock(mocker)
-    socket_to_source = {'carStateSP': SpeedLimitSource.car, 'liveMapDataSP': SpeedLimitSource.map}
-    minimum_key, minimum_speed_limit = min(
-      ((key, sm_mock[key].speedLimit) for key in
-       socket_to_source.keys()), key=lambda x: x[1])
+    map_speed_limit = sm_mock['liveMapDataSP'].speedLimit
 
-    # Assert the resolver
-    resolver.update(minimum_speed_limit, sm_mock)
-    assert resolver.speed_limit == minimum_speed_limit
-    assert resolver.source == socket_to_source[minimum_key]
+    # Assert the resolver: the map before the car
+    resolver.update(map_speed_limit, sm_mock)
+    assert resolver.speed_limit == map_speed_limit
+    assert resolver.source == SpeedLimitSource.map
 
   @parametrized_policies
   def test_parser(self, resolver_class, policy, sm_key, function_key, mocker):
@@ -264,7 +261,7 @@ class TestSpeedLimitResolverGpsFix(OpenpilotTestCase):
     assert resolver.source == SpeedLimitSource.car
     assert resolver.speed_limit == 55 * MPH
 
-  def test_combined_with_a_current_fix_still_takes_the_lower(self, resolver_class, mocker):
+  def test_combined_with_a_current_fix_takes_the_map(self, resolver_class, mocker):
     resolver = resolver_class()
     resolver.policy = Policy.combined
     resolver.update(26.8, gps_sm(mocker, 55 * MPH, 45 * MPH, fix_age=1.))
@@ -407,8 +404,10 @@ class TestSpeedLimitResolverVision(OpenpilotTestCase):
       assert resolver.source == SpeedLimitSource.vision
       assert resolver.speed_limit == vision
 
-  def test_combined_falls_back_to_lower_of_car_and_map(self, mocker):
+  def test_combined_falls_back_to_map_then_car(self, mocker):
     resolver = self._resolve(mocker, Policy.combined, 15., 20., 0.)
+    assert resolver.source == SpeedLimitSource.map and resolver.speed_limit == 20.
+    resolver = self._resolve(mocker, Policy.combined, 15., 0., 0.)
     assert resolver.source == SpeedLimitSource.car and resolver.speed_limit == 15.
 
   def test_vision_priority_falls_back_to_car_then_map(self, mocker):
@@ -423,7 +422,7 @@ class TestSpeedLimitResolverVision(OpenpilotTestCase):
 
   def test_vision_below_min_ignored(self, mocker):
     resolver = self._resolve(mocker, Policy.combined, 15., 20., CAR_LIMIT_MIN - 0.1)
-    assert resolver.source == SpeedLimitSource.car
+    assert resolver.source == SpeedLimitSource.map
 
   @parameterized.expand([(p,) for p in Policy if p not in (Policy.combined, Policy.vision_priority)], names=["policy"])
   def test_other_policies_ignore_vision(self, policy, mocker):
