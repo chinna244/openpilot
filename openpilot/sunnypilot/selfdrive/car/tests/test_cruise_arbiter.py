@@ -56,15 +56,17 @@ class TestCruiseArbiterNonPcm:
     assert self.arb.applicable
     self.v_cruise_kph = 60 * CV.MPH_TO_KPH
 
-  def _lp(self, limit_mph, has_limit=True):
+  def _lp(self, limit_mph, has_limit=True, current=None):
+    """current=False: no source has a limit now, only the resolver's last one (has_limit)."""
     lp = custom.LongitudinalPlanSP()
     lp.speedLimit.resolver.speedLimit = limit_mph * self.MPH
     lp.speedLimit.resolver.speedLimitFinalLast = limit_mph * self.MPH
     lp.speedLimit.resolver.speedLimitLastValid = has_limit
+    lp.speedLimit.resolver.speedLimitValid = has_limit if current is None else current
     return lp
 
-  def frame(self, cluster_mph, limit_mph, has_limit=True, events=None, v_mph=0., gas=False):
-    self.arb.update_limit(self._lp(limit_mph, has_limit))
+  def frame(self, cluster_mph, limit_mph, has_limit=True, events=None, v_mph=0., gas=False, current=None):
+    self.arb.update_limit(self._lp(limit_mph, has_limit, current))
     CS = car_struct.CarState()
     CS.buttonEvents = events or []
     CS.vEgo = v_mph * self.MPH
@@ -345,6 +347,54 @@ class TestCruiseArbiterNonPcm:
     assert self.announces(40, 40)
     assert self.arb.state == SpeedLimitAssistState.active
 
+  # only the last limit left (a parking lot, a source dropout): it may ask to slow down, never to speed up
+
+  def engage(self, seconds, cluster_mph, limit_mph, current):
+    for _ in range(int(seconds / DT_CTRL)):
+      self.frame(cluster_mph, limit_mph, current=current)
+
+  def test_a_last_only_limit_never_asks_to_speed_up(self):
+    """Route 00000025 246 s: engaged in a parking lot with no limit anywhere, "Press + for 41" from the road before."""
+    self.engage(1., 29, 41, current=False)
+    assert self.arb.state == SpeedLimitAssistState.inactive
+    assert self.arb.v_cap == cruise_arbiter.V_CRUISE_UNSET
+
+  def test_the_held_back_raise_asks_once_a_source_has_the_limit(self):
+    self.engage(1., 29, 41, current=False)
+    self.frame(29, 41)
+    assert self.arb.state == SpeedLimitAssistState.preActive
+
+  def test_a_short_rise_left_as_the_last_limit_does_not_raise_a_session(self):
+    """Confirmed 35; a 45 shorter than LIMIT_SETTLE is all the resolver keeps after it: the session holds 35 until a
+    source has the 45, then asks."""
+    self.go_pre_active(45, 35)
+    self.press(ButtonType.decelCruise, 45, 35)
+    assert self.arb.state == SpeedLimitAssistState.active
+    for _ in range(50):
+      self.frame(35, 45, current=False)
+    assert self.arb.state == SpeedLimitAssistState.active and round(self.arb.v_cap / self.MPH) == 35
+    self.frame(35, 45)
+    assert self.arb.state == SpeedLimitAssistState.preActive
+
+  def test_a_dismissal_cancels_the_held_back_raise(self):
+    """Held back at engage, the driver dials onto the 41 and then dismisses: a source showing the 41 again asks nothing."""
+    def tap(button, cluster):
+      for pressed in (True, False):
+        self.frame(cluster, 41, current=False, events=[car_struct.CarState.ButtonEvent(type=button, pressed=pressed)])
+    self.engage(1., 29, 41, current=False)
+    tap(ButtonType.accelCruise, 29)
+    self.frame(41, 41, current=False)
+    assert self.arb.state == SpeedLimitAssistState.active
+    tap(ButtonType.decelCruise, 41)
+    assert self.arb.state == SpeedLimitAssistState.inactive
+    for _ in range(50):
+      self.frame(40, 41)
+    assert self.arb.state == SpeedLimitAssistState.inactive
+
+  def test_a_last_only_limit_still_asks_to_slow_down(self):
+    self.engage(1., 45, 30, current=False)
+    assert self.arb.state == SpeedLimitAssistState.preActive
+
   # a new limit counts only once the resolver has held it for LIMIT_SETTLE
 
   def test_a_limit_flicker_inside_a_confirmed_session_asks_nothing(self, monkeypatch):
@@ -558,7 +608,7 @@ class TestCruiseArbiterNonPcm:
     self.go_pre_active(40, 45)
     self.press(ButtonType.accelCruise, 40, 45)
     assert self.arb.state == SpeedLimitAssistState.active
-    lp = self._lp(45)
+    lp = self._lp(45, current=False)
     lp.speedLimit.resolver.speedLimit = 0.  # no live source, the last limit holds
     for _ in range(5):
       self.arb.update_limit(lp)

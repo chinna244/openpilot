@@ -216,6 +216,7 @@ class Loop:
     LP_SP.speedLimit.resolver.speedLimit = self.limit_mph * self.u_ms
     LP_SP.speedLimit.resolver.speedLimitFinalLast = self.limit_mph * self.u_ms
     LP_SP.speedLimit.resolver.speedLimitLastValid = self.limit_mph > 0
+    LP_SP.speedLimit.resolver.speedLimitValid = self.limit_mph > 0
     return LP_SP
 
   def _cc_sp(self):

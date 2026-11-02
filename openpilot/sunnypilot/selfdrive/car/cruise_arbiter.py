@@ -96,7 +96,9 @@ class CruiseArbiter:
     self._slf = 0.  # speedLimitFinalLast, m/s
     self._slf_prev = 0.
     self._has_limit = False
-    self._limit_seen = (0., 0., False)  # the resolver's latest (speedLimit, speedLimitFinalLast, valid)
+    self._current = False  # a source has a limit now, not only the last one held
+    self._raise_deferred = False  # a raise prompt waits for a current limit
+    self._limit_seen = (0., 0., False, False)  # the resolver's latest (speedLimit, speedLimitFinalLast, valid, current)
     self._limit_seen_frames = 0
 
     self.long_enabled_prev = False
@@ -141,13 +143,17 @@ class CruiseArbiter:
     if not self.applicable:
       return
     resolver = LP_SP.speedLimit.resolver
-    seen = (float(resolver.speedLimit), float(resolver.speedLimitFinalLast), bool(resolver.speedLimitValid or resolver.speedLimitLastValid))
+    seen = (float(resolver.speedLimit), float(resolver.speedLimitFinalLast), bool(resolver.speedLimitValid or resolver.speedLimitLastValid),
+            bool(resolver.speedLimitValid))
     if seen != self._limit_seen:
       self._limit_seen = seen
       self._limit_seen_frames = 0
     self._limit_seen_frames += 1
     if self._limit_seen_frames >= int(LIMIT_SETTLE / DT_CTRL):
-      self._speed_limit, self._slf, self._has_limit = seen
+      self._current = seen[3]
+      if self._has_limit and seen[2] and not seen[3] and seen[1] > self._slf:
+        return  # a higher last limit no source has now (a reading shorter than LIMIT_SETTLE): wait for a source
+      self._speed_limit, self._slf, self._has_limit, self._current = seen
 
   @property
   def _conv(self) -> float:
@@ -184,7 +190,19 @@ class CruiseArbiter:
     if announce:
       self.announce_counter += 1
 
+  def _raise_blocked(self) -> bool:
+    """Only the last limit is left and it is above the dash: it may ask to slow down, never to speed up."""
+    return not self._current and self._target_conv() > self._cluster_conv
+
   def _enter_prompt(self, rearm: bool = True):
+    if self._raise_blocked():
+      # only the last limit is left: it may ask to slow down, never to speed up. Route 00000025 246 s: engaged in a
+      # parking lot with no limit anywhere, "Press + for 41" from the road before.
+      self._raise_deferred = True
+      if self.state not in ACTIVE_STATES:
+        self._set_state(SessionState.inactive)
+      return
+    self._raise_deferred = False
     if rearm:
       self._reprompts_left = REPROMPT_MAX
       self._ignored_prompt = False
@@ -205,6 +223,7 @@ class CruiseArbiter:
     return settle_conv(self._slf, self._cluster_conv, self.is_metric) != settle_conv(self.v_cap, self._cluster_conv, self.is_metric)
 
   def _activate(self, from_prompt: bool):
+    self._raise_deferred = False
     # Announce confirmations and sessions that move the speed, not an existing match.
     self._set_state(SessionState.active, announce=from_prompt or self._speed_moves)
     # only the ICBM servo walks the dash to the target; an openpilot-owned setpoint has nothing in transit
@@ -242,6 +261,7 @@ class CruiseArbiter:
             self._press[btn] = _Press(_PRESS_DISMISS)
           self._set_state(SessionState.inactive)
           self._driver_dismissed = True
+          self._raise_deferred = False
           self.last_intent = CruiseIntent.dismiss
         elif self.state_prev_frame == SessionState.preActive:
           self._press[btn] = _Press(_PRESS_PROMPT)
@@ -378,6 +398,7 @@ class CruiseArbiter:
     if self.state != SessionState.disabled:
       if not long_enabled or not self.enabled:
         self._set_state(SessionState.disabled)
+        self._raise_deferred = False
         self._driver_dismissed = False
         self._ignored_prompt = False
         self._late_answer_timer = 0
@@ -418,12 +439,14 @@ class CruiseArbiter:
         if self._limit_changed:
           self._driver_dismissed = False
           self._enter_prompt()
+        elif self._raise_deferred and self._current and not self._driver_dismissed:
+          self._enter_prompt()  # a source has the limit again: ask now
         elif not self._driver_dismissed and self._has_limit and self._target_conv() == self._cluster_conv \
              and not self._press and self._driver_dial_timer > 0:
           # The driver dialed onto the limit: wait for release so they can continue through
           # it. A dash the servo walked onto it is not a dial.
           self._activate(from_prompt=False)
-        elif self._reprompt_due(CS):
+        elif self._reprompt_due(CS) and not self._raise_blocked():
           self._reprompts_left -= 1
           self._reprompt_hold = 0
           self._enter_prompt(rearm=False)
