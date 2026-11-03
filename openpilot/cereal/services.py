@@ -109,6 +109,7 @@ _services: dict[str, tuple] = {
   "livestreamCabinEncodeData": (False, 20., None, QueueSize.MEDIUM),
   "customReservedRawData0": (True, 0.),
   "customReserved10": (True, 5., 5),  # the speed-limit sign the road camera reads, from speed_limit_vision
+  "customReserved11": (True, 10., 10),  # the stop lines the road camera sees ahead, from stop_line_detector
   "customReserved18": (True, 1., 1),  # the Jetson's USB GPS fix, published by modeld from JetLink telemetry
   "customReserved19": (True, 4., 1),  # liveTorqueParametersSP, published by torqued_ext
 }

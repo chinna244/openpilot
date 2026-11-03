@@ -503,7 +503,11 @@ struct CustomReserved10 @0xcb9fd56c7057593a {
   inferenceInterval @7 :Float32;     # s, the wait the reader picked between passes
 }
 
+# zoompilot: the bands across the lane the road camera sees ahead, for stopping at a stop line
+# (sunnypilot/selfdrive/controls/lib/stop_line.py). The service is customReserved11, from stop_line_detector.
 struct CustomReserved11 @0xc2243c65e0340384 {
+  lineDistances @0 :List(Float32);  # m ahead on flat ground, nearest first
+  frameId @1 :UInt32;               # of the road camera frame
 }
 
 struct CustomReserved12 @0x9ccdc8676701b412 {

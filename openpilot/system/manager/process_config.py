@@ -198,6 +198,7 @@ procs += [
   # Learned stop spots (Mazda TSR stop signs)
   PythonProcess("stop_spots_learner", "openpilot.sunnypilot.selfdrive.controls.lib.stop_spots_learner",
                 and_(only_offroad, is_mazda)),
+  PythonProcess("stop_line_detector", "openpilot.sunnypilot.selfdrive.controls.stop_line_detector", and_(only_onroad, is_mazda)),
 
   # Backup
   PythonProcess("backup_manager", "openpilot.sunnypilot.sunnylink.backups.manager", and_(only_offroad, sunnylink_ready_shim)),

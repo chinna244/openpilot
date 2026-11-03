@@ -4,9 +4,11 @@ Stop spots: stop lines learned from the driver's own stops, braked to when the m
 At the southbound stop sign 42.97205,-87.88467 the model only saw the stop 30-43 m out on 14 of 31 passes and planned
 to slow to 7-16 mph, then speed back up; the driver braked hard every time (routes 00000166-0000002b). The car's TSR
 showed the sign 0.6-1.4 s before the driver braked, too late to act on, and OSM has almost no stop signs tagged here.
-The local learner (tools/mazda_long/learn_stop_spots.py, outside git) writes STOP_SPOTS_PATH: a spot where the TSR
-showed a stop sign and the car stopped with no lead, on at least two drives from the same heading, at the median of
-those stops. plannerd reads it at start.
+stop_spots_learner writes STOP_SPOTS_PATH from the drives; plannerd reads it at start. A spot is the stop line, as the
+road camera saw it (stop_line.py) on at least two drives, and only such a "verified" spot brakes: where the driver
+comes to a full stop is not the line (at this crossroad the full stops end several metres past it, route 0000002d).
+On the approach the camera places the line itself once it sees it (LINE_TOL, LINE_FRAMES): GPS puts the same line a
+few metres apart from one day to the next, so it only says which stop sign is coming.
 
 On the approach to a spot, with a GPS fix, this candidate asks the constant decel that stops the
 car STOP_MARGIN short of the spot once that is START_DECEL or more (about 50 m out from 27 mph), or within START_TIME of
@@ -63,9 +65,28 @@ HOLD_TIME = 2.  # s at standstill before the model takes over
 HOLD_DIST = 4.  # m; stopped further short than this is not the stop: a creep on is stopped again at the spot
 HOLD_ACCEL = -1.0  # m/s2 the ask builds to while stopping at the spot
 DONE_DIST = 30.  # m beyond a spot before it can start a pass again
-# m short of the spot the stop aims at: a 5 m GPS error toward the line put the replayed stop 5 m past the drivers'
-# median, about at the line; the model creeps the rest after the hold
-STOP_MARGIN = 2.
+# m short of the spot (the stop line) the stop aims at, for the camera: it sits about 2 m behind the front bumper, so
+# the bumper stops about 1 m before the line
+STOP_MARGIN = 3.
+# The camera's line (stop_line.py) places the stop once seen. GPS is a few m off from one day to the next (the same
+# line came out 6-7.5 m apart on routes 0000002c and 0000002d), so once the GPS fixes agree on the spot, the band
+# nearest to where the spot puts the line, within LINE_TOL and LOCK_MAX_DIST, seen LINE_FRAMES times in a row within
+# LINE_AGREE of itself, is the line. Nearer than LOCK_MAX_DIST the flat-ground distance is good: a 0.5 deg nose-dive or
+# grade moves a band at 25 m by 4 m, at 10 m by 0.6 m. It is then tracked within LINE_TRACK at LINE_GAIN, never more
+# than LINE_DRIFT from where it locked. A lead reads as a band about 1.8x its gap (route 0000002d at 3-8 s: a band at
+# 16-17 m moving with the lead), and a tracked lead pulls the stop into the junction: bands from LEAD_BAND of the lead's
+# distance on are its, not road. The radar loses a close lead for up to 1.2 s (0000002c t=154.9 at 5.9 m, 0000002d
+# t=382.5), so the last lead stands for LEAD_HOLD after it goes. Road before the lead stays readable, as in a queue.
+LINE_TOL = 8.  # m
+LOCK_MAX_DIST = 20.  # m
+LINE_FRAMES = 3
+LINE_AGREE = 1.  # m
+LINE_TRACK = 1.  # m
+LINE_GAIN = 0.5
+LINE_DRIFT = 2.  # m
+LINE_LATENCY = 0.1  # s from the frame to the planner
+LEAD_BAND = 0.8
+LEAD_HOLD = 2.  # s
 
 
 def finite(x) -> bool:
@@ -80,7 +101,7 @@ def load_spots(path: Path = STOP_SPOTS_PATH) -> list[dict]:
   if not isinstance(spots, list):
     return []
   return [s for s in spots if isinstance(s, dict) and all(finite(s.get(k)) for k in ("lat", "lon", "bearing")) and
-          abs(s["lat"]) <= 90. and abs(s["lon"]) <= 180.]
+          abs(s["lat"]) <= 90. and abs(s["lon"]) <= 180. and s.get("verified") is True]
 
 
 def along_cross(spot: dict, lat: float, lon: float) -> tuple[float, float]:
@@ -106,6 +127,11 @@ class StopSpots:
     self.off_fixes = 0  # fixes in a row, once committed, off the spot's road
     self.pass_time = 0.
     self.paused = False  # the driver's gas is held: no brake until it is released
+    self.line_hits: list[float] = []  # m to the camera's candidate line, odometry-carried until it is locked
+    self.line_locked = False  # the stop is placed by the camera's line: GPS no longer moves it
+    self.line_anchor = 0.  # m to where the stop aimed when the line locked, odometry-carried
+    self.lead_dist: float | None = None  # m to the last lead the radar had
+    self.lead_age = 0.  # s since then
     self.braking = False
     self.a_target = 0.
     self.hold_frames = 0
@@ -130,7 +156,31 @@ class StopSpots:
       self.spot = best[0]
     dist = best[1] - STOP_MARGIN
     self.agree = self.agree + 1 if abs(dist - self.dist) <= AGREE_TOL else 1
-    self.dist, self.fix_age = dist, 0.
+    self.fix_age = 0.
+    if not self.line_locked:
+      self.dist = dist
+
+  def _see_line(self, line_dists: list[float], v_ego: float) -> None:
+    """The camera's bands across the lane (m ahead, nearest first) place, then track, the line."""
+    line = self.dist + STOP_MARGIN
+    lead = self.lead_dist if self.lead_dist is not None and self.lead_age <= LEAD_HOLD else None
+    dists = [d - v_ego * LINE_LATENCY for d in line_dists if lead is None or d < LEAD_BAND * lead]
+    if self.line_locked:
+      near = [d for d in dists if abs(d - line) <= LINE_TRACK]
+      if near:
+        dist = self.dist + LINE_GAIN * (min(near, key=lambda d: abs(d - line)) - line)
+        self.dist = min(max(dist, self.line_anchor - LINE_DRIFT), self.line_anchor + LINE_DRIFT)
+      return
+    if not (self.committed or self.agree >= ARM_FIXES):
+      return
+    near = [d for d in dists if abs(d - line) <= LINE_TOL and d <= LOCK_MAX_DIST]
+    if not near:
+      return
+    seen = min(near, key=lambda d: abs(d - line))
+    self.line_hits = [h for h in self.line_hits if abs(h - seen) <= LINE_AGREE] + [seen]
+    if len(self.line_hits) >= LINE_FRAMES:
+      self.dist, self.line_locked = seen - STOP_MARGIN, True
+      self.line_anchor = self.dist
 
   def _left_road(self, lat: float, lon: float, bearing: float, fix_speed: float) -> bool:
     _, cross = along_cross(self.spot, lat, lon)
@@ -141,6 +191,7 @@ class StopSpots:
   def _end(self) -> None:
     self.spot, self.committed, self.braking, self.a_target, self.hold_frames = None, False, False, 0., 0
     self.agree, self.off_fixes, self.pass_time, self.paused = 0, 0, 0., False
+    self.line_hits, self.line_locked, self.line_anchor = [], False, 0.
 
   def _finish(self) -> None:
     """The pass is over at its spot: latch it until the car is well past."""
@@ -149,19 +200,27 @@ class StopSpots:
 
   def update(self, lat: float, lon: float, bearing: float, accuracy: float, gps_fresh: bool, v_ego: float,
              standstill: bool, active: bool, driver_override: bool, steer_deg: float = 0.,
-             fix_speed: float | None = None) -> float | None:
+             fix_speed: float | None = None, line_dists: list[float] | None = None,
+             lead_dist: float | None = None) -> float | None:
     """The stop's accel candidate this cycle, or None. gps_fresh: a new fix with hasFix this cycle; accuracy: its
-    horizontal accuracy in m; fix_speed: its own speed (v_ego when not given)."""
+    horizontal accuracy in m; fix_speed: its own speed (v_ego when not given); line_dists: the camera's bands across the
+    lane this cycle (m ahead, nearest first), None without a new frame; lead_dist: the lead's, when there is one."""
     self.should_stop = False
     if not self.spots:
       return None
     self.fix_age += DT_MDL
     self.dist -= v_ego * DT_MDL
+    self.line_hits = [h - v_ego * DT_MDL for h in self.line_hits]
+    self.line_anchor -= v_ego * DT_MDL
+    if lead_dist is not None:
+      self.lead_dist, self.lead_age = lead_dist, 0.
+    else:
+      self.lead_age += DT_MDL
     if self.done_spot is not None:
       self.done_dist -= v_ego * DT_MDL
       if self.done_dist < -DONE_DIST:
         self.done_spot = None
-    if not self.committed:
+    if not self.committed and not self.line_locked:
       if gps_fresh and 0. < accuracy <= ARM_ACCURACY:
         self._locate(lat, lon, bearing)
       elif self.spot is not None and self.fix_age > GPS_MAX_AGE:
@@ -173,6 +232,8 @@ class StopSpots:
       self._finish()
     if self.spot is None:
       return None
+    if line_dists is not None:
+      self._see_line(line_dists, v_ego)
     if self.committed:
       self.pass_time += DT_MDL
       if self.pass_time > PASS_MAX_TIME:
@@ -211,7 +272,9 @@ class StopSpots:
       self.should_stop = True
       self.a_target = max(HOLD_ACCEL, self.a_target - START_JERK * DT_MDL)
       return self.a_target
-    sure = self.committed or self.agree >= ARM_FIXES  # one stray fix neither starts nor ends anything
+    # one stray fix neither starts nor ends anything; the camera's line is sure on its own (route 0000002d northbound:
+    # GPS 4.5 m off the line it saw, so no fix agreed with it, and GPS would have passed the spot before the line)
+    sure = self.committed or self.line_locked or self.agree >= ARM_FIXES
     turning = abs(steer_deg) > LEAVE_STEER  # not yet braked for: a turn onto the road, or off it, starts nothing
     if self.dist <= 0. and not self.braking and sure:
       # reached without needing to brake (or the fix puts it behind): nothing to stop for

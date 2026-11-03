@@ -2,6 +2,7 @@ import json
 import os
 import time
 
+import numpy as np
 import pytest
 import zstandard as zstd
 
@@ -125,7 +126,7 @@ def test_learn_reads_each_drive_once_and_keeps_spots_after_the_logs_go(tmp_path,
   monkeypatch.setattr(L, "route_events", lambda files, route: reads.append(route) or real(files, route))
   assert L.learn(str(logs), ev_path, sp_path, now=1e9)
   assert sorted(reads) == ["00000001--aaaa", "00000002--bbbb"]
-  assert len(load_spots(sp_path)) == 1
+  assert len(spots_in(sp_path)) == 1 and load_spots(sp_path) == [], "learned, written unverified: no brake"
   assert not L.learn(str(logs), ev_path, sp_path, now=1e9), "nothing new: no rewrite"
   assert len(reads) == 2
   for d in logs.iterdir():  # the deleter takes the logs
@@ -133,7 +134,51 @@ def test_learn_reads_each_drive_once_and_keeps_spots_after_the_logs_go(tmp_path,
       f.unlink()
     d.rmdir()
   assert not L.learn(str(logs), ev_path, sp_path, now=1e9)
-  assert len(load_spots(sp_path)) == 1
+  assert len(spots_in(sp_path)) == 1
+
+
+def spots_in(path):
+  return json.loads(path.read_text())["spots"]
+
+
+def test_a_spot_is_verified_at_the_camera_line_seen_on_two_drives():
+  """The stops end past the line (route 0000002d); the camera's line, from two drives, is the spot, and it brakes."""
+  def line(a, r):  # the line 6 m before the spot, wherever the car stopped
+    return dict(event(a, r), line=-6. - a)
+  spot, = L.cluster([line(0., "r1"), line(2., "r2")])
+  assert spot["verified"] and spot["lines"] == 2
+  assert L.along_cross(SPOT, spot["lat"], spot["lon"])[0] == pytest.approx(-6., abs=0.3)
+  one, = L.cluster([line(0., "r1"), event(2., "r2")])
+  assert not one["verified"], "a line from one drive is not enough"
+  assert L.along_cross(SPOT, one["lat"], one["lon"])[0] == pytest.approx(1., abs=0.3), "unverified: at the stops"
+
+
+def bands_seen(rel_bands, stop_t=25.):
+  """Sightings of bands at rel_bands m from a stop at stop_t, approached at 6 m/s, as the camera sees them."""
+  t = np.arange(0., 30., 0.05)
+  v = np.where(t < stop_t, 6., 0.)
+  odo = np.concatenate(([0.], np.cumsum(np.diff(t) * (v[1:] + v[:-1]) / 2.)))
+  stop_odo = float(np.interp(stop_t, t, odo))
+  lines = [(tl, sorted(d for d in (stop_odo + b - float(np.interp(tl, t, odo)) for b in rel_bands) if 5.4 < d < 30.))
+           for tl in t[::2] if tl <= stop_t]
+  return lines, t, odo
+
+
+@pytest.mark.parametrize("bands,line", [
+  ((-1.75, 1.25), -1.75),  # a crosswalk past the stop (route 0000002d southbound): its near edge
+  ((-6., -3., 0.), -6.),  # a stop bar before a crosswalk: the bar
+  ((-9., 0.), 0.),  # 9 m apart: not one marking, the band nearest the stop
+  ((-12., -9., -6., -3., 0.), -6.),  # concrete joints every 3 m: no more than LINE_STEPS
+])
+def test_stop_line_steps_upstream_through_one_marking(bands, line):
+  lines, t, odo = bands_seen(bands)
+  assert L.stop_line(lines, t, odo, 25.) == pytest.approx(line, abs=0.3)
+
+
+def test_stop_line_without_sightings_is_none():
+  _, t, odo = bands_seen(())
+  assert L.stop_line([], t, odo, 25.) is None
+
 
 
 def test_a_corrupt_events_file_starts_over(tmp_path):

@@ -27,7 +27,8 @@ class MockSubMaster(dict):
 def build_sm(v_cruise_kph=FAST, a_ego=-0.6, gas=False, brake=False, enabled=True, override=False, model_a=0.2, lead=None,
              force_decel=False):
   services = {s: getattr(messaging.new_message(s), s) for s in ("vehicleParameters", "carStateSP", "liveMapDataSP",
-                                                                "gpsLocationExternal", "gpsLocation", "customReserved10")}
+                                                                "gpsLocationExternal", "gpsLocation", "customReserved10",
+                                                                "customReserved11")}
   cs = messaging.new_message('carState')
   cs.carState.vEgo, cs.carState.aEgo, cs.carState.vCruise, cs.carState.vCruiseCluster = V_EGO, a_ego, v_cruise_kph, v_cruise_kph
   cs.carState.gasPressed, cs.carState.brakePressed = gas, brake

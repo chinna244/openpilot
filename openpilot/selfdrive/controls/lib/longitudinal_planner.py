@@ -230,7 +230,8 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
                                            self.CP.openpilotLongitudinalControl and sm['selfdriveState'].enabled and
                                            not sm['carState'].brakePressed,
                                            self.gas_override or sm['carState'].gasPressed, sm['carState'].steeringAngleDeg,
-                                           gps.speed)
+                                           gps.speed, list(sm['customReserved11'].lineDistances) if sm.updated['customReserved11'] else None,
+                                           sm['radarState'].leadOne.dRel if sm['radarState'].leadOne.present else None)
 
     # while the gas is held only the published plan is lifted: the MPC and the filter restart from the plain one
     lift_published = reset_state and a_cruise > self.a_cruise

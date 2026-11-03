@@ -2,7 +2,7 @@
 """
 Learns stop spots (stop_spots.py) on the device, offroad, from its own drives.
 
-A stop event is a stop (under STOP_SPEED after moving over MOVING_SPEED in the 20 s before) with no radar lead in the
+A stop event is a stop or a rolling stop (under STOP_SPEED after moving over MOVING_SPEED in the 20 s before) with no radar lead in the
 last 3 s, a GPS fix within GPS_MAX_ACCURACY at the stop, and the Mazda TSR's STOP_SIGN (CAM_TRAFFIC_SIGNS 0x35F, value
 9) still shown within TSR_AT_STOP of it: at all 25 stops learned from routes 00000166-0000002b the sign was shown until
 0.4 s before the stop or later, so a red light reached after passing a side road's stop sign is not one. A through
@@ -11,7 +11,10 @@ other are one spot, which needs stops on MIN_ROUTES drives and on THROUGH_RATIO 
 it; its point is the median stop along its heading, its bearing the mean approach bearing 4 s before each stop.
 
 Each finished drive is read once. Its events go to EVENTS_PATH, so spots outlive the logs the deleter removes, and
-STOP_SPOTS_PATH is rewritten when the spots change; plannerd reads it on the next start.
+STOP_SPOTS_PATH is rewritten when the spots change; plannerd reads it on the next start. The full stops are not the
+stop line (stop_spots.py): each stop also keeps where the road camera saw the line (customReserved11, stop_line.py),
+placed from the stop by odometry, so GPS adds no error of its own. A spot is at the median of those lines and
+"verified" (it brakes) once it has them from MIN_ROUTES drives; without, it is written unverified, at the stops.
 """
 import glob
 import json
@@ -32,7 +35,7 @@ EVENTS_PATH = Path("/data/stop_spots_events.json")
 TSR_ADDR = 0x35F
 TSR_STOP_SIGN = 9
 TSR_BUSES = (2, 130)
-STOP_SPEED = 0.6  # m/s
+STOP_SPEED = 1.5  # m/s: the driver's stops at the crossroad roll at 1-2 mph (routes 0000002c, 0000002d)
 MOVING_SPEED = 4.  # m/s
 TSR_WINDOW = 15.  # s
 TSR_AT_STOP = 1.5  # s either side of the stop the sign must still show
@@ -44,6 +47,11 @@ MIN_ROUTES = 2  # drives; two stops in one pass are one sighting
 SETTLE_TIME = 120.  # s since a drive's last write before it is read
 POLL_TIME = 60.  # s
 SEGMENT_RE = re.compile(r"^(.+)--(\d+)$")
+LINE_WINDOW = (-20., 12.)  # m from the stop the camera's line may be: stopped well past it, or short of it
+LINE_BIN = 0.5  # m
+LINE_MIN_HITS = 5  # camera frames on one line
+LINE_PAIR = (1.5, 5.)  # m upstream of the band nearest the stop: a crosswalk's near edge is the line
+LINE_STEPS = 2  # a crosswalk's far edge, its near edge, a stop bar
 
 
 def segment_files(route_dir: str) -> list[str]:
@@ -56,9 +64,37 @@ def segment_files(route_dir: str) -> list[str]:
   return sorted(files, key=seg)
 
 
-def route_events(files: list[str], route: str) -> list[dict]:
+def stop_line(lines: list[tuple[float, list[float]]], t: np.ndarray, odo: np.ndarray, ts: float) -> float | None:
+  """Where the camera's line is from the stop at ts (m along, + ahead), from lines = [(time, m ahead...)]: every
+  sighting from 20 s before to just after the stop, carried to the stop by odometry; from the band nearest the stop,
+  stepping upstream through bands LINE_PAIR apart (a crosswalk's edges, a stop bar before it). None without
+  LINE_MIN_HITS on one."""
+  odo_stop = float(np.interp(ts, t, odo))
+  pos = [d - (odo_stop - float(np.interp(tl, t, odo))) for tl, ds in lines if ts - 20. <= tl <= ts + 0.5 for d in ds]
+  pos = [p for p in pos if LINE_WINDOW[0] <= p <= LINE_WINDOW[1]]
+  if not pos:
+    return None
+  h, e = np.histogram(pos, bins=np.arange(LINE_WINDOW[0], LINE_WINDOW[1] + LINE_BIN, LINE_BIN))
+  bands = [float(np.median([p for p in pos if e[i] <= p < e[i + 1]])) for i in range(len(h))
+           if h[i] >= LINE_MIN_HITS and h[i] >= h[max(i - 1, 0)] and h[i] >= h[min(i + 1, len(h) - 1)]]
+  if not bands:
+    return None
+  # from the band nearest the stop, step upstream while one lies LINE_PAIR before: a crosswalk's far edge, its near
+  # edge, then a stop bar painted before it
+  line = min(bands, key=abs)
+  for _ in range(LINE_STEPS):  # no further: joints in a concrete road would chain on and on
+    upstream = [b for b in bands if line - LINE_PAIR[1] <= b <= line - LINE_PAIR[0]]
+    if not upstream:
+      break
+    line = max(upstream)
+  return line
+
+
+def route_events(files: list[str], route: str, lines: list[tuple[float, list[float]]] | None = None) -> list[dict]:
+  """lines: the camera's sightings (time from the route start, m ahead) when not in the logs (the PC tool's own)."""
   from openpilot.tools.lib.logreader import LogReader
   t0, cs, lead, gps, tsr = None, [], [], [], []
+  logged: list[tuple[float, list[float]]] = []
   for f in files:
     try:
       for m in LogReader(f):
@@ -74,6 +110,8 @@ def route_events(files: list[str], route: str) -> list[dict]:
           g = getattr(m, w)
           if g.hasFix and 0. < g.horizontalAccuracy <= GPS_MAX_ACCURACY:
             gps.append((t, g.latitude, g.longitude, g.bearingDeg))
+        elif w == "customReserved11":
+          logged.append((t, list(m.customReserved11.lineDistances)))
         elif w == "can":
           for c in m.can:
             if c.address == TSR_ADDR and c.src in TSR_BUSES and len(c.dat) > 3 and (c.dat[3] >> 4) & 0xF == TSR_STOP_SIGN:
@@ -84,6 +122,8 @@ def route_events(files: list[str], route: str) -> list[dict]:
     return []
   cs, lead, gps, tsr = np.array(cs), np.array(lead or [(0., 0.)]), np.array(gps), np.array(tsr)
   t, v = cs[:, 0], cs[:, 1]
+  odo = np.concatenate(([0.], np.cumsum(np.diff(t) * (v[1:] + v[:-1]) / 2.)))
+  lines = logged if lines is None else lines
   events, i = [], 1
   while i < len(t):
     if v[i] < STOP_SPEED <= v[i - 1]:
@@ -93,8 +133,12 @@ def route_events(files: list[str], route: str) -> list[dict]:
       seen = len(tsr) and ((tsr >= ts - TSR_AT_STOP) & (tsr <= ts + TSR_AT_STOP)).any()
       gi, gb = np.argmin(abs(gps[:, 0] - ts)), np.argmin(abs(gps[:, 0] - (ts - 4.)))
       if moving and not led and seen and abs(gps[gi, 0] - ts) < 1. and abs(gps[gb, 0] - (ts - 4.)) < 1.:
-        events.append({"lat": float(gps[gi, 1]), "lon": float(gps[gi, 2]), "bearing": float(gps[gb, 3]),
-                       "route": route, "t": round(float(ts), 1), "kind": "stop"})
+        e = {"lat": float(gps[gi, 1]), "lon": float(gps[gi, 2]), "bearing": float(gps[gb, 3]),
+             "route": route, "t": round(float(ts), 1), "kind": "stop"}
+        line = stop_line(lines, t, odo, ts) if lines else None
+        if line is not None:
+          e["line"] = round(line, 2)
+        events.append(e)
       while i < len(t) and v[i] < STOP_SPEED:
         i += 1
     i += 1
@@ -132,18 +176,22 @@ def cluster(events: list[dict]) -> list[dict]:
     b = math.degrees(math.atan2(np.mean([math.sin(math.radians(q["bearing"])) for q in g]),
                                 np.mean([math.cos(math.radians(q["bearing"])) for q in g]))) % 360.
     c = {"lat": float(np.mean([q["lat"] for q in g])), "lon": float(np.mean([q["lon"] for q in g])), "bearing": b}
-    along = float(np.median([along_cross(c, q["lat"], q["lon"])[0] for q in g]))
+    lined = [q for q in g if finite(q.get("line"))]
+    verified = len({q["route"] for q in lined}) >= MIN_ROUTES
+    # the camera's line where it has it from enough drives; else the stops, which only say a stop sign is there
+    along = float(np.median([along_cross(c, q["lat"], q["lon"])[0] + (q["line"] if verified else 0.) for q in (lined if verified else g)]))
     br = math.radians(b)
     lat = c["lat"] + along * math.cos(br) / EARTH_M_PER_DEG
     lon = c["lon"] + along * math.sin(br) / (EARTH_M_PER_DEG * math.cos(math.radians(c["lat"])))
     spots.append({"lat": round(lat, 7), "lon": round(lon, 7), "bearing": round(b, 1), "events": len(g),
-                  "routes": sorted({q["route"] for q in g})})
+                  "routes": sorted({q["route"] for q in g}), "lines": len(lined), "verified": verified})
   return spots
 
 
 def _valid(e) -> bool:
   return isinstance(e, dict) and all(finite(e.get(k)) for k in ("lat", "lon", "bearing", "t")) and \
-    isinstance(e.get("route"), str) and e.get("kind", "stop") in ("stop", "through")
+    isinstance(e.get("route"), str) and e.get("kind", "stop") in ("stop", "through") and \
+    ("line" not in e or finite(e["line"]))
 
 
 def load_events(path: Path = EVENTS_PATH) -> dict[str, list[dict]]:
