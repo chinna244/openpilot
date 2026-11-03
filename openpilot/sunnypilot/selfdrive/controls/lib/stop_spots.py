@@ -62,7 +62,7 @@ DONE_DIST = 30.  # m beyond a spot before it can start a pass again
 STOP_MARGIN = 2.
 
 
-def _finite(x) -> bool:
+def finite(x) -> bool:
   return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
 
 
@@ -73,7 +73,7 @@ def load_spots(path: Path = STOP_SPOTS_PATH) -> list[dict]:
     return []
   if not isinstance(spots, list):
     return []
-  return [s for s in spots if isinstance(s, dict) and all(_finite(s.get(k)) for k in ("lat", "lon", "bearing")) and
+  return [s for s in spots if isinstance(s, dict) and all(finite(s.get(k)) for k in ("lat", "lon", "bearing")) and
           abs(s["lat"]) <= 90. and abs(s["lon"]) <= 180.]
 
 

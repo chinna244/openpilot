@@ -76,6 +76,9 @@ def speed_limit_vision(started: bool, params: Params, CP: car.CarParams) -> bool
 def livestream(started: bool, params: Params, CP: car.CarParams) -> bool:
   return params.get_bool("IsLiveStreaming")
 
+def is_mazda(started: bool, params: Params, CP: car.CarParams) -> bool:
+  return CP.brand == "mazda"
+
 def use_copyparty(started, params, CP: car.CarParams) -> bool:
   return bool(params.get_bool("EnableCopyparty"))
 
@@ -191,6 +194,10 @@ procs += [
   PythonProcess("models_manager", "openpilot.sunnypilot.models.manager", only_offroad),
   NativeProcess("modeld_tinygrad", "openpilot/sunnypilot/modeld_v2", ["./modeld"], and_(only_onroad, is_tinygrad_model)),
   PythonProcess("modeld_warmup", "openpilot.sunnypilot.modeld_v2.warmup", only_offroad),
+
+  # Learned stop spots (Mazda TSR stop signs)
+  PythonProcess("stop_spots_learner", "openpilot.sunnypilot.selfdrive.controls.lib.stop_spots_learner",
+                and_(only_offroad, is_mazda)),
 
   # Backup
   PythonProcess("backup_manager", "openpilot.sunnypilot.sunnylink.backups.manager", and_(only_offroad, sunnylink_ready_shim)),
