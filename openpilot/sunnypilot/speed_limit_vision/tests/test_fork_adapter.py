@@ -372,3 +372,17 @@ def test_street_light_tint_is_not_a_plaque():
 def test_leaves_behind_a_sign_are_not_a_plaque():
   """Route 10 249 s: a 25 with autumn leaves above it."""
   assert not SpeedLimitVisionDaemon._is_school_zone_sign(plaque_sign(YELLOW, WHITE, patchy=True))
+
+
+def hsv_bgr(h, s, v):
+  return tuple(int(c) for c in slv.cv2.cvtColor(np.uint8([[[h, s, v]]]), slv.cv2.COLOR_HSV2BGR)[0, 0])
+
+
+def test_dusk_plaque_is_a_school_zone_sign():
+  """Route 29 355 s: a dim, washed-out plaque over a grey dusk body, under the daylight 90/60 test."""
+  assert SpeedLimitVisionDaemon._is_school_zone_sign(plaque_sign(hsv_bgr(20, 70, 50), hsv_bgr(100, 30, 60)))
+
+
+def test_dark_background_over_a_night_sign_is_not_a_plaque():
+  """Route 1b 445 s: a 25 at night, the crop's top rows dark and tinted above a bright body."""
+  assert not SpeedLimitVisionDaemon._is_school_zone_sign(plaque_sign(hsv_bgr(30, 65, 12), hsv_bgr(80, 35, 73)))

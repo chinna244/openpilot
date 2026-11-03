@@ -288,6 +288,14 @@ SIGN_CENTER_BLUE_MAX = 0.15
 SCHOOL_BAND_ROW_YELLOW = 0.7
 SCHOOL_BAND_MIN_ROWS = 0.2
 SCHOOL_BODY_YELLOW_MAX = 0.35
+# At dusk the plaque is dim and washed out (route 29 355 s: saturation 53-72, value ~45, under the 90/60 above) and SLA
+# asked for 23 in a 30. Judged against the sign's own body instead: more saturated than it by SCHOOL_DUSK_SAT_OVER_BODY,
+# about as bright as it (a dark background above a night 25, route 1b 445 s, is not). Routes 18-2a every 4th frame: 6 of
+# 6 school sightings flagged, 0 crops of 3 night/dusk 25s, the rest misreads of other signs (windows, "form two lines").
+SCHOOL_DUSK_SAT_MIN = 40
+SCHOOL_DUSK_SAT_OVER_BODY = 30
+SCHOOL_DUSK_VALUE_MIN = 30
+SCHOOL_DUSK_VALUE_OF_BODY = 0.7
 SCHOOL_ZONE_IGNORE_S = 10.  # that number, a while: some crops of the same sign cut the plaque off. Only that number: the
 # regular 25 just past a school zone (routes 0f 127 s, 10 129 s) is a real limit
 REGULATORY_MIN_WHITE_RATIO = 0.08
@@ -1996,12 +2004,18 @@ class SpeedLimitVisionDaemon:
     if top.size == 0 or body.size == 0:
       return False
 
-    def yellow(region):
-      hsv = cv2.cvtColor(region, cv2.COLOR_BGR2HSV)
-      return ((hsv[:, :, 0] >= REGULATORY_YELLOW_HUE_MIN) & (hsv[:, :, 0] <= REGULATORY_YELLOW_HUE_MAX) &
-              (hsv[:, :, 1] >= 90) & (hsv[:, :, 2] >= 60))
-    band_rows = float((yellow(top).mean(axis=1) >= SCHOOL_BAND_ROW_YELLOW).mean())
-    return band_rows >= SCHOOL_BAND_MIN_ROWS and float(yellow(body).mean()) <= SCHOOL_BODY_YELLOW_MAX
+    top_hsv, body_hsv = cv2.cvtColor(top, cv2.COLOR_BGR2HSV), cv2.cvtColor(body, cv2.COLOR_BGR2HSV)
+
+    def plaque(sat_min, value_min):
+      def yellow(hsv):
+        return ((hsv[:, :, 0] >= REGULATORY_YELLOW_HUE_MIN) & (hsv[:, :, 0] <= REGULATORY_YELLOW_HUE_MAX) &
+                (hsv[:, :, 1] >= sat_min) & (hsv[:, :, 2] >= value_min))
+      band_rows = float((yellow(top_hsv).mean(axis=1) >= SCHOOL_BAND_ROW_YELLOW).mean())
+      return band_rows >= SCHOOL_BAND_MIN_ROWS and float(yellow(body_hsv).mean()) <= SCHOOL_BODY_YELLOW_MAX
+
+    dusk_sat = max(SCHOOL_DUSK_SAT_MIN, float(np.median(body_hsv[:, :, 1])) + SCHOOL_DUSK_SAT_OVER_BODY)
+    dusk_value = max(SCHOOL_DUSK_VALUE_MIN, SCHOOL_DUSK_VALUE_OF_BODY * float(np.median(body_hsv[:, :, 2])))
+    return plaque(90, 60) or plaque(dusk_sat, dusk_value)
 
   def _classify_speed_limit_from_model(self, sign_crop):
     if self.classifier_net is None or sign_crop.size == 0:
