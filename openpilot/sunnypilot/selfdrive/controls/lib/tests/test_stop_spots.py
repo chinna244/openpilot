@@ -21,7 +21,7 @@ def at(along: float, cross: float = 0., spot: dict = SPOT) -> tuple[float, float
 
 def drive(ss: StopSpots, start: float, v: float, seconds: float, bearing: float = SPOT["bearing"], cross: float = 0.,
           gas_at=None, fix=None, fix_hz: float = 10., deliver: float = 1., lag: float = 0., model=None,
-          accuracy: float = 2., steer=None, fix_speed=None):
+          accuracy: float = 2., steer=None, fix_speed=None, gas=None):
   """Drive from start (m along the spot) at v, following min(model, candidate) through a first-order lag at deliver
   of what is asked. fix(t, x) -> (along, cross, bearing[, accuracy]) or None overrides the fix (None: no fix this
   cycle). Returns per-cycle (along, v, candidate, should_stop)."""
@@ -33,7 +33,8 @@ def drive(ss: StopSpots, start: float, v: float, seconds: float, bearing: float 
     fresh = i % every == 0 and f is not None
     lat, lon = at(f[0], f[1]) if f is not None else (0., 0.)
     acc = f[3] if f is not None and len(f) > 3 else accuracy
-    a = ss.update(lat, lon, f[2] if f is not None else 0., acc, fresh, v, v < 0.01, True, gas_at is not None and t >= gas_at,
+    pressed = (gas_at is not None and t >= gas_at) or (gas is not None and gas(t))
+    a = ss.update(lat, lon, f[2] if f is not None else 0., acc, fresh, v, v < 0.01, True, pressed,
                   0. if steer is None else steer(t, x), None if fix_speed is None else fix_speed(t, x, v))
     out.append((x, v, a, ss.should_stop))
     a_model = 0. if model is None else model(t, x, v)
@@ -53,7 +54,7 @@ def test_stops_at_the_spot_and_hands_over_after_the_hold():
   ss = StopSpots([SPOT])
   out = drive(ss, -120., 12., 25.)
   braking = [r for r in out if r[2] is not None and r[2] < 0.]
-  assert 60. <= -braking[0][0] <= 85., "brakes from about 70 m out at 27 mph"
+  assert 45. <= -braking[0][0] <= 58., "brakes from about 50 m out at 27 mph, where the driver's own stops start"
   assert min(r[2] for r in braking) >= -START_MAX
   steps = [b[2] - a[2] for a, b in zip(braking, braking[1:], strict=False)]
   assert min(steps) >= -START_JERK * DT_MDL - 1e-9, "the brake builds at START_JERK"
@@ -68,10 +69,95 @@ def test_other_heading_or_a_parallel_road_never_brakes(bearing, cross):
   assert all(r[2] is None for r in drive(StopSpots([SPOT]), -120., 12., 15., bearing=bearing, cross=cross))
 
 
-def test_gas_ends_the_pass():
-  out = drive(StopSpots([SPOT]), -120., 12., 12., gas_at=5.)
-  assert any(r[2] is not None for r in out[:int(5. / DT_MDL)]), "was braking before the gas"
-  assert all(r[2] is None for r in out[int(5. / DT_MDL):])
+def test_a_gas_tap_pauses_the_stop_and_it_resumes():
+  """Route 0000002c t=174: a 1 s tap 46 m out, the model slowing 27 -> 22 mph meanwhile, released 36 m out. No brake
+  while it is held; on release the stop carries on to the line."""
+  def model(t, x, v):
+    return -1.2 if 6.2 <= t < 7.2 else 0.
+  out = drive(StopSpots([SPOT]), -120., 12., 25., gas=lambda t: 6.2 <= t < 7.2, model=model)
+  assert any(r[2] is not None for r in out[:int(6.2 / DT_MDL)]), "was braking before the gas"
+  assert all(r[2] is None for r in out[int(6.2 / DT_MDL):int(7.2 / DT_MDL)])
+  assert stops(out) == [pytest.approx(-2., abs=1.)]
+
+
+def test_gas_from_the_hold_hands_the_go_to_the_driver():
+  """Stopped at the line in the hold, the driver presses the gas to go: no second stop, no hold."""
+  ss = StopSpots([SPOT])
+  out = drive(ss, -120., 12., 40., gas=lambda t: t >= 17., model=lambda t, x, v: 1.0 if t >= 17. else 0.)
+  assert len(stops(out)) == 1
+  assert all(r[2] is None for r in out[int(17. / DT_MDL):])
+
+
+def test_gas_released_at_the_line_is_the_drivers():
+  """Pushed off a crawl and lifted at the line to look: no brake back to a stop in the junction."""
+  state = {"t": None}
+
+  def gas(t):
+    return state["t"] is not None and state["t"] <= t < state["t"] + 1.5
+
+  def model(t, x, v):
+    if state["t"] is None and x > -6.:
+      state["t"] = t
+    return 1.0 if gas(t) else 0.
+
+  out = drive(StopSpots([SPOT]), -12., 0.9, 20., gas=lambda t: state["t"] is not None and state["t"] <= t < state["t"] + 0.6,
+              model=model)
+  assert stops(out) == [], "lifted about 3 m from the aim: not braked back to a stop"
+
+
+def test_gas_from_a_queue_stop_short_hands_the_go_to_the_driver():
+  """Stopped 20 m short in a queue, the driver creeps up on the gas and lifts: no stop at the line after that."""
+  state = {"t_stop": None}
+
+  def model(t, x, v):
+    if x < -22.5:
+      need = v ** 2 / (2. * max(-22. - x, 0.5))
+      return -need if need >= 1.8 else 0.
+    if v > 0. and state["t_stop"] is None:
+      return -2.5
+    state["t_stop"] = t if state["t_stop"] is None else state["t_stop"]
+    return 0.8 if 2. <= t - state["t_stop"] < 3. else 0.
+
+  out = drive(StopSpots([SPOT]), -120., 12., 40., model=model,
+              gas=lambda t: state["t_stop"] is not None and 2. <= t - state["t_stop"] < 3.)
+  assert stops(out)[0] == pytest.approx(-22., abs=1.5) and len(stops(out)) == 1
+  assert all(r[2] is None for r in out if r[0] > -21.)
+
+
+@pytest.mark.parametrize("released_at", [-33., -45.])
+def test_gas_released_resumes_only_a_gentle_stop(released_at):
+  """Held at 27 mph and released 31 m from the aim (needs 2.3) the stop is the driver's; at 43 m (1.7) as well, over
+  RESUME_MAX, as the ramp back would take it near BRAKE_MAX."""
+  state = {}
+
+  def gas(t):
+    return state.get("released") is None
+
+  def model(t, x, v):
+    if x >= released_at:
+      state["released"] = True
+    return 0.
+
+  out = drive(StopSpots([SPOT]), -120., 12., 25., gas=gas, model=model)
+  assert all(r[2] is None for r in out)
+
+
+def test_gas_released_under_resume_dist_is_the_drivers():
+  """Pushed at 7 mph and lifted 7 m from the aim: a resumed ramp there plus actuator lag reached 2-3 m/s2."""
+  out = drive(StopSpots([SPOT]), -40., 3., 30., gas=lambda t: 5. <= t < 9.6, lag=0.5)
+  assert any(-12. < r[0] < -8. for r in out[int(9.5 / DT_MDL):int(9.7 / DT_MDL)]), "released 6-10 m from the aim"
+  assert all(r[2] is None for r in out[int(9.6 / DT_MDL):])
+
+
+def test_gas_held_through_the_line_ends_the_pass():
+  out = drive(StopSpots([SPOT]), -120., 12., 25., gas=lambda t: t >= 6.5)
+  assert all(r[2] is None for r in out[int(6.5 / DT_MDL):]) and stops(out) == []
+
+
+def test_gas_released_too_close_to_stop_gently_is_the_drivers():
+  """Released 8 m out at 27 mph: a stop there needs 9 m/s2; no brake from the spot."""
+  out = drive(StopSpots([SPOT]), -120., 12., 15., gas=lambda t: 6.5 <= t < 9.)
+  assert all(r[2] is None for r in out[int(6.5 / DT_MDL):])
 
 
 def test_no_fix_before_it_brakes_ends_the_pass():
@@ -105,7 +191,7 @@ def test_a_crawl_the_model_lets_roll_on_is_stopped_at_the_spot():
 def test_a_crawl_short_of_the_spot_while_braking_is_not_asked_to_stop_there():
   """The model brakes harder and leaves the car rolling at 0.4 m/s 10 m short: no stop is asked until the spot."""
   def model(t, x, v):
-    return -2.5 if -30. < x < -12. and v > 0.4 else 0.
+    return -2.5 if -45. < x < -15. and v > 0.4 else 0.
   out = drive(StopSpots([SPOT]), -120., 12., 90., model=model)
   assert any(r[1] < 0.5 and r[0] < -8. for r in out), "crawled short of the spot"
   assert not any(r[3] for r in out if r[0] < -2. - 4.5)
@@ -133,15 +219,15 @@ def test_the_model_stopping_short_then_creeping_is_stopped_and_held_at_the_spot(
 
 
 @pytest.mark.parametrize("fix", [
-  lambda t, x: (x, 9., 184.) if 5. < t < 5.2 else (x, 0., 184.),  # one fix off the line
-  lambda t, x: None if 5. < t < 7. else (x, 0., 184.),  # a 2 s gap mid-brake
-  lambda t, x: (x + 3., 0., 184.) if t > 4. else (x, 0., 184.),  # projected stale fixes, 3 m ahead while braking
+  lambda t, x: (x, 9., 184.) if 7. < t < 7.2 else (x, 0., 184.),  # one fix off the line
+  lambda t, x: None if 7. < t < 9. else (x, 0., 184.),  # a 2 s gap mid-brake
+  lambda t, x: (x + 3., 0., 184.) if t > 6.5 else (x, 0., 184.),  # projected stale fixes, 3 m ahead while braking
 ])
 def test_once_braking_a_bad_missed_or_stale_fix_neither_releases_nor_moves_the_stop(fix):
   ref = drive(StopSpots([SPOT]), -120., 12., 25.)
   out = drive(StopSpots([SPOT]), -120., 12., 25., fix=fix)
   start = next(i for i, r in enumerate(out) if r[2] is not None)
-  assert start * DT_MDL < 4., "braking before the bad fixes"
+  assert start * DT_MDL < 6.5, "braking before the bad fixes"
   end = next(i for i, r in enumerate(out) if r[1] == 0.)
   assert all(r[2] is not None for r in out[start:end]), "the brake is never released"
   assert stops(out) == [pytest.approx(stops(ref)[0], abs=0.05)]
@@ -157,7 +243,7 @@ def test_a_wandering_or_lost_fix_at_the_line_never_cuts_the_hold_or_stops_twice(
   assert sum(r[3] and r[1] == 0. for r in out) * DT_MDL == pytest.approx(HOLD_TIME, abs=2 * DT_MDL)
 
 
-@pytest.mark.parametrize("deliver,lag", [(0.8, 0.8), (1., 0.6)])
+@pytest.mark.parametrize("deliver,lag", [(0.87, 0.55), (1., 0.6)])  # measured at low speed: 0.87 of the ask, 0.55 s
 def test_a_car_braking_less_or_later_than_asked_still_stops_at_the_line(deliver, lag):
   out = drive(StopSpots([SPOT]), -120., 15., 30., deliver=deliver, lag=lag)
   assert stops(out) and stops(out)[0] <= 0.5
@@ -195,7 +281,7 @@ def test_turning_off_before_the_line_ends_the_pass(by):
   def model(t, x, v):
     if x < -10.5:
       need = v ** 2 / (2. * max(-10. - x, 0.5))
-      return -need if need >= 1.5 else 0.  # after the spot has started braking
+      return -need if need >= 1.8 else 0.  # after the spot has started braking
     if v > 0. and state["t_stop"] is None:
       return -2.
     state["t_stop"] = t if state["t_stop"] is None else state["t_stop"]

@@ -9,14 +9,15 @@ showed a stop sign and the car stopped with no lead, on at least two drives from
 those stops. plannerd reads it at start.
 
 On the approach to a spot, with a GPS fix, this candidate asks the constant decel that stops the
-car STOP_MARGIN short of the spot once that is START_DECEL or more (about 70 m out from 27 mph), or within START_TIME of
+car STOP_MARGIN short of the spot once that is START_DECEL or more (about 50 m out from 27 mph), or within START_TIME of
 it (a car the model slowed to a crawl and lets roll on), built at START_JERK. A stop found needing more than START_MAX
 is left to the driver. It starts only on ARM_FIXES agreeing fixes within ARM_ACCURACY. Once it brakes, the distance
 left is the car's own odometry: a missed, wandering or stale fix (the Jetson fallback projects 1-3 s old ones) can
 neither release the brake nor move the line; fixes then only end a pass whose car turned off the spot's road. Stopped
 there, it asks to stop for HOLD_TIME at standstill, then lets go and the model decides when to move on; that spot is
 done until the car is DONE_DIST past it. The driver's gas or brake, reaching it without having braked for it, or
-PASS_MAX_TIME ends the pass. A lead
+PASS_MAX_TIME ends the pass. The driver's gas while rolling only pauses it: on release it resumes if the stop still
+needs RESUME_MAX or less and is RESUME_DIST or more away; gas from a stop or a crawl hands the go to the driver. A lead
 needs nothing here: the lead MPC is the lower candidate behind it, and with it gone the car still stops at the line.
 """
 import json
@@ -47,11 +48,16 @@ PASS_MAX_TIME = 90.  # s braked-for pass, at most
 HEADING_TOL = 30.  # deg
 CROSS_TOL = 8.  # m either side of the spot's heading line
 ARM_DIST = 120.  # m ahead; nothing further out is looked at
-START_DECEL = 1.0  # m/s2 the stop must need before it brakes
+# m/s2 the stop must need before it brakes: the driver's own stops at the southbound spot start 48-55 m out at 28 mph
+# (1.5-1.6 needed); 1.0 braked from 75 m at -1.1 and the driver pressed the gas (route 0000002c t=174). 1.3, built at
+# START_JERK 2.0, starts about 55 m out and asks at most 1.86 over the 27 replayed passes (1.5: 2.48, as it starts late)
+START_DECEL = 1.3
 START_TIME = 3.  # s from the spot: a car the model already slowed to a crawl is stopped from here
-START_JERK = 1.5  # m/s3 the brake builds at
+START_JERK = 2.0  # m/s3 the brake builds at
 START_MAX = 2.0  # m/s2; a stop needing more when found (a fix that jumped or came late) is the driver's
 BRAKE_MAX = 3.0  # m/s2; once braking, a car delivering less than asked is still stopped at the line
+RESUME_MAX = 1.5  # m/s2 a stop may need when the driver's gas is released; the ramp back adds about 0.5
+RESUME_DIST = 10.  # m from the aim at least: released closer, the ramp from 0 plus actuator lag reached 2-3 m/s2
 STOP_SPEED = 0.5  # m/s
 HOLD_TIME = 2.  # s at standstill before the model takes over
 HOLD_DIST = 4.  # m; stopped further short than this is not the stop: a creep on is stopped again at the spot
@@ -99,6 +105,7 @@ class StopSpots:
     self.agree = 0  # fixes in a row that place the spot where the odometry does
     self.off_fixes = 0  # fixes in a row, once committed, off the spot's road
     self.pass_time = 0.
+    self.paused = False  # the driver's gas is held: no brake until it is released
     self.braking = False
     self.a_target = 0.
     self.hold_frames = 0
@@ -133,7 +140,7 @@ class StopSpots:
 
   def _end(self) -> None:
     self.spot, self.committed, self.braking, self.a_target, self.hold_frames = None, False, False, 0., 0
-    self.agree, self.off_fixes, self.pass_time = 0, 0, 0.
+    self.agree, self.off_fixes, self.pass_time, self.paused = 0, 0, 0., False
 
   def _finish(self) -> None:
     """The pass is over at its spot: latch it until the car is well past."""
@@ -171,10 +178,25 @@ class StopSpots:
       if self.pass_time > PASS_MAX_TIME:
         self._finish()
         return None
-    if not active or driver_override:
-      # the driver has it: the pass is theirs
+    if not active:
+      # the driver's brake, or disengaged: the pass is theirs
       self._finish()
       return None
+    if driver_override:
+      if v_ego < STOP_SPEED:
+        # gas from a stop or a crawl (holding at the line, creeping in a queue): the go is the driver's
+        self._finish()
+        return None
+      # the driver's gas while rolling: no brake while it is held (route 0000002c t=174: a 1 s tap 46 m out ended the
+      # stop, and the model braked -2.1 at the line)
+      self.paused, self.braking, self.a_target, self.hold_frames = True, False, 0., 0
+      return None
+    if self.paused:
+      self.paused = False
+      if self.dist < RESUME_DIST or v_ego ** 2 / (2. * max(self.dist, 0.5)) > RESUME_MAX:
+        # released at the line, or too close to it to stop gently: the driver's
+        self._finish()
+        return None
 
     if v_ego < STOP_SPEED and self.braking and self.dist > HOLD_DIST:
       # stopped or crawling short (the model's own stop): let it be, and stop the creep on at the spot

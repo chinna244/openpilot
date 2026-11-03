@@ -225,7 +225,10 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
       gps = sm[self.gps_location_service]
       gps_fresh = sm.updated[self.gps_location_service] and gps.hasFix
       a_stop_spot = self.stop_spots.update(gps.latitude, gps.longitude, gps.bearingDeg, gps.horizontalAccuracy, gps_fresh, v_ego,
-                                           sm['carState'].standstill, self.CP.openpilotLongitudinalControl and not reset_state,
+                                           sm['carState'].standstill,
+                                           # engaged and off the brake: the gas only pauses a stop (reset_state is set by it)
+                                           self.CP.openpilotLongitudinalControl and sm['selfdriveState'].enabled and
+                                           not sm['carState'].brakePressed,
                                            self.gas_override or sm['carState'].gasPressed, sm['carState'].steeringAngleDeg,
                                            gps.speed)
 
