@@ -39,6 +39,9 @@ class Colors:
 FONT_SIZES = FontSizes()
 COLORS = Colors()
 
+# the corner icons (model, Set Speed Assist) are 44 px tall about the wheel's centre; the marker clears their top by 10 px
+AEB_OFF_LIFT = 57  # px
+
 
 class TurnIntent(Widget):
   FADE_IN_ANGLE = 30  # degrees
@@ -129,7 +132,7 @@ class HudRenderer(Widget):
     self._txt_chestnut_orange: rl.Texture = gui_app.texture('icons_mici/chestnut_orange.png', 75, 44)
     self._chestnut_icon: rl.Texture | None = None
     self._txt_aeb_off: rl.Texture = aeb_off_icon.load_texture()
-    self._model_source_width = 0  # the model icon's width in the bottom-right corner this frame, 0 if none
+    self._model_source_shown = 0.  # the model icon's fade in the bottom-right corner this frame, 0 if none
     self._wheel_alpha_filter = FirstOrderFilter(0, 0.05, 1 / gui_app.target_fps)
     self._wheel_y_filter = FirstOrderFilter(0, 0.1, 1 / gui_app.target_fps)
 
@@ -195,7 +198,7 @@ class HudRenderer(Widget):
     self._draw_aeb_off(rect)
 
   def _draw_model_source(self, rect: rl.Rectangle) -> None:
-    self._model_source_width = 0
+    self._model_source_shown = 0.
     if ui_state.sm.recv_frame['selfdriveState'] < ui_state.started_frame:
       return
 
@@ -223,24 +226,22 @@ class HudRenderer(Widget):
     pos = rl.Vector2(rect.x + rect.width - 10 - icon.width,
                      rect.y + rect.height - 14 - (self._txt_wheel.height + icon.height) / 2)
     rl.draw_texture_ex(icon, pos, 0.0, 1.0, rl.Color(255, 255, 255, int(255 * opacity * alpha)))
-    self._model_source_width = (icon.width + 10) * alpha  # slides with the fade, no jump at its end
+    self._model_source_shown = alpha  # the AEB-off marker rises with the fade, no jump at its end
 
-  def _corner_width(self) -> float:
-    """What the bottom-right corner holds this frame, so the AEB-off marker sits left of it."""
-    return self._model_source_width
+  def _aeb_off_rect(self, rect: rl.Rectangle) -> rl.Rectangle:
+    """Its spot this frame: the corner, rising above the model icon as that fades in."""
+    w, h = aeb_off_icon.SIZE
+    return rl.Rectangle(rect.x + rect.width - 10 - w, rect.y + rect.height - 14 - h - AEB_OFF_LIFT * self._model_source_shown, w, h)
 
   def _draw_aeb_off(self, rect: rl.Rectangle) -> None:
     """Amber AEB-off marker for as long as AEB is off or not yet counted as back, or the driver's
     own setting has it off. Bottom right, mirroring the wheel: clear of the torque arc, the turn
-    intent and MAX; left of the model icon while that shows in the same corner."""
+    intent and MAX; above the model icon while that shows in the same corner (beside it, it runs into the arc)."""
     zp = ui_state.sm['carStateSP'].zoompilot
     if not (zp.stockEcuOff or zp.aebSettingOff):
       return
-    w, h = aeb_off_icon.SIZE
-    x = rect.x + rect.width - 10 - w - self._corner_width()
-    y = rect.y + rect.height - 14 - h
     rl.draw_texture_pro(self._txt_aeb_off, rl.Rectangle(0, 0, self._txt_aeb_off.width, self._txt_aeb_off.height),
-                        rl.Rectangle(x, y, w, h), rl.Vector2(0, 0), 0.0, rl.WHITE)
+                        self._aeb_off_rect(rect), rl.Vector2(0, 0), 0.0, rl.WHITE)
 
   def _draw_steering_wheel(self, rect: rl.Rectangle) -> None:
     wheel_txt = self._txt_wheel_critical if self._show_wheel_critical else self._txt_wheel
