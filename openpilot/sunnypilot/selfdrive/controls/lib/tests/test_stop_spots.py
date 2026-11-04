@@ -4,7 +4,7 @@ import math
 import pytest
 
 from openpilot.common.realtime import DT_MDL
-from openpilot.sunnypilot.selfdrive.controls.lib.stop_spots import (BRAKE_MAX, EARTH_M_PER_DEG, HOLD_TIME, START_JERK,
+from openpilot.sunnypilot.selfdrive.controls.lib.stop_spots import (ARM_FIXES, BRAKE_MAX, EARTH_M_PER_DEG, HOLD_TIME, START_JERK,
                                                                     START_MAX, STOP_MARGIN, StopSpots, along_cross,
                                                                     load_spots)
 
@@ -390,17 +390,24 @@ def test_without_the_camera_the_gps_spot_is_used():
 
 
 def test_a_band_far_from_the_spot_or_seen_once_does_not_move_the_stop():
-  far = drive(StopSpots([SPOT]), -120., 12., 25., lines=camera(-14.))  # beyond LINE_TOL: some other marking
+  far = drive(StopSpots([SPOT]), -120., 12., 25., lines=camera(-17.))  # beyond LINE_BEFORE: some other marking
   assert stops(far) == [pytest.approx(-STOP_MARGIN, abs=1.)]
+  # a band 5 m before the line read on one frame only, 9-10 m ahead with the GPS agreeing (a glare, a shadow): not a band
+  seen = []
+  def once_lines(t, x):
+    if 9. < -5. - x < 10. and not seen:
+      seen.append(t)
+      return [-5. - x]
+    return []
   ss = StopSpots([SPOT])
-  once = drive(ss, -120., 12., 25., lines=lambda t, x: [-5. - x] if 4. < t < 4.06 and 5.4 < -5. - x < 30. else [])
-  assert stops(once) == [pytest.approx(-STOP_MARGIN, abs=1.)] and not ss.line_locked
+  once = drive(ss, -40., 6., 25., lines=once_lines)
+  assert seen and stops(once) == [pytest.approx(-STOP_MARGIN, abs=1.)] and not ss.line_locked
 
 
 def test_the_crosswalks_near_edge_is_taken_and_later_fixes_do_not_move_it():
   """Both edges of a crosswalk in view: the nearer (upstream) one is the line. Fixes jumping 5 m after the lock do not
   move the stop."""
-  ss = StopSpots([SPOT])
+  ss = StopSpots([{**SPOT, "marks": [0., 3.5]}])
   out = drive(ss, -120., 12., 25., lines=camera(-4., extra=(-0.5,)),
               fix=lambda t, x: (x + (5. if t > 7. else 0.), 0., 184.))
   assert stops(out) == [pytest.approx(-4. - STOP_MARGIN, abs=0.75)]
@@ -500,3 +507,121 @@ def test_in_a_queue_the_line_before_the_lead_is_still_read():
 
   out = drive(StopSpots([SPOT]), -120., 12., 25., lines=lines, lead=lead, fix=lambda t, x: (x + 4., 0., 184.))
   assert stops(out) == [pytest.approx(-STOP_MARGIN, abs=0.75)]
+
+
+def test_a_crosswalks_near_edge_gone_under_the_hood_is_still_the_line():
+  """Route 00000030 northbound: the learned spot 8.6 m past the near edge, the car turning in 40 m out at 7 mph. The near
+  edge, seen from 9.4 m to the hood, is the first band: the stop is before it, not on the crosswalk."""
+  out = drive(StopSpots([SPOT]), -40., 3., 40., lines=camera(-8.6, extra=(-5.6,)))
+  assert stops(out) == [pytest.approx(-8.6 - STOP_MARGIN, abs=0.75)]
+
+
+def test_the_near_edge_seen_before_the_gps_agreed_is_remembered():
+  """The near edge seen only while 8-10 m off (worn paint), the GPS agreeing only once it is under the hood: it is
+  remembered for BAND_MEMORY and is the first band."""
+  def lines(t, x):
+    near, far = -8.6 - x, -5.6 - x
+    return sorted([d for d in [near] if 8. < d < 10.] + [d for d in [far] if 5.4 < d < 30.])
+  out = drive(StopSpots([SPOT]), -20., 1.5, 40., lines=lines, fix_hz=0.7)  # crawling, as route 00000030 at 3.8 mph
+  assert stops(out) and stops(out)[0] == pytest.approx(-8.6 - STOP_MARGIN, abs=1.), "at the near edge, not on the crosswalk"
+
+
+def test_a_band_before_the_line_within_line_tol_is_taken_early_never_past():
+  """A joint or patch 7 m before the line: it is the first band, so the stop is early, never past the line."""
+  out = drive(StopSpots([SPOT]), -120., 12., 25., lines=camera(0., extra=(-7.,)))
+  assert stops(out) == [pytest.approx(-7. - STOP_MARGIN, abs=0.75)]
+
+
+def test_a_band_beyond_line_before_before_the_line_is_not_this_stops():
+  """Route 00000178 northbound: a band 19 m before the line, seen driving straight. Beyond LINE_BEFORE: the line is."""
+  out = drive(StopSpots([SPOT]), -120., 12., 25., lines=camera(0., extra=(-19.,)))
+  assert stops(out) == [pytest.approx(-STOP_MARGIN, abs=0.75)]
+
+
+def test_bands_seen_turning_in_are_not_read():
+  """Route 00000167 northbound: turning in, the camera sees the road at an angle and reads bands that are not across
+  the lane. One 9 m before the line, seen only while the wheel is past STRAIGHT_STEER, is not the stop's."""
+  def lines(t, x):
+    return sorted([d for d in [-9. - x] if x < -25. and 5.4 < -9. - x < 30.] + [d for d in [-x] if 5.4 < -x < 30.])
+  out = drive(StopSpots([SPOT]), -40., 4., 30., lines=lines, steer=lambda t, x: 90. if x < -25. else 0.)
+  assert stops(out) == [pytest.approx(-STOP_MARGIN, abs=0.75)]
+
+
+@pytest.mark.parametrize("gps_off", [-7.5, -4., 0., 4., 7.5])
+@pytest.mark.parametrize("v0", [5., 12.])
+def test_a_stop_line_and_crosswalk_stop_at_the_line_whatever_the_gps_says(gps_off, v0):
+  """The southbound crossroad: the line, then the crosswalk's edges 1.6 and 3.5 m on, read from 14 m. GPS 7.5 m either
+  way (routes 0000002c, 0000002d): the first band is the line."""
+  def lines(t, x):
+    return sorted(d for d in (m - x for m in (0., 1.6, 3.5)) if 5.4 < d < 14.)
+  out = drive(StopSpots([SPOT]), -120., v0, 40., lines=lines, fix=lambda t, x: (x + gps_off, 0., 184.))
+  # GPS 7.5 m late at 27 mph: braking for the GPS line, the camera's from 14 m moves it 7.5 m nearer; the bumper (about
+  # 2 m ahead of the aim point less the 1 m it leaves) reaches the line at worst, never the crosswalk
+  assert stops(out) and -STOP_MARGIN - 1. <= stops(out)[0] <= -STOP_MARGIN + 1.25
+  assert min(r[2] for r in out if r[2] is not None) >= -BRAKE_MAX
+
+
+def test_a_near_edge_first_seen_after_the_lock_moves_the_stop_back_to_it():
+  """Worn paint seen only from 8 m: the far edge locks first, then the near edge appears 3 m before it at 12 mph. The
+  full STOP_MARGIN would need over BRAKE_MAX: the stop moves back as far as BRAKE_MAX allows, short of the edge."""
+  def lines(t, x):
+    return sorted([d for d in [-8.6 - x] if 5.4 < d < 8.] + [d for d in [-5.6 - x] if 5.4 < d < 30.])
+  out = drive(StopSpots([SPOT]), -60., 6., 30., lines=lines)
+  assert stops(out) and stops(out)[0] <= -8.6 - 0.5, "short of the near edge, not on the crosswalk"
+  assert min(r[2] for r in out if r[2] is not None) >= -BRAKE_MAX
+
+
+def test_a_line_found_close_while_crawling_is_still_stopped_at():
+  """GPS 4 m behind: the camera finds the line about 6 m ahead at 4 m/s, before any brake: a stop needing more than
+  START_MAX but no more than BRAKE_MAX is still made."""
+  out = drive(StopSpots([SPOT]), -7., 4., 20., lines=camera(0.), fix=lambda t, x: (x - 4., 0., 184.))
+  # found 3.8 m before the aim at 9 mph, the brake building from nothing lands within 2 m of it; dropped, it rolls on
+  assert stops(out) and stops(out)[0] <= -STOP_MARGIN + 2.
+
+
+@pytest.mark.parametrize("v0", [6., 9.])
+def test_a_stop_bar_seen_only_early_is_still_the_first_band(v0):
+  """A stop bar at -9 seen only from 12-20 m, the crosswalk's near edge at -6.6 only under 8 m, its far edge at -3.6:
+  the remembered bar is the first band, and the stop is before it, gently."""
+  def lines(t, x):
+    return sorted([d for d in [-9. - x] if 12. < d < 20.] + [d for d in [-6.6 - x] if 5.4 < d < 8.] +
+                  [d for d in [-3.6 - x] if 5.4 < d < 30.])
+  out = drive(StopSpots([SPOT]), -80., v0, 40., lines=lines)
+  # at 20 mph the line found 9 m nearer than the GPS put it, mid-brake: up to 1.25 m past the aim, the bumper not over
+  assert stops(out) and -9. - STOP_MARGIN - 1. <= stops(out)[0] <= -9. - STOP_MARGIN + 1.25
+  assert min(r[2] for r in out if r[2] is not None) >= -BRAKE_MAX
+
+
+@pytest.mark.parametrize("v0", [5., 6., 6.5])
+def test_gps_7_5_m_late_still_locks_the_camera_line(v0):
+  """Review: GPS 7.5 m late (routes 2c/2d spread) at 11-15 mph, the frame latency adding 0.6 m: the line is still
+  matched and the stop is before it, not 5 m past."""
+  out = drive(StopSpots([SPOT]), -40., v0, 40., lines=camera(0.), fix=lambda t, x: (x - 7.5, 0., 184.))
+  assert stops(out) and stops(out)[0] <= -1.5
+
+
+@pytest.mark.parametrize("aim,seen,v", [(-0.89, 0.6, 2.62), (3., 4.5, 4.), (1.8, 1.0, 1.5)])
+def test_a_band_before_the_line_too_late_to_make_never_moves_the_stop_on(aim, seen, v):
+  """A band 1-1.5 m before the line placed when no stop at START_MAX is left: crawling past the aim, 3 m out at 9 mph
+  (the shrunk-margin aim would be further on than the one it has), 1.8 m out at 3 mph (no aim RESTEP_MIN_AIM out is
+  left). The stop stays. Route 0000002c northbound t=1456.8, before: the stop moved 2 m on, past the line."""
+  ss = StopSpots([SPOT])
+  ss.spot, ss.committed, ss.braking, ss.agree = SPOT, True, True, ARM_FIXES
+  ss.line_locked, ss.dist, ss.line_anchor, ss.expect = True, aim, aim, aim + STOP_MARGIN
+  ss.bands = [[seen, 8, 0.], [aim + STOP_MARGIN, 8, 0.]]
+  ss._see_line([], v, 0.)
+  assert ss.dist <= aim + 0.05
+
+
+def test_gps_10_m_late_turning_in_still_takes_the_first_band():
+  """Route 00000030 northbound: the GPS put the line 10.4 m past the real one by the time the bands were in view. The
+  line, then the crosswalk's edges 1.8 and 4.4 m on: the line is still the first band within LINE_BEFORE."""
+  out = drive(StopSpots([SPOT]), -40., 3.6, 40., lines=camera(-10.4, extra=(-8.6, -6.)))
+  assert stops(out) == [pytest.approx(-10.4 - STOP_MARGIN, abs=0.75)]
+
+
+def test_the_far_side_of_the_junction_is_not_the_line():
+  """The line itself not seen (worn, a car on it), only the far side's band 14 m past it: beyond LINE_TOL, so not
+  taken for the line; the GPS stop."""
+  out = drive(StopSpots([SPOT]), -120., 12., 25., lines=camera(14.))
+  assert stops(out) == [pytest.approx(-STOP_MARGIN, abs=1.)]
