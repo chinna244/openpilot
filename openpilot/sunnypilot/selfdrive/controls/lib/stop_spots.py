@@ -10,20 +10,23 @@ comes to a full stop is not the line (at this crossroad the full stops end sever
 On the approach the camera places the line itself once it sees it (LINE_TOL, LINE_FRAMES): GPS puts the same line a
 few metres apart from one day to the next, so it only says which stop sign is coming.
 
-On the approach to a spot, with a GPS fix, this candidate asks the constant decel that stops the
-car STOP_MARGIN short of the spot once that is START_DECEL or more (about 50 m out from 27 mph), or within START_TIME of
-it (a car the model slowed to a crawl and lets roll on), built at START_JERK. A stop found needing more than START_MAX
-is left to the driver. It starts only on ARM_FIXES agreeing fixes within ARM_ACCURACY. Once it brakes, the distance
-left is the car's own odometry: a missed, wandering or stale fix (the Jetson fallback projects 1-3 s old ones) can
-neither release the brake nor move the line; fixes then only end a pass whose car turned off the spot's road. Stopped
-there, it asks to stop for HOLD_TIME at standstill, then lets go and the model decides when to move on; that spot is
-done until the car is DONE_DIST past it. The driver's gas or brake, reaching it without having braked for it, or
-PASS_MAX_TIME ends the pass. The driver's gas while rolling only pauses it: on release it resumes if the stop still
-needs RESUME_MAX or less and is RESUME_DIST or more away; gas from a stop or a crawl hands the go to the driver. A lead
-needs nothing here: the lead MPC is the lower candidate behind it, and with it gone the car still stops at the line.
+On the approach to a spot, with a GPS fix, this candidate brakes to stop the car STOP_MARGIN short of the spot as the
+driver does: none until it needs STOP_DECEL_BP[0], firmer toward the end, finished at FINISH_DECEL, never more than
+STOP_ASK_MAX, built at START_JERK; down to SEEK_SPEED near the GPS line and LOOK_SPEED at it until the camera has
+placed the line. A stop found needing more than START_MAX is left to the driver. It starts only on ARM_FIXES agreeing
+fixes within ARM_ACCURACY. Once it brakes, the distance left is the car's own odometry: a missed, wandering or stale
+fix (the Jetson fallback projects 1-3 s old ones) can neither release the brake nor move the line; fixes then only end
+a pass whose car turned off the spot's road. Stopped there, it asks to stop for HOLD_TIME at standstill, then lets go
+and the model decides when to move on; that spot is done until the car is DONE_DIST past it. The driver's gas or
+brake, reaching it without having braked for it, or PASS_MAX_TIME ends the pass. The driver's gas while rolling only
+pauses it: on release it resumes if the stop still needs RESUME_MAX or less and is RESUME_DIST or more away (any
+distance under RESUME_SLOW); gas from a stop hands the go to the driver. A lead needs nothing here: the lead MPC is
+the lower candidate behind it, and with it gone the car still stops at the line.
 """
 import json
 import math
+
+import numpy as np
 from pathlib import Path
 
 from openpilot.common.realtime import DT_MDL
@@ -50,15 +53,12 @@ PASS_MAX_TIME = 90.  # s braked-for pass on the move, at most
 HEADING_TOL = 30.  # deg
 CROSS_TOL = 8.  # m either side of the spot's heading line
 ARM_DIST = 120.  # m ahead; nothing further out is looked at
-# m/s2 the stop must need before it brakes: the driver's own stops at the southbound spot start 48-55 m out at 28 mph
-# (1.5-1.6 needed); 1.0 braked from 75 m at -1.1 and the driver pressed the gas (route 0000002c t=174). 1.3, built at
-# START_JERK 2.0, starts about 55 m out and asks at most 1.86 over the 27 replayed passes (1.5: 2.48, as it starts late)
-START_DECEL = 1.3
-START_TIME = 3.  # s from the spot: a car the model already slowed to a crawl is stopped from here
 START_JERK = 2.0  # m/s3 the brake builds at
 START_MAX = 2.0  # m/s2; a stop needing more when found (a fix that jumped or came late) is the driver's
 BRAKE_MAX = 3.0  # m/s2; once braking, a car delivering less than asked is still stopped at the line
-RESUME_MAX = 1.5  # m/s2 a stop may need when the driver's gas is released; the ramp back adds about 0.5
+# m/s2 a stop may need when the driver's gas is released: up to where the stop asks all it needs (STOP_DECEL_BP[1]),
+# the ask never past STOP_ASK_MAX (route 0000002c t=174: a 1 s tap 46 m out at 27 mph, released needing 1.5-1.6)
+RESUME_MAX = 2.
 RESUME_DIST = 10.  # m from the aim at least: released closer, the ramp from 0 plus actuator lag reached 2-3 m/s2
 STOP_SPEED = 0.5  # m/s
 HOLD_TIME = 2.  # s at standstill before the model takes over
@@ -112,6 +112,46 @@ LOCK_JERK = 4.  # m/s3 the brake builds at to the camera's line: GPS off 7 m tow
 LOCK_JERK_TIME = 1.  # s after the camera places or moves the line; then START_JERK again
 RESTEP_MIN_AIM = 2.  # m: a move back after the lock only to an aim this far ahead
 RESTEP_EDGE = 1.  # m short of the line, at least, a late move back stops
+# The stop's shape, from the driver's own stop-sign stops (routes 00000009-00000032: 39 stops, 21 straight): braking
+# from where the stop needs about 1.3 m/s2, harder toward the end, peak 2.1 m/s2 median, 5 mph to standstill in 1.1 s,
+# under 2 m/s for 0.9 s. A constant decel from wherever the stop was found crawled for 2-9 s on 18 of 32 northbound
+# passes (the camera moving the aim on after a gentle start) and eased off toward the end everywhere. So the ask is
+# none while the stop needs under STOP_DECEL_BP[0] (the speed held), all of what it needs from STOP_DECEL_BP[1] on:
+# the stop settles there and ends firm.
+STOP_DECEL_BP = [1.0, 2.0]  # m/s2
+# The last metres: under FINISH_SPEED, once a stop at FINISH_DECEL from here (after the car's LAG_TIME) ends at the aim,
+# it is finished at FINISH_DECEL at least, not eased into a crawl as the car's own lag leaves it a little ahead of what
+# the stop needs
+FINISH_SPEED = 2.  # m/s
+FINISH_DECEL = 1.5  # m/s2 (the driver's 5 mph to standstill in 1.1-1.6 s)
+# Until the camera has placed the line the stop is only where GPS puts it, 7.8 m early to 11 m late: the car comes down
+# to LOOK_SPEED by there, not to a stop, so a line the camera finds on (northbound route 0000019c: braked to a stop 9 m
+# short, the line seen only then) is still stopped at; with none seen by the GPS aim, it stops there
+LOOK_SPEED = 1.8  # m/s, under FINISH_SPEED: the finish takes over before the ask to it eases to 0
+# s from an ask to the car delivering it (0.3 s lag + 0.2 s dead time, fitted on 21 braking windows): the stop is
+# planned from where the car will be, so the ask does not climb at the end (24 of 64 passes peaked 2.5-2.9 there)
+LAG_TIME = 0.3
+# Until the camera has placed the line, the car is down to SEEK_SPEED by SEEK_DIST short of where the GPS puts it:
+# GPS put the southbound line up to 11 m late (p90 6 m, 19 passes), and wet or at dusk the camera reads it from 12-14 m
+# only; from SEEK_SPEED a line found there is stopped for at no more than about 2 m/s2. Only a cap: the stop itself
+# stays at the GPS line until the camera moves it, so a line past early GPS is still found.
+SEEK_SPEED = 5.  # m/s
+SEEK_DIST = 14.  # m
+# m/s2 the cap needs before it brakes, and from where it asks all of it: an earlier, gentler slowdown (from about 115 m
+# at 27 mph) scored the same but crawls into the junction in traffic; from 1.5 it starts about where the driver does
+SEEK_DECEL_BP = [1.5, 2.2]
+AHEAD_AGE = 0.3  # s since a band's last sighting for it to count as paint ahead
+AHEAD_SPAN = 0.5  # m travelled over its sightings, coming LINE_CLOSING of it closer, for it to count
+SEEK_TAU = 1.  # s
+HOLD_ON_SPEED = 4.  # m/s
+# s a fix lags the car: the southbound line came out a median 2.3 m late at 8-12 m/s (19 passes with the camera's line)
+GPS_LAG = 0.3
+# m/s2 the stop asks at most once braking: a line placed late by the camera is stopped at this, the bumper then up to
+# about 1 m further on than the aim (still short of the band); BRAKE_MAX remains the bound a stop is placed within
+STOP_ASK_MAX = 2.5
+# m/s a gas released under this is a crawl: the stop resumes when it needs RESUME_MAX or less, however near (a gas tap
+# at a crawl ended the stop and the car rolled through it, route 00000032 northbound)
+RESUME_SLOW = 5.
 
 
 def finite(x) -> bool:
@@ -188,7 +228,7 @@ class StopSpots:
     self.done_dist = 0.
     self.should_stop = False
 
-  def _locate(self, lat: float, lon: float, bearing: float) -> None:
+  def _locate(self, lat: float, lon: float, bearing: float, speed: float = 0.) -> None:
     """The nearest spot ahead on this heading, or none."""
     best = None
     for spot in self.spots:
@@ -203,8 +243,8 @@ class StopSpots:
     if best[0] is not self.spot:
       self._end()
       self.spot = best[0]
-    dist = best[1] - STOP_MARGIN
-    self.expect = best[1]
+    dist = best[1] - speed * GPS_LAG - STOP_MARGIN
+    self.expect = best[1] - speed * GPS_LAG
     self.agree = self.agree + 1 if abs(dist - self.dist) <= AGREE_TOL else 1
     self.fix_age = 0.
     if not self.line_locked:
@@ -286,7 +326,7 @@ class StopSpots:
         self.done_spot = None
     if not self.committed and not self.line_locked:
       if gps_fresh and 0. < accuracy <= ARM_ACCURACY:
-        self._locate(lat, lon, bearing)
+        self._locate(lat, lon, bearing, v_ego if fix_speed is None else fix_speed)
       elif self.spot is not None and self.fix_age > GPS_MAX_AGE:
         self._end()
     elif (gps_fresh and 0. < accuracy <= GPS_MAX_ACCURACY and
@@ -318,7 +358,7 @@ class StopSpots:
       return None
     if self.paused:
       self.paused = False
-      if self.dist < RESUME_DIST or v_ego ** 2 / (2. * max(self.dist, 0.5)) > RESUME_MAX:
+      if (self.dist < RESUME_DIST and v_ego >= RESUME_SLOW) or self.dist < 0.5 or v_ego ** 2 / (2. * max(self.dist, 0.5)) > RESUME_MAX:
         # released at the line, or too close to it to stop gently: the driver's
         self._finish()
         return None
@@ -331,6 +371,9 @@ class StopSpots:
       # at the spot: stop and hold, then hand the go to the model
       self.hold_frames = self.hold_frames + 1 if standstill else 0
       if self.hold_frames * DT_MDL >= HOLD_TIME:
+        # held where GPS or the camera put the line: the go is the model's. Not stopped again for a band seen on: the
+        # line itself is under the hood by then, and the first band in view is the crosswalk's far edge (review
+        # 2026-11-03: a second stop on the crosswalk)
         self._finish()
         return None
       self.should_stop = True
@@ -345,14 +388,48 @@ class StopSpots:
       # reached without needing to brake (or the fix puts it behind): nothing to stop for
       self._finish()
       return None
-    need = v_ego ** 2 / (2. * max(self.dist, 0.5))
+    d_eff = max(self.dist - v_ego * LAG_TIME, 0.5)
+    need = v_ego ** 2 / (2. * d_eff)
     if not self.committed and sure and need > START_MAX:
       # found too late to stop gently: the driver's
       self._finish()
       return None
-    if self.braking or (sure and not turning and (need >= START_DECEL or self.dist <= v_ego * START_TIME)):
+    # paint glimpsed ahead within where the line can be: a recent sighting coming closer (a glare that keeps its
+    # distance does not; review 2026-11-03: one let the car roll through)
+    ahead = not self.line_locked and any(STOP_MARGIN < b[0] <= self.expect + LINE_TOL and b[2] <= AHEAD_AGE and
+                                         b[5] >= AHEAD_SPAN and b[6] >= LINE_CLOSING * b[5] for b in self.bands)
+    if self.braking and self.dist < -HOLD_DIST and not ahead:
+      # well past the line still rolling (a car short of what was asked, a stop found too late): the model's, not a
+      # hard stop in the junction
+      self._finish()
+      return None
+    seek = 0.
+    if not self.line_locked and v_ego > SEEK_SPEED:
+      to_seek = self.dist - SEEK_DIST - v_ego * LAG_TIME
+      # down to SEEK_SPEED by SEEK_DIST; inside it, shed what is over in SEEK_TAU rather than all at once (review
+      # 2026-11-03: braked at 2.5 to under SEEK_SPEED, let off, then braked again at 13-18 mph)
+      seek = (v_ego ** 2 - SEEK_SPEED ** 2) / (2. * to_seek) if to_seek > SEEK_TAU * v_ego else (v_ego - SEEK_SPEED) / SEEK_TAU
+    finish_dist = v_ego ** 2 / (2. * FINISH_DECEL) + v_ego * (LAG_TIME + FINISH_DECEL / (2. * START_JERK))  # lag + build
+    crawl_in = v_ego < FINISH_SPEED and self.dist < finish_dist  # a crawl the model lets roll on to the stop
+    was_braking = self.braking
+    if self.braking or (sure and not turning and (need >= STOP_DECEL_BP[0] or seek >= SEEK_DECEL_BP[0] or crawl_in)):
       self.braking = self.committed = True
+      # past where GPS puts the line with paint glimpsed ahead: roll on at LOOK_SPEED until the camera places it; with
+      # nothing seen, the stop is there
+      if self.line_locked or (self.dist <= 0. and not ahead):
+        stop = need
+      else:
+        stop = max(v_ego ** 2 - LOOK_SPEED ** 2, 0.) / (2. * d_eff)  # down to LOOK_SPEED at the GPS aim
+      ask = max(stop * float(np.interp(stop, STOP_DECEL_BP, [0., 1.])), seek * float(np.interp(seek, SEEK_DECEL_BP, [0., 1.])))
+      if was_braking and v_ego > HOLD_ON_SPEED:
+        # once braking, never let off below what the stop still needs: the cap's and the stop's onsets both ease in,
+        # and where one hands over to the other the ask fell to 0 and braked again (review 2026-11-03, 20-31 mph,
+        # around SEEK_SPEED); slower, the stop's own ease-in shapes the end (held on there, it crawled longer)
+        ask = max(ask, min(stop, -self.a_target))
+      if v_ego < FINISH_SPEED and not ahead and self.dist < finish_dist:
+        ask = max(ask, FINISH_DECEL)
       jerk = LOCK_JERK if self.line_locked and self.lock_age < LOCK_JERK_TIME else START_JERK
-      self.a_target = max(-min(need, BRAKE_MAX), self.a_target - jerk * DT_MDL)
+      target = -min(ask, STOP_ASK_MAX)
+      self.a_target += min(max(target - self.a_target, -jerk * DT_MDL), START_JERK * DT_MDL)
       return self.a_target
     return None

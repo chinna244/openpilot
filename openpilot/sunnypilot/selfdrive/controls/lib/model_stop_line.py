@@ -25,8 +25,9 @@ from openpilot.selfdrive.modeld.constants import ModelConstants
 from openpilot.sunnypilot.selfdrive.controls.lib.stop_spots import (BRAKE_MAX, HOLD_ACCEL, HOLD_DIST, LEAD_BAND, LEAD_HOLD,
                                                                     LEAVE_STEER, LINE_DRIFT, LINE_GAIN, LINE_LATENCY, LINE_TRACK,
                                                                     LOCK_JERK, LOCK_JERK_TIME, LOCK_MAX_DIST, RESTEP_EDGE,
-                                                                    RESTEP_MIN_AIM, RESUME_MAX, START_JERK, START_MAX, STOP_MARGIN,
-                                                                    STOP_SPEED, STRAIGHT_STEER, carry_bands, firm_band, see_band)
+                                                                    RESTEP_MIN_AIM, START_JERK, START_MAX, STOP_MARGIN,
+                                                                    STOP_SPEED, STRAIGHT_STEER, LAG_TIME, carry_bands, firm_band,
+                                                                    see_band)
 
 MODEL_STOP_SPEED = 0.5  # m/s the model's planned speed falls below where it stops
 # m past the line the model may still stop and be stopping for it: its own stop on the crosswalk is 2-3 m past the
@@ -40,9 +41,10 @@ GO_TIME = 0.5  # s the model plans to go before the stop lets go: one odd plan i
 # GO_PLAN_T than the car is a go too: through route 0000002d t=316.6-318.3 it stayed 0.8-3.9 m/s under the car's 4.4-8.4
 GO_ACCEL = -0.3
 GO_PLAN_T = 2.  # s
-# s after the driver's gas a new stop may need at most RESUME_MAX, as for a stop spot: released close to a line, the
-# full BRAKE_MAX ask came on top of the model's own
+# s after the driver's gas a new stop may need at most OVERRIDE_MAX: released close to a line, the full BRAKE_MAX ask
+# came on top of the model's own
 OVERRIDE_TIME = 2.
+OVERRIDE_MAX = 1.5  # m/s2
 # s the model plans a stop before one is placed: on route 0000002c 21 of 33 moving model stops with no lead lasted 3
 # frames or less (13 one), and a stop placed on one frame braked to -2.2 for GO_TIME, then let go in a step (review
 # 2026-11-03)
@@ -130,8 +132,10 @@ class ModelStopLine:
 
     firm = [b[0] for b in self.bands if firm_band(b)]
     if not self.locked:
-      if not stopping or self.stop_frames < round(STOP_TIME / DT_MDL) or lead is not None or v_ego < STOP_SPEED:
-        return None  # behind a lead the lead MPC places the stop
+      if not stopping or self.stop_frames < round(STOP_TIME / DT_MDL) or v_ego < STOP_SPEED:
+        return None
+      if lead is not None and lead < model_stop + GO_DIST:
+        return None  # behind a lead the lead MPC places the stop; one across the junction is not in the way
       # from GO_DIST before the model's stop: a line further back would read as the model going once stopped at it
       near = [d for d in firm if d > STOP_MARGIN and model_stop - GO_DIST <= d < model_stop + STOP_MARGIN]
       if not near:
@@ -142,7 +146,7 @@ class ModelStopLine:
       aim = max(seen - STOP_MARGIN, min(v_ego ** 2 / (2. * START_MAX), seen - RESTEP_EDGE))
       if aim >= model_stop:
         return None  # the model stops short of it anyway
-      if aim < RESTEP_MIN_AIM or v_ego ** 2 / (2. * aim) > (RESUME_MAX if self.override_age < OVERRIDE_TIME else BRAKE_MAX):
+      if aim < RESTEP_MIN_AIM or v_ego ** 2 / (2. * aim) > (OVERRIDE_MAX if self.override_age < OVERRIDE_TIME else BRAKE_MAX):
         self._end(True)  # too close to stop before it: the model's
         return None
       self.locked, self.dist, self.anchor, self.lock_age, self.a_target = True, aim, aim, 0., 0.
@@ -174,7 +178,7 @@ class ModelStopLine:
       # to HOLD_ACCEL at START_JERK from either side: a stop braked harder than it eases off, no step
       self.a_target += min(max(HOLD_ACCEL - self.a_target, -START_JERK * DT_MDL), START_JERK * DT_MDL)
       return self.a_target
-    need = v_ego ** 2 / (2. * max(self.dist, 0.5))
+    need = v_ego ** 2 / (2. * max(self.dist - v_ego * LAG_TIME, 0.5))
     if self.dist <= 0.5:
       need = max(need, -HOLD_ACCEL)  # at or past the aim still rolling (a car short of what was asked): stop now
     jerk = LOCK_JERK if self.lock_age < LOCK_JERK_TIME else START_JERK
