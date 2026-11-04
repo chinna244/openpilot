@@ -204,6 +204,14 @@ def test_a_limit_moving_to_the_signs_value_is_agreement_not_a_new_road():
   assert drive(rc, 30., car=25, map_limit=25, sign=25) is None
 
 
+def test_a_map_limit_back_after_a_gps_gap_is_the_signs_road():
+  """Read with no map limit (no fix): the first map limit back is this road's, not a change."""
+  rc = slv.RoadChange()
+  rc.reset(0, 0)
+  assert drive(rc, 30., car=0, map_limit=30, sign=35) is None
+  assert drive(rc, 11., car=0, map_limit=45, sign=35) == "map_limit"  # a real change after it still ends the sign
+
+
 def test_distance_backstop():
   rc = slv.RoadChange()
   rc.reset(55, 55)

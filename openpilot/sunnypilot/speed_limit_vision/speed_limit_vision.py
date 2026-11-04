@@ -79,6 +79,9 @@ class RoadChange:
     if self.distance_m > ROAD_MAX_DISTANCE_M:
       return "distance"
     for source, value in (("car", car), ("map", map_limit)):
+      if source == "map" and self.start[source] <= 0 < value:
+        self.start[source] = value  # no map limit when the sign was read (a GPS gap): the first one back is this road's
+        continue
       if value <= 0 or value == self.start[source] or value == sign:
         self.moved.pop(source, None)
         continue

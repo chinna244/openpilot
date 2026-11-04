@@ -428,3 +428,44 @@ class TestSpeedLimitResolverVision(OpenpilotTestCase):
   def test_other_policies_ignore_vision(self, policy, mocker):
     resolver = self._resolve(mocker, policy, 15., 20., 25.)
     assert resolver.source != SpeedLimitSource.vision
+
+  # a sign the camera withdraws (a school 20 read before its plaque showed, route 12 484 s) is not the last limit
+
+  def _feed(self, resolver, mocker, vision, seconds, vision_age=0.):
+    resolver.update_params = lambda: None  # keep the policy the test set
+    for _ in range(max(1, int(seconds / DT_MDL))):
+      resolver.update(10., self._sm(mocker, 0., 0., vision, vision_age))
+
+  def test_a_withdrawn_sign_gives_back_the_one_before(self, mocker):
+    resolver = SpeedLimitResolver()
+    resolver.policy = Policy.combined
+    self._feed(resolver, mocker, 35 * MPH, 10.)
+    self._feed(resolver, mocker, 20 * MPH, 1.5)
+    assert resolver.speed_limit_last == 20 * MPH  # a live reading still counts at once
+    self._feed(resolver, mocker, 0., 1.)
+    assert resolver.speed_limit_last == 35 * MPH
+    assert resolver.speed_limit_final_last == 35 * MPH + resolver.speed_limit_offset
+
+  def test_a_withdrawn_first_sign_leaves_no_last_limit(self, mocker):
+    resolver = SpeedLimitResolver()
+    resolver.policy = Policy.combined
+    self._feed(resolver, mocker, 20 * MPH, 1.5)
+    self._feed(resolver, mocker, 0., 1.)
+    assert resolver.speed_limit_last == 0.
+
+  def test_a_short_sign_lost_with_the_camera_still_stays(self, mocker):
+    # the camera stopped publishing: a dropout, not a withdrawal, and a lower short reading may be a real sign
+    resolver = SpeedLimitResolver()
+    resolver.policy = Policy.combined
+    self._feed(resolver, mocker, 35 * MPH, 10.)
+    self._feed(resolver, mocker, 20 * MPH, 1.5)
+    self._feed(resolver, mocker, 0., 1., vision_age=5.)
+    assert resolver.speed_limit_last == 20 * MPH
+
+  def test_a_held_sign_the_camera_drops_stays(self, mocker):
+    resolver = SpeedLimitResolver()
+    resolver.policy = Policy.combined
+    self._feed(resolver, mocker, 35 * MPH, 10.)
+    self._feed(resolver, mocker, 25 * MPH, LAST_LIMIT_SETTLE + 0.5)
+    self._feed(resolver, mocker, 0., 1.)
+    assert resolver.speed_limit_last == 25 * MPH

@@ -28,6 +28,8 @@ MAP_FIX_FUTURE_TOLERANCE = 1.  # s
 # for 0.72 s turning into a parking lot as the map dropped out, and that 35 stayed the last limit for 47 s ("Press + for 41"
 # twice, no limit anywhere). A reading that ends sooner gives way to the held one it took over from without a gap, if that
 # one is lower; a lower short reading stays (it may be a real sign), and one that began after a dropout stays as before.
+# Unless the camera itself took it back: a school 20 read before its plaque showed (route 12 484 s) is withdrawn while
+# the camera still publishes, and the last limit goes back to what it was before that reading.
 LAST_LIMIT_SETTLE = 2.  # s
 
 # A car (camera) limit below this is a misread sign, not a road limit: route 00000169 t207 and t234 read 5 mph
@@ -102,6 +104,9 @@ class SpeedLimitResolver:
     self._reading_final = 0.
     self._reading_frames = 0
     self._fallback: tuple[float, float] | None = None  # the held (limit, final) the current reading took over from
+    self._before = (0., 0.)  # the last (limit, final) when the current reading began
+    self._reading_source = SpeedLimitSource.none
+    self._vision_alive = False  # speed_limit_vision publishing, with or without a sign
 
   def update_speed_limit_states(self) -> None:
     self.speed_limit_final = self.speed_limit + self.speed_limit_offset
@@ -109,6 +114,8 @@ class SpeedLimitResolver:
     settle = int(LAST_LIMIT_SETTLE / DT_MDL)
     if self.speed_limit > 0.:
       if self.speed_limit != self._reading:
+        self._before = (self.speed_limit_last, self.speed_limit_final_last)
+        self._reading_source = self.source
         # only a reading that took over from a held one, with no dropout between, can give way to it
         if self._reading_frames >= settle:
           self._fallback = (self._reading, self._reading_final)
@@ -122,7 +129,10 @@ class SpeedLimitResolver:
       self.speed_limit_final_last = self.speed_limit_final
     elif self._reading > 0.:
       # every source dropped out: a reading that never held does not raise the last limit
-      if self._reading_frames < settle and self._fallback is not None and self._fallback[0] < self._reading:
+      if self._reading_frames < settle and self._reading_source == SpeedLimitSource.vision and self._vision_alive:
+        # the camera withdrew a sign it read moments ago
+        self.speed_limit_last, self.speed_limit_final_last = self._before
+      elif self._reading_frames < settle and self._fallback is not None and self._fallback[0] < self._reading:
         self.speed_limit_last, self.speed_limit_final_last = self._fallback
       self._reading = 0.
       self._reading_frames = 0
@@ -166,10 +176,9 @@ class SpeedLimitResolver:
   def _get_from_vision(self, sm: messaging.SubMaster) -> None:
     self._reset_limit_sources(SpeedLimitSource.vision)
     speed_limit = sm['customReserved10'].speedLimit
-    if speed_limit < CAR_LIMIT_MIN:
-      return
     age = time.monotonic() - sm.logMonoTime['customReserved10'] * 1e-9
-    if -MAP_FIX_FUTURE_TOLERANCE <= age <= VISION_MAX_AGE:
+    self._vision_alive = -MAP_FIX_FUTURE_TOLERANCE <= age <= VISION_MAX_AGE
+    if speed_limit >= CAR_LIMIT_MIN and self._vision_alive:
       self.limit_solutions[SpeedLimitSource.vision] = speed_limit
 
   def _get_from_map_data(self, sm: messaging.SubMaster) -> None:
