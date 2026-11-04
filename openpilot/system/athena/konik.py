@@ -26,6 +26,7 @@ class KonikConnection:
   def __init__(self, params: Params, exit_event: threading.Event):
     self.params = params
     self.exit_event = exit_event
+    self.was_connected = False  # the last session got through
 
   def configured(self, dongle_id: str | None = None) -> bool:
     current_id = self.params.get('KonikDongleId')
@@ -122,6 +123,7 @@ class KonikConnection:
         return
       ws = create_connection(f'{ATHENA_HOST}/ws/v2/{dongle_id}', cookie='jwt=' + token, enable_multithread=True, timeout=5)
       self.status('connected')
+      self.was_connected = True
       last_ping = time.monotonic()
       methods = self.methods()
       while not self.exit_event.is_set() and self.configured(dongle_id):
@@ -163,6 +165,7 @@ def main(exit_event: threading.Event | None = None):
   connection = KonikConnection(Params(), exit_event)
   retries = 0
   while not exit_event.is_set():
+    connection.was_connected = False
     try:
       connection.session()
     except Exception as e:
@@ -170,6 +173,8 @@ def main(exit_event: threading.Event | None = None):
       cloudlog.warning('Konik online connection interrupted (%s)', type(e).__name__)
     if exit_event.is_set():
       break
+    if connection.was_connected:
+      retries = 0  # it got through: a later drop starts the backoff again
     retries = min(retries + 1, 6)
     connection.status('reconnecting')
     exit_event.wait(min(2 ** retries, 60))

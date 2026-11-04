@@ -397,6 +397,24 @@ def test_connection_retries_after_network_failure_and_stops_cleanly(mocker):
   assert all(c.args[0] <= 60 for c in end.wait.call_args_list)
 
 
+def test_a_session_that_got_through_restarts_the_backoff(mocker):
+  end = mocker.Mock()
+  end.is_set.return_value = False
+  connection = mocker.patch.object(konik, 'KonikConnection').return_value
+  def session():
+    connection.was_connected = connection.session.call_count == 4
+    if not connection.was_connected:
+      raise ConnectionError('network unavailable')
+  connection.session.side_effect = session
+  mocker.patch.object(konik, 'Params')
+  def retry_wait(delay):
+    if end.wait.call_count == 5:
+      end.is_set.return_value = True
+  end.wait.side_effect = retry_wait
+  konik.main(end)
+  assert [c.args[0] for c in end.wait.call_args_list] == [2, 4, 8, 2, 4]
+
+
 def test_remote_socket_close_clears_presence_without_touching_comma(setup):
   setup.ws.recv_data.return_value = (ABNF.OPCODE_CLOSE, b'')
   setup.connection.session()
