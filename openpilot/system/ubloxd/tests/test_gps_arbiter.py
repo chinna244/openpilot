@@ -214,6 +214,15 @@ class TestArbitration:
     sim.run(5, ublox_fix=None)
     assert sim.arb.using_external and sim.arb.switches == 1
 
+  def test_one_good_fix_then_silence_is_no_recovery(self):
+    # review: one good ublox message, then silence, flipped back to the silent ublox for a wake
+    sim = Sim()
+    sim.run(3, ublox_fix=False)
+    assert sim.arb.using_external
+    sim.run(0.1, ublox_fix=True)
+    sim.run(8, ublox_fix=None)
+    assert sim.arb.using_external and sim.arb.switches == 1
+
   def test_tick_is_quiet_while_ublox_talks(self):
     sim = Sim()
     sim.run(3, ublox_fix=False)

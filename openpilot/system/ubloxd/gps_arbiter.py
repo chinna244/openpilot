@@ -148,6 +148,8 @@ class GpsArbiter:
   def tick(self, now: float) -> bool:
     """Every loop: True to publish the Jetson's fix now, for a ublox that has
     gone silent while falling back."""
+    if now - self._last_internal >= SILENT_FALLBACK:
+      self._good_since = None  # a silent ublox is no run of good fixes
     if self.using_external or now - self._last_internal >= SILENT_FALLBACK:
       self._decide(now)
     if not self.using_external or now - self._last_internal < SILENT_UBLOX or now - self._last_tick_publish < TICK_PUBLISH_PERIOD:

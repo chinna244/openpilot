@@ -235,6 +235,16 @@ def send_jetson_aid(pigeon: TTYPigeon, fix: ExternalFix, now: float) -> None:
   send_time(pigeon, t_fix, JETSON_AID_TIME_ACC)
   send_position_llh(pigeon, fix.latitude, fix.longitude, fix.altitude, fix.hdop * UERE + fix.speed * age + JETSON_AID_POS_MARGIN)
 
+def ublox_fix_seen(dat: bytes) -> bool:
+  """A NAV-PVT in this read with gnssFixOK: the ublox's own fix, whatever the arbiter publishes in its place."""
+  i = dat.find(b"\xb5\x62\x01\x07")
+  while i != -1:
+    if i + 6 + 22 <= len(dat) and dat[i + 6 + 21] & 0x01:
+      return True
+    i = dat.find(b"\xb5\x62\x01\x07", i + 1)
+  return False
+
+
 def jetson_aid_due(now: float, last_ublox_fix: float, last_aid: float, fix: ExternalFix | None) -> bool:
   return (fix is not None and fix.valid() and 0 <= fix.age(now) <= EXTERNAL_MAX_AGE and
           now - last_ublox_fix >= JETSON_AID_AFTER and now - last_aid >= JETSON_AID_PERIOD)
@@ -382,6 +392,8 @@ def run_receiving(duration: int = 0):
 
     dat = pigeon.receive()
     if len(dat) > 0:
+      if ublox_fix_seen(dat):
+        last_ublox_fix = time.monotonic()  # gpsLocationExternal carries the Jetson's fix while the arbiter falls back
       if dat[0] == 0x00:
         cloudlog.warning("received invalid data from ublox, re-initing!")
         init(pigeon)

@@ -77,3 +77,24 @@ class TestSend:
     monkeypatch.setattr(pigeond, "system_time_valid", lambda: True)
     pigeond.send_time(pigeon)
     assert struct.unpack("<BBBBHBBBBBxIHxxI", pigeon.sent[0][6:-2])[11] == 30
+
+
+def nav_pvt(fix_ok: bool) -> bytes:
+  payload = bytearray(92)
+  payload[20], payload[21] = (3, 0x01) if fix_ok else (0, 0x00)
+  return b"\xb5\x62\x01\x07" + struct.pack("<H", 92) + bytes(payload) + b"\x00\x00"
+
+
+class TestUbloxFixSeen:
+  """The ublox's own fix, read from its NAV-PVT: while the arbiter falls back, gpsLocationExternal is the Jetson's."""
+
+  def test_fix(self):
+    assert pigeond.ublox_fix_seen(b"\x01\x02" + nav_pvt(True))
+
+  def test_no_fix_or_no_pvt(self):
+    assert not pigeond.ublox_fix_seen(nav_pvt(False))
+    assert not pigeond.ublox_fix_seen(b"\xb5\x62\x02\x15" + bytes(40))
+
+  def test_cut_off_pvt_is_not_read(self):
+    assert not pigeond.ublox_fix_seen(nav_pvt(True)[:20])
+    assert pigeond.ublox_fix_seen(nav_pvt(True)[:20] + nav_pvt(True))
