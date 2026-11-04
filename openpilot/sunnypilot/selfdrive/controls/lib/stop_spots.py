@@ -46,7 +46,7 @@ LEAVE_SPEED = 3.  # m/s
 LEAVE_FIXES = 2
 LEAVE_STEER = 120.  # deg of wheel short of the stop (about a 20 m radius): turning off before the line, faster than
 # the fixes show it; a swerve round a parked car or a bend stays under it
-PASS_MAX_TIME = 90.  # s braked-for pass, at most
+PASS_MAX_TIME = 90.  # s braked-for pass on the move, at most
 HEADING_TOL = 30.  # deg
 CROSS_TOL = 8.  # m either side of the spot's heading line
 ARM_DIST = 120.  # m ahead; nothing further out is looked at
@@ -273,7 +273,7 @@ class StopSpots:
       return None
     if line_dists is not None:
       self._see_line(line_dists, v_ego, steer_deg)
-    if self.committed:
+    if self.committed and v_ego >= STOP_SPEED:  # moving only: a long wait in a queue short of the line is not the pass
       self.pass_time += DT_MDL
       if self.pass_time > PASS_MAX_TIME:
         self._finish()

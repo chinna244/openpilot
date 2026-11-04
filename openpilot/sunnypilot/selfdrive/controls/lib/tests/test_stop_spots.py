@@ -347,9 +347,19 @@ def test_a_braked_for_pass_ends_after_pass_max_time():
   ss = StopSpots([SPOT])
   drive(ss, -120., 12., 9.)
   assert ss.committed
+  ss.dist = 1000.  # a pass that never gets there (odometry lost the spot)
+  for _ in range(int(95. / DT_MDL)):
+    ss.update(*at(-30.), SPOT["bearing"], 2., False, 1., False, True, False)
+  assert ss.spot is None and ss.done_spot is SPOT
+
+
+def test_a_wait_stopped_short_does_not_use_up_the_pass():
+  ss = StopSpots([SPOT])
+  drive(ss, -120., 12., 9.)
+  assert ss.committed
   for _ in range(int(95. / DT_MDL)):
     ss.update(*at(-30.), SPOT["bearing"], 2., False, 0., True, True, False)
-  assert ss.spot is None and ss.done_spot is SPOT
+  assert ss.spot is SPOT and ss.committed
 
 
 def test_no_spots_or_bad_spots_do_nothing(tmp_path):
@@ -625,3 +635,15 @@ def test_the_far_side_of_the_junction_is_not_the_line():
   taken for the line; the GPS stop."""
   out = drive(StopSpots([SPOT]), -120., 12., 25., lines=camera(14.))
   assert stops(out) == [pytest.approx(-STOP_MARGIN, abs=1.)]
+
+
+def test_a_long_queue_short_of_the_spot_still_stops_at_the_line():
+  """The lead's queue stops the car 15-20 m short for 100 s, then it creeps up: the stop still comes at the line."""
+  def model(t, x, v):
+    if t < 100.:
+      return -3. if x > -40. else 0.
+    return 0.5 if v < 1.5 else 0.
+  out = drive(StopSpots([SPOT]), -120., 12., 130., model=model)
+  assert len(stops(out)) == 2
+  assert stops(out)[0] < -10., "first the queue"
+  assert stops(out)[1] == pytest.approx(-STOP_MARGIN, abs=1.), "then the line"
