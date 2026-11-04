@@ -15,6 +15,7 @@ from openpilot.selfdrive.controls.radard import _LEAD_ACCEL_TAU
 class PlantSM(dict):
   """The planner's SubMaster: every service valid and alive."""
   valid = alive = defaultdict(lambda: True)
+  logMonoTime = defaultdict(int)  # never received, as a real SubMaster has it
 
 
 class Plant:
