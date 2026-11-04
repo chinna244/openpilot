@@ -134,6 +134,18 @@ class TestRouteEngineWaypoints(unittest.TestCase):
     self.assertEqual(values['NavDestination'], {'latitude': 0, 'longitude': 0.004})
     self.assertEqual(engine.nav_waypoints, ())
 
+  def test_a_stop_near_the_start_waits_for_the_one_before(self):
+    # review: out to a far stop and back by a stop near home: leaving home dropped both
+    values = {'NavDestination': {'latitude': 0, 'longitude': 0.004, 'waypoints': [
+      {'latitude': 0, 'longitude': 0.003}, {'latitude': 0, 'longitude': 0.0002}]}}
+    engine = route_engine(values)
+    engine.last_position = (0., 0)  # 22 m from the second stop
+    remaining = engine.drop_passed_waypoints(values['NavDestination'], waypoints_from_param(values['NavDestination']))
+    self.assertEqual(len(remaining), 2)
+    engine.last_position = (0.003, 0)  # at the far stop: only it is passed
+    remaining = engine.drop_passed_waypoints(values['NavDestination'], remaining)
+    self.assertEqual([w[0] for w in remaining], [0.0002])
+
   def test_reroute_skips_passed_waypoints(self):
     values = {'NavDestination': {'latitude': 0, 'longitude': 0.004, 'waypoints': [
       {'latitude': 0, 'longitude': 0.001, 'via': True}, {'latitude': 0, 'longitude': 0.003, 'via': True}]}}

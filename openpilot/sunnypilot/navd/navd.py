@@ -87,14 +87,17 @@ class RouteEngineSP(RouteEngine):
       self.reroute_counter = 0
 
   def drop_passed_waypoints(self, destination, waypoints):
-    """The waypoints still ahead: up to the last one within PASSED_DISTANCE they are dropped, here and in the param."""
+    """The waypoints still ahead: up to the last one within PASSED_DISTANCE they are dropped, here and in the param.
+    A stop not yet reached holds the ones after it: an out-and-back trip starts near its last stop."""
     if not waypoints or self.last_position is None:
       return waypoints
 
     passed = 0
-    for index, (longitude, latitude, _) in enumerate(waypoints):
+    for index, (longitude, latitude, via) in enumerate(waypoints):
       if np.linalg.norm(local_meters((longitude, latitude), self.last_position)) < PASSED_DISTANCE:
         passed = index + 1
+      elif not via:
+        break
     if passed == 0:
       return waypoints
 
