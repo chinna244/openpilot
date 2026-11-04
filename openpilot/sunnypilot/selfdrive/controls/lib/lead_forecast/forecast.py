@@ -24,7 +24,9 @@ alpha-long logs show (35k samples, lead tracked 6 s, docs/zoompilot/lead-forecas
   Pulling away ourselves (under 5 m/s) the allowance is full whatever the lead's speed: without it
   the plan holds the lead at its creep speed and waits for a 17 m gap, 3.8 s to 4.5 mph against
   2.65 s (closed-loop replay, 15 Mazda departures). The cost was one 1.1 m creep in 30 waits behind
-  a stopped lead; a braking lead still may not speed up.
+  a stopped lead; a braking lead still may not speed up. Not while closing on the lead or braking:
+  approaching a stopped lead a predicted pull-away moved the brake later (2026-11-03 replay, 106
+  approaches: 13 closer by up to 5 m; a wrong forecast held drove the MPC into the lead in 16 of 17).
 - A radar lead keeps upstream's extrapolation (it is measured, the model's lead may be another
   object), and so does any lead the model forecast does not match.
 
@@ -58,6 +60,9 @@ SPEEDUP_V_BP = [3., 8.]  # m/s
 # Unless we are slow ourselves: pulling away behind a lead that is pulling away. Full under the
 # first, fading out to the second (15 -> 20 mph).
 PULL_AWAY_V_BP = [6.7, 8.9]  # m/s
+# ...and only while not closing on the lead nor braking: full under the first, none past the second
+PULL_AWAY_CLOSING_BP = [0.5, 1.5]  # m/s, v_ego - v_lead
+PULL_AWAY_A_BP = [-0.5, -0.1]  # m/s^2, our planned accel; none under the first, full from the second
 # Nor while the lead is braking now. Rare (1.2% of braking-and-closing frames forecast a speed-up)
 # but the costly direction: under -1 m/s^2 a quarter of those leads kept slowing.
 SPEEDUP_A_BP = [-1.0, -0.3]  # m/s^2
@@ -68,10 +73,12 @@ MATCH_DIST = 4.0  # m
 BLEND_RATE = 4.0  # 1/s
 
 
-def forecast_speed(v_lead: float, model_v, a_lead: float = 0., v_ego: float = math.inf) -> np.ndarray:
+def forecast_speed(v_lead: float, model_v, a_lead: float = 0., v_ego: float = math.inf, a_ego: float = 0.) -> np.ndarray:
   """Lead speed at LEAD_T_IDXS: the model's predicted change from now, anchored on vLead."""
   dv = np.asarray(model_v, dtype=float) - model_v[0]
-  allowance_v = max(float(np.interp(v_lead, SPEEDUP_V_BP, [0., 1.])), float(np.interp(v_ego, PULL_AWAY_V_BP, [1., 0.])))
+  pull_away = (float(np.interp(v_ego, PULL_AWAY_V_BP, [1., 0.])) * float(np.interp(v_ego - v_lead, PULL_AWAY_CLOSING_BP, [1., 0.])) *
+               float(np.interp(a_ego, PULL_AWAY_A_BP, [0., 1.])))
+  allowance_v = max(float(np.interp(v_lead, SPEEDUP_V_BP, [0., 1.])), pull_away)
   allowance = allowance_v * float(np.interp(a_lead, SPEEDUP_A_BP, [0., 1.]))
   dv = np.where(dv > 0., allowance * dv, dv)
   return np.maximum(v_lead + dv, 0.)
@@ -120,7 +127,8 @@ class LeadForecast:
       return Inhibit.mismatch, None
     # the MPC's state from the last frame: update() runs before the planner sets this frame's
     v_ego = float(self.mpc.x0[1]) if hasattr(self, 'mpc') else math.inf
-    return Inhibit.none, forecast_speed(lead.vLead, model_lead.v, lead.aLeadK, v_ego)
+    a_ego = float(self.mpc.x0[2]) if hasattr(self, 'mpc') else 0.
+    return Inhibit.none, forecast_speed(lead.vLead, model_lead.v, lead.aLeadK, v_ego, a_ego)
 
   def update(self, sm: messaging.SubMaster) -> None:
     self.frame += 1
