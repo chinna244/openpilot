@@ -6,7 +6,7 @@ import pytest
 from openpilot.cereal import custom, messaging
 from opendbc.car import structs
 from openpilot.selfdrive.controls.lib.longcontrol import LongCtrlState
-from openpilot.selfdrive.controls.lib.longitudinal_planner import LongitudinalPlanner, A_CRUISE_MIN
+from openpilot.selfdrive.controls.lib.longitudinal_planner import LongitudinalPlanner, A_CRUISE_MIN, GAS_COAST_ACCEL
 from openpilot.sunnypilot.selfdrive.controls.lib.longitudinal_planner import SCC_SOURCES, LongitudinalPlannerSP
 from openpilot.sunnypilot.selfdrive.controls.lib.smart_cruise_control.limits import OP_LONG_A_BUDGET
 
@@ -648,9 +648,22 @@ def test_a_forced_decel_brakes_as_before_never_coasts(from_the_gas):
   assert sent(p) <= A_CRUISE_MIN + 1e-6
 
 
-def test_gas_held_through_set_settles_and_does_not_coast():
+def test_gas_held_through_set_just_over_settles_and_does_not_coast():
   p = planner()
-  kph = (V_EGO - 3.0) * 3.6
+  kph = (V_EGO - 0.8) * 3.6
   engage(p, gas=True, a_ego=0.1, v_cruise_kph=kph)
   p.update(build_sm(a_ego=0.0, v_cruise_kph=kph, model_a=0.1))
-  assert not p.gas_coast
+  assert not p.gas_coast and p.engage_settle_frames > 0
+
+
+@pytest.mark.parametrize("over", [1.5, 3.0])
+def test_gas_held_through_res_well_over_coasts_down(over):
+  # review 2026-11-03: released past the settle band it braked toward A_CRUISE_MIN like a plain RES
+  p = planner()
+  kph = (V_EGO - over) * 3.6
+  engage(p, gas=True, a_ego=0.1, v_cruise_kph=kph)
+  press(p, gas=True, a_ego=0.1, v_cruise_kph=kph)  # engaged, the gas still held
+  for _ in range(int(3.0 / p.dt)):
+    p.update(build_sm(a_ego=0.0, v_cruise_kph=kph, model_a=0.1))
+    assert sent(p) >= GAS_COAST_ACCEL - 1e-6
+  assert p.gas_coast

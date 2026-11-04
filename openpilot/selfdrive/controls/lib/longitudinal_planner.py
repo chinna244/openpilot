@@ -142,6 +142,9 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
       if self.disengaged:
         self.engage_settle_frames = int(ENGAGE_SETTLE_TIME / self.dt)
         self.engage_v_cruise = v_cruise
+        if self.gas_override and v_ego - v_cruise > ENGAGE_SETTLE_BAND:
+          # a gas held through SET or RES, released further over than the settle covers: a lift-off like any other
+          self.gas_coast, self.gas_coast_v_cruise, self.a_coast = True, v_cruise, min(self.a_cruise, 0.)
       elif v_ego - v_cruise >= GAS_COAST_BAND and v_cruise >= self.gas_v_cruise:
         self.gas_coast, self.gas_coast_v_cruise, self.a_coast = True, v_cruise, min(self.a_cruise, 0.)
       self.gas_override, self.disengaged, self.gas_return = False, False, True
