@@ -35,7 +35,8 @@ class MockSubMaster(dict):
 
 def build_sm() -> MockSubMaster:
   services = {}
-  for service in ("radarState", "carStateSP", "liveMapDataSP", "gpsLocationExternal", "gpsLocation", "customReserved10"):
+  for service in ("radarState", "carStateSP", "liveMapDataSP", "gpsLocationExternal", "gpsLocation", "customReserved10",
+                  "customReserved11"):
     services[service] = getattr(messaging.new_message(service), service)
 
   # engaged on openpilot long: longcontrol running, so the planner does not reset

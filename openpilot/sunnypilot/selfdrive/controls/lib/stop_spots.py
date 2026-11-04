@@ -98,6 +98,13 @@ LEAD_HOLD = 2.  # s
 # after the lock (worn paint) moves the stop back to it, never on. Route 00000030 northbound, before: the band nearest
 # to where the GPS put the line was the crosswalk's far edge, and the car stopped on the crosswalk.
 BAND_MEMORY = 3.  # s
+# m the car travels between a band's first and last sighting, the band coming LINE_CLOSING of it closer, before it
+# counts: a bright spot that keeps its distance (a headlight's glare, a reflection off the hood, a car the radar does
+# not track) moves with the car, not the road, and three sightings a frame apart matched it (review 2026-11-03: a
+# constant band at 12 m locked 25 m out and stopped the car 17 m short). Worn paint is read over as little as 2 m
+# (route 00000030 northbound: a near edge only from 8-10 m); readings move about 0.4 m under braking (route 00000030)
+LINE_SPAN = 1.5
+LINE_CLOSING = 0.5
 # deg of wheel above which a band is not read: turning in, the camera sees the road at an angle (route 00000167
 # northbound: 11 of 11 bands 20-30 m before the line seen turning)
 STRAIGHT_STEER = 45.
@@ -134,6 +141,28 @@ def heading_diff(a: float, b: float) -> float:
   return abs((a - b + 180.) % 360. - 180.)
 
 
+# a band: [m ahead (mean of its sightings, odometry-carried), sightings, s since the last, m travelled since the first,
+# where the first was seen, m travelled at the last, how much closer the last was than the first]
+def carry_bands(bands: list[list[float]], v_ego: float) -> list[list[float]]:
+  """One cycle on: odometry-carried and aged; gone BAND_MEMORY after the last sighting."""
+  return [[b[0] - v_ego * DT_MDL, b[1], b[2] + DT_MDL, b[3] + v_ego * DT_MDL, b[4], b[5], b[6]]
+          for b in bands if b[2] + DT_MDL <= BAND_MEMORY]
+
+
+def see_band(bands: list[list[float]], d: float) -> None:
+  match = min(bands, key=lambda b: abs(b[0] - d), default=None)
+  if match is not None and abs(match[0] - d) <= LINE_AGREE:
+    match[0], match[1], match[2] = (match[0] * match[1] + d) / (match[1] + 1), match[1] + 1, 0.
+    match[5], match[6] = match[3], match[4] - d
+  else:
+    bands.append([d, 1, 0., 0., d, 0., 0.])
+
+
+def firm_band(b: list[float]) -> bool:
+  """Seen LINE_FRAMES times over LINE_SPAN of travel, coming closer as the road does."""
+  return b[1] >= LINE_FRAMES and b[5] >= LINE_SPAN and b[6] >= LINE_CLOSING * b[5]
+
+
 class StopSpots:
   def __init__(self, spots: list[dict] | None = None):
     self.spots = load_spots() if spots is None else spots
@@ -145,7 +174,7 @@ class StopSpots:
     self.off_fixes = 0  # fixes in a row, once committed, off the spot's road
     self.pass_time = 0.
     self.paused = False  # the driver's gas is held: no brake until it is released
-    self.bands: list[list[float]] = []  # [m ahead, sightings, s since the last] of the camera's bands, odometry-carried
+    self.bands: list[list[float]] = []  # the camera's bands (carry_bands)
     self.expect = 0.  # m to where the GPS puts the line, odometry-carried
     self.lock_age = 0.  # s since the camera placed or moved the line
     self.line_locked = False  # the stop is placed by the camera's line: GPS no longer moves it
@@ -187,14 +216,10 @@ class StopSpots:
     lead = self.lead_dist if self.lead_dist is not None and self.lead_age <= LEAD_HOLD else None
     dists = [d - v_ego * LINE_LATENCY for d in line_dists if lead is None or d < LEAD_BAND * lead]
     for d in (d for d in dists if d <= LOCK_MAX_DIST and abs(steer_deg) <= STRAIGHT_STEER):
-      match = min(self.bands, key=lambda b: abs(b[0] - d), default=None)
-      if match is not None and abs(match[0] - d) <= LINE_AGREE:
-        match[0], match[1], match[2] = (match[0] * match[1] + d) / (match[1] + 1), match[1] + 1, 0.
-      else:
-        self.bands.append([d, 1, 0.])
+      see_band(self.bands, d)
     if not (self.committed or self.agree >= ARM_FIXES):
       return
-    near = [b[0] for b in self.bands if b[1] >= LINE_FRAMES and -LINE_BEFORE <= b[0] - self.expect <= LINE_TOL]
+    near = [b[0] for b in self.bands if firm_band(b) and -LINE_BEFORE <= b[0] - self.expect <= LINE_TOL]
     if not near:
       return
     seen = min(near)  # the first: what is painted after it is past the stop
@@ -247,7 +272,7 @@ class StopSpots:
       return None
     self.fix_age += DT_MDL
     self.dist -= v_ego * DT_MDL
-    self.bands = [[b[0] - v_ego * DT_MDL, b[1], b[2] + DT_MDL] for b in self.bands if b[2] + DT_MDL <= BAND_MEMORY]
+    self.bands = carry_bands(self.bands, v_ego)
     self.line_anchor -= v_ego * DT_MDL
     self.expect -= v_ego * DT_MDL
     self.lock_age += DT_MDL
@@ -309,7 +334,8 @@ class StopSpots:
         self._finish()
         return None
       self.should_stop = True
-      self.a_target = max(HOLD_ACCEL, self.a_target - START_JERK * DT_MDL)
+      # to HOLD_ACCEL at START_JERK from either side: a stop braked harder than it eases off, no step
+      self.a_target += min(max(HOLD_ACCEL - self.a_target, -START_JERK * DT_MDL), START_JERK * DT_MDL)
       return self.a_target
     # one stray fix neither starts nor ends anything; the camera's line is sure on its own (route 0000002d northbound:
     # GPS 4.5 m off the line it saw, so no fix agreed with it, and GPS would have passed the spot before the line)

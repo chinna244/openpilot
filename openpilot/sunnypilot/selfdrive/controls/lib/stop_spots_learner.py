@@ -10,7 +10,8 @@ event is a TSR stop sign passed without slowing under THROUGH_SPEED. Events with
 other are one spot, which needs stops on MIN_ROUTES drives and on THROUGH_RATIO times as many drives as went through
 it; its point is the median stop along its heading, its bearing the mean approach bearing 4 s before each stop.
 
-Each finished drive is read once. Its events go to EVENTS_PATH, so spots outlive the logs the deleter removes, and
+Each finished drive is read once per LEARNER_VERSION (a change to what is learned reads the drives still on the device
+again; drives the deleter took, whole or in part, keep what they gave). Its events go to EVENTS_PATH, so spots outlive the logs, and
 STOP_SPOTS_PATH is rewritten when the spots change; plannerd reads it on the next start. The full stops are not the
 stop line (stop_spots.py): each stop also keeps where the road camera saw the line (customReserved11, stop_line.py),
 placed from the stop by odometry, so GPS adds no error of its own. A spot is at the median of those lines and
@@ -32,6 +33,7 @@ from openpilot.sunnypilot.selfdrive.controls.lib.stop_spots import (EARTH_M_PER_
                                                                     STOP_SPOTS_PATH, along_cross, finite, heading_diff)
 
 EVENTS_PATH = Path("/data/stop_spots_events.json")
+LEARNER_VERSION = 1  # raise with any change to route_events
 TSR_ADDR = 0x35F
 TSR_STOP_SIGN = 9
 TSR_BUSES = (2, 130)
@@ -205,6 +207,16 @@ def load_events(path: Path = EVENTS_PATH) -> dict[str, list[dict]]:
   return {r: [e for e in evs if _valid(e)] for r, evs in routes.items() if isinstance(r, str) and isinstance(evs, list)}
 
 
+def load_versions(path: Path = EVENTS_PATH, key: str = "versions") -> dict[str, int]:
+  """The LEARNER_VERSION each drive was read with ("versions"), or how many segments it had then ("segments"); none
+  for a file from before them."""
+  try:
+    values = json.loads(path.read_text()).get(key, {})
+  except (OSError, ValueError, AttributeError):
+    return {}
+  return {r: v for r, v in values.items() if isinstance(r, str) and isinstance(v, int)} if isinstance(values, dict) else {}
+
+
 def write_json(path: Path, data) -> None:
   tmp = path.with_suffix(".tmp")
   tmp.write_text(json.dumps(data, indent=1))
@@ -224,14 +236,20 @@ def finished_routes(log_root: str, now: float) -> dict[str, list[str]]:
 
 def learn(log_root: str, events_path: Path = EVENTS_PATH, spots_path: Path = STOP_SPOTS_PATH, now: float | None = None) -> bool:
   """Read every finished drive not yet read; rewrite the spots if they changed. Returns whether they did."""
-  known = load_events(events_path)
+  known, versions, counts = load_events(events_path), load_versions(events_path), load_versions(events_path, "segments")
   before = cluster([e for evs in known.values() for e in evs])
   # file mtimes are wall-clock time
   for route, files in finished_routes(log_root, time.time() if now is None else now).items():  # noqa: TID251
-    if route in known:
+    if route in known and versions.get(route) == LEARNER_VERSION:
       continue
-    known[route] = route_events(files, route)
-    write_json(events_path, {"routes": known})
+    segs = [int(SEGMENT_RE.match(os.path.basename(os.path.dirname(f))).group(2)) for f in files]
+    if route in known and (segs != list(range(len(segs))) or counts.get(route, len(segs)) != len(segs)):
+      # the deleter took some of its segments (the first ones, or all but a bookmark's): what it gave whole stands
+      versions[route] = LEARNER_VERSION
+    else:
+      known[route], versions[route], counts[route] = route_events(files, route), LEARNER_VERSION, len(segs)
+    write_json(events_path, {"routes": known, "versions": {r: v for r, v in versions.items() if r in known},
+                             "segments": {r: n for r, n in counts.items() if r in known}})
     cloudlog.info(f"stop_spots_learner: {route}: {len(known[route])} stops at a stop sign")
   spots = cluster([e for evs in known.values() for e in evs])
   if spots == before and spots_path.exists():

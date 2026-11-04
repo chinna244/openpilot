@@ -196,3 +196,48 @@ def test_a_corrupt_events_file_starts_over(tmp_path):
   L.cluster([e for evs in L.load_events(ev_path).values() for e in evs])  # and it clusters without raising
   assert L.learn(str(logs), ev_path, sp_path, now=1e9)
   assert load_spots(sp_path) == []
+
+
+def test_a_learner_change_reads_the_drives_still_on_the_device_again(tmp_path, monkeypatch):
+  """Review 2026-11-03: each drive was read once forever, so a learner fix never reached the drives already read."""
+  logs, ev_path, sp_path = tmp_path / "logs", tmp_path / "events.json", tmp_path / "spots.json"
+  logs.mkdir()
+  make_route(logs, "00000001--aaaa")
+  reads = []
+  real = L.route_events
+  monkeypatch.setattr(L, "route_events", lambda files, route: reads.append(route) or real(files, route))
+  L.learn(str(logs), ev_path, sp_path, now=1e9)
+  L.learn(str(logs), ev_path, sp_path, now=1e9)
+  assert reads == ["00000001--aaaa"]
+  # a file from before versions, with a drive whose logs are gone: the one on the device is read again, the other kept
+  data = json.loads(ev_path.read_text())
+  ev_path.write_text(json.dumps({"routes": {**data["routes"], "00000000--gone": data["routes"]["00000001--aaaa"]}}))
+  L.learn(str(logs), ev_path, sp_path, now=1e9)
+  assert reads == ["00000001--aaaa", "00000001--aaaa"]
+  assert set(L.load_events(ev_path)) == {"00000001--aaaa", "00000000--gone"}
+  monkeypatch.setattr(L, "LEARNER_VERSION", L.LEARNER_VERSION + 1)
+  L.learn(str(logs), ev_path, sp_path, now=1e9)
+  assert reads == ["00000001--aaaa"] * 3
+
+
+@pytest.mark.parametrize("gone", [[0], [2], [1]])
+def test_a_learner_change_keeps_a_drive_the_deleter_took_segments_of(tmp_path, monkeypatch, gone):
+  """Re-read from what is left, its stops in the deleted segments would be lost: it keeps what it gave whole. The
+  deleter takes a drive from its first segment, but keeps a bookmark's segments to the last (review 2026-11-03)."""
+  logs, ev_path, sp_path = tmp_path / "logs", tmp_path / "events.json", tmp_path / "spots.json"
+  logs.mkdir()
+  make_route(logs, "00000001--aaaa", segs=3)
+  L.learn(str(logs), ev_path, sp_path, now=1e9)
+  before = L.load_events(ev_path)
+  for n in gone:
+    seg = logs / f"00000001--aaaa--{n}"
+    for f in seg.iterdir():
+      f.unlink()
+    seg.rmdir()
+  reads = []
+  monkeypatch.setattr(L, "route_events", lambda files, route: reads.append(route) or [])
+  monkeypatch.setattr(L, "LEARNER_VERSION", L.LEARNER_VERSION + 1)
+  L.learn(str(logs), ev_path, sp_path, now=1e9)
+  assert reads == [] and L.load_events(ev_path) == before
+  L.learn(str(logs), ev_path, sp_path, now=1e9)
+  assert reads == []

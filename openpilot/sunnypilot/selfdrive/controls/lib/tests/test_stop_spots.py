@@ -1,10 +1,11 @@
 import json
 import math
 
+import numpy as np
 import pytest
 
 from openpilot.common.realtime import DT_MDL
-from openpilot.sunnypilot.selfdrive.controls.lib.stop_spots import (ARM_FIXES, BRAKE_MAX, EARTH_M_PER_DEG, HOLD_TIME, START_JERK,
+from openpilot.sunnypilot.selfdrive.controls.lib.stop_spots import (ARM_FIXES, BRAKE_MAX, EARTH_M_PER_DEG, HOLD_ACCEL, HOLD_TIME, START_JERK,
                                                                     START_MAX, STOP_MARGIN, StopSpots, along_cross,
                                                                     load_spots)
 
@@ -618,7 +619,7 @@ def test_a_band_before_the_line_too_late_to_make_never_moves_the_stop_on(aim, se
   ss = StopSpots([SPOT])
   ss.spot, ss.committed, ss.braking, ss.agree = SPOT, True, True, ARM_FIXES
   ss.line_locked, ss.dist, ss.line_anchor, ss.expect = True, aim, aim, aim + STOP_MARGIN
-  ss.bands = [[seen, 8, 0.], [aim + STOP_MARGIN, 8, 0.]]
+  ss.bands = [[seen, 8, 0., 3., seen + 3., 3., 3.], [aim + STOP_MARGIN, 8, 0., 3., aim + STOP_MARGIN + 3., 3., 3.]]
   ss._see_line([], v, 0.)
   assert ss.dist <= aim + 0.05
 
@@ -647,3 +648,33 @@ def test_a_long_queue_short_of_the_spot_still_stops_at_the_line():
   assert len(stops(out)) == 2
   assert stops(out)[0] < -10., "first the queue"
   assert stops(out)[1] == pytest.approx(-STOP_MARGIN, abs=1.), "then the line"
+
+
+@pytest.mark.parametrize("v0", [3., 6., 9., 12.])
+@pytest.mark.parametrize("glare", [8., 12., 16.])
+def test_a_bright_spot_that_keeps_its_distance_is_never_the_line(v0, glare):
+  """Review 2026-11-03: a headlight's glare or a reflection the same distance ahead every frame locked 25 m out and
+  stopped the car 17 m short. It moves with the car, not the road: the real line is the stop."""
+  rng = np.random.default_rng(int(v0 * 10 + glare))
+  def lines(t, x):
+    return sorted([glare + rng.uniform(-0.3, 0.3)] + camera(0.)(t, x))
+  out = drive(StopSpots([SPOT]), -120., v0, 60., lines=lines)
+  assert stops(out) == [pytest.approx(-STOP_MARGIN, abs=0.75)]
+
+
+def test_a_noisy_real_line_still_locks():
+  rng = np.random.default_rng(3)
+  out = drive(StopSpots([SPOT]), -120., 12., 25., lines=lambda t, x: [d + rng.uniform(-0.3, 0.3) for d in camera(4.)(t, x)])
+  assert stops(out) == [pytest.approx(4. - STOP_MARGIN, abs=0.75)]
+
+
+def test_the_hold_eases_off_a_hard_stop_without_a_step():
+  """At the spot still asking -3 as the car drops under STOP_SPEED: the hold eases to HOLD_ACCEL at START_JERK."""
+  ss = StopSpots([SPOT])
+  ss.spot, ss.committed, ss.braking, ss.agree, ss.dist, ss.a_target = SPOT, True, True, ARM_FIXES, 0.5, -BRAKE_MAX
+  prev = ss.a_target
+  for _ in range(40):
+    a = ss.update(0., 0., 0., 2., False, 0.3, False, True, False)
+    assert abs(a - prev) <= START_JERK * DT_MDL + 1e-9
+    prev = a
+  assert a == pytest.approx(HOLD_ACCEL)
