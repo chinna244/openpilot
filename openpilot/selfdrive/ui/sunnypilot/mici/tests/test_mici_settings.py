@@ -1300,7 +1300,7 @@ class TestModelsPanelMici:
 
 
 class TestSpeedAssistBadge:
-  """The Set Speed Assist badge comes and goes with the wheel and waits for the model icon."""
+  """The Set Speed Assist badge comes and goes with the wheel; the model icon no longer shares its corner."""
 
   def _settle(self, hud, monkeypatch, frames=200):
     import pyray as rl
@@ -1314,35 +1314,54 @@ class TestSpeedAssistBadge:
   @pytest.mark.parametrize(("status", "chestnut", "shown"), [
     ("ENGAGED", "DISCONNECTED", True),
     ("DISENGAGED", "DISCONNECTED", False),  # leaves with the wheel
-    ("ENGAGED", "LOADING", False),  # the model icon owns the corner
-    ("ENGAGED", "ACTIVE", False),  # within the model icon's persistence after engaging
+    ("ENGAGED", "LOADING", True),  # the model icon is top right now
+    ("ENGAGED", "ACTIVE", True),
   ])
   def test_follows_the_wheel(self, params, monkeypatch, status, chestnut, shown):
-    import pyray as rl
     from openpilot.selfdrive.ui.sunnypilot.mici.onroad.hud_renderer import HudRendererSP
     from openpilot.selfdrive.ui.ui_state import ChestnutState, UIState, UIStatus, ui_state
 
     monkeypatch.setattr(UIState, "speed_assist_active", property(lambda _: True))
     monkeypatch.setattr(ui_state, "status", UIStatus[status])
     monkeypatch.setattr(ui_state, "chestnut_state", ChestnutState[chestnut])
-    hud = HudRendererSP()
-    hud._chestnut_fade_time = rl.get_time()
-    drawn = self._settle(hud, monkeypatch)
+    drawn = self._settle(HudRendererSP(), monkeypatch)
     if shown:
       assert drawn and drawn[-1][3] > 0.85
     else:
       assert not drawn
 
-  def test_swaps_in_after_the_model_icon(self, params, monkeypatch):
-    from openpilot.selfdrive.ui.mici.onroad.hud_renderer import SET_SPEED_PERSISTENCE
-    from openpilot.selfdrive.ui.sunnypilot.mici.onroad.hud_renderer import HudRendererSP
-    from openpilot.selfdrive.ui.ui_state import ChestnutState, UIState, UIStatus, ui_state
-    import pyray as rl
 
-    monkeypatch.setattr(UIState, "speed_assist_active", property(lambda _: True))
-    monkeypatch.setattr(ui_state, "status", UIStatus.ENGAGED)
-    monkeypatch.setattr(ui_state, "chestnut_state", ChestnutState.ACTIVE)
-    hud = HudRendererSP()
-    hud._chestnut_fade_time = rl.get_time() - SET_SPEED_PERSISTENCE - 0.1
+class TestModelSourceIcon:
+  """The GPU icon sits small in the top-right corner for as long as the big model drives, and fades under an alert."""
+
+  def _settle(self, hud, monkeypatch, frames=200):
+    import pyray as rl
+    from openpilot.selfdrive.ui.mici.onroad import hud_renderer
+    drawn = []
+    monkeypatch.setattr(hud_renderer.rl, "draw_texture_ex", lambda tex, pos, rot, scale, color: drawn.append((tex, pos, color.a)))
+    monkeypatch.setattr(hud_renderer.ui_state, "started_frame", -1)  # selfdriveState counts as seen
+    for _ in range(frames):
+      drawn.clear()
+      hud._draw_model_source(rl.Rectangle(0, 0, 476, 240))
+    return drawn
+
+  @pytest.mark.parametrize(("chestnut", "alert", "shown"), [
+    ("ACTIVE", False, True),  # stays on, no 2.5 s fade
+    ("ACTIVE", True, False),  # an alert has the top
+    ("FAILED", False, True),
+    ("DISCONNECTED", False, False),  # the comma's own model drives
+  ])
+  def test_top_right_while_driving(self, params, monkeypatch, chestnut, alert, shown):
+    from openpilot.selfdrive.ui.mici.onroad.hud_renderer import MODEL_SOURCE_MARGIN, HudRenderer
+    from openpilot.selfdrive.ui.ui_state import ChestnutState, ui_state
+
+    monkeypatch.setattr(ui_state, "chestnut_state", ChestnutState[chestnut])
+    hud = HudRenderer()
+    hud.set_can_draw_top_icons(not alert)
     drawn = self._settle(hud, monkeypatch)
-    assert drawn and drawn[-1][3] > 0.85
+    if not shown:
+      assert not drawn
+      return
+    (tex, pos, a), = drawn
+    assert tex.height == 25 and a > 240
+    assert pos.y == MODEL_SOURCE_MARGIN and pos.x + tex.width == 476 - MODEL_SOURCE_MARGIN
