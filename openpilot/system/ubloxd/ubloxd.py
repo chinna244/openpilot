@@ -10,6 +10,9 @@ from dataclasses import dataclass
 from openpilot.cereal import log
 from openpilot.cereal import messaging
 from openpilot.common.params import Params
+from openpilot.common.swaglog import cloudlog
+from openpilot.sunnypilot.jetlink_adapter.gps import JETSON_GPS_SERVICE
+from openpilot.system.ubloxd.gps_arbiter import ExternalFix, GpsArbiter
 from openpilot.system.ubloxd.ubx import Ubx
 from openpilot.system.ubloxd.gps import Gps
 from openpilot.system.ubloxd.glonass import Glonass
@@ -512,11 +515,27 @@ def main():
   parser = UbloxMsgParser()
   pm = messaging.PubMaster(['ubloxGnss', 'gpsLocationExternal'])
   sock = messaging.sub_sock('ubloxRaw', timeout=100, conflate=False)
+  jetson_sock = messaging.sub_sock(JETSON_GPS_SERVICE, conflate=False)
   params = Params()
   last_position_save = float('-inf')
+  arbiter = GpsArbiter(time.monotonic())
+  switches = 0
+
+  def jetson_fix(now: float):
+    dat = messaging.new_message('gpsLocationExternal', valid=True)
+    arbiter.fill(dat.gpsLocationExternal, now)
+    return dat
 
   while True:
     msg = messaging.recv_one(sock)
+    now = time.monotonic()
+    for jetson in messaging.drain_sock(jetson_sock):
+      arbiter.external(ExternalFix.from_msg(jetson.customReserved18, jetson.logMonoTime))
+    if arbiter.tick(now):
+      pm.send('gpsLocationExternal', jetson_fix(now))
+    if arbiter.switches != switches:
+      switches = arbiter.switches
+      cloudlog.event("ubloxd.gps_source", source="jetson" if arbiter.using_external else "ublox", switches=switches)
     if msg is None:
       continue
 
@@ -531,6 +550,10 @@ def main():
       if not res:
         continue
       service, dat = res
+      if service == 'gpsLocationExternal':
+        gps = dat.gpsLocationExternal
+        if not arbiter.internal(gps.hasFix, gps.horizontalAccuracy, now):
+          dat = jetson_fix(now)
       pm.send(service, dat)
 
       if service == 'gpsLocationExternal' and dat.gpsLocationExternal.hasFix and time.monotonic() - last_position_save > 60:
