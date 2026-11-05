@@ -20,7 +20,7 @@ from openpilot.sunnypilot.selfdrive.controls.lib.smart_cruise_control.limits imp
 V_EGO = 20.
 A_CRUISE = 0.5  # the planner's cruise candidate
 RISE = 0.375  # m/s^3, the lift's rise at V_EGO: 0.5 in town easing to 0.25 by 25 m/s (local tuning)
-CAP = 0.65  # m/s^2, the floor's ceiling at V_EGO: 0.8 in town easing to 0.5 by 25 m/s (local tuning)
+CAP = 0.7  # m/s^2, the floor's ceiling at V_EGO: 0.9 in town easing to 0.5 by 25 m/s (local tuning)
 SETTLE_FRAMES = round(2. / (op_long_cruise_jerk(40.) * DT)) + 10
 
 

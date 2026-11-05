@@ -71,9 +71,9 @@ def test_on_raises_the_e2e_candidate():
   planner = run_planner(True)
   assert planner.e2e_set_speed.inhibit == Inhibit.none
   # the model holding at 0 under the set speed: lifted toward chill's answer, held to the ceiling for
-  # 20 m/s (0.65 m/s^2, local tuning)
-  assert planner.e2e_set_speed.lift == pytest.approx(0.65)
-  assert planner.output_a_target == pytest.approx(0.65)
+  # 20 m/s (0.7 m/s^2, local tuning)
+  assert planner.e2e_set_speed.lift == pytest.approx(0.7)
+  assert planner.output_a_target == pytest.approx(0.7)
   assert planner.a_cruise > 1.
 
 
@@ -109,7 +109,7 @@ def test_throttle_probability_reaches_the_floor():
   for _ in range(200):
     planner.update(sm)
   assert planner.e2e_set_speed.gain == pytest.approx(0.25)
-  assert planner.e2e_set_speed.lift == pytest.approx(0.25 * 0.65, rel=1e-3)
+  assert planner.e2e_set_speed.lift == pytest.approx(0.25 * 0.7, rel=1e-3)
 
 
 def gas_pressed_planner(enabled: bool) -> LongitudinalPlanner:

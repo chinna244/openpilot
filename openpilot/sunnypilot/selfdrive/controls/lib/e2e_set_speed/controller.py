@@ -64,9 +64,12 @@ LIFT_FALL = 2.4  # m/s^3
 # The floor approaches the cruise target the way stock cruise does, over TAU, and never past the
 # ceiling for the speed: a full floor at Mazda's ceiling surged the car on top of the model's own pull
 # (route 00000159), so the ceiling and the lift's rise ease from the town values to the highway ones
-# across FLOOR_SPEED_BP.
+# across FLOOR_SPEED_BP. Raised from 0.8, where free-road town pickups sat at the floor under a model asking 0.4-0.6:
+# replaying 396 min of engaged driving (routes 00000147-00000036), 15-25 / 20-30 mph pickups 5.7 / 6.6 s -> 5.5 / 6.3 s
+# against this driver's 5.4 / 6.3 s, 3 more catch-up kickdowns (76 before), at most 0.19 m/s^2 more in the 3 s before
+# 4 of 964 brakes.
 TAU = 4.0  # s
-FLOOR_MAX = 0.8  # m/s^2
+FLOOR_MAX = 0.9  # m/s^2
 FLOOR_SPEED_BP = [15., 25.]  # m/s
 FLOOR_MAX_HIGHWAY = 0.5  # m/s^2
 LIFT_RISE = 0.5  # m/s^3
@@ -74,7 +77,7 @@ LIFT_RISE_HIGHWAY = 0.25  # m/s^3
 
 # Town: the lift over the model is held to TOWN_LIFT_MAX below TOWN_LIFT_BP[0], easing back to FLOOR_MAX by
 # TOWN_LIFT_BP[1]. A hesitant model under the full floor pushed 0.6 for 7 s into stops it saw late (routes
-# 0000016a t=312-318, 0000016b t=387-394); 0.6 with FLOOR_MAX 0.8 kept the same pickup gain as 0.8 in replay
+# 0000016a t=312-318, 0000016b t=387-394); 0.6 with FLOOR_MAX then 0.8 kept the same pickup gain as 0.8 in replay
 # (median 0.40 s on 20 pickups, 00000174-00000177).
 TOWN_LIFT_BP = [12.5, 15.6]  # m/s, 28 to 35 mph
 TOWN_LIFT_MAX = 0.6  # m/s^2

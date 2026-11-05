@@ -31,7 +31,7 @@ def _plan(f):
 
 
 # town values to 15 m/s, highway from 25 m/s; below 15.6 m/s the town cap (0.6 to 12.5 m/s) holds the lift under the floor
-@pytest.mark.parametrize("v, rise, ceiling, lift", [(8., 0.5, 0.8, 0.6), (15., 0.5, 0.8, 0.76129), (20., 0.375, 0.65, 0.65),
+@pytest.mark.parametrize("v, rise, ceiling, lift", [(8., 0.5, 0.9, 0.6), (15., 0.5, 0.9, 0.84194), (20., 0.375, 0.7, 0.7),
                                                     (25., 0.25, 0.5, 0.5), (30., 0.25, 0.5, 0.5)])
 def test_floor_ceiling_and_rise_by_speed(v, rise, ceiling, lift):
   ctl = new_controller()
@@ -55,7 +55,7 @@ def test_floor_never_above_chill():
   assert ctl.floor == pytest.approx(0.3)
 
 
-@pytest.mark.parametrize("v, lift", [(8., 0.6), (12.5, 0.6), (14.05, 0.7)])
+@pytest.mark.parametrize("v, lift", [(8., 0.6), (12.5, 0.6), (14.05, 0.75)])
 def test_town_lift_held_over_a_hesitant_model(v, lift):
   ctl = new_controller()
   out = run(ctl, SETTLE, build_sm(v), a_model=0.1, v_cruise=v + 10.)
@@ -129,10 +129,10 @@ EASING = _plan(lambda t: max(V_EGO - 0.45 * t, 10.))
 def test_no_lift_once_the_plan_holds_a_slowdown():
   ctl = new_controller()
   run(ctl, SETTLE, build_sm(V_EGO))  # settled on the floor
-  assert ctl.lift == pytest.approx(0.65)
+  assert ctl.lift == pytest.approx(0.7)
   sm = build_sm(V_EGO, plan_v=EASING)
   run(ctl, ARM - 1, sm, a_model=-0.15)
-  assert ctl.lift > 0.5  # not before 0.5 s (gain 0.75 at -0.15 eases it toward 0.6)
+  assert ctl.lift > 0.5  # not before 0.5 s (gain 0.75 at -0.15 eases it toward 0.64)
   run(ctl, 20, sm, a_model=-0.15)
   assert ctl.lift == 0.
   assert run(ctl, 1, sm, a_model=-0.15) == pytest.approx(-0.15)
