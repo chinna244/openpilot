@@ -152,7 +152,8 @@ class SelfdriveD:
     self.state_machine = StateMachine()
     self.rk = Ratekeeper(100, print_delay_threshold=None)
 
-    self.ignored_processes = {'mapd', *ModelEventsSP.OPTIONAL_PROCESSES}
+    # speed_limit_vision is optional: its crash must not disengage (the resolver falls back to car and map)
+    self.ignored_processes = {'mapd', 'speed_limit_vision', *ModelEventsSP.OPTIONAL_PROCESSES}
     self.model_events = ModelEventsSP()
 
     # Determine startup event

@@ -19,7 +19,7 @@ from openpilot.selfdrive.car.cruise import V_CRUISE_MAX
 from openpilot.selfdrive.controls.lib.accel_boost import AccelBoost
 from openpilot.selfdrive.controls.lib.drive_helpers import CONTROL_N, get_accel_from_plan
 from openpilot.selfdrive.modeld.constants import ModelConstants
-from openpilot.sunnypilot.selfdrive.controls.lib.e2e_set_speed.controller import E2ESetSpeedController, approach_accel
+from openpilot.sunnypilot.selfdrive.controls.lib.e2e_set_speed.controller import E2ESetSpeedController
 from openpilot.sunnypilot.selfdrive.controls.lib.e2e_alerts_helper import E2EAlertsHelper
 from openpilot.sunnypilot.selfdrive.controls.lib.lead_forecast.forecast import LeadForecast
 from openpilot.sunnypilot.selfdrive.controls.lib.smart_cruise_control.limits import OP_LONG_A_BUDGET, op_long_cruise_jerk
@@ -108,7 +108,8 @@ class LongitudinalPlannerSP:
       LongitudinalPlanSource.cruise: (v_cruise, a_ego),
       LongitudinalPlanSource.sccVision: (self.scc.vision.output_v_target, self.scc.vision.output_a_target),
       LongitudinalPlanSource.sccMap: (self.scc.map.output_v_target, self.scc.map.output_a_target),
-      LongitudinalPlanSource.speedLimitAssist: (self.sla.output_v_target, self.sla.output_a_target),
+      # the mirror ramps a lower cap for the plan only; the pcm machine has no ramp
+      LongitudinalPlanSource.speedLimitAssist: (getattr(self.sla, 'plan_v_target', self.sla.output_v_target), self.sla.output_a_target),
     }
 
     self.source = min(targets, key=lambda k: targets[k][0])
@@ -133,15 +134,18 @@ class LongitudinalPlannerSP:
     self.a_cruise_prev, self.v_ego = self.a_cruise, CS.vEgo
     return self.output_v_target, self.output_a_target
 
-  def update_cruise_accel(self, a_cruise: float) -> float:
+  def update_cruise_accel(self, a_cruise: float, unlimited: bool = False) -> float:
     """Upstream caps the cruise candidate at A_CRUISE_MIN, gentle for a set-speed drop, and SLA
     coasts down to a lower limit the same way. SCC brakes for a curve through the same candidate by
     lowering v_cruise, planned on its own budget: while it is the target, rebuild the candidate from
-    it with that budget as the floor. Its a_target is not a plan to take (the map passes a_ego through)."""
+    it with that budget as the floor. Its a_target is not a plan to take (the map passes a_ego through).
+    unlimited: what the target asks this cycle, without the jerk limit (the gas handover's ask)."""
     if self.source not in SCC_SOURCES:
       return a_cruise
     j = op_long_cruise_jerk(self.v_ego) * DT_MDL
     a_limiter = np.clip(self.output_v_target - self.v_ego, -OP_LONG_A_BUDGET, ACCEL_MAX)
+    if unlimited:
+      return min(a_cruise, float(a_limiter))
     return min(a_cruise, float(np.clip(a_limiter, self.a_cruise_prev - j, self.a_cruise_prev + j)))
 
   def update_e2e_target(self, sm: messaging.SubMaster, a_model: float, should_stop_model: bool,
@@ -154,11 +158,12 @@ class LongitudinalPlannerSP:
     steer_lat_accel = sm['controlsState'].curvature * sm['carState'].vEgo ** 2
     # chill mode's answer: the MPC candidate as the host takes it from this frame's solution (a lead,
     # or its synthetic one far ahead), and last frame's cruise candidate (the host builds this
-    # frame's after the e2e candidate), capped at the approach pace
+    # frame's after the e2e candidate)
     a_mpc = get_accel_from_plan(self.v_desired_trajectory, self.a_desired_trajectory, CONTROL_N_T_IDX,
                                 action_t=self.CP.longitudinalActuatorDelay + DT_MDL)
-    a_chill = min(float(a_mpc), self.a_cruise, approach_accel(self.v_ego, self.output_v_target))
-    a_e2e = self.e2e_set_speed.update(sm, a_model, a_chill, is_e2e, reset_state, steer_lat_accel)
+    a_chill = min(float(a_mpc), self.a_cruise)
+    # output_v_target is this frame's cruise target after SCC and SLA, which the lift's floor approaches
+    a_e2e = self.e2e_set_speed.update(sm, a_model, a_chill, is_e2e, reset_state, steer_lat_accel, self.output_v_target)
     # upstream's gas boost learns past the model from gas presses; the set-speed floor already lifts
     # it, so the boost only runs with the floor off
     if self.e2e_set_speed.enabled:

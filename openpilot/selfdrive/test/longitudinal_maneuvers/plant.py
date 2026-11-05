@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import time
+from collections import defaultdict
 import numpy as np
 
 from openpilot.cereal import log
@@ -9,6 +10,12 @@ from openpilot.selfdrive.controls.lib.longcontrol import LongCtrlState
 from openpilot.selfdrive.modeld.constants import ModelConstants
 from openpilot.selfdrive.controls.lib.longitudinal_planner import LongitudinalPlanner
 from openpilot.selfdrive.controls.radard import _LEAD_ACCEL_TAU
+
+
+class PlantSM(dict):
+  """The planner's SubMaster: every service valid and alive."""
+  valid = alive = defaultdict(lambda: True)
+  logMonoTime = defaultdict(int)  # never received, as a real SubMaster has it
 
 
 class Plant:
@@ -135,8 +142,9 @@ class Plant:
           'modelV2': model.modelV2,
           'carStateSP': car_state_sp.carStateSP,
           'liveMapDataSP': live_map_data_sp.liveMapDataSP,
-          'gpsLocation': gps_data.gpsLocation}
-    self.planner.update(sm)
+          'gpsLocation': gps_data.gpsLocation,
+          'customReserved10': messaging.new_message('customReserved10').customReserved10}
+    self.planner.update(PlantSM(sm))
     self.acceleration = self.planner.output_a_target
     if self.planner.output_should_stop:
       self.acceleration = min(-0.5, self.acceleration)

@@ -21,6 +21,24 @@ SpeedLimitSource = custom.LongitudinalPlanSP.SpeedLimit.Source
 
 ALL_SOURCES = tuple(SpeedLimitSource.schema.enumerants.values())
 
+# A GPS message logged further ahead of now than this is not trusted either.
+MAP_FIX_FUTURE_TOLERANCE = 1.  # s
+
+# The last limit a source dropout falls back to must have held this long: route 00000009 at 220.05 s the camera read 35
+# for 0.72 s turning into a parking lot as the map dropped out, and that 35 stayed the last limit for 47 s ("Press + for 41"
+# twice, no limit anywhere). A reading that ends sooner gives way to the held one it took over from without a gap, if that
+# one is lower; a lower short reading stays (it may be a real sign), and one that began after a dropout stays as before.
+# Unless the camera itself took it back: a school 20 read before its plaque showed (route 12 484 s) is withdrawn while
+# the camera still publishes, and the last limit goes back to what it was before that reading.
+LAST_LIMIT_SETTLE = 2.  # s
+
+# A car (camera) limit below this is a misread sign, not a road limit: route 00000169 t207 and t234 read 5 mph
+# with no map limit, and the assist braked at -1.2 m/s2 toward 6 mph. 9 mph keeps 10 mph and 15 km/h signs.
+CAR_LIMIT_MIN = 9 * CV.MPH_TO_MS  # m/s
+
+# speed_limit_vision publishes at 5 Hz; a reading older than this means the process stopped or the toggle is off.
+VISION_MAX_AGE = 1.  # s
+
 
 class SpeedLimitResolver:
   limit_solutions: dict[custom.LongitudinalPlanSP.SpeedLimit.Source, float]
@@ -61,7 +79,8 @@ class SpeedLimitResolver:
       Policy.map_data_only: [SpeedLimitSource.map],
       Policy.car_state_priority: [SpeedLimitSource.car, SpeedLimitSource.map],
       Policy.map_data_priority: [SpeedLimitSource.map, SpeedLimitSource.car],
-      Policy.combined: [SpeedLimitSource.car, SpeedLimitSource.map],
+      Policy.combined: [SpeedLimitSource.vision, SpeedLimitSource.map, SpeedLimitSource.car],
+      Policy.vision_priority: [SpeedLimitSource.vision, SpeedLimitSource.car, SpeedLimitSource.map],
     }
     self.source = SpeedLimitSource.none
     for source in ALL_SOURCES:
@@ -81,13 +100,43 @@ class SpeedLimitResolver:
     self.speed_limit_final = 0.
     self.speed_limit_final_last = 0.
     self.speed_limit_offset = 0.
+    self._reading = 0.  # the current non-zero limit, its final, and how many frames it has held
+    self._reading_final = 0.
+    self._reading_frames = 0
+    self._fallback: tuple[float, float] | None = None  # the held (limit, final) the current reading took over from
+    self._before = (0., 0.)  # the last (limit, final) when the current reading began
+    self._reading_source = SpeedLimitSource.none
+    self._vision_alive = False  # speed_limit_vision publishing, with or without a sign
 
   def update_speed_limit_states(self) -> None:
     self.speed_limit_final = self.speed_limit + self.speed_limit_offset
 
+    settle = int(LAST_LIMIT_SETTLE / DT_MDL)
     if self.speed_limit > 0.:
+      if self.speed_limit != self._reading:
+        self._before = (self.speed_limit_last, self.speed_limit_final_last)
+        self._reading_source = self.source
+        # only a reading that took over from a held one, with no dropout between, can give way to it
+        if self._reading_frames >= settle:
+          self._fallback = (self._reading, self._reading_final)
+        elif self._reading <= 0.:
+          self._fallback = None
+        self._reading = self.speed_limit
+        self._reading_frames = 0
+      self._reading_frames += 1
+      self._reading_final = self.speed_limit_final
       self.speed_limit_last = self.speed_limit
       self.speed_limit_final_last = self.speed_limit_final
+    elif self._reading > 0.:
+      # every source dropped out: a reading that never held does not raise the last limit
+      if self._reading_frames < settle and self._reading_source == SpeedLimitSource.vision and self._vision_alive:
+        # the camera withdrew a sign it read moments ago
+        self.speed_limit_last, self.speed_limit_final_last = self._before
+      elif self._reading_frames < settle and self._fallback is not None and self._fallback[0] < self._reading:
+        self.speed_limit_last, self.speed_limit_final_last = self._fallback
+      self._reading = 0.
+      self._reading_frames = 0
+      self._fallback = None
 
   @property
   def speed_limit_valid(self) -> bool:
@@ -120,38 +169,69 @@ class SpeedLimitResolver:
 
   def _get_from_car_state(self, sm: messaging.SubMaster) -> None:
     self._reset_limit_sources(SpeedLimitSource.car)
-    self.limit_solutions[SpeedLimitSource.car] = sm['carStateSP'].speedLimit
+    speed_limit = sm['carStateSP'].speedLimit
+    self.limit_solutions[SpeedLimitSource.car] = speed_limit if speed_limit >= CAR_LIMIT_MIN else 0.
     self.distance_solutions[SpeedLimitSource.car] = 0.
+
+  def _get_from_vision(self, sm: messaging.SubMaster) -> None:
+    self._reset_limit_sources(SpeedLimitSource.vision)
+    speed_limit = sm['customReserved10'].speedLimit
+    age = time.monotonic() - sm.logMonoTime['customReserved10'] * 1e-9
+    self._vision_alive = -MAP_FIX_FUTURE_TOLERANCE <= age <= VISION_MAX_AGE
+    if speed_limit >= CAR_LIMIT_MIN and self._vision_alive:
+      self.limit_solutions[SpeedLimitSource.vision] = speed_limit
 
   def _get_from_map_data(self, sm: messaging.SubMaster) -> None:
     self._reset_limit_sources(SpeedLimitSource.map)
     self._process_map_data(sm)
 
+  @staticmethod
+  def _message_age(sm: messaging.SubMaster, service: str) -> float | None:
+    """Seconds since the last message of a service, on the monotonic clock it was logged on; None if too old (or
+    logged in the future). unixTimestampMillis is wall-clock time and cannot be aged against monotonic."""
+    age = time.monotonic() - sm.logMonoTime[service] * 1e-9
+    if not -MAP_FIX_FUTURE_TOLERANCE <= age <= LIMIT_MAX_MAP_DATA_AGE:
+      return None
+    return age
+
+  def _gps_fix_age(self, sm: messaging.SubMaster) -> float | None:
+    """Age of the last GPS message, which must carry a fix; None without a current fix. Without one mapd keeps
+    the last road it matched, and its limit must not reach the planner (routes 00000152-159)."""
+    if not sm[self._gps_location_service].hasFix:
+      return None
+    return self._message_age(sm, self._gps_location_service)
+
   def _process_map_data(self, sm: messaging.SubMaster) -> None:
-    gps_data = sm[self._gps_location_service]
     map_data = sm['liveMapDataSP']
 
-    gps_fix_age = time.monotonic() - gps_data.unixTimestampMillis * 1e-3
-    if gps_fix_age > LIMIT_MAX_MAP_DATA_AGE:
+    if self._gps_fix_age(sm) is None:
+      return
+
+    # plannerd ignores liveMapDataSP liveness: a mapd that stopped publishing leaves its last limit in the SubMaster
+    map_data_age = self._message_age(sm, 'liveMapDataSP')
+    if map_data_age is None:
       return
 
     speed_limit = map_data.speedLimit if map_data.speedLimitValid else 0.
     next_speed_limit = map_data.speedLimitAhead if map_data.speedLimitAheadValid else 0.
 
-    self._calculate_map_data_limits(sm, speed_limit, next_speed_limit)
+    self._calculate_map_data_limits(sm, speed_limit, next_speed_limit, map_data_age)
 
-  def _calculate_map_data_limits(self, sm: messaging.SubMaster, speed_limit: float, next_speed_limit: float) -> None:
-    gps_data = sm[self._gps_location_service]
+  def _calculate_map_data_limits(self, sm: messaging.SubMaster, speed_limit: float, next_speed_limit: float,
+                                 map_data_age: float) -> None:
     map_data = sm['liveMapDataSP']
 
-    distance_since_fix = self.v_ego * (time.monotonic() - gps_data.unixTimestampMillis * 1e-3)
-    distance_to_speed_limit_ahead = max(0., map_data.speedLimitAheadDistance - distance_since_fix)
+    # mapd measures the distance from the localizer's position as it publishes, not from the last GPS fix, which
+    # the localizer has already driven past: only the message's own age is still to come off
+    distance_since_publish = self.v_ego * max(map_data_age, 0.)
+    distance_to_speed_limit_ahead = max(0., map_data.speedLimitAheadDistance - distance_since_publish)
 
     self.limit_solutions[SpeedLimitSource.map] = speed_limit
     self.distance_solutions[SpeedLimitSource.map] = 0.
 
     # FIXME-SP: this is not working as expected
-    if 0. < next_speed_limit < self.v_ego:
+    # only a lower limit ahead is braked for early: above both, a higher one would lift the current limit before its sign
+    if 0. < next_speed_limit < self.v_ego and (speed_limit <= 0. or next_speed_limit < speed_limit):
       adapt_time = (next_speed_limit - self.v_ego) / self._adapt_acc
       adapt_distance = self.v_ego * adapt_time + 0.5 * self._adapt_acc * adapt_time ** 2
 
@@ -160,25 +240,17 @@ class SpeedLimitResolver:
         self.distance_solutions[SpeedLimitSource.map] = distance_to_speed_limit_ahead
 
   def _get_source_solution_according_to_policy(self) -> custom.LongitudinalPlanSP.SpeedLimit.Source:
-    sources_for_policy = self._policy_to_sources_map[Policy(self.policy)]
-
-    if Policy(self.policy) != Policy.combined:
-      # They are ordered in the order of preference, so we pick the first that's non-zero
-      for source in sources_for_policy:
-        if self.limit_solutions[source] > 0.:
-          return source
-      return SpeedLimitSource.none
-
-    sources_with_limits = [(s, limit) for s, limit in [(s, self.limit_solutions[s]) for s in sources_for_policy] if limit > 0.]
-    if sources_with_limits:
-      return min(sources_with_limits, key=lambda x: x[1])[0]
-
+    # They are ordered in the order of preference, so we pick the first that's non-zero
+    for source in self._policy_to_sources_map[Policy(self.policy)]:
+      if self.limit_solutions[source] > 0.:
+        return source
     return SpeedLimitSource.none
 
   def _resolve_limit_sources(self, sm: messaging.SubMaster) -> tuple[float, float, custom.LongitudinalPlanSP.SpeedLimit.Source]:
     """Get limit solutions from each data source"""
     self._get_from_car_state(sm)
     self._get_from_map_data(sm)
+    self._get_from_vision(sm)
 
     source = self._get_source_solution_according_to_policy()
     speed_limit = self.limit_solutions[source] if source else 0.

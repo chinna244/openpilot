@@ -29,6 +29,27 @@ CruiseIntent = custom.CarStateZP.CruiseSession.CruiseIntent
 # Timers use 100 Hz control frames.
 DISABLED_GUARD_PERIOD = 0.5   # s after engagement before the session may form
 PRE_ACTIVE_GUARD_PERIOD = 5.  # s a confirm prompt stays open
+# A prompt nobody answered asks again while the set speed still stands off the limit, either way: routes 00000160 (476 s,
+# 28 s at 61-63 mph in a 58 mph target) and 00000163 (987 s, set speed 63 in a 35 mph target, 29 minus taps) went quiet
+# after the one prompt, and route 00000009 (88 s, + for 35 from a set speed of 19) left the driver 10 plus taps.
+# Only an unanswered prompt re-asks (any press is the driver's answer), twice at most per limit.
+REPROMPT_MARGIN = 3     # display units the set speed must stand above or below the limit's target
+REPROMPT_NEAR = 5       # display units: the car must be within this of the lower of set speed and target, or the set
+                        # speed is not yet what holds it
+# A press in the prompt's direction just after it closed unanswered is still its answer: route 00000009 the driver's
+# + came 0.53 s after the 5 s window, counted as a plain +1, and the session stayed off.
+LATE_ANSWER_PERIOD = 1.5  # s
+# After a confirm the dash takes a few seconds to reach the target; a further press the same way is the driver still
+# asking for it, not a dismissal: routes 00000009, 0000014c and 00000153 the driver's next + 1.2-2.4 s after the
+# confirm would have ended the session it had just started.
+CONFIRM_FOLLOW_PERIOD = 5.  # s
+REPROMPT_HOLD = 2.      # s the condition must hold
+REPROMPT_COOLDOWN = 25.  # s after a prompt closes unanswered, about 30 s from one prompt to the next
+REPROMPT_MAX = 2
+# A new limit counts only once the resolver has held it this long: in route 00000167 the map came back on the road
+# just left (30 for 1.0 s inside a 25 the driver had confirmed) and flicked 30-25-30 for 0.9 s, the camera read 25 for
+# 1.8 s in a map gap, and each asked the driver again; in route 00000166 the camera flipped 5-35 in under 0.5 s.
+LIMIT_SETTLE = 2.  # s
 DRIVER_DIAL_PERIOD = 1.  # s after a wheel press edge in which a cluster match counts as the driver's dial
 # Resolve a held prompt before cruise.py emits its first long-press repeat tick.
 LONG_PRESS_FRAMES = 50 - 1
@@ -46,6 +67,7 @@ _PRESS_PROMPT = 2   # started while a confirm prompt was open: resolves at relea
 class _Press:
   cls: int
   frames: int = 0
+  late: bool = False       # a prompt press made just after the prompt closed unanswered
   resolved: bool = False   # a resolved prompt press remains owned
   released: bool = False   # retain through the release frame for press_owned
 
@@ -71,14 +93,25 @@ class CruiseArbiter:
 
     # longitudinalPlanSP updates these at the planning rate.
     self._speed_limit = 0.
-    self._speed_limit_prev = 0.
     self._slf = 0.  # speedLimitFinalLast, m/s
+    self._slf_prev = 0.
     self._has_limit = False
+    self._current = False  # a source has a limit now, not only the last one held
+    self._raise_deferred = False  # a raise prompt waits for a current limit
+    self._limit_seen = (0., 0., False, False)  # the resolver's latest (speedLimit, speedLimitFinalLast, valid, current)
+    self._limit_seen_frames = 0
 
     self.long_enabled_prev = False
     self.long_engaged_timer = 0
     self.pre_active_timer = 0
     self._driver_dismissed = False
+    self._ignored_prompt = False  # the last prompt closed unanswered; any press clears it
+    self._reprompts_left = 0
+    self._reprompt_cooldown = 0
+    self._reprompt_hold = 0
+    self._late_answer_timer = 0  # frames since a prompt closed unanswered in which its direction still confirms
+    self._confirm_follow_timer = 0  # frames after a confirm in which a press toward the target is still the confirm
+    self._adopted_dir = 0  # +1/-1: the last confirm moved the setpoint onto the limit, so the dash walks that way
     self._cluster_conv = 0
     self._cluster_conv_prev = 0
     self._driver_dial_timer = 0  # frames since a wheel press edge: a cluster match is the driver's
@@ -110,9 +143,17 @@ class CruiseArbiter:
     if not self.applicable:
       return
     resolver = LP_SP.speedLimit.resolver
-    self._speed_limit = float(resolver.speedLimit)
-    self._slf = float(resolver.speedLimitFinalLast)
-    self._has_limit = bool(resolver.speedLimitValid or resolver.speedLimitLastValid)
+    seen = (float(resolver.speedLimit), float(resolver.speedLimitFinalLast), bool(resolver.speedLimitValid or resolver.speedLimitLastValid),
+            bool(resolver.speedLimitValid))
+    if seen != self._limit_seen:
+      self._limit_seen = seen
+      self._limit_seen_frames = 0
+    self._limit_seen_frames += 1
+    if self._limit_seen_frames >= int(LIMIT_SETTLE / DT_CTRL):
+      self._current = seen[3]
+      if self._has_limit and seen[2] and not seen[3] and seen[1] > self._slf:
+        return  # a higher last limit no source has now (a reading shorter than LIMIT_SETTLE): wait for a source
+      self._speed_limit, self._slf, self._has_limit, self._current = seen
 
   @property
   def _conv(self) -> float:
@@ -141,14 +182,30 @@ class CruiseArbiter:
 
   @property
   def _limit_changed(self) -> bool:
-    return self._has_limit and self._speed_limit != self._speed_limit_prev
+    # the target is what a prompt asks for: a source dropping out behind an unchanged last limit asks nothing
+    return self._has_limit and self._slf != self._slf_prev
 
   def _set_state(self, state, announce=False):
     self.state = state
     if announce:
       self.announce_counter += 1
 
-  def _enter_prompt(self):
+  def _raise_blocked(self) -> bool:
+    """Only the last limit is left and it is above the dash: it may ask to slow down, never to speed up."""
+    return not self._current and self._target_conv() > self._cluster_conv
+
+  def _enter_prompt(self, rearm: bool = True):
+    if self._raise_blocked():
+      # only the last limit is left: it may ask to slow down, never to speed up. Route 00000025 246 s: engaged in a
+      # parking lot with no limit anywhere, "Press + for 41" from the road before.
+      self._raise_deferred = True
+      if self.state not in ACTIVE_STATES:
+        self._set_state(SessionState.inactive)
+      return
+    self._raise_deferred = False
+    if rearm:
+      self._reprompts_left = REPROMPT_MAX
+      self._ignored_prompt = False
     if self._target_conv() == self._cluster_conv:
       self._activate(from_prompt=False)  # the dash already shows the limit: nothing to confirm
       return
@@ -166,8 +223,11 @@ class CruiseArbiter:
     return settle_conv(self._slf, self._cluster_conv, self.is_metric) != settle_conv(self.v_cap, self._cluster_conv, self.is_metric)
 
   def _activate(self, from_prompt: bool):
+    self._raise_deferred = False
     # Announce confirmations and sessions that move the speed, not an existing match.
     self._set_state(SessionState.active, announce=from_prompt or self._speed_moves)
+    # only the ICBM servo walks the dash to the target; an openpilot-owned setpoint has nothing in transit
+    self._confirm_follow_timer = int(CONFIRM_FOLLOW_PERIOD / DT_CTRL) if from_prompt and not self.op_owns_setpoint else 0
 
   def _classify_presses(self, CS, v_cruise_kph: float) -> float:
     """Consume button edges; decide intents from the pre-frame session snapshot.
@@ -184,9 +244,13 @@ class CruiseArbiter:
         continue
       btn = b.type.raw
       self._driver_dial_timer = int(DRIVER_DIAL_PERIOD / DT_CTRL)
+      if b.pressed:
+        self._ignored_prompt = False  # a press is an answer, even a no
 
       if b.pressed:
-        if self.state_prev_frame in ACTIVE_STATES:
+        if self.state_prev_frame in ACTIVE_STATES and self._toward_target(btn, self._confirm_follow_timer, follow=True):
+          self._press[btn] = _Press(_PRESS_PROMPT, resolved=True)  # owned: the confirm stands, no step
+        elif self.state_prev_frame in ACTIVE_STATES:
           # A press dismisses an active session. Re-anchor openpilot-owned setpoints to the
           # active cap before applying the press; ICBM platforms adopt the ECU's result.
           if self.op_owns_setpoint and self.v_cap < V_CRUISE_UNSET:
@@ -197,9 +261,12 @@ class CruiseArbiter:
             self._press[btn] = _Press(_PRESS_DISMISS)
           self._set_state(SessionState.inactive)
           self._driver_dismissed = True
+          self._raise_deferred = False
           self.last_intent = CruiseIntent.dismiss
         elif self.state_prev_frame == SessionState.preActive:
           self._press[btn] = _Press(_PRESS_PROMPT)
+        elif self._late_answer(btn):
+          self._press[btn] = _Press(_PRESS_PROMPT, late=True)
         else:
           self._press[btn] = _Press(_PRESS_NORMAL)
 
@@ -223,7 +290,33 @@ class CruiseArbiter:
 
     return v_cruise_kph
 
+  def _toward_target(self, button: int, window: int, follow: bool = False) -> bool:
+    """Inside the window, with a limit, a press in the direction the dash still has to move to reach the target."""
+    if window <= 0 or not self._has_limit or self._cluster_conv <= 0:
+      return False
+    req_plus, req_minus = compare_cluster_target(self._cluster_conv / self._conv, self._slf, self.is_metric)
+    if follow and not (req_plus or req_minus):
+      # the confirm already moved the setpoint onto the limit; the dash may still be walking there
+      req_plus, req_minus = self._adopted_dir > 0, self._adopted_dir < 0
+    return (req_plus and button in PLUS_BUTTONS) or (req_minus and button in MINUS_BUTTONS)
+
+  def _late_answer(self, button: int) -> bool:
+    """A press in the closed prompt's direction, inside the late-answer window, with the limit unchanged."""
+    return self.state_prev_frame == SessionState.inactive and self._toward_target(button, self._late_answer_timer)
+
   def _resolve_prompt_press(self, button: int, press: _Press, v_cruise_kph: float) -> float:
+    if press.late and self.state != SessionState.inactive:
+      # a new prompt (or disengagement) since: this press answered the old one, not that
+      press.cls = _PRESS_NORMAL
+      return v_cruise_kph
+    if press.late:
+      # the prompt it answers already closed: confirm in its direction, as the open prompt would
+      press.resolved = True
+      self.last_intent = CruiseIntent.confirm
+      v_cruise_kph = self._adopt_target(button in PLUS_BUTTONS, v_cruise_kph)
+      self._activate(from_prompt=True)
+      return v_cruise_kph
+
     if self.state != SessionState.preActive:
       # Treat an in-flight press as normal if another event resolved the prompt.
       press.cls = _PRESS_NORMAL
@@ -233,12 +326,9 @@ class CruiseArbiter:
     is_plus = button in PLUS_BUTTONS
 
     if (req_plus and is_plus) or (req_minus and not is_plus):
-      # An upward confirmation may raise the baseline; the active cap handles lower limits.
       press.resolved = True
       self.last_intent = CruiseIntent.confirm
-      if is_plus and self.target_kph > v_cruise_kph:
-        v_cruise_kph = self.target_kph
-        self.adopted_this_frame = True
+      v_cruise_kph = self._adopt_target(is_plus, v_cruise_kph)
       self._activate(from_prompt=True)
     else:
       # A press in the opposite direction declines and resumes normal setpoint handling.
@@ -246,6 +336,19 @@ class CruiseArbiter:
       self.last_intent = CruiseIntent.decline
       self._set_state(SessionState.inactive)
 
+    return v_cruise_kph
+
+  def _adopt_target(self, is_plus: bool, v_cruise_kph: float) -> float:
+    """A confirmation moves the baseline to the limit, + up and - down. A - that only capped left the baseline
+    above it, and whatever ended or raised the cap next walked the car back up to it unasked: routes 00000017 15:59
+    and 00000019 25:53 confirmed 35 off a 60 mph highway, the map limit dropped out on the ramp, and ICBM pressed +
+    toward the old set speed at 27 mph."""
+    # an openpilot-owned setpoint re-anchors to the cap when the session ends, so only ICBM adopts a - here
+    if (self.target_kph > v_cruise_kph) if is_plus else (not self.op_owns_setpoint and self.target_kph < v_cruise_kph):
+      self.adopted_this_frame = True
+      self._adopted_dir = 1 if is_plus else -1
+      return self.target_kph
+    self._adopted_dir = 0
     return v_cruise_kph
 
   def press_owned(self, button_type: int) -> bool:
@@ -258,6 +361,17 @@ class CruiseArbiter:
     if press.cls == _PRESS_DISMISS:
       return True
     return press.cls == _PRESS_PROMPT and press.resolved
+
+  def _reprompt_due(self, CS) -> bool:
+    """An unanswered prompt, the set speed still more than the margin over or under the limit's target, and the car at
+    or near the lower of the two (the one that holds it)."""
+    target = self._target_conv()
+    off_limit = self._cluster_conv > 0 and abs(self._cluster_conv - target) > REPROMPT_MARGIN
+    near = round(CS.vEgo * self._conv) > min(self._cluster_conv, target) - REPROMPT_NEAR
+    due = (self._ignored_prompt and self._reprompts_left > 0 and self._has_limit and target > 0
+           and off_limit and near and not CS.gasPressed and not CS.standstill)
+    self._reprompt_hold = self._reprompt_hold + 1 if due else 0
+    return self._reprompt_cooldown <= 0 and self._reprompt_hold >= int(REPROMPT_HOLD / DT_CTRL)
 
   def step(self, CS, long_enabled: bool, v_cruise_kph: float, v_cruise_cluster_kph: float) -> float:
     """Classify presses, advance the session, and publish its cap in a fixed order."""
@@ -275,35 +389,67 @@ class CruiseArbiter:
     self.long_engaged_timer = max(0, self.long_engaged_timer - 1)
     self.pre_active_timer = max(0, self.pre_active_timer - 1)
     self._driver_dial_timer = max(0, self._driver_dial_timer - 1)
+    self._reprompt_cooldown = max(0, self._reprompt_cooldown - 1)
+    self._late_answer_timer = max(0, self._late_answer_timer - 1)
+    self._confirm_follow_timer = max(0, self._confirm_follow_timer - 1)
+    if not self._ignored_prompt or self._limit_changed:
+      self._late_answer_timer = 0  # answered, or the limit it asked about is gone
 
     if self.state != SessionState.disabled:
       if not long_enabled or not self.enabled:
         self._set_state(SessionState.disabled)
+        self._raise_deferred = False
         self._driver_dismissed = False
+        self._ignored_prompt = False
+        self._late_answer_timer = 0
 
       elif self.state in ACTIVE_STATES:
-        if self._limit_changed and confirm_needed_for_change(self._cluster_conv, self._target_conv(), self.is_metric):
+        # a target above the speed the session holds asks first, at any speed: route 00000018 14:26 raised a
+        # confirmed 58 to 64 unasked
+        held_conv = round(self.v_cap * self._conv) if self.v_cap < V_CRUISE_UNSET else self._cluster_conv
+        raises = self._target_conv() > held_conv
+        if self._limit_changed and (raises or confirm_needed_for_change(self._cluster_conv, self._target_conv(), self.is_metric)):
           self._enter_prompt()
         elif self._limit_changed and self._speed_moves:
           # Auto-apply target changes that do not require confirmation; a limit above the
           # setpoint the car already holds changes nothing to announce.
           self.announce_counter += 1
+        if self._limit_changed and self.state in ACTIVE_STATES and not self.op_owns_setpoint and self.target_kph < v_cruise_kph:
+          # an unasked drop lowers the ICBM setpoint too, or a later rise walks the car back up to it unasked
+          v_cruise_kph = self.target_kph
+          self.adopted_this_frame = True
 
       elif self.state == SessionState.preActive:
         # a press resolves the prompt (above); the ICBM servo may walk the dash through the
         # limit for a curve meanwhile, which confirms nothing
-        if self.pre_active_timer <= 0:
+        if self.pre_active_timer <= 0 and any(p.cls == _PRESS_PROMPT and not p.released for p in self._press.values()):
+          # a press held across the timeout answers this prompt at its release
+          for p in self._press.values():
+            if p.cls == _PRESS_PROMPT and not p.released:
+              p.late = True
           self._set_state(SessionState.inactive)
+        elif self.pre_active_timer <= 0:
+          self._set_state(SessionState.inactive)
+          self._ignored_prompt = True
+          self._reprompt_cooldown = int(REPROMPT_COOLDOWN / DT_CTRL)
+          self._reprompt_hold = 0
+          self._late_answer_timer = int(LATE_ANSWER_PERIOD / DT_CTRL)
 
       elif self.state == SessionState.inactive:
         if self._limit_changed:
           self._driver_dismissed = False
           self._enter_prompt()
+        elif self._raise_deferred and self._current and not self._driver_dismissed:
+          self._enter_prompt()  # a source has the limit again: ask now
         elif not self._driver_dismissed and self._has_limit and self._target_conv() == self._cluster_conv \
              and not self._press and self._driver_dial_timer > 0:
           # The driver dialed onto the limit: wait for release so they can continue through
           # it. A dash the servo walked onto it is not a dial.
           self._activate(from_prompt=False)
+        elif self._reprompt_due(CS) and not self._raise_blocked():
+          self._reprompts_left -= 1
+          self._reprompt_hold = 0
+          self._enter_prompt(rearm=False)
 
     else:
       if long_enabled and self.enabled:
@@ -323,7 +469,7 @@ class CruiseArbiter:
     elif self.state != SessionState.preActive:  # a prompt keeps its frozen hold
       self.v_cap = V_CRUISE_UNSET
 
-    self._speed_limit_prev = self._speed_limit
+    self._slf_prev = self._slf
     self.long_enabled_prev = long_enabled
     return v_cruise_kph
 

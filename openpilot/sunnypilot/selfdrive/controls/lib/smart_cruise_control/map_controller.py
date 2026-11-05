@@ -71,6 +71,7 @@ class SmartCruiseControlMap:
   a_ego: float = 0.
   output_v_target: float = V_CRUISE_UNSET
   output_a_target: float = 0.
+  position_valid: bool = True
 
   def __init__(self):
     self.params = Params()
@@ -109,7 +110,8 @@ class SmartCruiseControlMap:
     lat = self.last_position.latitude
     lon = self.last_position.longitude
 
-    self.target_velocities = velocities_from_param("MapTargetVelocities", self.mem_params) or []
+    # targets belong to the position mapd was given; without a valid one they are stale
+    self.target_velocities = (velocities_from_param("MapTargetVelocities", self.mem_params) or []) if self.position_valid else []
 
     if self.last_position is None or self.target_velocities is None:
       return
@@ -253,6 +255,9 @@ class SmartCruiseControlMap:
     self.v_ego = v_ego
     self.a_ego = a_ego
     self.v_cruise = v_cruise
+    # liveMapDataSP is valid while the localizer is and alive while mapd publishes: without both, the position
+    # and targets mapd holds are stale (a frozen target would hold a speed cap the car never reaches)
+    self.position_valid = bool(sm.valid['liveMapDataSP'] and sm.alive['liveMapDataSP'])
 
     self.update_params()
     self.update_calculations(sm)

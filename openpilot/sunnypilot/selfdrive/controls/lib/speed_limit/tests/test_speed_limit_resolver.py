@@ -12,7 +12,9 @@ from openpilot.common.parameterized import parameterized
 from openpilot.cereal import custom
 from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit import LIMIT_MAX_MAP_DATA_AGE
 
-from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.speed_limit_resolver import SpeedLimitResolver, ALL_SOURCES
+from openpilot.common.realtime import DT_MDL
+from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.speed_limit_resolver import SpeedLimitResolver, ALL_SOURCES, CAR_LIMIT_MIN, \
+  LAST_LIMIT_SETTLE
 from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.common import Policy
 from openpilot.common.test import OpenpilotTestCase
 
@@ -27,7 +29,7 @@ def create_mock(properties, mocker):
 
 
 def setup_sm_mock(mocker):
-  cruise_speed_limit = random.uniform(0, 120)
+  cruise_speed_limit = random.uniform(CAR_LIMIT_MIN, 120)
   live_map_data_limit = random.uniform(0, 120)
 
   car_state = create_mock({
@@ -46,7 +48,10 @@ def setup_sm_mock(mocker):
     'speedLimitAheadDistance': 0.,
   }, mocker)
   gps_data = create_mock({
-    'unixTimestampMillis': time.monotonic() * 1e3,
+    'hasFix': True,
+  }, mocker)
+  vision = create_mock({
+    'speedLimit': 0.,
   }, mocker)
   sm_mock = mocker.MagicMock()
   sm_mock.__getitem__.side_effect = lambda key: {
@@ -54,7 +59,10 @@ def setup_sm_mock(mocker):
     'liveMapDataSP': live_map_data,
     'carStateSP': car_state_sp,
     'gpsLocation': gps_data,
+    'customReserved10': vision,
   }[key]
+  sm_mock.logMonoTime = {'gpsLocation': int(time.monotonic() * 1e9), 'liveMapDataSP': int(time.monotonic() * 1e9),
+                         'customReserved10': int(time.monotonic() * 1e9)}
   return sm_mock
 
 
@@ -100,15 +108,12 @@ class TestSpeedLimitResolverValidation(OpenpilotTestCase):
     resolver = resolver_class()
     resolver.policy = Policy.combined
     sm_mock = setup_sm_mock(mocker)
-    socket_to_source = {'carStateSP': SpeedLimitSource.car, 'liveMapDataSP': SpeedLimitSource.map}
-    minimum_key, minimum_speed_limit = min(
-      ((key, sm_mock[key].speedLimit) for key in
-       socket_to_source.keys()), key=lambda x: x[1])
+    map_speed_limit = sm_mock['liveMapDataSP'].speedLimit
 
-    # Assert the resolver
-    resolver.update(minimum_speed_limit, sm_mock)
-    assert resolver.speed_limit == minimum_speed_limit
-    assert resolver.source == socket_to_source[minimum_key]
+    # Assert the resolver: the map before the car
+    resolver.update(map_speed_limit, sm_mock)
+    assert resolver.speed_limit == map_speed_limit
+    assert resolver.source == SpeedLimitSource.map
 
   @parametrized_policies
   def test_parser(self, resolver_class, policy, sm_key, function_key, mocker):
@@ -141,7 +146,326 @@ class TestSpeedLimitResolverValidation(OpenpilotTestCase):
     resolver = resolver_class()
     resolver.policy = policy
     sm_mock = mocker.MagicMock()
-    sm_mock['gpsLocation'].unixTimestampMillis = (time.monotonic() - 2 * LIMIT_MAX_MAP_DATA_AGE) * 1e3
+    sm_mock['gpsLocation'].hasFix = True
+    sm_mock.logMonoTime = {'gpsLocation': int((time.monotonic() - 2 * LIMIT_MAX_MAP_DATA_AGE) * 1e9)}
     resolver._get_from_map_data(sm_mock)
     assert resolver.limit_solutions[SpeedLimitSource.map] == 0.
     assert resolver.distance_solutions[SpeedLimitSource.map] == 0.
+
+
+MPH = 0.44704
+
+
+def gps_sm(mocker, car_limit, map_limit, has_fix=True, fix_age=0., ahead_limit=0., ahead_distance=0., map_age=0.):
+  """carStateSP, liveMapDataSP and gpsLocation as the resolver reads them; fix_age: seconds since the GPS message
+  was logged, on the monotonic clock (negative: logged in the future); map_age: the same for liveMapDataSP."""
+  car_state_sp = create_mock({'speedLimit': car_limit}, mocker)
+  live_map_data = create_mock({
+    'speedLimit': map_limit,
+    'speedLimitValid': map_limit > 0.,
+    'speedLimitAhead': ahead_limit,
+    'speedLimitAheadValid': ahead_limit > 0.,
+    'speedLimitAheadDistance': ahead_distance,
+  }, mocker)
+  gps_data = create_mock({'hasFix': has_fix}, mocker)
+  sm_mock = mocker.MagicMock()
+  sm_mock.__getitem__.side_effect = lambda key: {
+    'carStateSP': car_state_sp,
+    'liveMapDataSP': live_map_data,
+    'gpsLocation': gps_data,
+    'customReserved10': create_mock({'speedLimit': 0.}, mocker),
+  }[key]
+  sm_mock.logMonoTime = {'gpsLocation': int((time.monotonic() - fix_age) * 1e9),
+                         'liveMapDataSP': int((time.monotonic() - map_age) * 1e9),
+                         'customReserved10': int(time.monotonic() * 1e9)}
+  return sm_mock
+
+
+MAP_POLICIES = [Policy.map_data_only, Policy.map_data_priority, Policy.combined]
+UNUSABLE_FIXES = [
+  ("no_fix", False, 0.),
+  ("stale_fix", True, 2 * LIMIT_MAX_MAP_DATA_AGE),
+  ("future_fix", True, -5.),
+]
+
+
+class TestSpeedLimitResolverGpsFix(OpenpilotTestCase):
+  """Map limits need a current GPS fix: without one mapd keeps the last road it matched, and that limit must not
+  reach the planner (routes 00000152-159: no fix all drive, a stale 30 mph limit capped a 55 mph highway)."""
+
+  @parameterized.expand([(p, n, f, a) for p in MAP_POLICIES for n, f, a in UNUSABLE_FIXES],
+                        names=["policy", "case", "has_fix", "fix_age"])
+  def test_map_limit_needs_a_current_fix(self, resolver_class, policy, case, has_fix, fix_age, mocker):
+    resolver = resolver_class()
+    resolver.policy = policy
+    resolver.update(20., gps_sm(mocker, 0., 30 * MPH, has_fix=has_fix, fix_age=fix_age))
+    assert resolver.limit_solutions[SpeedLimitSource.map] == 0.
+    # nothing else to go on: no limit at all, never a low or zero target
+    assert resolver.source == SpeedLimitSource.none
+    assert resolver.speed_limit == 0. and not resolver.speed_limit_valid
+    assert resolver.speed_limit_final == 0.
+
+  @parameterized.expand([(p,) for p in MAP_POLICIES], names=["policy"])
+  def test_map_limit_needs_a_current_map_message(self, resolver_class, policy, mocker):
+    # plannerd ignores liveMapDataSP liveness, so a mapd that stopped publishing leaves its last limit in the
+    # SubMaster; a fresh GPS fix must not make that limit current again
+    resolver = resolver_class()
+    resolver.policy = policy
+    resolver.update(20., gps_sm(mocker, 0., 30 * MPH, fix_age=1., map_age=2 * LIMIT_MAX_MAP_DATA_AGE))
+    assert resolver.limit_solutions[SpeedLimitSource.map] == 0.
+    assert resolver.source == SpeedLimitSource.none
+    assert resolver.speed_limit == 0.
+
+  @parameterized.expand([(p,) for p in MAP_POLICIES], names=["policy"])
+  def test_a_current_fix_uses_the_map(self, resolver_class, policy, mocker):
+    resolver = resolver_class()
+    resolver.policy = policy
+    resolver.update(20., gps_sm(mocker, 0., 30 * MPH, fix_age=1.))
+    assert resolver.source == SpeedLimitSource.map
+    assert resolver.speed_limit == 30 * MPH
+
+  @parameterized.expand([(Policy.combined,), (Policy.map_data_priority,), (Policy.car_state_priority,)], names=["policy"])
+  def test_stale_map_limit_falls_back_to_the_car(self, resolver_class, policy, mocker):
+    # route 00000159 t232: the car reads 55, mapd still holds 30 from a road left long ago, GPS has no fix
+    resolver = resolver_class()
+    resolver.policy = policy
+    resolver.update(26.8, gps_sm(mocker, 55 * MPH, 30 * MPH, has_fix=False))
+    assert resolver.source == SpeedLimitSource.car
+    assert resolver.speed_limit == 55 * MPH
+
+  @parameterized.expand([(p,) for p in Policy], names=["policy"])
+  def test_a_misread_low_car_limit_is_ignored(self, resolver_class, policy, mocker):
+    # route 00000169 t207: the camera read 5 mph, the map had no limit; the assist braked toward 6 mph
+    resolver = resolver_class()
+    resolver.policy = policy
+    resolver.update(6.8, gps_sm(mocker, 5 * MPH, 0.))
+    assert resolver.limit_solutions[SpeedLimitSource.car] == 0.
+    assert resolver.source == SpeedLimitSource.none
+    assert resolver.speed_limit == 0.
+
+  @parameterized.expand([(p,) for p in Policy], names=["policy"])
+  def test_a_10_mph_car_limit_still_counts(self, resolver_class, policy, mocker):
+    resolver = resolver_class()
+    resolver.policy = policy
+    resolver.update(6.8, gps_sm(mocker, 10 * MPH, 0.))
+    if policy == Policy.map_data_only:
+      assert resolver.source == SpeedLimitSource.none
+    else:
+      assert resolver.source == SpeedLimitSource.car
+      assert resolver.speed_limit == 10 * MPH
+
+  def test_car_state_only_ignores_the_map(self, resolver_class, mocker):
+    resolver = resolver_class()
+    resolver.policy = Policy.car_state_only
+    resolver.update(26.8, gps_sm(mocker, 55 * MPH, 30 * MPH, fix_age=1.))
+    assert resolver.source == SpeedLimitSource.car
+    assert resolver.speed_limit == 55 * MPH
+
+  def test_combined_with_a_current_fix_takes_the_map(self, resolver_class, mocker):
+    resolver = resolver_class()
+    resolver.policy = Policy.combined
+    resolver.update(26.8, gps_sm(mocker, 55 * MPH, 45 * MPH, fix_age=1.))
+    assert resolver.source == SpeedLimitSource.map
+    assert resolver.speed_limit == 45 * MPH
+
+  def test_distance_to_the_next_limit_counts_from_the_map_message(self, resolver_class, mocker):
+    # 20 m/s, a 10 m/s limit 100 m ahead where mapd published 2 s ago: 60 m ahead now, inside the
+    # 150 m it takes to slow at LIMIT_ADAPT_ACC, so the next limit applies
+    resolver = resolver_class()
+    resolver.policy = Policy.map_data_only
+    resolver.update(20., gps_sm(mocker, 0., 15., ahead_limit=10., ahead_distance=100., map_age=2.))
+    assert resolver.speed_limit == 10.
+    assert abs(resolver.distance - 60.) < 0.5
+
+  def test_an_older_fix_does_not_advance_a_current_distance(self, resolver_class, mocker):
+    # review: mapd's 200 m is from the localizer's position now; a 9 s old fix (still accepted) took 180 m off
+    # and slowed for the 10 m/s limit 50 m before its 150 m braking distance
+    resolver = resolver_class()
+    resolver.policy = Policy.map_data_only
+    resolver.update(20., gps_sm(mocker, 0., 15., fix_age=9., ahead_limit=10., ahead_distance=200.))
+    assert resolver.speed_limit == 15.
+
+  @parameterized.expand([(35.,), (29.,)], names=["v_ego"])
+  def test_a_higher_limit_ahead_waits_for_its_sign(self, resolver_class, v_ego, mocker):
+    # review: at 35 m/s in a 25 m/s zone with 30 m/s 100 m ahead, the higher limit replaced the current one
+    # before the sign, and dropping under it brought 25 back: the limit followed the car's speed
+    resolver = resolver_class()
+    resolver.policy = Policy.map_data_only
+    resolver.update(v_ego, gps_sm(mocker, 0., 25., ahead_limit=30., ahead_distance=100.))
+    assert resolver.speed_limit == 25.
+    assert resolver.distance == 0.
+
+  def test_a_lower_limit_ahead_with_no_current_limit_still_applies(self, resolver_class, mocker):
+    resolver = resolver_class()
+    resolver.policy = Policy.map_data_only
+    resolver.update(20., gps_sm(mocker, 0., 0., ahead_limit=10., ahead_distance=100.))
+    assert resolver.speed_limit == 10.
+
+  # the last limit a source dropout falls back to must have held LAST_LIMIT_SETTLE
+
+  def _feed(self, resolver, mocker, car_limit, map_limit, seconds):
+    for _ in range(max(1, int(seconds / DT_MDL))):
+      resolver.update(10., gps_sm(mocker, car_limit, map_limit))
+
+  def test_a_blip_before_a_dropout_is_not_the_last_limit(self, resolver_class, mocker):
+    # route 00000009 220.05 s: map 25 held, the camera read 35 for 0.72 s as the map dropped, then nothing
+    resolver = resolver_class()
+    resolver.policy = Policy.combined
+    self._feed(resolver, mocker, 35 * MPH, 25 * MPH, 10.)
+    self._feed(resolver, mocker, 35 * MPH, 0., 0.7)
+    assert resolver.speed_limit == 35 * MPH and resolver.speed_limit_last == 35 * MPH  # a live reading still counts at once
+    self._feed(resolver, mocker, 0., 0., 1.)
+    assert resolver.speed_limit == 0.
+    assert resolver.speed_limit_last == 25 * MPH
+    assert resolver.speed_limit_final_last == 25 * MPH + resolver.speed_limit_offset
+
+  def test_a_reading_that_held_stays_the_last_limit(self, resolver_class, mocker):
+    resolver = resolver_class()
+    resolver.policy = Policy.car_state_only
+    self._feed(resolver, mocker, 25 * MPH, 0., 10.)
+    self._feed(resolver, mocker, 35 * MPH, 0., LAST_LIMIT_SETTLE + 0.1)
+    self._feed(resolver, mocker, 0., 0., 5.)
+    assert resolver.speed_limit_last == 35 * MPH
+
+  def test_a_short_lower_reading_still_lowers_the_last_limit(self, resolver_class, mocker):
+    # it may be a real sign: a short reading never raises the last limit, it may lower it
+    resolver = resolver_class()
+    resolver.policy = Policy.car_state_only
+    self._feed(resolver, mocker, 35 * MPH, 0., 10.)
+    self._feed(resolver, mocker, 25 * MPH, 0., 0.7)
+    self._feed(resolver, mocker, 0., 0., 1.)
+    assert resolver.speed_limit_last == 25 * MPH
+
+  def test_a_blip_with_nothing_held_before_stays(self, resolver_class, mocker):
+    resolver = resolver_class()
+    resolver.policy = Policy.car_state_only
+    self._feed(resolver, mocker, 35 * MPH, 0., 0.5)
+    self._feed(resolver, mocker, 0., 0., 1.)
+    assert resolver.speed_limit_last == 35 * MPH
+
+  def test_a_new_limit_still_applies_at_once(self, resolver_class, mocker):
+    resolver = resolver_class()
+    resolver.policy = Policy.car_state_only
+    self._feed(resolver, mocker, 35 * MPH, 0., 10.)
+    resolver.update(10., gps_sm(mocker, 25 * MPH, 0.))
+    assert resolver.speed_limit_last == 25 * MPH
+
+  def test_a_limit_from_before_a_dropout_is_never_brought_back(self, resolver_class, mocker):
+    # a stale town 25 must not replace a real 65 seen briefly after minutes with no limit
+    resolver = resolver_class()
+    resolver.policy = Policy.car_state_only
+    self._feed(resolver, mocker, 25 * MPH, 0., 60.)
+    self._feed(resolver, mocker, 0., 0., 300.)
+    self._feed(resolver, mocker, 65 * MPH, 0., 1.5)
+    self._feed(resolver, mocker, 0., 0., 1.)
+    assert resolver.speed_limit_last == 65 * MPH
+
+  def test_a_flickering_new_limit_takes_over(self, resolver_class, mocker):
+    # a road read in pieces: after its first gap the old limit is gone for good
+    resolver = resolver_class()
+    resolver.policy = Policy.car_state_only
+    self._feed(resolver, mocker, 25 * MPH, 0., 10.)
+    for _ in range(10):
+      self._feed(resolver, mocker, 45 * MPH, 0., 1.5)
+      self._feed(resolver, mocker, 0., 0., 0.5)
+    assert resolver.speed_limit_last == 45 * MPH
+
+  def test_a_chain_of_short_readings_falls_back_to_the_held_one(self, resolver_class, mocker):
+    resolver = resolver_class()
+    resolver.policy = Policy.car_state_only
+    self._feed(resolver, mocker, 25 * MPH, 0., 10.)
+    self._feed(resolver, mocker, 30 * MPH, 0., 0.5)
+    self._feed(resolver, mocker, 35 * MPH, 0., 0.5)
+    self._feed(resolver, mocker, 0., 0., 1.)
+    assert resolver.speed_limit_last == 25 * MPH
+
+
+class TestSpeedLimitResolverVision(OpenpilotTestCase):
+  """A camera-read sign comes first in combined and vision_priority, and only there."""
+
+  def _sm(self, mocker, car, map_limit, vision, vision_age=0.):
+    sm_mock = setup_sm_mock(mocker)
+    sm_mock['carStateSP'].speedLimit = car
+    sm_mock['liveMapDataSP'].speedLimit = map_limit
+    sm_mock['customReserved10'].speedLimit = vision
+    sm_mock.logMonoTime['customReserved10'] = int((time.monotonic() - vision_age) * 1e9)
+    return sm_mock
+
+  def _resolve(self, mocker, policy, car, map_limit, vision, vision_age=0.):
+    resolver = SpeedLimitResolver()
+    resolver.policy = policy
+    resolver.update(10., self._sm(mocker, car, map_limit, vision, vision_age))
+    return resolver
+
+  @parameterized.expand([(Policy.combined,), (Policy.vision_priority,)], names=["policy"])
+  def test_vision_wins_higher_or_lower(self, policy, mocker):
+    for vision in (11., 25.):
+      resolver = self._resolve(mocker, policy, 15., 20., vision)
+      assert resolver.source == SpeedLimitSource.vision
+      assert resolver.speed_limit == vision
+
+  def test_combined_falls_back_to_map_then_car(self, mocker):
+    resolver = self._resolve(mocker, Policy.combined, 15., 20., 0.)
+    assert resolver.source == SpeedLimitSource.map and resolver.speed_limit == 20.
+    resolver = self._resolve(mocker, Policy.combined, 15., 0., 0.)
+    assert resolver.source == SpeedLimitSource.car and resolver.speed_limit == 15.
+
+  def test_vision_priority_falls_back_to_car_then_map(self, mocker):
+    assert self._resolve(mocker, Policy.vision_priority, 15., 20., 0.).source == SpeedLimitSource.car
+    resolver = self._resolve(mocker, Policy.vision_priority, 0., 20., 0.)
+    assert resolver.source == SpeedLimitSource.map and resolver.speed_limit == 20.
+
+  @parameterized.expand([(Policy.combined,), (Policy.vision_priority,)], names=["policy"])
+  def test_stale_vision_ignored(self, policy, mocker):
+    resolver = self._resolve(mocker, policy, 15., 20., 25., vision_age=2.)
+    assert resolver.source != SpeedLimitSource.vision
+
+  def test_vision_below_min_ignored(self, mocker):
+    resolver = self._resolve(mocker, Policy.combined, 15., 20., CAR_LIMIT_MIN - 0.1)
+    assert resolver.source == SpeedLimitSource.map
+
+  @parameterized.expand([(p,) for p in Policy if p not in (Policy.combined, Policy.vision_priority)], names=["policy"])
+  def test_other_policies_ignore_vision(self, policy, mocker):
+    resolver = self._resolve(mocker, policy, 15., 20., 25.)
+    assert resolver.source != SpeedLimitSource.vision
+
+  # a sign the camera withdraws (a school 20 read before its plaque showed, route 12 484 s) is not the last limit
+
+  def _feed(self, resolver, mocker, vision, seconds, vision_age=0.):
+    resolver.update_params = lambda: None  # keep the policy the test set
+    for _ in range(max(1, int(seconds / DT_MDL))):
+      resolver.update(10., self._sm(mocker, 0., 0., vision, vision_age))
+
+  def test_a_withdrawn_sign_gives_back_the_one_before(self, mocker):
+    resolver = SpeedLimitResolver()
+    resolver.policy = Policy.combined
+    self._feed(resolver, mocker, 35 * MPH, 10.)
+    self._feed(resolver, mocker, 20 * MPH, 1.5)
+    assert resolver.speed_limit_last == 20 * MPH  # a live reading still counts at once
+    self._feed(resolver, mocker, 0., 1.)
+    assert resolver.speed_limit_last == 35 * MPH
+    assert resolver.speed_limit_final_last == 35 * MPH + resolver.speed_limit_offset
+
+  def test_a_withdrawn_first_sign_leaves_no_last_limit(self, mocker):
+    resolver = SpeedLimitResolver()
+    resolver.policy = Policy.combined
+    self._feed(resolver, mocker, 20 * MPH, 1.5)
+    self._feed(resolver, mocker, 0., 1.)
+    assert resolver.speed_limit_last == 0.
+
+  def test_a_short_sign_lost_with_the_camera_still_stays(self, mocker):
+    # the camera stopped publishing: a dropout, not a withdrawal, and a lower short reading may be a real sign
+    resolver = SpeedLimitResolver()
+    resolver.policy = Policy.combined
+    self._feed(resolver, mocker, 35 * MPH, 10.)
+    self._feed(resolver, mocker, 20 * MPH, 1.5)
+    self._feed(resolver, mocker, 0., 1., vision_age=5.)
+    assert resolver.speed_limit_last == 20 * MPH
+
+  def test_a_held_sign_the_camera_drops_stays(self, mocker):
+    resolver = SpeedLimitResolver()
+    resolver.policy = Policy.combined
+    self._feed(resolver, mocker, 35 * MPH, 10.)
+    self._feed(resolver, mocker, 25 * MPH, LAST_LIMIT_SETTLE + 0.5)
+    self._feed(resolver, mocker, 0., 1.)
+    assert resolver.speed_limit_last == 25 * MPH

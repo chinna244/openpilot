@@ -24,6 +24,7 @@ class MockSubMaster(dict):
   def __init__(self, services: dict):
     super().__init__(services)
     self.valid = dict.fromkeys(services, True)
+    self.alive = dict.fromkeys(services, True)
     self.logMonoTime = dict.fromkeys(services, 0)
     self.updated = dict.fromkeys(services, True)
     self.recv_frame = dict.fromkeys(services, 1)
@@ -34,7 +35,7 @@ class MockSubMaster(dict):
 
 def build_sm() -> MockSubMaster:
   services = {}
-  for service in ("radarState", "carStateSP", "liveMapDataSP", "gpsLocationExternal", "gpsLocation"):
+  for service in ("radarState", "carStateSP", "liveMapDataSP", "gpsLocationExternal", "gpsLocation", "customReserved10"):
     services[service] = getattr(messaging.new_message(service), service)
 
   # engaged on openpilot long: longcontrol running, so the planner does not reset
@@ -105,6 +106,6 @@ class TestExperimentalGate(OpenpilotTestCase):
     sm['controlsState'] = controls_state.as_reader()
     seen = []
     update = planner.e2e_set_speed.update
-    planner.e2e_set_speed.update = lambda *args: seen.append(args[-1]) or update(*args)
+    planner.e2e_set_speed.update = lambda *args: seen.append(args[5]) or update(*args)  # steer_lat_accel, before v_cruise
     planner.update(sm)
     assert seen == [pytest.approx(0.002 * V_EGO ** 2)]

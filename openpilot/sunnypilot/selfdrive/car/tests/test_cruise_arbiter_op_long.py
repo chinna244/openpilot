@@ -50,6 +50,7 @@ class TestOpLongNonPcmDismiss:
     lp.speedLimit.resolver.speedLimit = self.LIMIT_MPH * CV.MPH_TO_MS
     lp.speedLimit.resolver.speedLimitFinalLast = self.LIMIT_MPH * CV.MPH_TO_MS
     lp.speedLimit.resolver.speedLimitLastValid = True
+    lp.speedLimit.resolver.speedLimitValid = True
     h.update_speed_limit_assist(is_metric, lp)
     return h
 

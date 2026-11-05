@@ -191,8 +191,15 @@ sections:
         label: Car State Priority
       - value: 3
         label: Map Data Priority
+      - value: 5
+        label: Vision Priority
       - value: 4
         label: Combined
+    - key: SpeedLimitVision
+      widget: toggle
+      title: Camera Sign Reading
+      description: Read speed limit signs with the road camera; a sign holds until the road changes. Vision Priority
+        uses the camera sign, else Car, else Map. Combined uses the camera sign, else Map, else Car.
     - key: SpeedLimitOffsetType
       widget: multiple_button
       title: Speed Limit Offset Type

@@ -53,6 +53,7 @@ class TestSetpointReconcile:
     LP_SP.speedLimit.resolver.speedLimit = limit_kph * CV.KPH_TO_MS
     LP_SP.speedLimit.resolver.speedLimitFinalLast = limit_kph * CV.KPH_TO_MS
     LP_SP.speedLimit.resolver.speedLimitLastValid = limit_kph > 0
+    LP_SP.speedLimit.resolver.speedLimitValid = limit_kph > 0
     CC_SP = custom.CarControlSP()
     CC_SP.intelligentCruiseButtonManagement.state = icbm_state
     self.v_cruise_helper.update_speed_limit_assist(self.is_metric, LP_SP)
@@ -62,7 +63,7 @@ class TestSetpointReconcile:
     arb = self.v_cruise_helper.cruise_arbiter
     arb.enabled = True
     arb.state = getattr(custom.LongitudinalPlanSP.SpeedLimit.AssistState, sla_state)
-    arb._speed_limit_prev = arb._speed_limit  # regime setup is not a limit-change edge
+    arb._slf_prev = arb._slf  # regime setup is not a limit-change edge
 
   def run_frames(self, CS, n=1, enabled=True):
     for _ in range(n):
