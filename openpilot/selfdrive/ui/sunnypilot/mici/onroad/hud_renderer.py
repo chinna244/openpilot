@@ -9,13 +9,16 @@ import pyray as rl
 from openpilot.common.filter_simple import FirstOrderFilter
 from openpilot.selfdrive.ui.mici.onroad.hud_renderer import SET_SPEED_PERSISTENCE, HudRenderer
 from openpilot.selfdrive.ui.sunnypilot.onroad.blind_spot_indicators import BlindSpotIndicators
-from openpilot.selfdrive.ui.sunnypilot.onroad.speed_assist_badge import draw_gauge_centered
+from openpilot.selfdrive.ui.sunnypilot.onroad.speed_assist_badge import GAUGE_ASPECT, draw_gauge_centered
 from openpilot.selfdrive.ui.ui_state import ChestnutState, UIStatus, ui_state
 from openpilot.system.ui.lib.application import gui_app
 
 # zoompilot's Set Speed Assist gauge mirrors the steering wheel in the bottom-right corner
 SPEED_ASSIST_HEIGHT = 44  # the wheel is 50, and round; the gauge's swoosh carries it to the same weight
 SPEED_ASSIST_ALPHA = 0.9
+# the AEB-off marker beside the gauge: 46x38 of its 60x50 fits between the gauge and the torque arc's end (x 415)
+AEB_OFF_BESIDE = (46, 38)
+AEB_OFF_GAP = 4  # px
 
 
 class HudRendererSP(HudRenderer):
@@ -50,6 +53,18 @@ class HudRendererSP(HudRenderer):
     if state not in (ChestnutState.UNCOMPILED, ChestnutState.FAILED, ChestnutState.ACTIVE):
       return False
     return rl.get_time() - self._chestnut_fade_time < SET_SPEED_PERSISTENCE
+
+  def _aeb_off_rect(self, rect: rl.Rectangle) -> rl.Rectangle:
+    # beside the gauge, shrunk to fit between it and the torque arc's end and centred on it; slides with the
+    # gauge's fade (last frame's: it draws after the marker)
+    corner = super()._aeb_off_rect(rect)
+    s = self._speed_assist_alpha_filter.x / SPEED_ASSIST_ALPHA
+    if s < 1e-2:
+      return corner
+    w, h = AEB_OFF_BESIDE
+    cx, cy = rect.x + rect.width - 21 - self._txt_wheel.width / 2, rect.y + rect.height - 14 - self._txt_wheel.height / 2
+    beside = (cx - GAUGE_ASPECT * SPEED_ASSIST_HEIGHT / 2 - AEB_OFF_GAP - w, cy - h / 2, w, h)
+    return rl.Rectangle(*(c + s * (b - c) for c, b in zip((corner.x, corner.y, corner.width, corner.height), beside, strict=True)))
 
   def _draw_speed_assist(self, rect: rl.Rectangle) -> None:
     # comes and goes with the wheel, and swaps in once the model icon is done with the shared corner
