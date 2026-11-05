@@ -1223,12 +1223,14 @@ class TestModelsPanelMici:
                                              "camera offset", "jetlink", "small model steer", "refresh models", "clear cache"]
     assert {item._get_label_font_size() for item in items} == {BigButton("t")._get_label_font_size()}, "a long title shrinks its font"
 
-  def test_the_default_model_locks_small_model_steering(self, monkeypatch):
+  def test_the_default_model_and_a_chestnut_lock_small_model_steering(self, monkeypatch):
     from openpilot.selfdrive.ui.ui_state import ui_state
     options = self._options()
     for runner_tinygrad in (False, True):
-      monkeypatch.setattr(ui_state, "active_runner_tinygrad", runner_tinygrad)
-      assert options.small_steering.enabled is runner_tinygrad
+      for chestnut in (False, True):
+        monkeypatch.setattr(ui_state, "active_runner_tinygrad", runner_tinygrad)
+        monkeypatch.setattr(ui_state, "chestnut_present", chestnut)
+        assert options.small_steering.enabled is (runner_tinygrad and not chestnut)
 
   def test_lane_center_cycles_off_on_debug(self, params):
     params.put_bool("Blendful", False, block=True)
@@ -1318,7 +1320,7 @@ class TestSpeedAssistBadge:
     ("ENGAGED", "ACTIVE", True),
   ])
   def test_follows_the_wheel(self, params, monkeypatch, status, chestnut, shown):
-    from openpilot.selfdrive.ui.sunnypilot.mici.onroad.hud_renderer import HudRendererSP
+    from openpilot.selfdrive.ui.sunnypilot.mici.onroad.hud_renderer import SPEED_ASSIST_ALPHA, HudRendererSP
     from openpilot.selfdrive.ui.ui_state import ChestnutState, UIState, UIStatus, ui_state
 
     monkeypatch.setattr(UIState, "speed_assist_active", property(lambda _: True))
@@ -1326,7 +1328,7 @@ class TestSpeedAssistBadge:
     monkeypatch.setattr(ui_state, "chestnut_state", ChestnutState[chestnut])
     drawn = self._settle(HudRendererSP(), monkeypatch)
     if shown:
-      assert drawn and drawn[-1][3] > 0.85
+      assert drawn and drawn[-1][3] == pytest.approx(SPEED_ASSIST_ALPHA, abs=0.02)
     else:
       assert not drawn
 
