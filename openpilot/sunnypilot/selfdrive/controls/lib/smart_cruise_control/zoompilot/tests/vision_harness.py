@@ -116,11 +116,14 @@ class VisionCase:
     return SmartCruiseControlVision(make_cp(op_long=False))
 
   def make_sm(self, v: float, kappa_fn, cur_curvature: float = 0., v_model: float | None = None,
-              attenuate: bool = False, big: bool = False) -> Any:
+              attenuate: bool = False, big: bool = False, v_car: float | None = None) -> Any:
+    """v_car is carState.vEgo where it differs from the filtered speed the planner hands the controller."""
     controls_state = messaging.new_message('controlsState')
     controls_state.controlsState.curvature = float(cur_curvature)
+    car_state = messaging.new_message('carState')
+    car_state.carState.vEgo = float(v if v_car is None else v_car)
     return {'modelV2': model_for_road(v, kappa_fn, v_model, attenuate, big).modelV2,
-            'controlsState': controls_state.controlsState}
+            'controlsState': controls_state.controlsState, 'carState': car_state.carState}
 
   def run_road(self, v: float, kappa_fn, n: int = 3, cur_curvature: float = 0.,
                v_model: float | None = None, setpoint: float = SETPOINT,

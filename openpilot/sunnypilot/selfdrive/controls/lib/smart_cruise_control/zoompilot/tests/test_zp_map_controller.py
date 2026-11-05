@@ -33,6 +33,8 @@ class FakeSM(dict):
     super().__init__()
     self.service = service
     self.logMonoTime = {'modelV2': 0, service: 0}
+    self.valid = {'liveMapDataSP': True}
+    self.alive = {'liveMapDataSP': True}
     self.fresh = True
     self.fix(0., 0.)
 
@@ -107,6 +109,240 @@ class TestSmartCruiseControlMap(OpenpilotTestCase):
     for _ in range(40):
       self.scc_m.update(self.sm.tick(), True, False, v_ego, 0., 25.)
     assert self.scc_m.output_a_target == pytest.approx(expected, abs=1e-3)
+
+  def test_kinked_highway_target_relaxed(self):
+    """A sweeping bend mapped as one kinked node (route 18b 465 s): at speed the node's 15 m/s
+    is relaxed to the bend's 100 m curve speed, so the car does not brake to 15"""
+    lat0, lon0 = 32.0, -117.0
+    m_per_deg = R * math.pi / 180.
+    targets, north, east = [], 0., 0.
+    for i in range(21):
+      targets.append({"latitude": lat0 + north / m_per_deg, "longitude": lon0 + east / (m_per_deg * math.cos(math.radians(lat0))),
+                      "velocity": 15.0 if i == 10 else 40.0})
+      h = 0. if i < 10 else math.radians(20.)
+      north, east = north + 30. * math.cos(h), east + 30. * math.sin(h)
+    self.sm.fix(lat0, lon0)  # bearing 0: heading north along the road
+    self.mem_params.put("MapTargetVelocities", json.dumps(targets), block=True)
+
+    # without a model path the camera cannot agree: mapd's 15 binds
+    self.bind(self.scc_m, 27., 40.)
+    assert self.scc_m.v_target == pytest.approx(15.)
+
+    # the camera sees the road straight to 600 m, but a gps bearing of exactly 0 is "no course": not judged
+    model = messaging.new_message('modelV2').modelV2
+    model.position.x = np.linspace(0., 600., 33).tolist()
+    model.position.y = [0.] * 33
+    self.sm['modelV2'] = model
+    self.bind(self.scc_m, 27., 40.)
+    assert self.scc_m.v_target == pytest.approx(15.)
+
+    # with a course (just west of north): relaxed, and the bound 15 is released
+    self.sm[self.sm.service].bearingDeg = 359.9
+    self.bind(self.scc_m, 27., 40.)
+    assert self.scc_m.v_target != pytest.approx(15.)
+    assert self.scc_m.v_target in (0., pytest.approx(23.94, abs=0.01))
+
+  def test_lowered_target_stays_bound(self):
+    """A bound relaxed target that the camera then reads tighter is lowered in place: same target, no
+    release, no new confirmation wait"""
+    lat0, lon0 = 32.0, -117.0
+    m_per_deg = R * math.pi / 180.
+    targets, north, east = [], 0., 0.
+    for i in range(21):
+      targets.append({"latitude": lat0 + north / m_per_deg, "longitude": lon0 + east / (m_per_deg * math.cos(math.radians(lat0))),
+                      "velocity": 15.0 if i == 10 else 40.0})
+      h = 0. if i < 10 else math.radians(20.)
+      north, east = north + 30. * math.cos(h), east + 30. * math.sin(h)
+    self.sm.fix(lat0, lon0)
+    self.sm[self.sm.service].bearingDeg = 359.9
+    self.mem_params.put("MapTargetVelocities", json.dumps(targets), block=True)
+    model = messaging.new_message('modelV2').modelV2
+    model.position.x = np.linspace(0., 600., 301).tolist()
+    model.position.y = [0.] * 301
+    self.sm['modelV2'] = model
+    self.bind(self.scc_m, 32., 40.)
+    assert self.scc_m.v_target == pytest.approx(23.94, abs=0.01)
+    age = self.scc_m.candidate_age
+
+    # the camera now sees 0.15 rad at the kink (20.0 m/s over the 30 m chords)
+    x = np.linspace(0., 600., 301)
+    model.position.y = np.where(x < 300., 0., (x - 300.) * math.tan(0.15)).tolist()
+    self.sm['modelV2'] = model
+    self.scc_m.update(self.sm.tick(), True, False, 32., 0., 40.)
+    assert self.scc_m.v_target == pytest.approx(20.0, abs=0.01)
+    assert self.scc_m.candidate_age == age + 1
+
+  def test_lowered_target_retained_under_the_gate(self):
+    """The car has already slowed to 21 m/s, so the relaxed target no longer passes the commit gate but is
+    still ahead: retained, and the camera's lower reading moves it in place"""
+    lat0, lon0 = 32.0, -117.0
+    m_per_deg = R * math.pi / 180.
+    targets, north, east = [], 0., 0.
+    for i in range(21):
+      targets.append({"latitude": lat0 + north / m_per_deg, "longitude": lon0 + east / (m_per_deg * math.cos(math.radians(lat0))),
+                      "velocity": 15.0 if i == 10 else 40.0})
+      h = 0. if i < 10 else math.radians(20.)
+      north, east = north + 30. * math.cos(h), east + 30. * math.sin(h)
+    self.sm.fix(lat0, lon0)
+    self.sm[self.sm.service].bearingDeg = 359.9
+    self.mem_params.put("MapTargetVelocities", json.dumps(targets), block=True)
+    x = np.linspace(0., 600., 301)
+    model = messaging.new_message('modelV2').modelV2
+    model.position.x = x.tolist()
+    model.position.y = [0.] * 301
+    self.sm['modelV2'] = model
+    self.bind(self.scc_m, 32., 40.)
+    assert self.scc_m.v_target == pytest.approx(23.94, abs=0.01)
+
+    model.position.y = np.where(x < 300., 0., (x - 300.) * math.tan(0.15)).tolist()
+    self.sm['modelV2'] = model
+    self.scc_m.update(self.sm.tick(), True, False, 21., 0., 40.)
+    assert self.scc_m.v_target == pytest.approx(20.0, abs=0.01)
+    assert 250. < self.scc_m.target_distance < 310.
+
+  def approach_real_curve(self, v_cam, seed=0):
+    """Drive at a real curve mapped as one 20 deg node (mapd 15 m/s) 600 m ahead, the camera reading
+    it at v_cam(distance, rng) m/s; returns the speed reaching it and how often a bound target dropped"""
+    rng = np.random.default_rng(seed)
+    lat0, lon0 = 32.0, -117.0
+    m_per_deg = R * math.pi / 180.
+    targets, north, east = [], 0., 0.
+    for i in range(41):
+      targets.append({"latitude": lat0 + north / m_per_deg, "longitude": lon0 + east / (m_per_deg * math.cos(math.radians(lat0))),
+                      "velocity": 15.0 if i == 20 else 40.0})
+      h = 0. if i < 20 else math.radians(20.)
+      north, east = north + 30. * math.cos(h), east + 30. * math.sin(h)
+    self.mem_params.put("MapTargetVelocities", json.dumps(targets), block=True)
+    s, v, prev, releases = 100., 27., 0., 0
+    while s < 595.:
+      self.sm.fix(lat0 + s / m_per_deg, lon0)
+      self.sm[self.sm.service].bearingDeg = 359.9
+      d = 600. - s
+      if v_cam is not None:
+        x = np.linspace(0., 300., 61)
+        turn = 60. / v_cam(d, rng) ** 2  # the 30 m chord's heading change for that curve speed
+        model = messaging.new_message('modelV2').modelV2
+        model.position.x = x.tolist()
+        model.position.y = np.where(x > d, (x - d) * math.tan(turn), 0.).tolist()
+        self.sm['modelV2'] = model
+      self.scc_m.update(self.sm.tick(), True, False, v, 0., 40.)
+      releases += bool(prev and not self.scc_m.v_target)
+      prev = self.scc_m.v_target
+      v = max(0., v + min(0., self.scc_m.output_a_target if self.scc_m.v_target else 0.) * DT_MDL)
+      s += v * DT_MDL
+    return v, releases
+
+  def test_real_curve_braking_kept_with_camera(self):
+    """The camera reads a real curve near mapd's speed, noisily or tightening as it nears (review of the
+    relaxation): a bound target is never dropped, noise changes nothing, and a camera that reads the curve
+    gentle (18.5 m/s) until 150 m out still has the car take it under 2.8 m/s2 (mapd's 15 m/s at 2.0 is a
+    112.5 m radius; it arrives at 17.0 m/s, 2.57 m/s2)"""
+    v_map, rel = self.approach_real_curve(None)
+    assert rel == 0 and v_map == pytest.approx(16.27, abs=0.01)
+    for v_cam, seed, same in [(lambda d, r: 15., 0, True), (lambda d, r: 16. + r.normal(0., 1.2), 1, True),
+                              (lambda d, r: 16. + r.normal(0., 1.2), 2, True), (lambda d, r: 17. + r.normal(0., 0.7), 3, True),
+                              (lambda d, r: 18.5 if d > 150. else 15.5 + 3. * max(d - 100., 0.) / 50., 0, False)]:
+      self.scc_m = SmartCruiseControlMap(structs.CarParams(brand="mazda", openpilotLongitudinalControl=True, longitudinalActuatorDelay=0.36))
+      self.sm = FakeSM(self.scc_m.gps_location_service)
+      v, rel = self.approach_real_curve(v_cam, seed)
+      assert rel == 0
+      assert v ** 2 / (15. ** 2 / 2.0) <= 2.6
+      if same:
+        assert v == pytest.approx(v_map, abs=0.01)
+
+  def test_real_curve_read_gentle_until_100_m(self):
+    """The accepted exposure, pinned: a camera that reads a real curve gentle (22 m/s) until 100 m out
+    lets the car arrive at 19.1 m/s, 3.25 m/s2 on that curve (review 3); mapd alone arrives at 16.27"""
+    v, rel = self.approach_real_curve(lambda d, r: 22. if d > 100. else 15.)
+    assert rel == 0
+    assert v == pytest.approx(19.1, abs=0.1)
+
+  def test_kinked_target_relaxed_heading_east(self):
+    """The same road heading east: the camera check finds the kink along the gps bearing"""
+    lat0, lon0 = 32.0, -117.0
+    m_per_deg = R * math.pi / 180.
+    targets, north, east = [], 0., 0.
+    for i in range(21):
+      targets.append({"latitude": lat0 + north / m_per_deg, "longitude": lon0 + east / (m_per_deg * math.cos(math.radians(lat0))),
+                      "velocity": 15.0 if i == 10 else 40.0})
+      h = 0. if i < 10 else math.radians(20.)
+      north, east = north + 30. * math.sin(h), east + 30. * math.cos(h)
+    self.sm.fix(lat0, lon0)
+    self.sm[self.sm.service].bearingDeg = 90.
+    self.mem_params.put("MapTargetVelocities", json.dumps(targets), block=True)
+    # the camera sees the road straight to 600 m; the kink lies 300 m ahead only along a 90 deg bearing
+    model = messaging.new_message('modelV2').modelV2
+    model.position.x = np.linspace(0., 600., 33).tolist()
+    model.position.y = [0.] * 33
+    self.sm['modelV2'] = model
+    self.bind(self.scc_m, 27., 40.)
+    assert self.scc_m.v_target != pytest.approx(15.)
+    assert self.scc_m.v_target in (0., pytest.approx(23.94, abs=0.01))
+
+  def _reversal(self, start, v=2.):
+    """mapd's list from start m ahead, doubling back at its third node (route 17a, the bridge); the car heads east"""
+    lat0, lon0 = 32.0, -117.0
+    m_per_deg = R * math.pi / 180.
+    targets, ahead, right = [], start, 0.
+    for i in range(8):
+      # heading east: ahead is east, right is south
+      targets.append({"latitude": lat0 - right / m_per_deg, "longitude": lon0 + ahead / (m_per_deg * math.cos(math.radians(lat0))),
+                      "velocity": v if 1 <= i <= 3 else 40.0})
+      h = 0. if i < 2 else math.radians(150.)
+      ahead, right = ahead + 20. * math.cos(h), right + 20. * math.sin(h)
+    self.sm.fix(lat0, lon0)
+    self.sm[self.sm.service].bearingDeg = 90.
+    self.mem_params.put("MapTargetVelocities", json.dumps(targets), block=True)
+
+  def _straight_model(self):
+    model = messaging.new_message('modelV2').modelV2
+    model.position.x = np.linspace(0., 200., 33).tolist()
+    model.position.y = [0.] * 33
+    self.sm['modelV2'] = model
+
+  def _fresh(self, model: bool):
+    self.scc_m = SmartCruiseControlMap(structs.CarParams(brand="mazda", openpilotLongitudinalControl=True, longitudinalActuatorDelay=0.36))
+    self.sm = FakeSM(self.scc_m.gps_location_service)
+    if model:
+      self._straight_model()
+
+  def test_reversal_on_a_straight_road_dropped(self):
+    """With the camera seeing the road straight, the reversal's targets are dropped; not below 15 mph,
+    where a gps course is unreliable"""
+    self._fresh(model=True)
+    self._reversal(5.)
+    self.bind(self.scc_m, 6.7, 20.)
+    assert self.scc_m.v_target == 0.
+    self._fresh(model=True)
+    self._reversal(5.)
+    self.bind(self.scc_m, 6.6, 20.)
+    assert self.scc_m.v_target == pytest.approx(2.)
+
+  def test_reversal_target_being_braked_for_is_kept(self):
+    """A target bound before the guard could judge it (here: no model path yet) is not dropped"""
+    self._fresh(model=False)
+    self._reversal(5.)
+    self.bind(self.scc_m, 6.7, 20.)
+    assert self.scc_m.v_target == pytest.approx(2.)
+    self._straight_model()
+    self.bind(self.scc_m, 6.7, 20.)
+    assert self.scc_m.v_target == pytest.approx(2.)
+
+  def test_reversal_judged_on_the_reckoned_position(self):
+    """Between 1 Hz fixes the reversal node (65 m from the fix) comes within the 60 m judged as the car
+    covers the road, before its 7 m/s targets would bind"""
+    first = {}
+    for model in (False, True):
+      self._fresh(model)
+      self._reversal(25., v=7.)
+      self.sm.fresh = False
+      bound = []
+      for _ in range(int(2.9 / DT_MDL)):
+        self.scc_m.update(self.sm.tick(), True, False, 10., 0., 20.)
+        bound.append(self.scc_m.v_target)
+      first[model] = next((i for i, v in enumerate(bound) if v != 0.), None)
+    assert first[False] is not None and first[False] == 12  # 0.6 s: the node is in reach by then
+    assert first[True] is None
 
   def test_retained_target_tracks_distance(self):
     """A target that slips under the commit gate while still ahead (the car is already

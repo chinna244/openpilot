@@ -15,7 +15,7 @@ from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import T_IDX
 from openpilot.selfdrive.controls.lib.longitudinal_planner import LongitudinalPlanner, LongitudinalPlanSource
 from openpilot.sunnypilot.selfdrive.car.tests.fakes import FakeParams
 from openpilot.sunnypilot.selfdrive.controls.lib.tests.test_experimental_gate import build_planner, build_sm
-from openpilot.sunnypilot.selfdrive.controls.lib.e2e_set_speed.controller import E2ESetSpeedController, Inhibit, approach_accel
+from openpilot.sunnypilot.selfdrive.controls.lib.e2e_set_speed.controller import E2ESetSpeedController, Inhibit
 
 MODEL_ACCEL = 0.
 
@@ -70,11 +70,11 @@ def test_off_is_upstream():
 def test_on_raises_the_e2e_candidate():
   planner = run_planner(True)
   assert planner.e2e_set_speed.inhibit == Inhibit.none
-  # the model holding at 0 under the set speed: lifted at the approach pace, below the cruise law's
-  approach = approach_accel(planner.v_ego, planner.output_v_target)
-  assert planner.e2e_set_speed.lift == pytest.approx(approach)
-  assert planner.output_a_target == pytest.approx(approach)
-  assert planner.a_cruise > 1. > approach
+  # the model holding at 0 under the set speed: lifted toward chill's answer, held to the ceiling for
+  # 20 m/s (0.7 m/s^2, local tuning)
+  assert planner.e2e_set_speed.lift == pytest.approx(0.7)
+  assert planner.output_a_target == pytest.approx(0.7)
+  assert planner.a_cruise > 1.
 
 
 def test_behind_a_lead_follows_as_chill():
@@ -109,7 +109,7 @@ def test_throttle_probability_reaches_the_floor():
   for _ in range(200):
     planner.update(sm)
   assert planner.e2e_set_speed.gain == pytest.approx(0.25)
-  assert planner.e2e_set_speed.lift == pytest.approx(0.25 * planner.e2e_set_speed.floor, rel=1e-3)
+  assert planner.e2e_set_speed.lift == pytest.approx(0.25 * 0.7, rel=1e-3)
 
 
 def gas_pressed_planner(enabled: bool) -> LongitudinalPlanner:

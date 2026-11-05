@@ -182,7 +182,7 @@ class LongitudinalPlannerSP:
     longitudinalPlanSP = plan_sp_send.longitudinalPlanSP
     longitudinalPlanSP.longitudinalPlanSource = self.source
     longitudinalPlanSP.vTarget = float(self.output_v_target)
-    longitudinalPlanSP.aTarget = float(self.output_a_target)
+    longitudinalPlanSP.aTarget = float(getattr(self, 'a_target_published', self.output_a_target))
     longitudinalPlanSP.events = self.events_sp.to_msg()
 
     # Smart Cruise Control

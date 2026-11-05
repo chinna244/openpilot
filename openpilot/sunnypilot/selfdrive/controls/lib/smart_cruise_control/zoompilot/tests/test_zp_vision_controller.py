@@ -60,7 +60,7 @@ class TestHoldSetSpeed(VisionCase):
   def test_distant_curve_holds_set_speed(self):
     # a curve 185 m out, as the model actually reports one at that range: even with the
     # under-read corrected it asks well under the 0.7 * 1.2 commit, so the car holds
-    self.run_road(V_EGO, curve_at(185., kappa=0.012), attenuate=True)
+    self.run_road(V_EGO, curve_at(185., kappa=0.015), attenuate=True)  # 0.012 under the 2.2 ceiling, scaled to 2.8
     assert self.scc_v.state == VisionState.enabled
     assert self.scc_v.output_v_target == V_CRUISE_UNSET
     assert 0. < self.scc_v.a_required < 0.84
@@ -146,7 +146,7 @@ class TestFarFieldCurvatureBias(VisionCase):
 
   def test_bias_correction_commits_earlier(self):
     # Bias correction moves the reported corner above the commit threshold.
-    road = curve_at(110., kappa=0.013)
+    road = curve_at(110., kappa=0.015)
     self.run_road(V_EGO, road, attenuate=True)
     assert self.scc_v.is_active
 
@@ -255,9 +255,15 @@ class TestCurveRecovery(VisionCase):
     speeds = vision_controller.curve_speed(np.linspace(0.0005, 0.03, 200))
     assert np.all(np.diff(speeds) < 0)
 
+  def test_curves_are_taken_at_this_drivers_own_lateral_acceleration(self):
+    # a 50 m radius at 2.8 m/s2 (less the 5 % margin) by 35 mph; 2.8 at 55 mph and 2.6 at 70 mph
+    assert float(vision_controller.curve_speed(0.02)) == pytest.approx((2.8 * 0.95 / 0.02) ** 0.5, rel=1e-3)
+    assert float(vision_controller.curve_speed(2.8 * 0.95 / 24.6 ** 2)) == pytest.approx(24.6, rel=1e-3)
+    assert float(vision_controller.curve_speed(2.6 * 0.95 / 31.3 ** 2)) == pytest.approx(31.3, rel=1e-3)
+
   def test_stock_target_rises_to_the_profile_below_the_allowed_speed(self):
     scc = self.commit(self.stock())
-    v = 14.  # just under the curve's allowed speed
+    v = float(vision_controller.curve_speed(self.KAPPA)) - 0.4  # just under the curve's allowed speed
     self.in_curve(scc, v)
     assert scc.solver_active and scc.a_required == 0.
     assert v < scc.v_near_min < v + 1.
@@ -273,3 +279,24 @@ class TestCurveRecovery(VisionCase):
     assert scc.output_v_target == V_CRUISE_UNSET
     # the restore is still capped at the curve by the lookahead
     assert scc.v_ahead_min < SETPOINT
+
+
+class TestPlannedStop(VisionCase):
+  """Yaw-rate noise over a plan that has all but stopped is no bend (route 00000163 909 s)."""
+
+  def test_noise_at_a_planned_stop_is_not_a_curve(self):
+    # 45 mph, the plan slowing to 3 m/s, a steady 0.023 rad/s: rate / speed would read a 130 m bend
+    self.run_road(20., lambda s: 0.023 / 3., v_model=3.)
+    assert self.scc_v.state == VisionState.enabled
+    assert not self.scc_v.solver_active
+    assert self.scc_v.output_v_target == V_CRUISE_UNSET
+
+  def test_a_turn_planned_slowly_from_a_slow_car_keeps_its_curvature(self):
+    # pulling into a corner: the car is as slow as the plan, so the curvature stands
+    self.run_road(4., lambda s: CURVE_KAPPA, v_model=3.)
+    assert np.isfinite(self.scc_v.v_near_min)
+
+  def test_a_bend_planned_just_over_the_cut_keeps_its_curvature(self):
+    # 45 mph, the plan at 5 m/s: over the 4.5 m/s cut, so the bend is read even though the car is 4x faster
+    self.run_road(20., lambda s: CURVE_KAPPA, v_model=5.)
+    assert np.isfinite(self.scc_v.v_near_min)

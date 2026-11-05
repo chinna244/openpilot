@@ -30,7 +30,16 @@ __all__ = ['ACTIVE_STATES', 'ENABLED_STATES', 'SmartCruiseControlVision', 'Visio
 # curve's own speed, not the set speed. Tolerance falls with speed, but banked highway curves
 # (2.5-4 deg) hide 0.4-0.65 m/s2, so the ceiling dips mid-range and recovers (doc).
 _A_LAT_CURVE_BP = [15.6, 24.6, 31.3]  # m/s curve speed; 35, 55, 70 mph
-_A_LAT_CURVE = [2.2, 2.1, 2.2]
+# Local tuning (zoompilot 2.2, 2.1, 2.2): this driver's own turns peak at a median 2.4 m/s2 at 15-24 mph (31 turns,
+# routes 0000014e-00000163), and the model's own plan took a 210 m bend at about 2.6 (route 00000160 830 s) where
+# 2.0 held the car 7 mph under it.
+# This driver's own curves (gyro yaw rate x speed, routes 00000160-0000018f, 107 curves): taken without slowing, apex
+# 2.5 to 3.1 m/s2 median and 3.6 to 3.8 p90 at 20-40 mph, 1.6 to 1.7 median and 2.0 to 2.4 p90 from 50 mph, and up to
+# 2.9 at p90 where curve control slowed the car and the driver pressed the gas. Replayed on 41 drives (closed loop):
+# town curves braked 47 -> 38 (101 -> 73 s), highway 15 -> 12 (50 -> 32 s). The town value stops at 2.8: with the
+# actuator lag a hairpin entered from a stop peaks 0.9 over it (3.8 at r = 15 m, about this driver's own p90), and 3.5
+# would put loops at 4.0-4.5.
+_A_LAT_CURVE = [2.8, 2.8, 2.6]
 # Reserve margin for actuation delay at the apex.
 _PLAN_MARGIN = 0.95
 # The same table by curvature (ascending), so each point's ceiling needs no speed solve.
@@ -83,6 +92,32 @@ _NEAR_T = 3.0  # s
 _NEAR_T_BIG = 4.0  # s
 
 _V_FLOOR = 0.5  # m/s; model velocity floor when converting yaw rate to curvature
+# Where the plan has all but stopped and the car has not, yaw-rate noise over that speed reads as a sharp bend
+# (route 00000163 909 s: 0.023 rad/s at a planned 8 mph, a 156 m "curve" on a straight approach to a stop). Those
+# points carry no curvature; a plan that slow is already under any bend that matters.
+_KAPPA_V_MIN = 4.5  # m/s
+_KAPPA_V_FRAC = 0.5  # of vEgo
+
+# Floor turns. Pulling away from a signal on openpilot long, the car crosses MIN_V mid-turn in a
+# corner tighter than the floor allows, and a cycle started there can only hold MIN_V: the pull-away
+# pauses at the exit (routes 0000014b, 00000151-153). A corner the car is already turning through
+# near the floor is left to the plan until the solver releases it, unless the car would reach
+# _FLOOR_TURN_LAT_CAP on the curvature past the actuation lead _FLOOR_TURN_PROJ_T on (the turn goes
+# on: loops, hairpins, a tightening corner), or gets more than the in-curve margin over the curve.
+_FLOOR_TURN_LAT_ACC = 1.6  # m/s2, already turning
+_FLOOR_TURN_LAT_CAP = 2.8  # m/s2; at this cap synthetic R15/R20 loops from a stop peaked as before under the 2.4 ceiling
+_FLOOR_TURN_PROJ_T = 1.0  # s
+
+# In-turn braking (openpilot long, town speed). Through an intersection corner the near field still reads the bend
+# the car is in, and the solver held -1.2 until the exit, where this driver was already back on the gas (13 of 22
+# episodes, routes 00000166-0000016e). Once the car is turning, braking stops at _IN_TURN_A_MIN unless the turn past
+# the actuation lead would put the car over _IN_TURN_ESCAPE_LAT. Closed-loop replay through the host's speed filter,
+# cruise candidate and actuator lag over 35 episodes (28 drives): town in-turn braking under -0.55 12.7 s -> 4.3 s,
+# +0.1 mph mean, worst corner 4.26 m/s2 as without the cap (route 00000167 318 s, a turn the escape hands back).
+_IN_TURN_V_MAX = 15.6  # m/s, 35 mph
+_IN_TURN_LAT_ACC = 1.6  # m/s2, current lateral acceleration that counts as turning
+_IN_TURN_A_MIN = -0.5  # m/s2
+_IN_TURN_ESCAPE_LAT = 3.5  # m/s2, lateral acceleration past the actuation lead that restores full braking
 
 # UI state thresholds do not affect control output.
 _TURNING_LAT_ACC_TH = 1.6  # current lat acc above this displays as turning
@@ -101,6 +136,7 @@ class SmartCruiseControlVision(UpstreamVision):
     self.limits = get_planning_limits(CP)
     self._reset_solver()
     self.a_out = 0.
+    self.v_ego_car = 0.
 
   def _reset_solver(self) -> None:
     self.solver_valid = False
@@ -114,6 +150,8 @@ class SmartCruiseControlVision(UpstreamVision):
     self.d_held = 0.  # and its remaining distance
     self.seen_frames = 0  # consecutive frames a bend has bound
     self.max_pred_lat_acc = 0.
+    self.lat_ahead = 0.  # lateral acceleration past the actuation lead, _FLOOR_TURN_PROJ_T on
+    self.floor_turn = False  # the curve is a floor turn left to the plan
 
   def _update_calculations(self, sm: messaging.SubMaster) -> None:
     if not self.long_enabled or not self.enabled:
@@ -130,9 +168,12 @@ class SmartCruiseControlVision(UpstreamVision):
       return
 
     self.current_lat_acc = self.v_ego ** 2 * abs(sm['controlsState'].curvature)
+    # the planner hands this controller its filtered speed but builds the cruise candidate on carState.vEgo
+    self.v_ego_car = sm['carState'].vEgo
 
     # Derive speed-independent curvature from model geometry.
     kappa = rate_z / np.maximum(vel, _V_FLOOR)
+    kappa = np.where((vel < _KAPPA_V_MIN) & (vel < _KAPPA_V_FRAC * self.v_ego), 0., kappa)
     dist = np.empty_like(x)
     dist[0] = 0.
     dist[1:] = np.cumsum(np.hypot(np.diff(x), np.diff(y)))
@@ -160,6 +201,10 @@ class SmartCruiseControlVision(UpstreamVision):
       if np.isfinite(v_dip):
         t_lead += lim.dash_traversal_time(max(self.v_ego - max(v_dip, MIN_V), 0.))
     d_lead = lead_distance(self.v_ego, t_lead, lim.a_budget, lim.jerk(self.v_ego))
+    # kappa is a magnitude, so left and right turns read alike
+    past_lead = near & (dist >= d_lead)
+    v_soon = self.v_ego + max(self.a_ego, 0.) * _FLOOR_TURN_PROJ_T
+    self.lat_ahead = v_soon ** 2 * float(np.max(kappa[past_lead])) if np.any(past_lead) else 0.
 
     self.a_required = required_decel(self.v_ego, v_allowed, dist, d_lead)
     # What the car must still shed from here. The commit gate budgets the stock dash walk in
@@ -206,7 +251,17 @@ class SmartCruiseControlVision(UpstreamVision):
       self.v_dip_held = float(v_max[i_dip])
       self.d_held = float(dist[i_dip])
 
+  def _update_floor_turn(self) -> None:
+    band = MIN_V + _IN_CURVE_MARGIN
+    escape = self.v_ego > max(self.v_near_min, MIN_V) + _IN_CURVE_MARGIN or self.lat_ahead >= _FLOOR_TURN_LAT_CAP
+    if not self.solver_active or escape:
+      self.floor_turn = False
+    elif (self.limits.op_long and self.v_dip_ahead <= band and self.v_ego <= band and
+          self.current_lat_acc >= _FLOOR_TURN_LAT_ACC):
+      self.floor_turn = True
+
   def _update_state_machine(self) -> tuple[bool, bool]:
+    self._update_floor_turn()
     if self.state != VisionState.disabled:
       # Longitudinal and feature disable take priority over active states.
       if not self.long_enabled or not self.enabled:
@@ -219,7 +274,7 @@ class SmartCruiseControlVision(UpstreamVision):
           # Do not start a turn-control cycle below the operating speed.
           if self.v_ego <= MIN_V:
             pass
-          elif self.solver_active:
+          elif self.solver_active and not self.floor_turn:
             self.state = VisionState.entering
 
         elif self.state == VisionState.overriding:
@@ -281,7 +336,14 @@ class SmartCruiseControlVision(UpstreamVision):
       a_need = min(a_need, max(self.v_ego - self.v_dip_ahead, 0.))
     # Measured geometry may use the ECU's range past the budget; jerk-limit the published command.
     self.a_out = publish_ramp(-a_need, self.a_out, self.limits, self.v_ego, a_floor=A_PUB_MIN)
+    if self._in_turn_capped:
+      self.a_out = max(self.a_out, _IN_TURN_A_MIN)
     return self.a_out
+
+  @property
+  def _in_turn_capped(self) -> bool:
+    return (self.limits.op_long and self.v_ego < _IN_TURN_V_MAX and self.current_lat_acc >= _IN_TURN_LAT_ACC and
+            self.lat_ahead < _IN_TURN_ESCAPE_LAT)
 
   def get_v_target_from_control(self) -> float:
     if not self._controlling:
@@ -294,6 +356,10 @@ class SmartCruiseControlVision(UpstreamVision):
       v = min(self.v_profile_now, v_lead)
       if np.isfinite(self.v_dip_ahead):
         v = max(v, self.v_dip_ahead)
+      if self._in_turn_capped:
+        # the unit-gain cruise candidate brakes no harder than the in-turn cap either, on the measured speed it
+        # is built from as well as the filtered speed the MPC starts from
+        v = max(v, max(self.v_ego, self.v_ego_car) + _IN_TURN_A_MIN)
     else:
       # Pre-position the discrete stock-ACC setpoint at the horizon minimum, and lead vEgo down
       # only while braking: with nothing to brake for the dash follows the profile up.
