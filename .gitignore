@@ -9,6 +9,7 @@ venv/
 .idea
 .overlay_init
 .overlay_consistent
+.built_source
 .sconsign.dblite
 a.out
 .hypothesis
