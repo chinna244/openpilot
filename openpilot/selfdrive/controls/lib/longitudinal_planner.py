@@ -5,8 +5,6 @@ import openpilot.cereal.messaging as messaging
 from opendbc.car.interfaces import ACCEL_MIN, ACCEL_MAX
 from openpilot.common.constants import CV
 from openpilot.common.filter_simple import FirstOrderFilter
-from openpilot.common.gps import get_gps_location_service
-from openpilot.common.params import Params
 from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.modeld.constants import ModelConstants
 from openpilot.selfdrive.controls.lib.accel_boost import AccelBoost
@@ -18,8 +16,6 @@ from openpilot.selfdrive.car.cruise import V_CRUISE_MAX, V_CRUISE_UNSET
 from openpilot.common.swaglog import cloudlog
 
 from openpilot.sunnypilot.selfdrive.controls.lib.longitudinal_planner import LongitudinalPlannerSP
-from openpilot.sunnypilot.selfdrive.controls.lib.model_stop_line import GO_PLAN_T, ModelStopLine, model_stop_dist
-from openpilot.sunnypilot.selfdrive.controls.lib.stop_spots import StopSpots
 
 J_CRUISE_VALS = [1.6, 1.2, 0.8, 0.6]
 J_CRUISE_BP = [0., 10.0, 25., 40.]
@@ -61,9 +57,6 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
     self.fcw = False
     self.dt = dt
     self.accel_boost = AccelBoost()
-    self.stop_spots = StopSpots()
-    self.model_stop_line = ModelStopLine()
-    self.gps_location_service = get_gps_location_service(Params())
 
     self.v_desired_filter = FirstOrderFilter(init_v, 2.0, self.dt)
     self.a_cruise = init_a
@@ -224,44 +217,11 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
 
     output_a_target_e2e = self.accel_boost.update(sm, output_a_target_e2e, output_a_target_mpc, self.a_cruise)
 
-    # a stop line learned from the driver's stops, for the model's late stop signs (stop_spots.py)
-    a_stop_spot = None
-    if self.stop_spots.spots:
-      gps = sm[self.gps_location_service]
-      gps_fresh = sm.updated[self.gps_location_service] and gps.hasFix
-      a_stop_spot = self.stop_spots.update(gps.latitude, gps.longitude, gps.bearingDeg, gps.horizontalAccuracy, gps_fresh, v_ego,
-                                           sm['carState'].standstill,
-                                           # engaged and off the brake: the gas only pauses a stop (reset_state is set by it)
-                                           self.CP.openpilotLongitudinalControl and sm['selfdriveState'].enabled and
-                                           not sm['carState'].brakePressed,
-                                           self.gas_override or sm['carState'].gasPressed, sm['carState'].steeringAngleDeg,
-                                           gps.speed, list(sm['customReserved11'].lineDistances) if sm.updated['customReserved11'] else None,
-                                           sm['radarState'].leadOne.dRel if sm['radarState'].leadOne.present else None)
-
-    # the model's own stops placed before the first line painted across the lane (model_stop_line.py); the camera's bands
-    # (stop_line_detector) are a Mazda's only
-    a_model_stop = None
-    if self.CP.brand == "mazda":
-      md = sm['modelV2']
-      md_v = float(np.interp(GO_PLAN_T, ModelConstants.T_IDXS, md.velocity.x)) if len(md.velocity.x) == len(ModelConstants.T_IDXS) else None
-      a_model_stop = self.model_stop_line.update(v_ego, sm['carState'].standstill,
-                                                 self.CP.openpilotLongitudinalControl and sm['selfdriveState'].enabled and
-                                                 not sm['carState'].brakePressed,
-                                                 self.gas_override or sm['carState'].gasPressed, sm['carState'].steeringAngleDeg,
-                                                 model_stop_dist(list(md.velocity.x), list(md.position.x)),
-                                                 list(sm['customReserved11'].lineDistances) if sm.updated['customReserved11'] else None,
-                                                 sm['radarState'].leadOne.dRel if sm['radarState'].leadOne.present else None,
-                                                 md.action.desiredAcceleration, md_v)
-
     # while the gas is held only the published plan is lifted: the MPC and the filter restart from the plain one
     lift_published = reset_state and a_cruise > self.a_cruise
     candidates = [(output_a_target_mpc, self.mpc.source, output_should_stop_mpc),
                   (self.a_cruise if lift_published else a_cruise, LongitudinalPlanSource.cruise, cruise_should_stop),
                   (output_a_target_e2e, LongitudinalPlanSource.e2e, output_should_stop_e2e)]
-    if a_stop_spot is not None:
-      candidates.append((a_stop_spot, LongitudinalPlanSource.e2e, self.stop_spots.should_stop))
-    if a_model_stop is not None:
-      candidates.append((a_model_stop, LongitudinalPlanSource.e2e, self.model_stop_line.should_stop))
 
     output_a_target, self.mpc.source, _ = min(candidates, key=lambda c: c[0])
     self.output_should_stop = any(should_stop for _, _, should_stop in candidates)
