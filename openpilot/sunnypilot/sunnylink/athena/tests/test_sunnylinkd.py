@@ -36,6 +36,13 @@ class TestSunnylinkdMethods(OpenpilotTestCase):
       "GithubSshKeys": "ssh-rsa attacker_key",
       "OnroadCycleRequested": "1",
       "AlphaLongitudinalEnabled": "1",
+      "KonikUploadsEnabled": "1",
+      "KonikDongleId": "attacker",
+      "KonikUploadStatus": "fake success",
+      "KonikUploadControl": "fake requests",
+      "KonikCurrentUpload": "fake progress",
+      "KonikConnectionStatus": "fake connection",
+      "KonikLastAthenaPingTime": "123",
     }
 
     sunnylinkd.saveParams(blocked_params)

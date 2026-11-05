@@ -1,4 +1,6 @@
 import asyncio
+import contextlib
+import pytest
 import json
 import time
 
@@ -85,3 +87,131 @@ class TestStreamSession(OpenpilotTestCase):
     response = self.loop.run_until_complete(handle_get_stream(ServerState(), b"{}", "text/plain"))
 
     assert response == (415, b'{"error": "unsupported media type"}', "application/json; charset=utf-8")
+
+
+class TestCameraSwitchPolicy:
+  @pytest.mark.parametrize("camera", ["driver", "road", "wideRoad"])
+  def test_konik_session_allows_supported_camera_switch(self, mocker, camera):
+    from openpilot.system.webrtc.webrtcd import StreamSession
+    session = object.__new__(StreamSession)
+    session.konik = True
+    track = mocker.Mock()
+    session.video_tracks = [track]
+    session.message_handler(json.dumps({'type': 'livestreamCameraSwitch', 'data': {'camera': camera}}).encode())
+    track.switch_camera.assert_called_once_with(camera)
+
+  def test_existing_sessions_keep_camera_switch(self, mocker):
+    from openpilot.system.webrtc.webrtcd import StreamSession
+    session = object.__new__(StreamSession)
+    session.konik = False
+    track = mocker.Mock()
+    session.video_tracks = [track]
+    session.message_handler(json.dumps({'type': 'livestreamCameraSwitch', 'data': {'camera': 'road'}}).encode())
+    track.switch_camera.assert_called_once_with('road')
+
+
+  @pytest.mark.parametrize("key", ["KonikUploadsEnabled", "IsOffroad"])
+  @pytest.mark.parametrize("phase", ["negotiating", "streaming"])
+  def test_revoking_konik_stops_only_its_session(self, mocker, key, phase):
+    from openpilot.system.webrtc.webrtcd import StreamSession
+    async def check():
+      flags = {"KonikUploadsEnabled": True, "IsOffroad": True}
+      entered = asyncio.Event()
+      session = object.__new__(StreamSession)
+      session.konik = True
+      session.identifier = 'konik-test'
+      session.is_body = False
+      session.bitrate_controller = None
+      session.params = mocker.Mock()
+      session.params.get_bool.side_effect = lambda k: flags[k]
+      session.stream = mocker.Mock()
+      session.stream.has_messaging_channel.return_value = False
+      async def block():
+        entered.set()
+        await asyncio.Event().wait()
+      session.stream.wait_for_connection = block if phase == "negotiating" else mocker.AsyncMock()
+      session.run_normal_session = block
+      session.post_run_cleanup = mocker.AsyncMock()
+      session.logger = mocker.Mock()
+      unrelated_comma_viewer = asyncio.create_task(asyncio.Event().wait())
+      task = asyncio.create_task(session.run())
+      try:
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        flags[key] = False
+        with pytest.raises(asyncio.CancelledError):
+          await asyncio.wait_for(task, timeout=1)
+        session.post_run_cleanup.assert_awaited_once()
+        assert not unrelated_comma_viewer.done()
+      finally:
+        unrelated_comma_viewer.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+          await unrelated_comma_viewer
+    asyncio.run(check())
+
+
+  @pytest.mark.parametrize("camera", ["sendcan", "../driver", "unknown", None])
+  def test_konik_session_rejects_unknown_camera(self, mocker, camera):
+    from openpilot.system.webrtc.webrtcd import StreamSession
+    session = object.__new__(StreamSession)
+    session.konik = True
+    track = mocker.Mock()
+    session.video_tracks = [track]
+    session.message_handler(json.dumps({'type': 'livestreamCameraSwitch', 'data': {'camera': camera}}).encode())
+    track.switch_camera.assert_not_called()
+
+
+def test_camera_switch_requests_new_keyframe_and_resets_decoder_state(mocker):
+  track = object.__new__(LiveStreamVideoStreamTrack)
+  track._seen_keyframe = True
+  track._make_sock = mocker.Mock(return_value='driver socket')
+  track.request_keyframe = mocker.Mock()
+  track.switch_camera('driver')
+  assert track._sock == 'driver socket'
+  assert track._seen_keyframe is False
+  track.request_keyframe.assert_called_once()
+
+
+def test_resuming_live_video_requests_a_fresh_keyframe(mocker):
+  track = object.__new__(LiveStreamVideoStreamTrack)
+  track.video_enabled = False
+  track._seen_keyframe = True
+  track.request_keyframe = mocker.Mock()
+  track.enable(True)
+  assert track.video_enabled is True
+  assert track._seen_keyframe is False
+  track.request_keyframe.assert_called_once()
+
+
+def test_redundant_video_enable_does_not_restart_keyframes(mocker):
+  track = object.__new__(LiveStreamVideoStreamTrack)
+  track.video_enabled = True
+  track._seen_keyframe = True
+  track.request_keyframe = mocker.Mock()
+  track.enable(True)
+  assert track._seen_keyframe is True
+  track.request_keyframe.assert_not_called()
+
+
+@pytest.mark.parametrize("quality", ["low", "med", "high", "auto"])
+def test_website_quality_control_reaches_bitrate_controller(mocker, quality):
+  from openpilot.system.webrtc.webrtcd import StreamSession
+  session = object.__new__(StreamSession)
+  session.bitrate_controller = mocker.Mock()
+  session.message_handler(json.dumps({'type': 'livestreamSettings', 'data': {'quality': quality}}).encode())
+  session.bitrate_controller.set_quality.assert_called_once_with(quality)
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_website_pause_controls_video_and_telemetry(mocker, enabled):
+  from openpilot.system.webrtc.webrtcd import StreamSession
+  session = object.__new__(StreamSession)
+  track = mocker.Mock()
+  session.video_tracks = [track]
+  session.outgoing_bridge = mocker.Mock()
+  session.bitrate_controller = mocker.Mock()
+  session.params = mocker.Mock()
+  session.message_handler(json.dumps({'type': 'livestreamVideoEnable', 'data': {'enabled': enabled}}).encode())
+  assert session.enabled is enabled
+  track.enable.assert_called_once_with(enabled)
+  session.outgoing_bridge.enable.assert_called_once_with(enabled)
+  session.bitrate_controller.enable.assert_called_once_with(enabled)
