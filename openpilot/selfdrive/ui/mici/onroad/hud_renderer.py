@@ -2,6 +2,7 @@ import math
 import pyray as rl
 from dataclasses import dataclass
 from openpilot.common.constants import CV
+from openpilot.selfdrive.ui.mici.onroad import aeb_off_icon
 from openpilot.selfdrive.ui.sunnypilot.onroad.blendful_zp import TorqueBarZP
 from openpilot.selfdrive.ui.ui_state import ui_state, UIStatus, ChestnutState
 from openpilot.system.ui.lib.application import gui_app, FontWeight
@@ -127,6 +128,8 @@ class HudRenderer(Widget):
     self._txt_chestnut_green: rl.Texture = gui_app.texture('icons_mici/chestnut_green.png', 60, 44)
     self._txt_chestnut_orange: rl.Texture = gui_app.texture('icons_mici/chestnut_orange.png', 75, 44)
     self._chestnut_icon: rl.Texture | None = None
+    self._txt_aeb_off: rl.Texture = aeb_off_icon.load_texture()
+    self._model_source_shown = 0.  # the model icon's fade in the bottom-right corner this frame, 0 if none
     self._wheel_alpha_filter = FirstOrderFilter(0, 0.05, 1 / gui_app.target_fps)
     self._wheel_y_filter = FirstOrderFilter(0, 0.1, 1 / gui_app.target_fps)
 
@@ -189,7 +192,13 @@ class HudRenderer(Widget):
 
     self._draw_steering_wheel(rect)
 
+    self._draw_aeb_off(rect)
+
   def _draw_model_source(self, rect: rl.Rectangle) -> None:
+    self._model_source_shown = 0.
+    if ui_state.sm.recv_frame['selfdriveState'] < ui_state.started_frame:
+      return
+
     loading = ui_state.chestnut_state == ChestnutState.LOADING
     if loading:
       icon = self._txt_chestnut

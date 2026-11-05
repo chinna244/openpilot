@@ -136,3 +136,66 @@ class TestMazdaStockLkasOff:
     assert not events_sp.contains(ET.NO_ENTRY), "lateral has to engage for the EPS to take torque"
     assert not events_sp.contains(ET.USER_DISABLE)
     assert not car_events.update(self._cs(False), _events(), cs_sp, True, False).zp.has(EventNameZP.stockLkasArming)
+
+
+class TestMazdaCameraFault:
+  """Mazda swaps steerUnavailable (the camera's fault) for the ZP cameraLkasFault when MADS is on:
+  cruise stays engaged, the MADS machine alone pauses lateral. Otherwise upstream's disable stands."""
+
+  @staticmethod
+  def _cs(faulted: bool) -> structs.CarState:
+    CS = structs.CarState()
+    CS.steerFaultPermanent = faulted
+    return CS
+
+  def test_mads_on_keeps_cruise_and_raises_the_zp_event(self):
+    car_events = _car_events('mazda', MazdaFlags.GEN1 | MazdaFlags.STEER_TO_ZERO_EPS)
+    events = _events(EventName.steerUnavailable)
+    events_sp = car_events.update(self._cs(True), events, _car_state_sp(), True)
+    assert not events.has(EventName.steerUnavailable)
+    assert not events.contains(ET.IMMEDIATE_DISABLE), "cruise must not let go on a camera fault"
+    assert not events.contains(ET.NO_ENTRY), "cruise must still engage"
+    assert events_sp.zp.has(EventNameZP.cameraLkasFault)
+    assert events_sp.contains(ET.NO_ENTRY)
+    assert not events_sp.contains(ET.IMMEDIATE_DISABLE)
+    assert not events_sp.contains(ET.USER_DISABLE), "MADS pauses on it; a disable would not resume"
+
+  def test_mads_off_keeps_upstream_immediate_disable(self):
+    car_events = _car_events('mazda', MazdaFlags.GEN1)
+    events = _events(EventName.steerUnavailable)
+    events_sp = car_events.update(self._cs(True), events, _car_state_sp(), False)
+    assert events.has(EventName.steerUnavailable)
+    assert events.contains(ET.IMMEDIATE_DISABLE)
+    assert not events_sp.zp.has(EventNameZP.cameraLkasFault)
+
+  def test_no_fault_swaps_nothing(self):
+    car_events = _car_events('mazda', MazdaFlags.GEN1)
+    events = _events()
+    events_sp = car_events.update(self._cs(False), events, _car_state_sp(), True)
+    assert events.names == []
+    assert not events_sp.zp.has(EventNameZP.cameraLkasFault)
+
+  def test_other_brands_are_untouched(self):
+    car_events = _car_events('honda')
+    events = _events(EventName.steerUnavailable)
+    events_sp = car_events.update(self._cs(True), events, _car_state_sp(), True)
+    assert events.has(EventName.steerUnavailable)
+    assert not events_sp.zp.has(EventNameZP.cameraLkasFault)
+
+  def test_the_event_holds_one_second_past_the_clear(self):
+    car_events = _car_events('mazda', MazdaFlags.GEN1)
+    clear = car_events.CAMERA_FAULT_CLEAR_FRAMES
+    assert car_events.update(self._cs(True), _events(EventName.steerUnavailable), _car_state_sp(), True).zp.has(EventNameZP.cameraLkasFault)
+    for _ in range(clear - 1):
+      assert car_events.update(self._cs(False), _events(), _car_state_sp(), True).zp.has(EventNameZP.cameraLkasFault)
+    assert not car_events.update(self._cs(False), _events(), _car_state_sp(), True).zp.has(EventNameZP.cameraLkasFault)
+
+  def test_a_flicker_restarts_the_hold(self):
+    car_events = _car_events('mazda', MazdaFlags.GEN1)
+    clear = car_events.CAMERA_FAULT_CLEAR_FRAMES
+    car_events.update(self._cs(True), _events(EventName.steerUnavailable), _car_state_sp(), True)
+    for _ in range(clear // 2):
+      car_events.update(self._cs(False), _events(), _car_state_sp(), True)
+    car_events.update(self._cs(True), _events(EventName.steerUnavailable), _car_state_sp(), True)
+    for _ in range(clear - 1):
+      assert car_events.update(self._cs(False), _events(), _car_state_sp(), True).zp.has(EventNameZP.cameraLkasFault)

@@ -14,6 +14,7 @@ from openpilot.selfdrive.selfdrived.events import Events
 from openpilot.sunnypilot.mads.mads import SET_SPEED_BUTTONS
 from opendbc.sunnypilot.car.stock_ecu import ENGAGES_NORMALLY
 from openpilot.common.params import Params
+from openpilot.common.realtime import DT_CTRL
 from openpilot.sunnypilot.selfdrive.car.stock_ecu_handback import FAILED_KEY
 from openpilot.sunnypilot.selfdrive.selfdrived.events import EventsSP
 
@@ -32,12 +33,19 @@ class CarEventsSP(EventsSP):
 
 
 class CarSpecificEventsSP:
+  # the camera's fault holds lateral this long past its clear, so a fault flickering as it clears
+  # cannot toggle steering or replay the onset alert
+  CAMERA_FAULT_CLEAR_FRAMES = int(1.0 / DT_CTRL)
+
   def __init__(self, CP: structs.CarParams, CP_SP: structs.CarParamsSP, params=None):
     self.CP = CP
     self.CP_SP = CP_SP
 
     self.low_speed_alert = False
     self.stock_ecu_prev = StockEcuState.notNeeded
+    self.stock_ecu_off_prev = False
+    self.alpha_long_announced = False
+    self.camera_fault_clear_frames = self.CAMERA_FAULT_CLEAR_FRAMES
     # set by the stop that ended the last session; selfdrived starts fresh every session
     self.stock_cruise_failed = (params or Params()).get_bool(FAILED_KEY)
 
@@ -80,6 +88,15 @@ class CarSpecificEventsSP:
         # upstream's no-entry stands.
         events.remove(EventName.invalidLkasSetting)
         events_sp.zp.add(EventNameZP.stockLkasOff)
+      self.camera_fault_clear_frames = 0 if CS.steerFaultPermanent else self.camera_fault_clear_frames + 1
+      if mads_enabled_toggle and self.camera_fault_clear_frames < self.CAMERA_FAULT_CLEAR_FRAMES:
+        # MADS on: the camera's fault (CAM_LKAS ERR_BIT_1, the only source of steerFaultPermanent
+        # here) is glare, fog or a blocked windshield as often as a failure, and it can clear
+        # mid-drive (route 00000172: 46 s). It takes lateral, which controlsd already gates on
+        # steerFaultPermanent and the EPS sees in our command, not cruise: MADS pauses on it and
+        # resumes 1 s after it clears (mads.py). With MADS off upstream's immediate disable stands.
+        events.remove(EventName.steerUnavailable)
+        events_sp.zp.add(EventNameZP.cameraLkasFault)
       if mads_enabled and CS_SP.zoompilot.lkasArming:
         # LKA back on with lateral coming back, the EPS not delivering yet
         events_sp.zp.add(EventNameZP.stockLkasArming)
@@ -96,8 +113,20 @@ class CarSpecificEventsSP:
     if self.stock_cruise_failed:
       events_sp.zp.add(EventNameZP.stockCruiseFailed)
     stock_ecu = CS_SP.zoompilot.stockEcu
-    if str(stock_ecu) not in ENGAGES_NORMALLY and any(be.pressed and be.type in SET_SPEED_BUTTONS for be in CS.buttonEvents):
+    # The car's own cruise on the stock radar: SET works there as on a stock car, so no press alert.
+    stock_cruise = stock_ecu == StockEcuState.stockCruiseOn
+    if str(stock_ecu) not in ENGAGES_NORMALLY and not stock_cruise and \
+       any(be.pressed and be.type in SET_SPEED_BUTTONS for be in CS.buttonEvents):
       events_sp.zp.add(EventNameZP.stockEcuNotReady)
+    # The car plays nothing when its own cruise engages or ends (route 0000012e): openpilot's
+    # chimes, sound-only, as for a stock-longitudinal car. They change no state.
+    stock_cruise_prev = self.stock_ecu_prev == StockEcuState.stockCruiseOn
+    if stock_cruise and not stock_cruise_prev:
+      events_sp.zp.add(EventNameZP.longitudinalEnableChime)
+    elif stock_cruise_prev and not stock_cruise and stock_ecu != StockEcuState.restored:
+      # restored here is the end-of-drive hand-back answered under the car's still-engaged
+      # cruise: nothing ended, so no chime
+      events_sp.zp.add(EventNameZP.longitudinalDisableChime)
     # Unprompted only where waiting changes the outcome: stopped with the takeover still
     # starting (route 0000021b pulled away 5 s short of it). Rolling, the press alert carries
     # "stop to engage"; a standing banner would nag a whole drive. One line on the ready edge.
@@ -106,3 +135,16 @@ class CarSpecificEventsSP:
     if stock_ecu == StockEcuState.ready and self.stock_ecu_prev != StockEcuState.ready:
       events_sp.zp.add(EventNameZP.stockEcuReady)
     self.stock_ecu_prev = stock_ecu
+    # The stock ECU's own functions counted as back (Mazda AEB on). Said once, and not while the
+    # driver's own setting keeps AEB off.
+    off = CS_SP.zoompilot.stockEcuOff
+    if self.stock_ecu_off_prev and not off and not CS_SP.zoompilot.aebSettingOff:
+      events_sp.zp.add(EventNameZP.stockEcuHandedBack)
+    self.stock_ecu_off_prev = off
+    # The request registered, said once per request while driving: the takeover waits for the
+    # next stop. Pressed at a stop, it is said on pulling away if no takeover started first.
+    if not CS_SP.zoompilot.alphaLongRequested:
+      self.alpha_long_announced = False
+    elif not self.alpha_long_announced and not CS.standstill:
+      events_sp.zp.add(EventNameZP.alphaLongNextStop)
+      self.alpha_long_announced = True

@@ -23,9 +23,10 @@ AudibleAlert = structs.CarControl.HUDControl.AudibleAlert
 AlertSize = log.SelfdriveState.AlertSize
 
 
-def cs_sp(farther: bool = False):
+def cs_sp(farther: bool = False, stock_ecu: str = "notNeeded"):
   msg = messaging.new_message('carStateSP').carStateSP
   msg.zoompilot.distanceFarther = farther
+  msg.zoompilot.stockEcu = stock_ecu
   return msg
 
 
@@ -55,11 +56,11 @@ class Selfdrived:
     self.icbm = FakeICBM()
     self.events, self.events_sp = Events(), EventsSP()
 
-  def step(self, CS=None, farther: bool = False) -> None:
+  def step(self, CS=None, farther: bool = False, stock_ecu: str = "notNeeded") -> None:
     CS = CS or car_state()
     self.events.clear()
     self.events_sp.clear()
-    self.personality = self.zp.update(CS, cs_sp(farther), self.events, self.events_sp, self.icbm, self.personality)
+    self.personality = self.zp.update(CS, cs_sp(farther, stock_ecu), self.events, self.events_sp, self.icbm, self.personality)
     if self.zp.CP.openpilotLongitudinalControl:
       if any(not be.pressed and be.type == ButtonType.gapAdjustCruise for be in CS.buttonEvents) and self.zp.gap_release_steps:
         self.personality = (self.personality - 1) % 3
@@ -178,6 +179,49 @@ class TestDistanceFarther:
     for farther in (True, False, True):
       sd.step(farther=farther)
     assert sd.icbm.activations == [True, False, True]
+
+
+class TestCarCruiseOwnsDistance:
+  """While the car's own cruise drives (Mazda stockCruiseOn), its distance button is the car's:
+  selfdrived leaves openpilot's personality and the Set Speed Assist switch alone."""
+
+  def test_only_the_car_cruise_counts(self):
+    zp = SelfdrivedZP(structs.CarParams(openpilotLongitudinalControl=True), FakeParams(ExperimentalModeSetSpeed=True))
+    assert zp.car_cruise_on(cs_sp(False, "stockCruiseOn"))
+    for state in ("notNeeded", "parkToTakeOver", "starting", "ready", "restoring", "restored", "failed"):
+      assert not zp.car_cruise_on(cs_sp(False, state))
+
+  def test_short_press_does_not_step(self):
+    sd = Selfdrived()
+    sd.step(car_state(True), stock_ecu="stockCruiseOn")
+    sd.step(car_state(False), stock_ecu="stockCruiseOn")
+    assert sd.personality == 1 and not sd.events.has(EventName.personalityChanged)
+
+  def test_long_press_does_not_switch(self):
+    sd = Selfdrived()
+    sd.step(car_state(True), stock_ecu="stockCruiseOn")
+    for _ in range(DISTANCE_LONG_PRESS * 2):
+      sd.step(stock_ecu="stockCruiseOn")
+      assert not sd.events_sp.zp.has(EventNameZP.speedAssistSwitched)
+    sd.step(car_state(False), stock_ecu="stockCruiseOn")
+    assert sd.zp.speed_assist is True and sd.personality == 1
+
+  def test_farther_release_does_not_step(self):
+    sd = Selfdrived()
+    sd.step(farther=True, stock_ecu="stockCruiseOn")
+    sd.step(stock_ecu="stockCruiseOn")
+    assert sd.personality == 1 and not sd.events.has(EventName.personalityChanged)
+
+  def test_a_held_press_is_dropped(self):
+    sd = Selfdrived()
+    sd.step(car_state(True))
+    for _ in range(DISTANCE_LONG_PRESS - 10):
+      sd.step()
+    for _ in range(20):
+      sd.step(stock_ecu="stockCruiseOn")
+    for _ in range(DISTANCE_LONG_PRESS - 10):
+      sd.step()
+    assert sd.zp.speed_assist is True
 
 
 class TestRoadEdgeAlert:

@@ -13,6 +13,7 @@ from openpilot.sunnypilot.selfdrive.controls.lib.relc import RoadEdgeMode, read_
 ButtonType = structs.CarState.ButtonEvent.Type
 EventName = log.OnroadEvent.EventName
 EventNameZP = custom.OnroadEventZP.EventName
+StockEcuState = custom.CarStateZP.StockEcuState
 
 # selfdrived runs at 100 Hz
 DISTANCE_LONG_PRESS = 50  # frames the distance button is held to switch Set Speed Assist
@@ -42,6 +43,7 @@ class SelfdrivedZP:
     # upstream steps the personality down on a gapAdjustCruise release unless it ended a long press
     self.gap_release_steps = True
     self.distance_farther_prev = False
+    self.car_cruise = False
 
   def _read_road_edge_silent(self) -> None:
     SelfdrivedZP.road_edge_silent = read_road_edge_mode(self.params) == RoadEdgeMode.SILENT
@@ -54,7 +56,9 @@ class SelfdrivedZP:
       self._read_road_edge_silent()
 
     self.gap_release_steps = True
-    if self.CP.openpilotLongitudinalControl:
+    # the car's own cruise driving: its distance button is the car's, not openpilot's personality
+    self.car_cruise = self.car_cruise_on(CS_SP)
+    if self.CP.openpilotLongitudinalControl and not self.car_cruise:
       gap_released = any(not be.pressed and be.type == ButtonType.gapAdjustCruise for be in CS.buttonEvents)
       if CS.cruiseState.available:
         update_manual_button_timers(CS, self.gap_timers)
@@ -78,6 +82,17 @@ class SelfdrivedZP:
 
     icbm.update_activation(CS_SP)
     return personality
+
+  def car_cruise_on(self, CS_SP) -> bool:
+    """The car's own cruise engaged on its own radar (Mazda stockCruiseOn): the distance button
+    sets that cruise's gap, so openpilot's personality and the long-press Set Speed Assist switch
+    leave it alone and show nothing. A press held into it is dropped, not counted on after."""
+    on = CS_SP.zoompilot.stockEcu == StockEcuState.stockCruiseOn
+    if on:
+      self.gap_timers[ButtonType.gapAdjustCruise] = 0
+      self.speed_assist_switched = False
+      self.gap_release_steps = False
+    return on
 
   def _read_speed_assist(self, events_sp) -> None:
     """Announces a switch made elsewhere (the UI's quick toggles and settings, sunnylink)."""

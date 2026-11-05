@@ -46,6 +46,9 @@ class ModularAssistiveDrivingSystem:
     self.allow_always = False
     self.no_main_cruise = False
     self.lateral_held = False
+    # cameraLkasFault last frame, and whether the pause lateral sits in is the fault's
+    self.camera_fault_prev = False
+    self.camera_fault_paused = False
     self.selfdrive = selfdrive
     self.selfdrive.enabled_prev = False
     self.state_machine = StateMachine(self)
@@ -127,6 +130,16 @@ class ModularAssistiveDrivingSystem:
     # way (GEARS_ALLOW_PAUSED_SILENT). A disable on the same frame (the MADS button, main off,
     # the brake under disengage) wins: the pause would otherwise mask it.
     if self.events_sp.zp.has(EventNameZP.stockLkasOff) and self.enabled and not self.events_sp.contains(ET.USER_DISABLE):
+      self.transition_paused_state()
+
+    # The camera's fault takes lateral the same way: paused, cruise untouched, resumed when it
+    # clears. The driver did not choose it, so its first frame is loud whenever MADS is on, a brake
+    # pause included: the driver expects steering back on release.
+    camera_fault = self.events_sp.zp.has(EventNameZP.cameraLkasFault)
+    if camera_fault and not self.camera_fault_prev and self.enabled:
+      self.events_sp.zp.add(EventNameZP.cameraLkasFaultOnset)
+    self.camera_fault_prev = camera_fault
+    if camera_fault and self.enabled and not self.events_sp.contains(ET.USER_DISABLE):
       self.transition_paused_state()
 
   def transition_paused_state(self):
@@ -274,7 +287,17 @@ class ModularAssistiveDrivingSystem:
     if not self.CP.passive and self.selfdrive.initialized:
       self.enabled, self.active = self.state_machine.update()
 
-    self.lateral_held = ((self.state_machine.state == State.paused and self.events_sp.zp.has(EventNameZP.stockLkasOff)) or
+    state = self.state_machine.state
+    if state == State.paused and self.events_sp.zp.has(EventNameZP.cameraLkasFault):
+      self.camera_fault_paused = True
+    elif state == State.disabled:
+      self.camera_fault_paused = False
+    elif self.camera_fault_paused and self.active:
+      self.camera_fault_paused = False
+      self.events_sp.zp.add(EventNameZP.cameraLkasResumed)
+
+    self.lateral_held = ((state == State.paused and (self.events_sp.zp.has(EventNameZP.stockLkasOff) or
+                                                     self.events_sp.zp.has(EventNameZP.cameraLkasFault))) or
                          (self.enabled and self.events_sp.zp.has(EventNameZP.stockLkasArming)))
 
     # Copy of previous SelfdriveD states for MADS events handling

@@ -77,6 +77,11 @@ class VCruiseHelper(VCruiseHelperSP):
     if not enabled:
       return
 
+    # ICBM cars: no baseline yet means the ECU has not reported its set speed; stepping 255 would clip to V_CRUISE_MAX.
+    # The dash is adopted once it reports (reconcile_setpoint_with_dash).
+    if self.CP.pcmCruise and self.v_cruise_kph == V_CRUISE_UNSET:
+      return
+
     long_press = False
     button_type = None
 

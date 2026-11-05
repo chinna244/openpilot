@@ -58,3 +58,14 @@ def test_car_specific_round_trip_keeps_ours():
   events_sp.add_from_msg(car_events.to_msg())
   assert events_sp.has(EventNameSP.lkasEnable) and events_sp.zp.has(EventNameZP.stockEcuReady)
   assert events_sp.names == [EventNameSP.lkasEnable, 'stockEcuReady']  # ours not read as sunnypilot's same int
+
+
+def test_camera_fault_alerts():
+  events_sp = EventsSP()
+  events_sp.zp.add(EventNameZP.cameraLkasFault)
+  events_sp.zp.add(EventNameZP.cameraLkasFaultOnset)
+  events_sp.zp.add(EventNameZP.cameraLkasResumed)
+  assert not events_sp.contains(ET.IMMEDIATE_DISABLE) and not events_sp.contains(ET.SOFT_DISABLE)
+  alerts = events_sp.create_alerts([ET.PERMANENT, ET.NO_ENTRY])
+  assert sorted(a.alert_type for a in alerts) == sorted(['cameraLkasFault/permanent', 'cameraLkasFault/noEntry',
+                                                         'cameraLkasFaultOnset/permanent', 'cameraLkasResumed/permanent'])

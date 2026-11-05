@@ -37,13 +37,14 @@ EVENT_NAME_ZP = {v: k for k, v in EventNameZP.schema.enumerants.items()}
 
 # What the driver has to do, per stock ECU state that does not engage normally, in the shape of
 # upstream's no-entry alerts ("Gear not D"). Main off has no entry: the cluster's MRCC
-# indicator is the car's own.
+# indicator is the car's own. (title, line): mici shows the line big, so it is the action and
+# short enough for one line at the largest size (<= 12 characters); the title fits one small line.
 STOCK_ECU_ALERT_TEXT = {
-  StockEcuState.STARTING: ("Longitudinal Initializing", "Remain stopped"),
-  StockEcuState.PARK_TO_TAKE_OVER: ("Stop to Engage Longitudinal", "Longitudinal enables at next stop"),
-  StockEcuState.STOCK_CRUISE_ON: ("Turn Off Stock Cruise", "Longitudinal waits for it"),
-  StockEcuState.RESTORING: ("Restarting Stock Cruise", "Resumes in a few seconds"),
-  StockEcuState.FAILED: ("Longitudinal Failed", "Restart the car and retry"),
+  StockEcuState.STARTING: ("AEB turning off", "Stay still"),
+  StockEcuState.PARK_TO_TAKE_OVER: ("openpilot cruise at stop", "Stop first"),
+  StockEcuState.STOCK_CRUISE_ON: ("car cruise is on", "Cancel first"),
+  StockEcuState.RESTORING: ("car cruise restarting", "Wait ~12 s"),
+  StockEcuState.FAILED: ("radar switch failed", "Restart car"),
 }
 
 
@@ -72,9 +73,9 @@ def big_model_ready_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.Sub
 
 def stock_ecu_not_ready_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.SubMaster, metric: bool, soft_disable_time: int, personality) -> Alert:
   state = str(sm['carStateSP'].zoompilot.stockEcu)
-  if state == StockEcuState.STARTING and not CS.standstill:
-    state = StockEcuState.PARK_TO_TAKE_OVER  # the takeover needs a stop either way
   title, line = STOCK_ECU_ALERT_TEXT.get(state, STOCK_ECU_ALERT_TEXT[StockEcuState.STARTING])
+  if state == StockEcuState.STARTING and not CS.standstill:
+    line = "Wait"  # rolling with the moving takeover in flight
   return NoEntryAlert(line, alert_text_1=title)
 
 
@@ -174,6 +175,36 @@ EVENTS_ZP: dict[int, dict[str, Alert | AlertCallbackType]] = {
     **({ET.PERMANENT: NormalPermanentAlert("Lateral Disabled", "LKAS is off", priority=Priority.LOW)} if IS_MICI else {}),
   },
 
+  # Mazda: steerUnavailable (the camera's fault) is swapped for this when MADS is on
+  # (CarSpecificEventsSP); MADS holds lateral paused on it and cruise stays engaged.
+  EventNameZP.cameraLkasFault: {
+    ET.NO_ENTRY: Alert(
+      "Lateral Disabled",
+      "Camera blocked",
+      AlertStatus.normal, AlertSize.mid,
+      Priority.LOW, VisualAlert.none, AudibleAlert.refuse, 3.),
+    ET.PERMANENT: NormalPermanentAlert("Steering Paused", "Camera blocked", priority=Priority.LOW),
+  },
+
+  # The fault's first frame while MADS is on (mads.py): as loud as a soft disable for 3 s, but
+  # cruise has not let go, so it says steer, not TAKE CONTROL.
+  EventNameZP.cameraLkasFaultOnset: {
+    ET.PERMANENT: Alert(
+      "Steering Paused: Steer Now",
+      "Camera blocked",
+      AlertStatus.userPrompt, AlertSize.mid,
+      Priority.MID, VisualAlert.steerRequired, AudibleAlert.warningSoft, 3.),
+  },
+
+  # The camera cleared and MADS resumed lateral from the pause the fault put it in.
+  EventNameZP.cameraLkasResumed: {
+    ET.PERMANENT: Alert(
+      "Steering Resumed",
+      "",
+      AlertStatus.normal, AlertSize.small,
+      Priority.LOW, VisualAlert.none, AudibleAlert.engage, 2.),
+  },
+
   # LKA back on with lateral resuming, the EPS not delivering yet: still disabled to the driver.
   EventNameZP.stockLkasArming: {
     ET.PERMANENT: NormalPermanentAlert("Lateral Disabled", "Waiting for steering", priority=Priority.LOW),
@@ -223,12 +254,28 @@ EVENTS_ZP: dict[int, dict[str, Alert | AlertCallbackType]] = {
   # Stopped with the takeover still starting: unprompted, re-raised every frame it holds. MID so
   # the startup and big model banners (LOWER/LOW) cannot cover it while the driver waits.
   EventNameZP.stockEcuInitializing: {
-    ET.PERMANENT: NormalPermanentAlert(*STOCK_ECU_ALERT_TEXT[StockEcuState.STARTING], priority=Priority.MID),
+    ET.PERMANENT: NormalPermanentAlert("Stay still", "AEB turning off", priority=Priority.MID),
   },
 
-  # the takeover landed: the car's own emergency braking went with the radar
+  # The takeover's end: a chime, and it replaces whatever the stop left up ("Stay still", a
+  # press's no-entry): the later one wins. Route 0000012c hid it behind a press.
   EventNameZP.stockEcuReady: {
-    ET.PERMANENT: NormalPermanentAlert("Longitudinal Ready", "Stock AEB now off", duration=2.),
+    ET.PERMANENT: Alert("AEB off", "SET+ for alpha long", AlertStatus.normal, AlertSize.mid,
+                        Priority.MID, VisualAlert.none, AudibleAlert.prompt, 2.),
+  },
+
+  # The stock ECU's own functions (Mazda AEB) counted as back: its default session and the radar's
+  # restart time after it (~12 s, route 0000012b), as stockEcuOff falls.
+  EventNameZP.stockEcuHandedBack: {
+    ET.PERMANENT: Alert("AEB on", "radar back to car", AlertStatus.normal, AlertSize.mid,
+                        Priority.LOW, VisualAlert.none, AudibleAlert.prompt, 3.),
+  },
+
+  # RES registered as a request for alpha long after the radar refused a moving takeover: the
+  # radar is taken at the next 2 s stop.
+  EventNameZP.alphaLongNextStop: {
+    ET.PERMANENT: Alert("Alpha long", "next stop, 2 s", AlertStatus.normal, AlertSize.mid,
+                        Priority.LOW, VisualAlert.none, AudibleAlert.prompt, 3.),
   },
 
   # The last session's hand-back failed and its stop went ahead anyway: the radar is left to
@@ -270,6 +317,12 @@ EVENTS_ZP: dict[int, dict[str, Alert | AlertCallbackType]] = {
       Priority.MID, VisualAlert.steerRequired, AudibleAlert.warningSoft, .2),
   },
 }
+
+# The radar messages chime once: another alert shown over one (an engage chime, a gear change)
+# must not replay its sound when it comes back (route 00000133, 163.3 s and 271.2 s).
+for _event in (EventNameZP.stockEcuReady, EventNameZP.stockEcuHandedBack, EventNameZP.alphaLongNextStop,
+               EventNameZP.cameraLkasFaultOnset, EventNameZP.cameraLkasResumed):
+  EVENTS_ZP[_event][ET.PERMANENT].sound_once = True
 
 
 class EventsZP(EventsBase):
