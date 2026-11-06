@@ -8,6 +8,7 @@ from openpilot.common.filter_simple import FirstOrderFilter
 from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.modeld.constants import ModelConstants
 from openpilot.selfdrive.controls.lib.accel_boost import AccelBoost
+from openpilot.selfdrive.controls.lib.firm_stop import FirmStop
 from openpilot.selfdrive.controls.lib.longcontrol import LongCtrlState
 from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import LongitudinalMpc, LongitudinalPlanSource
 from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import T_IDXS as T_IDXS_MPC
@@ -57,6 +58,7 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
     self.fcw = False
     self.dt = dt
     self.accel_boost = AccelBoost()
+    self.firm_stop = FirmStop()
 
     self.v_desired_filter = FirstOrderFilter(init_v, 2.0, self.dt)
     self.a_cruise = init_a
@@ -216,6 +218,11 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
     cruise_should_stop = should_stop(v_ego, self.a_cruise)
 
     output_a_target_e2e = self.accel_boost.update(sm, output_a_target_e2e, output_a_target_mpc, self.a_cruise)
+    # the model's planned stop, finished steadily instead of tapered: only ever lower than the e2e candidate
+    a_firm = self.firm_stop.update(v_ego, sm['modelV2'].velocity.x, sm['modelV2'].position.x,
+                                   self.CP.openpilotLongitudinalControl and not reset_state, output_a_target_e2e)
+    output_a_target_e2e = min(output_a_target_e2e, a_firm)
+    output_should_stop_e2e = output_should_stop_e2e or self.firm_stop.should_stop
 
     # while the gas is held only the published plan is lifted: the MPC and the filter restart from the plain one
     lift_published = reset_state and a_cruise > self.a_cruise
