@@ -1365,5 +1365,5 @@ class TestModelSourceIcon:
       assert not drawn
       return
     (tex, pos, a), = drawn
-    assert tex.height == 25 and a > 240
+    assert 28 <= tex.height <= 31 and a > 240  # medium, scaled to fit its box
     assert pos.y == MODEL_SOURCE_MARGIN and pos.x + tex.width == 476 - MODEL_SOURCE_MARGIN
