@@ -333,6 +333,7 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"LeadForecast", {PERSISTENT | BACKUP, BOOL, "1"}},
     {"LeadForecastRadar", {PERSISTENT | BACKUP, BOOL, "1"}},
     {"LiveTorqueParametersSP", {PERSISTENT | DONT_LOG, BYTES}},
+    {"MazdaCanFilter", {PERSISTENT | BACKUP, BOOL, "0"}},
     {"MazdaTjaButton", {PERSISTENT | BACKUP, BOOL, "0"}},
     {"ModelManager_CarryOver", {PERSISTENT, JSON}},  // model picks waiting to be re-queued after a selector bump (models/default_bootstrap.py)
     {"OffroadModeRequested", {CLEAR_ON_MANAGER_START, BOOL}},

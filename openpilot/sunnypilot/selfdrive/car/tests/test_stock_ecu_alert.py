@@ -21,6 +21,7 @@ from openpilot.selfdrive.selfdrived.state import StateMachine
 from openpilot.sunnypilot.selfdrive.car.car_specific import CarSpecificEventsSP
 from openpilot.sunnypilot.selfdrive.car.stock_ecu_handback import FAILED_KEY
 from openpilot.sunnypilot.selfdrive.car.tests.fakes import FakeParams
+from opendbc.sunnypilot.car.mazda.values import MazdaFlagsSP
 from openpilot.sunnypilot.selfdrive.selfdrived.events import EventsSP
 from openpilot.sunnypilot.selfdrive.selfdrived.events_zp import EVENTS_ZP
 from openpilot.sunnypilot.selfdrive.selfdrived.events_base import ET, AudibleAlert
@@ -31,19 +32,24 @@ EventNameZP = custom.OnroadEventZP.EventName
 ButtonType = structs.CarState.ButtonEvent.Type
 
 
-def _car_events(brand: str = 'mazda', **params) -> CarSpecificEventsSP:
+def _car_events(brand: str = 'mazda', sp_flags: int = 0, **params) -> CarSpecificEventsSP:
   CP = structs.CarParams()
   CP.brand = brand
-  return CarSpecificEventsSP(CP, structs.CarParamsSP(), FakeParams(**params))
+  CP_SP = structs.CarParamsSP()
+  CP_SP.flags = sp_flags
+  return CarSpecificEventsSP(CP, CP_SP, FakeParams(**params))
 
 
-def _update(car_events: CarSpecificEventsSP, state: str, button=None, pressed: bool = True, standstill: bool = False):
+def _update(car_events: CarSpecificEventsSP, state: str, button=None, pressed: bool = True, standstill: bool = False,
+            stock_ecu_off: bool | None = None):
   CS = structs.CarState()
   CS.standstill = standstill
   if button is not None:
     CS.buttonEvents = [structs.CarState.ButtonEvent(type=button, pressed=pressed)]
   CS_SP = messaging.new_message('carStateSP').carStateSP
   CS_SP.zoompilot.stockEcu = state
+  # the UDS takeover's ready is a silenced radar: AEB off
+  CS_SP.zoompilot.stockEcuOff = state == "ready" if stock_ecu_off is None else stock_ecu_off
   return car_events.update(CS, Events(), CS_SP)
 
 
@@ -54,6 +60,7 @@ def _events_for(state: str, button=ButtonType.accelCruise, pressed: bool = True,
 def _car_state_sp(state: str):
   CS_SP = messaging.new_message('carStateSP').carStateSP
   CS_SP.zoompilot.stockEcu = state
+  CS_SP.zoompilot.stockEcuOff = state == "ready"
   return CS_SP
 
 
@@ -128,6 +135,25 @@ class TestStockEcuUnprompted:
     assert _update(car_events, "starting", standstill=True).zp.has(EventNameZP.stockEcuInitializing)
     assert not _update(car_events, "starting", standstill=False).zp.has(EventNameZP.stockEcuInitializing)
 
+  def test_smart_can_filter_never_says_aeb_turning_off(self):
+    # the radar stays online behind the filter, and a board that never answers stays starting:
+    # no standing banner and no "AEB turning off" on a press, stopped or rolling
+    car_events = _car_events(sp_flags=MazdaFlagsSP.CAN_FILTER)
+    for standstill in (True, False):
+      for _ in range(3):
+        events_sp = _update(car_events, "starting", ButtonType.accelCruise, standstill=standstill)
+        assert not events_sp.zp.has(EventNameZP.stockEcuInitializing)
+        assert not events_sp.zp.has(EventNameZP.stockEcuNotReady)
+
+  def test_the_flag_bit_on_another_brand_changes_nothing(self):
+    car_events = _car_events('toyota', sp_flags=MazdaFlagsSP.CAN_FILTER)
+    assert _update(car_events, "starting", standstill=True).zp.has(EventNameZP.stockEcuInitializing)
+
+  def test_uds_takeover_still_says_it(self):
+    car_events = _car_events()
+    assert _update(car_events, "starting", standstill=True).zp.has(EventNameZP.stockEcuInitializing)
+    assert _update(car_events, "starting", ButtonType.accelCruise, standstill=True).zp.has(EventNameZP.stockEcuNotReady)
+
   @pytest.mark.parametrize("state", ["notNeeded", "parkToTakeOver", "stockCruiseOn", "ready", "restoring", "restored", "failed"])
   def test_only_the_starting_state(self, state):
     assert not _update(_car_events(), state, standstill=True).zp.has(EventNameZP.stockEcuInitializing)
@@ -140,6 +166,13 @@ class TestStockEcuUnprompted:
     # a returned radar (accFaulted) and a fresh ownership: told again
     _update(car_events, "starting")
     assert _update(car_events, "ready").zp.has(EventNameZP.stockEcuReady)
+
+  def test_ready_with_the_stock_ecu_online_says_nothing(self):
+    # Mazda's Smart CAN Filter: ready with the radar online, so no "AEB off"
+    car_events = _car_events()
+    _update(car_events, "starting", stock_ecu_off=False)
+    assert not _update(car_events, "ready", stock_ecu_off=False).zp.has(EventNameZP.stockEcuReady)
+    assert not _update(car_events, "ready", stock_ecu_off=False).zp.has(EventNameZP.stockEcuReady)
 
   def test_boot_straight_into_ready_is_still_told(self):
     # first frame of a session already owned (comma restart onroad adopting a quiet radar)

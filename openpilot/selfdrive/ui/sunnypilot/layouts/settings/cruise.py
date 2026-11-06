@@ -69,6 +69,14 @@ class CruiseLayout(Widget):
       min_value=1, max_value=3, value_change_step=1,
       inline=True)
 
+    self.can_filter_toggle = toggle_item_sp(
+      title=tr("Smart CAN Filter (Experimental)"),
+      description=tr("Keeps the factory radar online under alpha longitudinal, through a Smart CAN Filter fitted at the radar. " +
+                     "Turn on only with the board installed. Takes effect at the next drive initialization."),
+      param="MazdaCanFilter",
+      enabled=ui_state.is_offroad)
+    self.can_filter_toggle.set_visible(ui_state.mazda_can_filter_available)
+
     self.sla_settings_button = simple_button_item_sp(
       button_text=lambda: tr("Speed Limit"),
       button_width=800,
@@ -77,6 +85,7 @@ class CruiseLayout(Widget):
 
     items = [
       *self._alpha_long.items,
+      self.can_filter_toggle,
       self.scc_v_toggle,
       self.scc_m_toggle,
       self.sla_settings_button,

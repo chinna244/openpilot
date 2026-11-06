@@ -63,6 +63,13 @@ class CruiseLayoutMici(NavScroller):
     self._scc_m_toggle = BigParamControlSP(tr("slow for curves: map"), "SmartCruiseControlMap",
                                            description=tr("Slows for curves in map data, then resumes your set speed.\n" +
                                                           "Download maps in sunnylink first."))
+    self._can_filter_toggle = BigParamControlSP(tr("smart CAN filter (experimental)"), "MazdaCanFilter",
+                                                description=tr("Keeps the factory radar online under alpha long,\n" +
+                                                               "through a Smart CAN Filter fitted at the radar.\n" +
+                                                               "Turn on only with the board installed.\n" +
+                                                               "Takes effect at the next drive initialization."))
+    self._can_filter_toggle.set_enabled(ui_state.is_offroad)
+    self._can_filter_toggle.set_visible(ui_state.mazda_can_filter_available)
     self._custom_acc_btn = BigButtonSP(tr("custom increments"))
     self._speed_limit_btn = BigButtonSP(tr("speed limit"))
 
@@ -71,6 +78,7 @@ class CruiseLayoutMici(NavScroller):
 
     self._scroller.add_widgets([
       *self._alpha_long.items,
+      self._can_filter_toggle,
       self._scc_v_toggle, self._scc_m_toggle,
       self._speed_limit_btn, self._custom_acc_btn,
     ])
@@ -125,6 +133,7 @@ class CruiseLayoutMici(NavScroller):
 
     self._scc_v_toggle.refresh()
     self._scc_m_toggle.refresh()
+    self._can_filter_toggle.refresh()
 
     cp_ready = ui_state.CP is not None and ui_state.CP_SP is not None
     has_long = cp_ready and ui_state.has_longitudinal_control

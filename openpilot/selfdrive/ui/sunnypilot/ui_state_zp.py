@@ -150,6 +150,18 @@ class UIStateZP:
       brand = self.CP.brand
     return brand
 
+  def mazda_can_filter_available(self) -> bool:
+    """The Smart CAN Filter setting: a CX-5 2022 (the manual platform selection while offroad, CarParams
+    otherwise) with alpha long on. The car side checks both again at the next drive initialization."""
+    platform = ""
+    if self.is_offroad():
+      bundle = self.params.get("CarPlatformBundle")
+      platform = bundle.get("platform", "") if isinstance(bundle, dict) else ""
+    if not platform and self.CP is not None:
+      platform = self.CP.carFingerprint
+    alpha_long_available = self.CP is None or self.CP.alphaLongitudinalAvailable
+    return platform == "MAZDA_CX5_2022" and alpha_long_available and self.params.get_bool("AlphaLongitudinalEnabled")
+
   def _enforce_usb_port(self) -> None:
     """ADB and Jetlink both need the comma's USB port: the link
     on turns ADB off, and the developer panels grey its toggle out. Here, not

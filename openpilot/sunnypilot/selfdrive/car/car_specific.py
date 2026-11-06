@@ -12,6 +12,7 @@ from opendbc.car.chrysler.values import RAM_DT
 from opendbc.car.mazda.values import MazdaFlags
 from openpilot.selfdrive.selfdrived.events import Events
 from openpilot.sunnypilot.mads.mads import SET_SPEED_BUTTONS
+from opendbc.sunnypilot.car.mazda.values import MazdaFlagsSP
 from opendbc.sunnypilot.car.stock_ecu import ENGAGES_NORMALLY
 from openpilot.common.params import Params
 from openpilot.common.realtime import DT_CTRL
@@ -40,6 +41,8 @@ class CarSpecificEventsSP:
   def __init__(self, CP: structs.CarParams, CP_SP: structs.CarParamsSP, params=None):
     self.CP = CP
     self.CP_SP = CP_SP
+    # Mazda's Smart CAN Filter keeps the radar online: its starting turns no AEB off and needs no stop
+    self.stock_ecu_online = CP.brand == 'mazda' and bool(CP_SP.flags & MazdaFlagsSP.CAN_FILTER)
 
     self.low_speed_alert = False
     self.stock_ecu_prev = StockEcuState.notNeeded
@@ -115,7 +118,8 @@ class CarSpecificEventsSP:
     stock_ecu = CS_SP.zoompilot.stockEcu
     # The car's own cruise on the stock radar: SET works there as on a stock car, so no press alert.
     stock_cruise = stock_ecu == StockEcuState.stockCruiseOn
-    if str(stock_ecu) not in ENGAGES_NORMALLY and not stock_cruise and \
+    starting_online = stock_ecu == StockEcuState.starting and self.stock_ecu_online
+    if str(stock_ecu) not in ENGAGES_NORMALLY and not stock_cruise and not starting_online and \
        any(be.pressed and be.type in SET_SPEED_BUTTONS for be in CS.buttonEvents):
       events_sp.zp.add(EventNameZP.stockEcuNotReady)
     # The car plays nothing when its own cruise engages or ends (route 0000012e): openpilot's
@@ -130,9 +134,10 @@ class CarSpecificEventsSP:
     # Unprompted only where waiting changes the outcome: stopped with the takeover still
     # starting (route 0000021b pulled away 5 s short of it). Rolling, the press alert carries
     # "stop to engage"; a standing banner would nag a whole drive. One line on the ready edge.
-    if stock_ecu == StockEcuState.starting and CS.standstill:
+    if stock_ecu == StockEcuState.starting and CS.standstill and not self.stock_ecu_online:
       events_sp.zp.add(EventNameZP.stockEcuInitializing)
-    if stock_ecu == StockEcuState.ready and self.stock_ecu_prev != StockEcuState.ready:
+    # "AEB off" only where it is: a stock ECU kept online (Mazda's Smart CAN Filter) is ready with AEB on.
+    if stock_ecu == StockEcuState.ready and self.stock_ecu_prev != StockEcuState.ready and CS_SP.zoompilot.stockEcuOff:
       events_sp.zp.add(EventNameZP.stockEcuReady)
     self.stock_ecu_prev = stock_ecu
     # The stock ECU's own functions counted as back (Mazda AEB on). Said once, and not while the
