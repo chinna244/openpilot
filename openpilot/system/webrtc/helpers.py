@@ -13,6 +13,7 @@ class StreamRequestBody:
   bridge_services_in: list[str] = field(default_factory=list)
   bridge_services_out: list[str] = field(default_factory=list)
   konik: bool = False
+  raw: bool = False  # bridge services as raw capnp bytes instead of JSON
 
 
 def post_stream_request(body: StreamRequestBody) -> dict:

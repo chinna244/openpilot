@@ -152,7 +152,7 @@ class TestModelReasons:
 
 class TestPlacement:
   def test_top_by_alert_size(self):
-    import pyray as rl
+    import raylib_nb as rl
     from openpilot.selfdrive.ui.mici.onroad.slow_banner import SlowBanner
     rect = rl.Rectangle(0, 0, 476, 240)
     # alertSize none 0, small 1, mid 2, full 3; a small alert is 140 px tall on this screen
@@ -167,14 +167,14 @@ class TestPlacement:
     assert SlowBanner._text_for('model_lead', False, 45.7, 0., False) == 'Model: car'
 
   def test_box_centered_unless_icon(self):
-    import pyray as rl
+    import raylib_nb as rl
     from openpilot.selfdrive.ui.mici.onroad.slow_banner import SlowBanner
     rect = rl.Rectangle(0, 0, 476, 240)
     assert SlowBanner._box_x(rect, 200) == 124  # (476 - 200) / 2 - 14
     assert SlowBanner._box_x(rect, 330) == 84  # would reach the icon: pushed right
 
   def test_top_follows_small_alert_text(self):
-    import pyray as rl
+    import raylib_nb as rl
     from openpilot.selfdrive.ui.mici.onroad.slow_banner import SlowBanner
     rect = rl.Rectangle(0, 0, 476, 240)
     assert SlowBanner._top(1, rect, 52.) == 58  # 6 px under the alert text

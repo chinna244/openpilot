@@ -1,5 +1,5 @@
 import math
-import pyray as rl
+import raylib_nb as rl
 from openpilot.cereal import log, custom
 from openpilot.common.constants import CV
 from openpilot.common.filter_simple import FirstOrderFilter

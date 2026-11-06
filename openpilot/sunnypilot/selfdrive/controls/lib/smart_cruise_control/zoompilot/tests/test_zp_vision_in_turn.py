@@ -26,7 +26,7 @@ V_CRUISE = 20.
 
 def host_cruise(v_target, v_car, a_prev):
   """The host's cruise candidate on the SCC target: upstream's, then rebuilt on SCC's budget while SCC is the target."""
-  a = get_cruise_accel(v_target, v_car, a_prev, DT_MDL)
+  a = get_cruise_accel(v_target, v_car, a_prev, a_prev, DT_MDL)
   if v_target >= V_CRUISE:
     return a
   j = op_long_cruise_jerk(v_car) * DT_MDL

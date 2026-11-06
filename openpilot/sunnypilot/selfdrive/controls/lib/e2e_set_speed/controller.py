@@ -56,8 +56,8 @@ GAIN_BP = [-0.3, -0.1]  # m/s^2
 FADE_LAT_BP = [0.6, 1.0]  # m/s^2
 LAT_HORIZON = 10.0  # s
 
-# The lift rises at upstream's cruise jerk, as the cruise candidate it stands in for, and falls fast
-# so the model's own braking is never held off.
+# The lift rises at upstream's cruise jerk, as the cruise candidate it stands in for. This is the
+# slowest it eases off, e.g. on a lane change or a bend.
 LIFT_FALL = 2.4  # m/s^3
 
 # Local tuning (this fork, Mazda CX-5), carried onto the lift from the earlier set-speed floor.
@@ -185,7 +185,8 @@ class E2ESetSpeedController:
     throttle_prob = throttle_probs[1] if len(throttle_probs) > 1 else 1.
     if (any(len(x) != ModelConstants.IDX_N for x in (vel, yaw_rate, pos)) or
         not (np.isfinite(vel).all() and np.isfinite(yaw_rate).all() and np.isfinite(pos).all()) or
-        not all(math.isfinite(x) for x in (v_ego, a_model, a_chill, throttle_prob, curvature)) or math.isnan(v_cruise)):
+        not all(math.isfinite(x) for x in (v_ego, a_model, a_chill, throttle_prob, curvature, steer_lat_accel)) or
+        math.isnan(v_cruise)):
       self._reset(Inhibit.invalid)
       return self._plan_lead(a_model, None) if math.isfinite(a_model) else a_model
 
@@ -197,8 +198,8 @@ class E2ESetSpeedController:
     approach = float(np.clip((v_cruise - v_ego) / TAU, 0., floor_max(v_ego))) if math.isfinite(v_cruise) else floor_max(v_ego)
     self.floor = min(a_chill, approach)
     # stop-and-go stays the model's: the gain fades in above walking pace
-    self.gain = (float(np.interp(a_model, GAIN_BP, [0., 1.])) * float(np.clip(throttle_prob, 0., 1.)) *
-                 float(np.interp(v_ego, [MIN_SPEED, FULL_SPEED], [0., 1.])))
+    model_gain = float(np.interp(a_model, GAIN_BP, [0., 1.])) * float(np.interp(v_ego, [MIN_SPEED, FULL_SPEED], [0., 1.]))
+    self.gain = model_gain * float(np.clip(throttle_prob, 0., 1.))
     self.fade = float(np.interp(lat_ahead, FADE_LAT_BP, [1., 0.]))
 
     if not self.enabled:
@@ -214,7 +215,11 @@ class E2ESetSpeedController:
     self.slowing_count = self.slowing_count + 1 if req <= PLB_OFF else 0
     slowing = self.slowing_count >= self.plb_arm_frames
     target = min(self.gain * self.fade * max(0., self.floor - a_model), lift_max(v_ego)) if self.inhibit == Inhibit.none and not slowing else 0.
-    self.lift = rate_limit(target, self.lift, -LIFT_FALL * self.dt, lift_rise(v_ego) * self.dt)
+    # Normally the lift eases off at LIFT_FALL. When the model starts to brake the gain drops, and
+    # the lift may drop with it in one frame, so at gain 0 the model's braking is not delayed. Only the
+    # model's own easing off counts here: a flickering throttle probability eases out at LIFT_FALL.
+    fall = max(LIFT_FALL * self.dt, (1. - model_gain) * self.lift)
+    self.lift = rate_limit(target, self.lift, -fall, lift_rise(v_ego) * self.dt)
 
     # Arms on PLB_ARM of consecutive need, only at speed; once armed it stays through the final approach under
     # MIN_SPEED, where the model's lag would otherwise leave it the hardest braking.

@@ -3,7 +3,7 @@ Route 00000177 t=183: reset to a -0.55 measured accel, the cruise candidate sent
 import numpy as np
 import pytest
 
-from openpilot.cereal import custom, messaging
+from openpilot.cereal import custom, log, messaging
 from opendbc.car import structs
 from openpilot.selfdrive.controls.lib.longcontrol import LongCtrlState
 from openpilot.selfdrive.controls.lib.longitudinal_planner import LongitudinalPlanner, A_CRUISE_MIN, GAS_COAST_ACCEL
@@ -38,6 +38,7 @@ def build_sm(v_cruise_kph=FAST, a_ego=-0.6, gas=False, brake=False, enabled=True
   services['controlsState'] = ctl.controlsState.as_reader()
   sd = messaging.new_message('selfdriveState')
   sd.selfdriveState.enabled = enabled
+  sd.selfdriveState.personality = log.LongitudinalPersonality.standard  # aggressive (the default) adds upstream's boost
   services['selfdriveState'] = sd.selfdriveState.as_reader()
   services['selfdriveStateSP'] = messaging.new_message('selfdriveStateSP').selfdriveStateSP.as_reader()
   cc = messaging.new_message('carControl')

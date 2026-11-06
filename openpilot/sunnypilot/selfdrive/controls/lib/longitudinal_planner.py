@@ -19,6 +19,7 @@ from openpilot.selfdrive.car.cruise import V_CRUISE_MAX
 from openpilot.selfdrive.controls.lib.accel_boost import AccelBoost
 from openpilot.selfdrive.controls.lib.drive_helpers import CONTROL_N, get_accel_from_plan
 from openpilot.selfdrive.modeld.constants import ModelConstants
+from openpilot.sunnypilot.selfdrive.controls.lib.e2e_set_speed.accel_boost import SetSpeedAssistGatedBoost
 from openpilot.sunnypilot.selfdrive.controls.lib.e2e_set_speed.controller import E2ESetSpeedController
 from openpilot.sunnypilot.selfdrive.controls.lib.e2e_alerts_helper import E2EAlertsHelper
 from openpilot.sunnypilot.selfdrive.controls.lib.lead_forecast.forecast import LeadForecast
@@ -164,16 +165,13 @@ class LongitudinalPlannerSP:
     a_chill = min(float(a_mpc), self.a_cruise)
     # output_v_target is this frame's cruise target after SCC and SLA, which the lift's floor approaches
     a_e2e = self.e2e_set_speed.update(sm, a_model, a_chill, is_e2e, reset_state, steer_lat_accel, self.output_v_target)
-    # upstream's gas boost learns past the model from gas presses; the set-speed floor already lifts
-    # it, so the boost only runs with the floor off
-    if self.e2e_set_speed.enabled:
-      self.accel_boost.total_boost = 0.
-      self.accel_boost.boost_eligible = False
     if not is_e2e:
       return ACCEL_MAX, False
     return a_e2e, should_stop_model
 
   def update(self, sm: messaging.SubMaster) -> None:
+    if not isinstance(self.accel_boost, SetSpeedAssistGatedBoost):
+      self.accel_boost = SetSpeedAssistGatedBoost(lambda: self.e2e_set_speed.enabled)
     self.events_sp.clear()
     self.lead_forecast.update(sm)
 

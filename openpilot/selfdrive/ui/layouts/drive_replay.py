@@ -2,7 +2,9 @@
 from datetime import datetime
 import threading
 
-import pyray as rl
+import numpy as np
+
+import raylib_nb as rl
 
 from openpilot.common.hardware.hw import Paths
 from openpilot.common.params import Params
@@ -159,11 +161,11 @@ class DriveReplayLayout(Widget):
       width, height, pixels = frame
       if self._texture is None or self._texture.width != width or self._texture.height != height:
         self._release_texture()
-        image = rl.Image(rl.ffi.from_buffer(pixels), width, height, 1, rl.PixelFormat.PIXELFORMAT_UNCOMPRESSED_R8G8B8)
+        image = rl.Image(np.frombuffer(pixels, dtype=np.uint8), width, height, 1, rl.PixelFormat.PIXELFORMAT_UNCOMPRESSED_R8G8B8)
         self._texture = rl.load_texture_from_image(image)
         rl.set_texture_filter(self._texture, rl.TextureFilter.TEXTURE_FILTER_BILINEAR)
       else:
-        rl.update_texture(self._texture, rl.ffi.cast('void *', rl.ffi.from_buffer(pixels)))
+        rl.update_texture(self._texture, np.frombuffer(pixels, dtype=np.uint8))
       self._last_frame = frame
     if self._texture is not None:
       factor = max(rect.width / self._texture.width, rect.height / self._texture.height)

@@ -9,7 +9,8 @@ from openpilot.common.test import OpenpilotTestCase
 from openpilot.cereal import messaging, log
 from teleoprtc.tracks import VIDEO_CLOCK_RATE
 
-from openpilot.system.webrtc.webrtcd import CerealOutgoingMessageProxy, CerealIncomingMessageProxy, ServerState, handle_get_stream
+from openpilot.system.webrtc.device.messaging import CerealOutgoingMessageProxy, CerealIncomingMessageProxy
+from openpilot.system.webrtc.webrtcd import ServerState, handle_get_stream
 from openpilot.system.webrtc.device.video import LiveStreamVideoStreamTrack
 
 
@@ -41,6 +42,23 @@ class TestStreamSession(OpenpilotTestCase):
     proxy.update()
 
     channel.send.assert_called_once_with(expected_json)
+
+  def test_outgoing_proxy_raw(self, mocker):
+    pm = messaging.PubMaster(["customReservedRawData0"])
+    proxy = CerealOutgoingMessageProxy(["customReservedRawData0"], raw=True)
+    channel = mocker.Mock()
+    channel.is_open.return_value = True
+    channel.max_message_size.return_value = 1024
+    proxy.add_channel(channel)
+
+    small = messaging.new_message(None, customReservedRawData0=b"test").to_bytes()
+    big = messaging.new_message(None, customReservedRawData0=bytes(2048)).to_bytes()
+    pm.send("customReservedRawData0", small)
+    pm.send("customReservedRawData0", big)
+    proxy.update()
+
+    # raw capnp bytes are passed through, messages bigger than the channel's max are dropped
+    channel.send.assert_called_once_with(small)
 
   def test_incoming_proxy(self, mocker):
     tested_msgs = [
@@ -94,6 +112,7 @@ class TestCameraSwitchPolicy:
   def test_konik_session_allows_supported_camera_switch(self, mocker, camera):
     from openpilot.system.webrtc.webrtcd import StreamSession
     session = object.__new__(StreamSession)
+    session.raw, session.video_enabled = False, True
     session.konik = True
     track = mocker.Mock()
     session.video_tracks = [track]
@@ -103,6 +122,7 @@ class TestCameraSwitchPolicy:
   def test_existing_sessions_keep_camera_switch(self, mocker):
     from openpilot.system.webrtc.webrtcd import StreamSession
     session = object.__new__(StreamSession)
+    session.raw, session.video_enabled = False, True
     session.konik = False
     track = mocker.Mock()
     session.video_tracks = [track]
@@ -118,6 +138,7 @@ class TestCameraSwitchPolicy:
       flags = {"KonikUploadsEnabled": True, "IsOffroad": True}
       entered = asyncio.Event()
       session = object.__new__(StreamSession)
+      session.raw, session.video_enabled = False, True
       session.konik = True
       session.identifier = 'konik-test'
       session.is_body = False
@@ -153,6 +174,7 @@ class TestCameraSwitchPolicy:
   def test_konik_session_rejects_unknown_camera(self, mocker, camera):
     from openpilot.system.webrtc.webrtcd import StreamSession
     session = object.__new__(StreamSession)
+    session.raw, session.video_enabled = False, True
     session.konik = True
     track = mocker.Mock()
     session.video_tracks = [track]
@@ -196,6 +218,7 @@ def test_redundant_video_enable_does_not_restart_keyframes(mocker):
 def test_website_quality_control_reaches_bitrate_controller(mocker, quality):
   from openpilot.system.webrtc.webrtcd import StreamSession
   session = object.__new__(StreamSession)
+  session.raw, session.video_enabled = False, True
   session.bitrate_controller = mocker.Mock()
   session.message_handler(json.dumps({'type': 'livestreamSettings', 'data': {'quality': quality}}).encode())
   session.bitrate_controller.set_quality.assert_called_once_with(quality)
@@ -205,13 +228,14 @@ def test_website_quality_control_reaches_bitrate_controller(mocker, quality):
 def test_website_pause_controls_video_and_telemetry(mocker, enabled):
   from openpilot.system.webrtc.webrtcd import StreamSession
   session = object.__new__(StreamSession)
+  session.raw, session.video_enabled = False, True
   track = mocker.Mock()
   session.video_tracks = [track]
   session.outgoing_bridge = mocker.Mock()
   session.bitrate_controller = mocker.Mock()
   session.params = mocker.Mock()
   session.message_handler(json.dumps({'type': 'livestreamVideoEnable', 'data': {'enabled': enabled}}).encode())
-  assert session.enabled is enabled
+  assert session.video_enabled is enabled
   track.enable.assert_called_once_with(enabled)
   session.outgoing_bridge.enable.assert_called_once_with(enabled)
   session.bitrate_controller.enable.assert_called_once_with(enabled)

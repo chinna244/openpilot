@@ -4,8 +4,9 @@ driver's own setting has it off (aebSettingOff). A 120x100 PNG drawn at 60x50, t
 embedded so the patch stays text.
 """
 import base64
+import tempfile
 
-import pyray as rl
+import raylib_nb as rl
 
 SIZE = (60, 50)
 _PNG = base64.b64decode(
@@ -109,7 +110,11 @@ _PNG = base64.b64decode(
 
 
 def load_texture() -> rl.Texture:
-  image = rl.load_image_from_memory(".png", _PNG, len(_PNG))
+  # raylib_nb binds no load_image_from_memory
+  with tempfile.NamedTemporaryFile(suffix=".png") as f:
+    f.write(_PNG)
+    f.flush()
+    image = rl.load_image(f.name)
   texture = rl.load_texture_from_image(image)
   rl.unload_image(image)
   rl.set_texture_filter(texture, rl.TextureFilter.TEXTURE_FILTER_BILINEAR)

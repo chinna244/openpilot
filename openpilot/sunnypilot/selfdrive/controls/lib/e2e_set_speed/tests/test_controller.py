@@ -4,7 +4,6 @@ Copyright (c) 2026-, Zeph Leggett.
 This file is part of zoompilot and is licensed under the MIT License.
 See the LICENSE.md file in the root directory for more details.
 """
-import math
 
 import numpy as np
 import pytest
@@ -126,12 +125,22 @@ def test_never_lowers_the_model():
     assert ctl.lift == 0.
 
 
-def test_lets_go_of_the_models_braking_fast():
+def test_lets_go_of_the_models_braking_at_once():
   ctl = settled(a_cruise=1.5)
-  run(ctl, 1, build_sm(V_EGO), a_model=-0.5, a_cruise=1.5)
-  assert ctl.lift == pytest.approx(CAP - 2.4 * DT)
-  run(ctl, math.ceil(CAP / (2.4 * DT)), build_sm(V_EGO), a_model=-0.5, a_cruise=1.5)
+  # halfway into the fade, the lift drops to its new value in one frame instead of easing off
+  a_model = sum(c.GAIN_BP) / 2
+  run(ctl, 1, build_sm(V_EGO), a_model=a_model, a_cruise=1.5)
+  assert ctl.lift == pytest.approx(0.5 * (ctl.floor - a_model))
+  ctl = settled(a_cruise=1.5)
+  assert run(ctl, 1, build_sm(V_EGO), a_model=-0.5, a_cruise=1.5) == -0.5
   assert ctl.lift == 0.
+
+
+def test_throttle_probability_dip_eases_out():
+  # only the model's own easing off drops the lift at once; a throttle probability dip eases it out
+  ctl = settled(a_cruise=1.5)
+  run(ctl, 1, build_sm(V_EGO, throttle_prob=0.), a_cruise=1.5)
+  assert ctl.lift == pytest.approx(CAP - c.LIFT_FALL * DT)
 
 
 def test_far_plan_speeds_do_not_move_the_lift():

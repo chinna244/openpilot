@@ -28,7 +28,7 @@ ACTUATOR_TAU = 0.5  # s
 def simulate(enabled, seconds=60., tau=50., brake_at=None):
   """Rows of (t, v_ego, a_model, e2e candidate). brake_at: the model brakes at -0.5 from then on."""
   ctl = E2ESetSpeedController(params=FakeParams(ExperimentalModeSetSpeed=enabled), dt=DT)
-  v, a_act, a_cruise = V_PREF, 0., 0.
+  v, a_act, a_cruise, out = V_PREF, 0., 0., 0.
   log = []
   for i in range(int(seconds / DT)):
     t = i * DT
@@ -37,7 +37,7 @@ def simulate(enabled, seconds=60., tau=50., brake_at=None):
       a_model = -0.5
     # the host passes last frame's cruise candidate, then builds this frame's
     e2e = ctl.update(build_sm(v), a_model, a_cruise, **ENGAGED)
-    a_cruise = get_cruise_accel(V_CRUISE, v, a_cruise, DT)
+    a_cruise = get_cruise_accel(V_CRUISE, v, a_cruise, out, DT)
     out = min(e2e, a_cruise)
     a_act += DT / ACTUATOR_TAU * (out - a_act)
     v += a_act * DT
@@ -50,7 +50,7 @@ def chill_peak(seconds=60.):
   v, a_act, a_cruise = V_PREF, 0., 0.
   peak = v
   for _ in range(int(seconds / DT)):
-    a_cruise = get_cruise_accel(V_CRUISE, v, a_cruise, DT)
+    a_cruise = get_cruise_accel(V_CRUISE, v, a_cruise, a_cruise, DT)
     a_act += DT / ACTUATOR_TAU * (a_cruise - a_act)
     v += a_act * DT
     peak = max(peak, v)
@@ -75,6 +75,7 @@ def test_reaches_set_speed(tau, deficit):
 
 
 def test_added_jerk_bounded():
+  # the model never brakes in this run, so the lift never takes the gain's faster drop
   log = simulate(True)
   lift = log[:, 3] - log[:, 2]
   jerk = np.diff(lift) / DT

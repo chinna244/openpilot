@@ -1,4 +1,4 @@
-import pyray as rl
+import raylib_nb as rl
 
 from openpilot.common.api.konik import pairing_url
 from openpilot.common.swaglog import cloudlog

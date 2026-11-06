@@ -273,17 +273,13 @@ def test_render_after_ignition_does_not_draw_or_recreate_resources(mocker):
   draw.assert_not_called()
 
 
-def test_consecutive_video_frames_use_pyray_compatible_pixel_pointer(mocker):
+def test_consecutive_video_frames_upload_their_pixels(mocker):
   from types import SimpleNamespace
   from openpilot.selfdrive.ui.layouts import drive_replay as ui
 
-  # Exercise pyray's actual void-pointer conversion without a GPU context.
+  # raylib_nb takes the pixels as a buffer; check what reaches it without a GPU context.
   uploaded = []
-  @ui.rl.ffi.callback('void(int, const void *)')
-  def upload(texture_id, pixels):
-    uploaded.append((texture_id, bytes(ui.rl.ffi.buffer(pixels, 12))))
-  wrapped_upload = ui.rl._wrap_function(upload)
-  mocker.patch.object(ui.rl, 'update_texture', side_effect=lambda texture, pixels: wrapped_upload(texture.id, pixels))
+  mocker.patch.object(ui.rl, 'update_texture', side_effect=lambda texture, pixels: uploaded.append((texture.id, bytes(pixels))))
   for name in ('draw_rectangle_rec', 'draw_texture_pro'):
     mocker.patch.object(ui.rl, name)
 

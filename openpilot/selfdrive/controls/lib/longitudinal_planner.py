@@ -42,10 +42,10 @@ GAS_COAST_JERK = 0.3  # m/s^3
 CONTROL_N_T_IDX = ModelConstants.T_IDXS[:CONTROL_N]
 
 
-def get_cruise_accel(v_cruise, v_ego, a_cruise_prev, dt):
+def get_cruise_accel(v_cruise, v_ego, a_cruise_prev, a_target_prev, dt):
   target_accel = np.clip(v_cruise - v_ego, A_CRUISE_MIN, ACCEL_MAX)
   j_cruise = np.interp(v_ego, J_CRUISE_BP, J_CRUISE_VALS)
-  target_accel = float(np.clip(target_accel, a_cruise_prev - j_cruise * dt, a_cruise_prev + j_cruise * dt))
+  target_accel = float(np.clip(target_accel, min(a_cruise_prev, a_target_prev) - j_cruise * dt, a_cruise_prev + j_cruise * dt))
 
   return target_accel
 
@@ -110,6 +110,7 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
     prev_accel_constraint = not (reset_state or sm['carState'].standstill)
 
     # Get new v_cruise and a_target from Smart Cruise Control and Speed Limit Assist
+    prev_output_a_target = self.output_a_target  # the cruise law's lower bound, before update_targets reseeds it
     v_cruise, self.output_a_target = LongitudinalPlannerSP.update_targets(self, sm, self.v_desired_filter.x, self.output_a_target, v_cruise)
 
     # A gas override resets the cruise state to the measured accel, which in a turn or over a bump reads as braking nobody
@@ -174,12 +175,12 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
     output_a_target_e2e, output_should_stop_e2e = LongitudinalPlannerSP.update_e2e_target(self, sm, output_a_target_e2e,
                                                                                           output_should_stop_e2e, reset_state)
 
-    self.a_cruise = get_cruise_accel(v_cruise, v_ego, self.a_cruise, self.dt)
+    self.a_cruise = get_cruise_accel(v_cruise, v_ego, self.a_cruise, prev_output_a_target, self.dt)
     self.a_cruise = LongitudinalPlannerSP.update_cruise_accel(self, self.a_cruise)
     a_cruise = self.a_cruise
     if self.gas_override or self.gas_return:
       # what the target asks this cycle: the cruise accel without its jerk limit (SCC's budget included), never above 0
-      cruise_ask = min(LongitudinalPlannerSP.update_cruise_accel(self, get_cruise_accel(v_cruise, v_ego, 0., 1e3), unlimited=True), 0.)
+      cruise_ask = min(LongitudinalPlannerSP.update_cruise_accel(self, get_cruise_accel(v_cruise, v_ego, 0., 0., 1e3), unlimited=True), 0.)
       if self.gas_return and self.a_cruise >= cruise_ask:
         self.gas_return = False
       else:
@@ -209,7 +210,7 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
       # toward what the set speed asks now (never above 0) at the cruise jerk limit: down while still over it, up once
       # under it (a raised set speed), until the state is back over the candidate
       j = float(np.interp(v_ego, J_CRUISE_BP, J_CRUISE_VALS)) * self.dt
-      settle = float(np.clip(min(get_cruise_accel(v_cruise, v_ego, 0., 1e3), 0.), self.a_settle - j, self.a_settle + j))
+      settle = float(np.clip(min(get_cruise_accel(v_cruise, v_ego, 0., 0., 1e3), 0.), self.a_settle - j, self.a_settle + j))
     if settle is not None and settle > a_cruise:
       a_cruise = settle
       self.a_settle = a_cruise
@@ -248,7 +249,7 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
 
     longitudinalPlan = plan_send.longitudinalPlan
     longitudinalPlan.modelMonoTime = sm.logMonoTime['modelV2']
-    longitudinalPlan.processingDelay = (plan_send.logMonoTime / 1e9) - sm.logMonoTime['modelV2']
+    longitudinalPlan.processingDelay = (plan_send.logMonoTime - sm.logMonoTime['modelV2']) / 1e9
     longitudinalPlan.solverExecutionTime = self.mpc.solve_time
 
     longitudinalPlan.speeds = self.v_desired_trajectory.tolist()
