@@ -15,7 +15,11 @@ LANE_CHANGE_SPEED_MIN = 20 * CV.MPH_TO_MS
 
 # "Wait for the turn": the blinker only arms the turn, and the one-shot turn desire is sent when one of these says
 # the turn is here. The model treats the desire as "turn now", so sending it early makes it take the first opening.
-TURN_STOPPED_SPEED = 0.5  # m/s, stopped at the turn (red light, stop sign)
+TURN_STOPPED_SPEED = 0.5  # m/s, stopped at the turn (red light, stop sign): the desire waits for the car to move off
+# fork: the desire is never sent while stopped unless the driver nudges the wheel. Sent at a red light it made the model
+# drive into the turn: route 00000043 t=159, blinker on at a red, turnLeft sent at once, the plan went 0.6 -> 28 m and the
+# car pulled away at +0.3 until the brake; with the desire gone at t=166 the model stopped again. Moving off from the
+# stop on the model's own plan (the green, the stop sign done) sends it.
 MODEL_TURN_PROB = 0.35  # model's own prediction that a turn starts within the next horizons
 MODEL_TURN_HORIZONS = 2  # desirePrediction horizons checked, soonest first
 DESIRE_PRED_WIDTH = 8
@@ -36,6 +40,8 @@ class LaneTurnController:
     self.DH = desire_helper
     self.turn_direction = TurnDirection.none
     self.armed_direction = TurnDirection.none
+    self.stopped_armed = False  # stopped with the blinker armed: moving off is the turn
+    self.nudge_latched = False  # the desire came from the driver's nudge, kept while stopped
     self.params = Params()
     self.lane_turn_value = float(self.params.get("LaneTurnValue", return_default=True)) * CV.MPH_TO_MS
     self.param_read_counter = 0
@@ -64,22 +70,27 @@ class LaneTurnController:
     if not self.wait_for_turn or requested == TurnDirection.none:
       self.armed_direction = TurnDirection.none
       self.turn_direction = requested
+      self.stopped_armed = self.nudge_latched = False
       return
 
     if requested != self.armed_direction:
       # newly armed, or the blinker switched sides: wait again
       self.armed_direction = requested
       self.turn_direction = TurnDirection.none
+      self.stopped_armed = self.nudge_latched = False
 
-    if self.turn_direction == TurnDirection.none and self.turn_is_here(requested, v_ego, steering_pressed, steering_torque, turn_probs):
-      self.turn_direction = requested  # latched until the blinker goes off
-
-  @staticmethod
-  def turn_is_here(direction, v_ego: float, steering_pressed: bool, steering_torque: float, turn_probs: tuple[float, float]) -> bool:
-    left = direction == TurnDirection.turnLeft
+    left = requested == TurnDirection.turnLeft
     nudged = steering_pressed and (steering_torque > 0 if left else steering_torque < 0)
     model_sees_turn = (turn_probs[0] if left else turn_probs[1]) >= MODEL_TURN_PROB
-    return v_ego < TURN_STOPPED_SPEED or nudged or model_sees_turn
+    stopped = v_ego < TURN_STOPPED_SPEED
+    if stopped:
+      self.stopped_armed = True
+      if not self.nudge_latched:
+        self.turn_direction = TurnDirection.none  # also one latched on the approach: the model holds the red without it
+
+    if self.turn_direction == TurnDirection.none and (nudged or (not stopped and (model_sees_turn or self.stopped_armed))):
+      self.turn_direction = requested  # latched until the blinker goes off
+      self.nudge_latched = nudged
 
   def get_turn_direction(self):
     if not self.enabled:

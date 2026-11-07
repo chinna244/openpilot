@@ -191,7 +191,6 @@ class TestWaitForTurn(OpenpilotTestCase):
     assert controller.get_turn_direction() == TurnDirection.none
 
   @parameterized.expand([
-    ("stopped", {"v_ego": 0.2}),
     ("nudge", {"steering_pressed": True, "steering_torque": 1.5}),
     ("model", {"turn_probs": (MODEL_TURN_PROB, 0.)}),
   ])
@@ -217,9 +216,36 @@ class TestWaitForTurn(OpenpilotTestCase):
       controller.update_lane_turn(False, False, False, True, 6, **trigger)
     assert controller.get_turn_direction() == TurnDirection.none
 
+  def test_stopped_holds_the_turn_until_moving_off(self):
+    # route 00000043 t=159: a turn desire sent at a red light made the model drive into the turn
+    controller = make_wait_controller()
+    for _ in range(20):
+      controller.update_lane_turn(False, False, True, False, 0., turn_probs=(0.9, 0.))
+    assert controller.get_turn_direction() == TurnDirection.none
+    controller.update_lane_turn(False, False, True, False, 0.6)  # the model moves off on its own (the green)
+    assert controller.get_turn_direction() == TurnDirection.turnLeft
+
+  def test_turn_latched_on_the_approach_is_withdrawn_at_the_stop(self):
+    controller = make_wait_controller()
+    controller.update_lane_turn(False, False, True, False, 6, turn_probs=(0.9, 0.))
+    assert controller.get_turn_direction() == TurnDirection.turnLeft
+    controller.update_lane_turn(False, False, True, False, 0.)
+    assert controller.get_turn_direction() == TurnDirection.none
+    controller.update_lane_turn(False, False, True, False, 1.0)
+    assert controller.get_turn_direction() == TurnDirection.turnLeft
+
+  def test_nudge_sends_the_turn_while_stopped(self):
+    controller = make_wait_controller()
+    controller.update_lane_turn(False, False, True, False, 0.)
+    controller.update_lane_turn(False, False, True, False, 0., steering_pressed=True, steering_torque=1.5)
+    assert controller.get_turn_direction() == TurnDirection.turnLeft
+    controller.update_lane_turn(False, False, True, False, 0.)  # kept: the driver asked for it
+    assert controller.get_turn_direction() == TurnDirection.turnLeft
+
   def test_blinker_off_rearms(self):
     controller = make_wait_controller()
     controller.update_lane_turn(False, False, True, False, 0.)
+    controller.update_lane_turn(False, False, True, False, 1.0)
     assert controller.get_turn_direction() == TurnDirection.turnLeft
     controller.update_lane_turn(False, False, False, False, 6)
     controller.update_lane_turn(False, False, True, False, 6)
