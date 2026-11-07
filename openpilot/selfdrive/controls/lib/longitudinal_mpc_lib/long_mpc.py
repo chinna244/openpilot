@@ -270,9 +270,10 @@ class LongitudinalMpc:
     for i in range(N):
       self.solver.cost_set(i, 'Zl', Zl)
 
-  def set_weights(self, prev_accel_constraint=True, personality=log.LongitudinalPersonality.standard):
+  def set_weights(self, prev_accel_constraint=True, personality=log.LongitudinalPersonality.standard, stop_jerk_scale=1.0):
     jerk_factor = get_jerk_factor(personality)
     a_change_cost = A_CHANGE_COST if prev_accel_constraint else 0
+    a_change_cost *= stop_jerk_scale if stop_jerk_scale in (0.32, 0.8) else 1.0  # Vision Force Stop, as StarPilot
     cost_weights = [X_EGO_OBSTACLE_COST, X_EGO_COST, V_EGO_COST, A_EGO_COST, jerk_factor * a_change_cost, jerk_factor * J_EGO_COST]
     constraint_cost_weights = [LIMIT_COST, LIMIT_COST, LIMIT_COST, DANGER_ZONE_COST]
     self.set_cost_weights(cost_weights, constraint_cost_weights)
@@ -316,7 +317,7 @@ class LongitudinalMpc:
     lead_xv = self.extrapolate_lead(x_lead, v_lead, a_lead, a_lead_tau)
     return lead_xv
 
-  def update(self, radarstate, personality=log.LongitudinalPersonality.standard):
+  def update(self, radarstate, personality=log.LongitudinalPersonality.standard, stop_line_m=None):
     t_follow = get_city_T_FOLLOW(get_T_FOLLOW(personality), self.x0[1])
 
     lead_xv_0 = self.process_lead(radarstate.leadOne)
@@ -330,6 +331,12 @@ class LongitudinalMpc:
 
     x_obstacles = np.column_stack([lead_0_obstacle, lead_1_obstacle])
     self.source = MPC_SOURCES[np.argmin(x_obstacles[0])]
+    # Vision Force Stop's stop line, as StarPilot adds it: a standing obstacle with the standing distance added back
+    if stop_line_m is not None and np.isfinite(stop_line_m) and 0.0 <= stop_line_m <= 500.0:
+      stop_obstacle = stop_line_m + STOP_DISTANCE
+      if stop_obstacle < np.min(x_obstacles[0]):
+        self.source = LongitudinalPlanSource.cruise
+      x_obstacles = np.column_stack((x_obstacles, np.full(N + 1, stop_obstacle)))
 
     self.yref[:,:] = 0.0
     for i in range(N):

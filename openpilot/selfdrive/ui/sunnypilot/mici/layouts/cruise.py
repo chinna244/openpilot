@@ -102,13 +102,18 @@ class CruiseLayoutMici(NavScroller):
     self._sl_vision = BigParamControlSP(tr("camera signs"), "SpeedLimitVision",
                                         description=tr("Reads speed limit signs with the road camera.\n" +
                                                        "Combined and vision-first use it. Off: car and map only."))
+    self._sl_force_stop = BigParamControlSP(tr("stop at signs"), "VisionForceStop",
+                                            description=tr("Stops for STOP signs the camera reads, as StarPilot's Force Stop does.\n" +
+                                                           "Only under 40 mph, when the driving model also slows. Gas or RES to go.\n" +
+                                                           "Needs camera signs on. Street lights at night can read as STOP signs."))
     self._sl_offset_type = BigMultiParamToggleSP(tr("offset type"), "SpeedLimitOffsetType", [tr("none"), tr("fixed"), "%"], off_index=0,
                                                  description=tr("Adds an offset to the speed limit.\n" +
                                                                 "Fixed adds a set amount of speed. % adds a percentage of the limit."))
     self._sl_offset_value = BigParamOption(tr("offset value"), "SpeedLimitValueOffset",
                                            min_value=-30, max_value=30, label_callback=_offset_label, picker_unit=_offset_unit,
                                            description=tr("The amount added to the speed limit. Negative values go below it."))
-    self._sl_view = self._speed_limit_btn.link_sub_panel([self._sl_mode, self._sl_source, self._sl_vision, self._sl_offset_type, self._sl_offset_value])
+    self._sl_view = self._speed_limit_btn.link_sub_panel([self._sl_mode, self._sl_source, self._sl_vision, self._sl_force_stop,
+                                                         self._sl_offset_type, self._sl_offset_value])
 
   def show_event(self):
     super().show_event()

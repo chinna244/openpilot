@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import time
 import numpy as np
 
 import openpilot.cereal.messaging as messaging
@@ -10,13 +11,15 @@ from openpilot.selfdrive.modeld.constants import ModelConstants
 from openpilot.selfdrive.controls.lib.accel_boost import AccelBoost
 from openpilot.selfdrive.controls.lib.firm_stop import FirmStop
 from openpilot.selfdrive.controls.lib.longcontrol import LongCtrlState
-from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import LongitudinalMpc, LongitudinalPlanSource
+from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import LongitudinalMpc, LongitudinalPlanSource, get_T_FOLLOW
 from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import T_IDXS as T_IDXS_MPC
 from openpilot.selfdrive.controls.lib.drive_helpers import CONTROL_N, get_accel_from_plan, should_stop
 from openpilot.selfdrive.car.cruise import V_CRUISE_MAX, V_CRUISE_UNSET
 from openpilot.common.swaglog import cloudlog
 
 from openpilot.sunnypilot.selfdrive.controls.lib.longitudinal_planner import LongitudinalPlannerSP
+from openpilot.sunnypilot.selfdrive.controls.lib.vision_force_stop.force_stop import StopPlan
+from openpilot.sunnypilot.selfdrive.controls.lib.vision_force_stop.runtime import VisionForceStop
 
 J_CRUISE_VALS = [1.6, 1.2, 0.8, 0.6]
 J_CRUISE_BP = [0., 10.0, 25., 40.]
@@ -51,7 +54,7 @@ def get_cruise_accel(v_cruise, v_ego, a_cruise_prev, a_target_prev, dt):
 
 
 class LongitudinalPlanner(LongitudinalPlannerSP):
-  def __init__(self, CP, CP_SP, init_v=0.0, init_a=0.0, dt=DT_MDL):
+  def __init__(self, CP, CP_SP, init_v=0.0, init_a=0.0, dt=DT_MDL, params=None):
     self.CP = CP
     self.mpc = LongitudinalMpc(dt=dt)
     LongitudinalPlannerSP.__init__(self, self.CP, CP_SP, self.mpc)
@@ -59,6 +62,9 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
     self.dt = dt
     self.accel_boost = AccelBoost()
     self.firm_stop = FirmStop()
+    self.vision_force_stop = VisionForceStop(params)
+    self.force_stop_plan = StopPlan()
+    self.drive_id = time.monotonic_ns()
 
     self.v_desired_filter = FirstOrderFilter(init_v, 2.0, self.dt)
     self.a_cruise = init_a
@@ -147,12 +153,21 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
         self.gas_coast, self.gas_coast_v_cruise, self.a_coast = True, v_cruise, min(self.a_cruise, 0.)
       self.gas_override, self.disengaged, self.gas_return = False, False, True
 
-    self.mpc.set_weights(prev_accel_constraint, personality=sm['selfdriveState'].personality)
+    # Vision Force Stop (StarPilot's sign path): a speed ceiling toward the stop and the stop line for the MPC
+    self.force_stop_plan = self.vision_force_stop.sample(sm, self.CP, now_ns=time.monotonic_ns(), drive_id=self.drive_id,
+                                                         follow_seconds=get_T_FOLLOW(sm['selfdriveState'].personality))
+    if reset_state or self.force_stop_plan.model_ns != sm.logMonoTime['modelV2']:
+      self.force_stop_plan = StopPlan()
+    if self.force_stop_plan.speed_ceiling_mps is not None:
+      v_cruise = min(v_cruise, self.force_stop_plan.speed_ceiling_mps)
+
+    self.mpc.set_weights(prev_accel_constraint, personality=sm['selfdriveState'].personality,
+                         stop_jerk_scale=self.force_stop_plan.jerk_scale)
     if self.CP.openpilotLongitudinalControl:
       self.mpc.set_cur_state(self.v_desired_filter.x, self.output_a_target)
     else:
       self.mpc.set_cur_state(v_ego, sm['carState'].aEgo)
-    self.mpc.update(sm['radarState'], personality=sm['selfdriveState'].personality)
+    self.mpc.update(sm['radarState'], personality=sm['selfdriveState'].personality, stop_line_m=self.force_stop_plan.obstacle_m)
 
     self.v_desired_trajectory = np.interp(CONTROL_N_T_IDX, T_IDXS_MPC, self.mpc.v_solution)
     self.a_desired_trajectory = np.interp(CONTROL_N_T_IDX, T_IDXS_MPC, self.mpc.a_solution)
@@ -232,7 +247,7 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
                   (output_a_target_e2e, LongitudinalPlanSource.e2e, output_should_stop_e2e)]
 
     output_a_target, self.mpc.source, _ = min(candidates, key=lambda c: c[0])
-    self.output_should_stop = any(should_stop for _, _, should_stop in candidates)
+    self.output_should_stop = self.force_stop_plan.should_stop or any(should_stop for _, _, should_stop in candidates)
     self.output_a_target = np.clip(output_a_target, ACCEL_MIN, ACCEL_MAX)
     self.a_target_published, self.source_published = float(self.output_a_target), self.mpc.source
     if lift_published:

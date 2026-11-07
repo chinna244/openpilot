@@ -501,6 +501,15 @@ struct CustomReserved10 @0xcb9fd56c7057593a {
   status @5 :Text;                   # StarPilot's status line: Scanning, Candidate, Holding, Idle, a missing model
   frameProcessTime @6 :Float32;      # s, the last inference pass
   inferenceInterval @7 :Float32;     # s, the wait the reader picked between passes
+  # STOP signs from the joint detector (StarPilot traffic_signs_us_detector), one sample per detector pass
+  stopValid @8 :Bool;                # this sample's frame went through the STOP head
+  stopObservedMonoTime @9 :UInt64;   # ns, monotonic, when the frame was received
+  stopFrameEofTime @10 :UInt64;      # ns, the camera frame's end of frame (boot clock)
+  stopFrameId @11 :UInt32;
+  stopImageWidth @12 :UInt16;
+  stopImageHeight @13 :UInt16;
+  stopConfidences @14 :List(Float32);  # up to 4 boxes, >= 0.6
+  stopBoxes @15 :List(Int32);          # x1, y1, x2, y2 per box, frame pixels
 }
 
 struct CustomReserved11 @0xc2243c65e0340384 {

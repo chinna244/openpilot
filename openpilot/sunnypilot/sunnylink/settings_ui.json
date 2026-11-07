@@ -988,6 +988,12 @@
                   "description": "Read speed limit signs with the road camera; a sign holds until the road changes. Vision Priority uses the camera sign, else Car, else Map. Combined uses the camera sign, else Map, else Car."
                 },
                 {
+                  "key": "VisionForceStop",
+                  "widget": "toggle",
+                  "title": "Stop at STOP Signs",
+                  "description": "Stops for STOP signs the camera reads, as StarPilot's Force Stop does. Only under 40 mph and when the driving model also slows; press the gas or RES to go. Needs Camera Sign Reading on. Street lights at night can read as STOP signs."
+                },
+                {
                   "key": "SpeedLimitOffsetType",
                   "widget": "multiple_button",
                   "title": "Speed Limit Offset Type",

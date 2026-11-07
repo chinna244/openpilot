@@ -337,6 +337,13 @@ LEGACY_MODEL_PATH = MODEL_DIR / "speed_limit_vision.onnx"
 US_DETECTOR_MODEL_PATH = MODEL_DIR / "speed_limit_us_detector.onnx"
 US_CLASSIFIER_MODEL_PATH = MODEL_DIR / "speed_limit_us_value_classifier.onnx"
 US_REJECT_CLASSIFIER_MODEL_PATH = MODEL_DIR / "speed_limit_us_reject_classifier.onnx"
+# StarPilot's joint detector: the same speed classes plus a STOP head (stop/output0, (1, 5, 4096)), read for Vision Force Stop
+STOP_DETECTOR_MODEL_PATH = MODEL_DIR / "traffic_signs_us_detector.onnx"
+STOP_THRESHOLD = 0.6
+STOP_SAMPLE_MAX_AGE_NS = 1_500_000_000
+# fork: STOP boxes whose red does not beat green/blue are dropped (75th percentile of R - max(G, B) over the middle);
+# on routes 18-2a it removed 2 of 16 false STOPs and kept all 33 real ones, a backlit sign included
+STOP_RED_DOMINANCE_MIN = 5
 US_DETECTOR_CLASSES = {
   0: "regulatory_speed_limit",
   1: "advisory_speed_limit",
@@ -601,6 +608,11 @@ class SpeedLimitVisionDaemon:
     self.last_detector_forward_duration_s = 0.0
     self.last_classifier_forward_count = 0
     self.last_classifier_forward_duration_s = 0.0
+    self.force_stop_enabled = False
+    self.last_force_stop_refresh_at = -float("inf")
+    self.frame_meta = None
+    self.pass_stop_boxes = None
+    self.stop_sample = None
 
     self.digit_templates = self._build_digit_templates()
     self.speed_value_templates = self._build_speed_value_templates()
@@ -1239,6 +1251,8 @@ class SpeedLimitVisionDaemon:
 
   def _load_model(self):
     self.net = None
+    self.net_has_stop = False
+    self.stop_net = None
     self.classifier_net = None
     self.reject_classifier_net = None
     self.model_mode = "legacy"
@@ -1268,6 +1282,8 @@ class SpeedLimitVisionDaemon:
             self.reject_classifier_net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
           except Exception:
             self.reject_classifier_net = None
+        self.net_has_stop = "stop/output0" in self.net.getUnconnectedOutLayersNames()
+        self.stop_net = None  # loaded when Vision Force Stop turns on (_refresh_force_stop)
         self.model_mode = "detector_classifier"
         self.last_error = ""
         return
@@ -1420,6 +1436,8 @@ class SpeedLimitVisionDaemon:
     width, height, stride, uv_offset = client.width, client.height, client.stride, buffer.uv_offset
     y = data[:stride * height].reshape((height, stride))[:, :width]
     uv = data[uv_offset:uv_offset + stride * (height // 2)].reshape((height // 2, stride))[:, :width]
+    frame_id = int(getattr(client, "frame_id", 0)) or getattr(self, "inference_count", 0)  # STOP confirmation needs ids that grow
+    self.frame_meta = (time.monotonic_ns(), int(getattr(client, "timestamp_eof", 0)), frame_id, width, height)
     return cv2.cvtColor(np.vstack((y, uv)), cv2.COLOR_YUV2BGR_NV12)
 
   @staticmethod
@@ -1660,6 +1678,7 @@ class SpeedLimitVisionDaemon:
 
   def _detect_sign(self, frame_bgr):
     self.latest_detector_proposal = None
+    self.pass_stop_boxes = None
     if self.net is None:
       if FULL_FRAME_OCR_FALLBACK_ENABLED:
         return self._publishable_detection(self._detect_sign_from_ocr_candidates(frame_bgr))
@@ -1901,9 +1920,26 @@ class SpeedLimitVisionDaemon:
     self.net.setInput(blob)
 
     forward_started_at = time.monotonic()
-    predictions = np.squeeze(self.net.forward())
+    stops = None
+    force_stop = getattr(self, "force_stop_enabled", False)
+    if getattr(self, "net_has_stop", False):
+      output, stops = self.net.forward(["output0", "stop/output0"]) if force_stop else (self.net.forward("output0"), None)
+    else:
+      output = self.net.forward()
+    predictions = np.squeeze(output)
     self.last_detector_forward_count += 1
     self.last_detector_forward_duration_s += time.monotonic() - forward_started_at
+    if force_stop:
+      try:  # a STOP failure must never cost the speed-limit reading
+        if stops is None and getattr(self, "stop_net", None) is not None:
+          self.stop_net.setInput(blob)
+          stops = self.stop_net.forward(["output0", "stop/output0"])[1]
+        if stops is not None:
+          self.pass_stop_boxes = (self.pass_stop_boxes or []) + self._decode_stop_signs(
+            stops, frame_bgr, ratio, pad_width, pad_height, origin_x, origin_y, full_frame_width, full_frame_height)
+      except Exception as exc:
+        cloudlog.exception(f"speed_limit_vision: STOP head failed, Vision Force Stop off: {exc}")
+        self.force_stop_enabled, self.stop_net, self.net_has_stop = False, None, False
     if predictions.ndim != 2:
       return []
     if predictions.shape[0] < predictions.shape[1]:
@@ -1946,6 +1982,56 @@ class SpeedLimitVisionDaemon:
       candidates.append((confidence, class_id, (x1, y1, x2, y2)))
 
     return candidates
+
+  def _refresh_force_stop(self):
+    """Vision Force Stop's toggle: the separate STOP model is loaded only while it is on and released when it goes off."""
+    params = getattr(self, "params", None)
+    wanted = params is not None and params.get_bool("VisionForceStop") and getattr(self, "net", None) is not None
+    if wanted and not getattr(self, "net_has_stop", False) and getattr(self, "stop_net", None) is None and STOP_DETECTOR_MODEL_PATH.is_file():
+      try:
+        self.stop_net = cv2.dnn.readNetFromONNX(str(STOP_DETECTOR_MODEL_PATH))
+        self.stop_net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
+        self.stop_net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
+      except Exception:
+        self.stop_net = None
+    if not wanted:
+      self.stop_net = None
+    self.force_stop_enabled = wanted and (getattr(self, "net_has_stop", False) or getattr(self, "stop_net", None) is not None)
+    if not self.force_stop_enabled:
+      self.stop_sample = None
+
+  @staticmethod
+  def _stop_red_dominance(crop):
+    height, width = crop.shape[:2]
+    middle = crop[int(height * 0.15):int(height * 0.85), int(width * 0.15):int(width * 0.85)].astype(np.int32)
+    if middle.size == 0:
+      return 0.0
+    return float(np.percentile(middle[..., 2] - np.maximum(middle[..., 1], middle[..., 0]), 75))
+
+  def _decode_stop_signs(self, stops, region_bgr, ratio, pad_width, pad_height, origin_x, origin_y, full_frame_width, full_frame_height):
+    """StarPilot's decode_stop_signs (threshold, size bounds, NMS, 4 boxes), then the red dominance check."""
+    if stops is None or stops.shape != (1, 5, 4096) or not np.isfinite(stops).all():
+      return []
+    region_height, region_width = region_bgr.shape[:2]
+    selected = np.flatnonzero(stops[0, 4] >= STOP_THRESHOLD)
+    selected = selected[np.argsort(-stops[0, 4, selected], kind="stable")[:32]]
+    boxes, scores = [], []
+    for index in selected:
+      cx, cy, width, height = stops[0, :4, index]
+      x1 = max(int((cx - width / 2 - pad_width) / ratio), 0)
+      y1 = max(int((cy - height / 2 - pad_height) / ratio), 0)
+      x2 = min(int((cx + width / 2 - pad_width) / ratio), region_width)
+      y2 = min(int((cy + height / 2 - pad_height) / ratio), region_height)
+      if x2 - x1 < 10 or y2 - y1 < 10 or (x2 - x1) * (y2 - y1) > full_frame_width * full_frame_height * .18:
+        continue
+      if self._stop_red_dominance(region_bgr[y1:y2, x1:x2]) < STOP_RED_DOMINANCE_MIN:
+        continue
+      boxes.append([x1 + origin_x, y1 + origin_y, x2 - x1, y2 - y1])
+      scores.append(float(stops[0, 4, index]))
+    if not boxes:
+      return []
+    keep = np.asarray(cv2.dnn.NMSBoxes(boxes, scores, STOP_THRESHOLD, .4)).reshape(-1)
+    return [(scores[i], (boxes[i][0], boxes[i][1], boxes[i][0] + boxes[i][2], boxes[i][1] + boxes[i][3])) for i in keep[:4]]
 
   def _collect_detector_classifier_proposals(self, frame_bgr):
     if self.net is None:
@@ -2955,6 +3041,17 @@ class SpeedLimitVisionDaemon:
     out.status = str(self.params_memory.get("VisionSpeedLimitStatus") or "")[:120]
     out.frameProcessTime = float(self.last_frame_process_duration_s)
     out.inferenceInterval = float(self.last_inference_interval)
+    stop_sample = getattr(self, "stop_sample", None)
+    if stop_sample is not None and time.monotonic_ns() - stop_sample[0][0] < STOP_SAMPLE_MAX_AGE_NS:
+      (observed_ns, eof_ns, frame_id, width, height), boxes = stop_sample
+      out.stopValid = True
+      out.stopObservedMonoTime = observed_ns
+      out.stopFrameEofTime = eof_ns
+      out.stopFrameId = frame_id & 0xffffffff
+      out.stopImageWidth = width
+      out.stopImageHeight = height
+      out.stopConfidences = [float(score) for score, _ in boxes]
+      out.stopBoxes = [int(v) for _, box in boxes for v in box]
     self.pm.send(SERVICE, msg)
 
   def run(self):
@@ -2968,6 +3065,9 @@ class SpeedLimitVisionDaemon:
       self.loop_count += 1
       self.sm.update(0)
       self._update_memory_pressure()
+      if now - getattr(self, "last_force_stop_refresh_at", -float("inf")) >= 2.0:
+        self.last_force_stop_refresh_at = now
+        self._refresh_force_stop()
       if now - self.last_sent_at >= SEND_INTERVAL:
         self.last_sent_at = now
         self._send_state()
@@ -3093,6 +3193,8 @@ class SpeedLimitVisionDaemon:
         self.detector_inference_count += 1
         self.last_inference_at = now
         detection = self._detect_sign(frame_bgr)
+        if getattr(self, "force_stop_enabled", False) and self.pass_stop_boxes is not None and self.frame_meta is not None:
+          self.stop_sample = (self.frame_meta, sorted(self.pass_stop_boxes, reverse=True)[:4])
         self._start_latest_detector_track(frame_bgr, now)
       else:
         detection = self._classify_proposal_track(frame_bgr, now)

@@ -394,3 +394,40 @@ def test_dusk_plaque_is_a_school_zone_sign():
 def test_dark_background_over_a_night_sign_is_not_a_plaque():
   """Route 1b 445 s: a 25 at night, the crop's top rows dark and tinted above a bright body."""
   assert not SpeedLimitVisionDaemon._is_school_zone_sign(plaque_sign(hsv_bgr(30, 65, 12), hsv_bgr(80, 35, 73)))
+
+
+def stop_output(boxes):
+  """A (1, 5, 4096) STOP head output with the given (cx, cy, w, h, score) rows in letterbox pixels."""
+  out = np.zeros((1, 5, 4096), np.float32)
+  for i, row in enumerate(boxes):
+    out[0, :, i] = row
+  return out
+
+
+def test_decode_stop_signs_keeps_a_red_stop_and_drops_a_grey_box():
+  region = np.full((200, 200, 3), 120, np.uint8)
+  region[40:80, 40:80] = (30, 30, 200)  # red (BGR)
+  d = daemon()
+  stops = stop_output([(60, 60, 40, 40, 0.9), (150, 150, 40, 40, 0.9), (60, 60, 40, 40, 0.5)])
+  boxes = d._decode_stop_signs(stops, region, 1.0, 0, 0, 600, 10, 1344, 760)
+  assert len(boxes) == 1
+  score, (x1, y1, x2, y2) = boxes[0]
+  assert abs(score - 0.9) < 1e-6 and (x1, y1, x2, y2) == (640, 50, 680, 90)
+
+
+def test_send_state_publishes_a_fresh_stop_sample():
+  sent = []
+  d = daemon()
+  d.messaging = messaging
+  d.pm = SimpleNamespace(send=lambda service, msg: sent.append(msg))
+  d.published_speed_limit_mph = d.published_confidence = d.last_candidate_speed_limit_mph = d.last_candidate_confidence = 0
+  d.last_frame_process_duration_s = d.last_inference_interval = 0.
+  d.stop_sample = ((slv.time.monotonic_ns(), 5, 42, 1344, 760), [(0.8, (900, 200, 940, 240))])
+  d._send_state()
+  out = sent[0].customReserved10
+  assert out.stopValid and out.stopFrameId == 42 and list(out.stopBoxes) == [900, 200, 940, 240]
+  assert abs(out.stopConfidences[0] - 0.8) < 1e-6
+
+  d.stop_sample = ((slv.time.monotonic_ns() - 2_000_000_000, 5, 43, 1344, 760), [(0.8, (900, 200, 940, 240))])
+  d._send_state()
+  assert not sent[1].customReserved10.stopValid  # a stale sample is not sent
