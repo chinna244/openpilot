@@ -404,6 +404,23 @@ class TestSpeedLimitResolverVision(OpenpilotTestCase):
       assert resolver.source == SpeedLimitSource.vision
       assert resolver.speed_limit == vision
 
+  def test_combined_map_and_car_outvote_the_camera(self, mocker):
+    # routes 45/48: the camera read 40 on the highway while map and car both said 55
+    resolver = self._resolve(mocker, Policy.combined, 55 * MPH, 55 * MPH, 40 * MPH)
+    assert resolver.source == SpeedLimitSource.map and resolver.speed_limit == 55 * MPH
+    resolver = self._resolve(mocker, Policy.combined, 54 * MPH, 55 * MPH, 40 * MPH)  # within 2 mph still agrees
+    assert resolver.source == SpeedLimitSource.map
+
+  def test_combined_camera_with_one_agreeing_source_wins(self, mocker):
+    resolver = self._resolve(mocker, Policy.combined, 30 * MPH, 45 * MPH, 30 * MPH)
+    assert resolver.source == SpeedLimitSource.vision and resolver.speed_limit == 30 * MPH
+    resolver = self._resolve(mocker, Policy.combined, 0., 45 * MPH, 45 * MPH)
+    assert resolver.source == SpeedLimitSource.vision
+
+  def test_vision_priority_has_no_vote(self, mocker):
+    resolver = self._resolve(mocker, Policy.vision_priority, 55 * MPH, 55 * MPH, 40 * MPH)
+    assert resolver.source == SpeedLimitSource.vision
+
   def test_combined_falls_back_to_map_then_car(self, mocker):
     resolver = self._resolve(mocker, Policy.combined, 15., 20., 0.)
     assert resolver.source == SpeedLimitSource.map and resolver.speed_limit == 20.

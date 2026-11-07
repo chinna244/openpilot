@@ -39,6 +39,9 @@ CAR_LIMIT_MIN = 9 * CV.MPH_TO_MS  # m/s
 # speed_limit_vision publishes at 5 Hz; a reading older than this means the process stopped or the toggle is off.
 VISION_MAX_AGE = 1.  # s
 
+# Combined policy: two sources this close agree on the limit (map and car round differently).
+VOTE_TOLERANCE = 2 * CV.MPH_TO_MS  # m/s
+
 
 class SpeedLimitResolver:
   limit_solutions: dict[custom.LongitudinalPlanSP.SpeedLimit.Source, float]
@@ -240,8 +243,16 @@ class SpeedLimitResolver:
         self.distance_solutions[SpeedLimitSource.map] = distance_to_speed_limit_ahead
 
   def _get_source_solution_according_to_policy(self) -> custom.LongitudinalPlanSP.SpeedLimit.Source:
+    sources = self._policy_to_sources_map[Policy(self.policy)]
+    if Policy(self.policy) == Policy.combined:
+      # 2 of 3 decide: routes 45/48 the camera read 40/45 on the highway for 10-14% of the time while map and car both
+      # said 55/70; the first source in order that another agrees with wins, and only with no agreement the order alone
+      found = [s for s in sources if self.limit_solutions[s] > 0.]
+      for source in found:
+        if any(abs(self.limit_solutions[source] - self.limit_solutions[other]) <= VOTE_TOLERANCE for other in found if other != source):
+          return source
     # They are ordered in the order of preference, so we pick the first that's non-zero
-    for source in self._policy_to_sources_map[Policy(self.policy)]:
+    for source in sources:
       if self.limit_solutions[source] > 0.:
         return source
     return SpeedLimitSource.none

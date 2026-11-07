@@ -431,3 +431,48 @@ def test_send_state_publishes_a_fresh_stop_sample():
   d.stop_sample = ((slv.time.monotonic_ns() - 2_000_000_000, 5, 43, 1344, 760), [(0.8, (900, 200, 940, 240))])
   d._send_state()
   assert not sent[1].customReserved10.stopValid  # a stale sample is not sent
+
+
+class JointNet:
+  def __init__(self, outputs=("output0", "stop/output0")):
+    self.outputs = outputs
+
+  def setPreferableBackend(self, backend):
+    pass
+
+  def setPreferableTarget(self, target):
+    pass
+
+  def getUnconnectedOutLayersNames(self):
+    return self.outputs
+
+
+def test_force_stop_swaps_in_the_joint_detector_and_back(monkeypatch):
+  """Route 45/48: a second STOP pass doubled the pass time and reads to ~1.45 s, past the 1.5 s STOP age."""
+  joint = JointNet()
+  monkeypatch.setattr(slv.cv2.dnn, "readNetFromONNX", lambda path: joint)
+  monkeypatch.setattr(slv, "STOP_DETECTOR_MODEL_PATH", SimpleNamespace(is_file=lambda: True))
+  monkeypatch.setattr(SpeedLimitVisionDaemon, "_probe_input_size", staticmethod(lambda net, size, candidates: 640))
+  d = daemon()
+  speed = object()
+  d.net, d.detector_input_size, d.net_has_stop, d.stop_net = speed, 256, False, None
+  d.params = FakeParams({"VisionForceStop": True})
+  d._refresh_force_stop()
+  assert (d.net, d.detector_input_size, d.net_has_stop, d.force_stop_enabled, d.stop_net) == (joint, 640, True, True, None)
+  d._refresh_force_stop()  # no reload while on
+  assert d.net is joint and d.speed_net[0] is speed
+
+  d.params = FakeParams({})
+  d._refresh_force_stop()
+  assert (d.net, d.detector_input_size, d.net_has_stop, d.force_stop_enabled) == (speed, 256, False, False)
+
+
+def test_force_stop_stays_off_without_a_stop_head(monkeypatch):
+  monkeypatch.setattr(slv.cv2.dnn, "readNetFromONNX", lambda path: JointNet(("output0",)))
+  monkeypatch.setattr(slv, "STOP_DETECTOR_MODEL_PATH", SimpleNamespace(is_file=lambda: True))
+  d = daemon()
+  speed = object()
+  d.net, d.detector_input_size, d.net_has_stop, d.stop_net = speed, 256, False, None
+  d.params = FakeParams({"VisionForceStop": True})
+  d._refresh_force_stop()
+  assert d.net is speed and not d.force_stop_enabled

@@ -1939,7 +1939,8 @@ class SpeedLimitVisionDaemon:
             stops, frame_bgr, ratio, pad_width, pad_height, origin_x, origin_y, full_frame_width, full_frame_height)
       except Exception as exc:
         cloudlog.exception(f"speed_limit_vision: STOP head failed, Vision Force Stop off: {exc}")
-        self.force_stop_enabled, self.stop_net, self.net_has_stop = False, None, False
+        self.force_stop_enabled, self.stop_net = False, None
+        self._restore_speed_detector()
     if predictions.ndim != 2:
       return []
     if predictions.shape[0] < predictions.shape[1]:
@@ -1984,21 +1985,33 @@ class SpeedLimitVisionDaemon:
     return candidates
 
   def _refresh_force_stop(self):
-    """Vision Force Stop's toggle: the separate STOP model is loaded only while it is on and released when it goes off."""
+    """Vision Force Stop's toggle: while it is on, the joint STOP + speed detector replaces the speed detector, one pass per
+    frame (a second STOP pass doubled the pass time, and the throttle stretched reads to ~1.45 s, past the 1.5 s STOP age);
+    the speed detector comes back when it goes off."""
     params = getattr(self, "params", None)
     wanted = params is not None and params.get_bool("VisionForceStop") and getattr(self, "net", None) is not None
-    if wanted and not getattr(self, "net_has_stop", False) and getattr(self, "stop_net", None) is None and STOP_DETECTOR_MODEL_PATH.is_file():
+    if wanted and not getattr(self, "net_has_stop", False) and STOP_DETECTOR_MODEL_PATH.is_file():
       try:
-        self.stop_net = cv2.dnn.readNetFromONNX(str(STOP_DETECTOR_MODEL_PATH))
-        self.stop_net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
-        self.stop_net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
+        joint = cv2.dnn.readNetFromONNX(str(STOP_DETECTOR_MODEL_PATH))
+        joint.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
+        joint.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
+        if "stop/output0" in joint.getUnconnectedOutLayersNames():
+          size = self._probe_input_size(joint, self.detector_input_size, DETECTOR_INPUT_SIZE_CANDIDATES)
+          self.speed_net = (self.net, self.detector_input_size)
+          self.net, self.detector_input_size, self.net_has_stop = joint, size, True
       except Exception:
-        self.stop_net = None
+        pass
     if not wanted:
-      self.stop_net = None
-    self.force_stop_enabled = wanted and (getattr(self, "net_has_stop", False) or getattr(self, "stop_net", None) is not None)
+      self._restore_speed_detector()
+    self.stop_net = None
+    self.force_stop_enabled = wanted and getattr(self, "net_has_stop", False)
     if not self.force_stop_enabled:
       self.stop_sample = None
+
+  def _restore_speed_detector(self):
+    if getattr(self, "speed_net", None) is not None:
+      self.net, self.detector_input_size = self.speed_net
+      self.speed_net, self.net_has_stop = None, False
 
   @staticmethod
   def _stop_red_dominance(crop):
