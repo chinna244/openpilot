@@ -15,6 +15,7 @@ from openpilot.sunnypilot.selfdrive.car.mazda_torque_seed import seed_car_defaul
 
 E2E_ASSISTS_MIGRATED = "ExperimentalAssistsDefaultOn"
 E2E_ASSISTS = ("ExperimentalModeSetSpeed",)
+LANE_CENTER_MIGRATED = "LaneCenterAssistDefaultOn"
 
 
 def _migrate_e2e_assists_on(params: Params) -> None:
@@ -31,6 +32,21 @@ def _migrate_e2e_assists_on(params: Params) -> None:
     cloudlog.exception("params_migration_zp: e2e assists migration failed, retrying next boot")
 
 
+def _migrate_lane_center_on(params: Params) -> None:
+  # Lane Center Assist became default on 2026-11-06; turn it on once for every install, after
+  # which the driver's choice stands. Upstream's Blendful default stays "0", so new installs get
+  # it here too. The debug readout is left as it is.
+  if params.get_bool(LANE_CENTER_MIGRATED):
+    return
+  try:
+    params.put_bool("Blendful", True, block=True)
+    params.put_bool(LANE_CENTER_MIGRATED, True, block=True)
+    cloudlog.info("params_migration_zp: turned on Lane Center Assist")
+  except Exception:
+    cloudlog.exception("params_migration_zp: lane center migration failed, retrying next boot")
+
+
 def run_migration_zp(params: Params) -> None:
   _migrate_e2e_assists_on(params)
+  _migrate_lane_center_on(params)
   seed_car_defaults_offroad(params)
