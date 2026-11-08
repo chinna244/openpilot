@@ -93,12 +93,19 @@ def rollback_blocker() -> str:
 CONFIRM_S = 60.
 armed: dict[str, float] = {}  # label of the armed request -> when it was selected
 
+# the device never writes UpdateRequest back: sunnylink rejects a change when the device changed the value
+# since the page loaded, so a reset to Ready made the next choice (Confirm) fail. A new choice is a change.
+seen_request = UpdateRequest.NONE
+
 def handle_update_request(params, wait_helper: WaitTimeHelper) -> None:
-  """Acts on the Check / Download / Install / Roll back / Confirm buttons in sunnylink, then clears the request."""
+  """Acts when the Check / Download / Install / Roll back / Confirm choice in sunnylink changes."""
+  global seen_request
   request = params.get("UpdateRequest", return_default=True)
+  if request == seen_request:
+    return
+  seen_request = request
   if request == UpdateRequest.NONE:
     return
-  params.put("UpdateRequest", UpdateRequest.NONE, block=True)
   cloudlog.info(f"update request {request}")
 
   def message(text: str) -> None:
@@ -155,6 +162,8 @@ def check_result(updater, skip_commit: str | None) -> str:
   return f"{datetime.datetime.now(datetime.UTC):%b %d %H:%M} UTC: {found}"
 
 def watch_update_requests(params, wait_helper: WaitTimeHelper) -> None:
+  global seen_request
+  seen_request = params.get("UpdateRequest", return_default=True)  # a choice left from before this start is not acted on
   disabled = params.get_bool("DisableUpdates")
   while True:
     try:

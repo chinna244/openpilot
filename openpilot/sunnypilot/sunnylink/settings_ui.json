@@ -1959,7 +1959,7 @@
               "key": "UpdateRequest",
               "widget": "multiple_button",
               "title": "Update Action",
-              "description": "Check looks for a new version. Download fetches it now. Install reboots into the downloaded version. Roll back reboots into the last version that drove clean (engaged 2+ minutes with no error) and skips the version you leave until a newer one is pushed. Install and Roll back reboot the device, so select Confirm within 60 seconds after them (Updater Message says when). Returns to Ready once the device acts; refresh the page to see new status. While updates are disabled only Roll back works.",
+              "description": "Check looks for a new version. Download fetches it now. Install reboots into the downloaded version. Roll back reboots into the last version that drove clean (engaged 2+ minutes with no error) and skips the version you leave until a newer one is pushed. Install and Roll back reboot the device, so select Confirm within 60 seconds after them (Updater Message says when). The device acts when the choice changes; to repeat the same choice, pick Ready first. Refresh the page to see new status. While updates are disabled only Roll back works.",
               "options": [
                 {
                   "value": 0,

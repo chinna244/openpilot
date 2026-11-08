@@ -140,7 +140,7 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"UpdaterState", {CLEAR_ON_MANAGER_START, STRING}},
     {"UpdaterTargetBranch", {CLEAR_ON_MANAGER_START, STRING}},
     {"UpdaterLastFetchTime", {PERSISTENT, TIME}},
-    {"UpdateRequest", {CLEAR_ON_MANAGER_START, INT, "0"}},
+    {"UpdateRequest", {PERSISTENT, INT, "0"}},
     {"UpdaterProvenCommit", {PERSISTENT, STRING}},
     {"UpdaterSkipCommit", {PERSISTENT, STRING}},
     {"UpdaterRollback", {PERSISTENT, BOOL}},

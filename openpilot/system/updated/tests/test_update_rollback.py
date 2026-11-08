@@ -104,16 +104,40 @@ class TestUpdateRequest:
     monkeypatch.setattr(updated, "PREVIOUS", str(prev))
     monkeypatch.setattr(updated, "BASEDIR", str(make_repo(tmp_path / "cur")))
     monkeypatch.setattr(updated, "armed", {})
+    monkeypatch.setattr(updated, "seen_request", UpdateRequest.NONE)
     params, wait = FakeParams(**values), FakeWait()
     for r in (request, UpdateRequest.CONFIRM) if confirm else (request,):
       params.values["UpdateRequest"] = r
       handle_update_request(params, wait)
-      assert params.values["UpdateRequest"] == UpdateRequest.NONE  # back to Ready
+      assert params.values["UpdateRequest"] == r  # the device never writes it back (sunnylink would reject the next choice)
     return params.values, wait.calls
 
   def test_none_does_nothing(self, tmp_path, monkeypatch):
     values, calls = self.run(UpdateRequest.NONE, tmp_path, monkeypatch, IsOffroad=True)
     assert calls == [] and "DoReboot" not in values
+
+  def test_acts_on_change_only(self, tmp_path, monkeypatch):
+    monkeypatch.setattr(updated, "seen_request", UpdateRequest.NONE)
+    params, wait = FakeParams(UpdateRequest=UpdateRequest.CHECK), FakeWait()
+    for _ in range(3):
+      handle_update_request(params, wait)
+    assert wait.calls == ["check"]  # the choice stays shown, it acts once
+    params.values["UpdateRequest"] = UpdateRequest.NONE
+    handle_update_request(params, wait)
+    params.values["UpdateRequest"] = UpdateRequest.CHECK  # Ready, then Check again
+    handle_update_request(params, wait)
+    assert wait.calls == ["check", "check"]
+
+  def test_choice_from_before_start_is_ignored(self, monkeypatch):
+    params, wait = FakeParams(UpdateRequest=UpdateRequest.ROLLBACK, IsOffroad=True), FakeWait()
+    def stop(t):
+      raise StopLoop
+    monkeypatch.setattr(updated.time, "sleep", stop)
+    try:
+      updated.watch_update_requests(params, wait)
+    except StopLoop:
+      pass
+    assert "UpdaterRollback" not in params.values and "UpdaterCheckResult" not in params.values
 
   def test_check_and_download(self, tmp_path, monkeypatch):
     assert self.run(UpdateRequest.CHECK, tmp_path, monkeypatch)[1] == ["check"]
@@ -144,6 +168,7 @@ class TestUpdateRequest:
     monkeypatch.setattr(updated, "PREVIOUS", str(prev))
     monkeypatch.setattr(updated, "BASEDIR", str(make_repo(tmp_path / "cur")))
     monkeypatch.setattr(updated, "armed", {})
+    monkeypatch.setattr(updated, "seen_request", UpdateRequest.NONE)
     params = FakeParams(IsOffroad=True)
     def press(r, dt=0.):
       t[0] += dt
@@ -162,6 +187,7 @@ class TestUpdateRequest:
 
   def test_confirm_rechecks_state(self, tmp_path, monkeypatch):
     monkeypatch.setattr(updated, "armed", {})
+    monkeypatch.setattr(updated, "seen_request", UpdateRequest.NONE)
     params = FakeParams(IsOffroad=True, UpdateAvailable=True)
     params.values["UpdateRequest"] = UpdateRequest.INSTALL
     handle_update_request(params, FakeWait())
