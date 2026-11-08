@@ -104,6 +104,35 @@ class CheckUpdateButtonSP(CheckUpdateButton):
     super()._handle_mouse_release(mouse_pos)
 
 
+class RollbackButton(BigButton):
+  """Reboots into the build kept before the last update (launch_chffrplus.sh swaps it in)."""
+
+  def __init__(self):
+    self._icon = gui_app.texture("icons_mici/settings/device/reboot.png", 64, 70)
+    super().__init__("roll back", "", self._icon)
+    self.set_visible(lambda: ui_state.is_offroad() and (ui_state.params.get("UpdaterRollbackDescription") or "none") != "none")
+    self.set_click_callback(lambda: gui_app.push_widget(BigConfirmationDialog("roll back + reboot", self._icon, self._roll_back, red=True)))
+
+  def _roll_back(self):
+    def run():
+      if ui_state.is_offroad():
+        ui_state.params.put_bool("UpdaterRollback", True, block=True)
+        ui_state.params.put_bool("DoReboot", True, block=True)
+
+    threading.Thread(target=run, daemon=True).start()
+
+  def _update_state(self):
+    super()._update_state()
+    # "commit date (proven good)" of the kept build, or why the boot script would refuse it
+    rollback = ui_state.params.get("UpdaterRollbackDescription") or ""
+    blocked = " - not possible: " in rollback
+    self.set_enabled(not blocked)
+    desc = _split_description(rollback)
+    value = rollback.split(" - ", 1)[1] if blocked else f"{desc[2]} {desc[3]}" if desc is not None else ""
+    if self.get_value() != value:
+      self.set_value(value)
+
+
 class KonikBackupButton(BigButton):
   def __init__(self):
     self._icon = gui_app.texture("icons_mici/settings/device/green_settings.png", 64, 64)
@@ -147,3 +176,8 @@ class SoftwareLayoutSP(SoftwareLayoutMici):
     items = self._scroller.items
     install = next(i for i, item in enumerate(items) if isinstance(item, InstallUpdateButton))
     items.insert(install + 1, items.pop())
+
+    # roll back sits after the release notes, below install
+    self._scroller.add_widget(RollbackButton())
+    items = self._scroller.items
+    items.insert(install + 2, items.pop())

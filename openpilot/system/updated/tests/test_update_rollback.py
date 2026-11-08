@@ -1,0 +1,168 @@
+import subprocess
+
+from openpilot.system.updated import updated
+from openpilot.system.updated.proven import DriveProof, ENGAGED_MIN_S
+from openpilot.system.updated.updated import UpdateRequest, handle_update_request
+
+
+def drive(proof, seconds, enabled=True, alert="", procs=()):
+  for _ in range(int(seconds / 0.5)):
+    proof.update(0.5, enabled, alert, list(procs))
+
+
+class TestDriveProof:
+  def test_clean_drive_is_proven(self):
+    p = DriveProof()
+    drive(p, ENGAGED_MIN_S)
+    assert p.proven()
+
+  def test_short_drive_is_not(self):
+    p = DriveProof()
+    drive(p, ENGAGED_MIN_S - 1)
+    drive(p, 600, enabled=False)
+    assert not p.proven()
+
+  def test_error_disable_fails(self):
+    for alert in ("controlsMismatch/immediateDisable", "commIssue/softDisable"):
+      p = DriveProof()
+      drive(p, 300)
+      drive(p, 1, alert=alert)
+      assert not p.proven() and p.error == alert
+
+  def test_driver_and_user_disables_are_not_errors(self):
+    p = DriveProof()
+    drive(p, 300)
+    for alert in ("doorOpen/softDisable", "seatbeltNotLatched/softDisable", "buttonCancel/userDisable", "steerSaturated/warning"):
+      drive(p, 1, alert=alert)
+    assert p.proven()
+
+  def test_process_down(self):
+    p = DriveProof()
+    drive(p, 300, procs=[("modeld", True, True), ("updated", False, False)])
+    drive(p, 4, procs=[("modeld", False, True)])
+    assert p.proven()  # a short restart is fine
+    drive(p, 6, procs=[("modeld", False, True)])
+    assert not p.proven() and p.error == "modeld not running"
+
+  def test_process_down_before_drive_or_optional(self):
+    p = DriveProof()
+    drive(p, 300, procs=[("statsd", False, True)])  # never ran this drive
+    drive(p, 10, procs=[("mapd", True, True)])
+    drive(p, 10, procs=[("mapd", False, True)])  # optional, selfdrived ignores it too
+    assert p.proven()
+
+  def test_failed_drive(self):
+    p = DriveProof()
+    drive(p, 10, alert="controlsMismatch/immediateDisable")
+    assert p.failed() and not p.proven()
+    p = DriveProof()
+    drive(p, 10, enabled=False)
+    assert not p.failed() and not p.proven()
+
+  def test_reset(self):
+    p = DriveProof()
+    drive(p, 300, alert="controlsMismatch/immediateDisable")
+    p.reset()
+    drive(p, ENGAGED_MIN_S)
+    assert p.proven()
+
+
+def make_repo(path):
+  if not path.is_dir():
+    path.mkdir()
+    (path / "f").write_text("a")
+    for cmd in (["init", "-q"], ["add", "f"], ["-c", "user.name=t", "-c", "user.email=t", "commit", "-qm", "a"]):
+      subprocess.check_call(["git", *cmd], cwd=path)
+  return path
+
+
+class FakeParams:
+  def __init__(self, **values):
+    self.values = values
+
+  def get(self, key, return_default=False):
+    return self.values.get(key, 0 if key == "UpdateRequest" else None)
+
+  def get_bool(self, key):
+    return bool(self.values.get(key, False))
+
+  def put(self, key, value, block=False):
+    self.values[key] = value
+
+  def put_bool(self, key, value, block=False):
+    self.values[key] = value
+
+
+class FakeWait:
+  def __init__(self):
+    self.calls = []
+
+  def check_now(self, signum, frame):
+    self.calls.append("check")
+
+  def update_now(self, signum, frame):
+    self.calls.append("download")
+
+
+class TestUpdateRequest:
+  def run(self, request, tmp_path, monkeypatch, previous=True, **values):
+    prev = tmp_path / "previous"
+    if previous:
+      prev.mkdir(exist_ok=True)
+    monkeypatch.setattr(updated, "PREVIOUS", str(prev))
+    monkeypatch.setattr(updated, "BASEDIR", str(make_repo(tmp_path / "cur")))
+    params, wait = FakeParams(UpdateRequest=request, **values), FakeWait()
+    handle_update_request(params, wait)
+    assert params.values["UpdateRequest"] == UpdateRequest.NONE  # back to Ready
+    return params.values, wait.calls
+
+  def test_none_does_nothing(self, tmp_path, monkeypatch):
+    values, calls = self.run(UpdateRequest.NONE, tmp_path, monkeypatch, IsOffroad=True)
+    assert calls == [] and "DoReboot" not in values
+
+  def test_check_and_download(self, tmp_path, monkeypatch):
+    assert self.run(UpdateRequest.CHECK, tmp_path, monkeypatch)[1] == ["check"]
+    assert self.run(UpdateRequest.DOWNLOAD, tmp_path, monkeypatch)[1] == ["download"]
+
+  def test_install(self, tmp_path, monkeypatch):
+    values, _ = self.run(UpdateRequest.INSTALL, tmp_path, monkeypatch, IsOffroad=True, UpdateAvailable=True)
+    assert values["DoReboot"] and "UpdaterRollback" not in values
+
+  def test_install_needs_update_and_offroad(self, tmp_path, monkeypatch):
+    assert "DoReboot" not in self.run(UpdateRequest.INSTALL, tmp_path, monkeypatch, IsOffroad=True)[0]
+    assert "DoReboot" not in self.run(UpdateRequest.INSTALL, tmp_path, monkeypatch, IsOffroad=False, UpdateAvailable=True)[0]
+
+  def test_rollback(self, tmp_path, monkeypatch):
+    values, _ = self.run(UpdateRequest.ROLLBACK, tmp_path, monkeypatch, IsOffroad=True)
+    assert values["UpdaterRollback"] and values["DoReboot"]
+
+  def test_rollback_needs_previous_and_offroad(self, tmp_path, monkeypatch):
+    for kwargs in ({"previous": False, "IsOffroad": True}, {"IsOffroad": False}):
+      values, _ = self.run(UpdateRequest.ROLLBACK, tmp_path, monkeypatch, **kwargs)
+      assert "UpdaterRollback" not in values and "DoReboot" not in values
+
+  def test_rollback_refused_with_local_changes(self, tmp_path, monkeypatch):
+    (make_repo(tmp_path / "cur") / "f").write_text("patched")  # run() reuses this repo as BASEDIR
+    values, _ = self.run(UpdateRequest.ROLLBACK, tmp_path, monkeypatch, IsOffroad=True)
+    assert "UpdaterRollback" not in values and "DoReboot" not in values
+
+
+class TestRollbackBlocker:
+  def test_blockers(self, tmp_path, monkeypatch):
+    prev, cur = tmp_path / "previous", make_repo(tmp_path / "cur")
+    monkeypatch.setattr(updated, "PREVIOUS", str(prev))
+    monkeypatch.setattr(updated, "BASEDIR", str(cur))
+    monkeypatch.setattr(updated, "AGNOS", False)
+    assert updated.rollback_blocker() == "no previous version"
+    prev.mkdir()
+    assert updated.rollback_blocker() == ""
+    (cur / "f").write_text("patched")
+    assert updated.rollback_blocker() == "local changes on the device"
+    (cur / "f").write_text("a")
+
+    monkeypatch.setattr(updated, "AGNOS", True)
+    monkeypatch.setattr(updated.HARDWARE, "get_os_version", lambda: "20.3")
+    (prev / "launch_env.sh").write_text('if [ -z "$AGNOS_VERSION" ]; then\n  export AGNOS_VERSION="19.9"\nfi\n')
+    assert updated.rollback_blocker() == "needs AGNOS 19.9"
+    (prev / "launch_env.sh").write_text('export AGNOS_VERSION="20.3"\n')
+    assert updated.rollback_blocker() == ""

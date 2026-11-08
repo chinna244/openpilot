@@ -168,6 +168,7 @@ procs = [
   PythonProcess("hardwared", "openpilot.system.hardware.hardwared", always_run),
   PythonProcess("tombstoned", "openpilot.system.tombstoned", always_run, enabled=not PC),
   PythonProcess("updated", "openpilot.system.updated.updated", only_offroad, enabled=not PC),
+  PythonProcess("update_proven", "openpilot.system.updated.proven", always_run, enabled=not PC),
   PythonProcess("konik_connect", "openpilot.system.athena.konik", konik_connect_ready),
   PythonProcess("konik_uploader", "openpilot.system.loggerd.konik", konik_uploads_ready),
   PythonProcess("uploader", "openpilot.system.loggerd.uploader", uploader_ready),

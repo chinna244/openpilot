@@ -7,6 +7,7 @@ import shutil
 import signal
 import fcntl
 import threading
+import time
 from collections import defaultdict
 from pathlib import Path
 
@@ -28,6 +29,9 @@ OVERLAY_MERGED = os.path.join(STAGING_ROOT, "merged")
 FINALIZED = os.path.join(STAGING_ROOT, "finalized")
 
 OVERLAY_INIT = Path(os.path.join(BASEDIR, ".overlay_init"))
+
+# the build kept for Roll back, swapped in by launch_chffrplus.sh
+PREVIOUS = os.getenv("UPDATER_PREVIOUS", "/data/openpilot_previous")
 
 # do not allow to engage after this many hours onroad and this many routes
 HOURS_NO_CONNECTIVITY_MAX = 27
@@ -63,6 +67,55 @@ class WaitTimeHelper:
 
   def sleep(self, t: float) -> None:
     self.ready_event.wait(timeout=t)
+
+class UpdateRequest:
+  NONE = 0
+  CHECK = 1
+  DOWNLOAD = 2
+  INSTALL = 3
+  ROLLBACK = 4
+
+def rollback_blocker() -> str:
+  """Why launch_chffrplus.sh would refuse to roll back, or "" when it can."""
+  if not os.path.isdir(PREVIOUS):
+    return "no previous version"
+  if run(["git", "status", "--porcelain", "--untracked-files=no"], BASEDIR).strip():
+    return "local changes on the device"
+  if AGNOS:
+    agnos = run(["bash", "-c", "unset AGNOS_VERSION && source launch_env.sh && echo -n $AGNOS_VERSION"], PREVIOUS).strip()
+    if agnos != HARDWARE.get_os_version():
+      return f"needs AGNOS {agnos}"
+  return ""
+
+def handle_update_request(params, wait_helper: WaitTimeHelper) -> None:
+  """Acts on the Check / Download / Install / Roll back buttons in sunnylink, then clears the request."""
+  request = params.get("UpdateRequest", return_default=True)
+  if request == UpdateRequest.NONE:
+    return
+  params.put("UpdateRequest", UpdateRequest.NONE, block=True)
+  cloudlog.info(f"update request {request}")
+
+  if request == UpdateRequest.CHECK:
+    wait_helper.check_now(signal.SIGUSR1, None)
+  elif request == UpdateRequest.DOWNLOAD:
+    wait_helper.update_now(signal.SIGHUP, None)
+  elif not params.get_bool("IsOffroad"):
+    cloudlog.warning("ignoring install / roll back request while onroad")
+  elif request == UpdateRequest.INSTALL and params.get_bool("UpdateAvailable"):
+    params.put_bool("DoReboot", True, block=True)
+  elif request == UpdateRequest.ROLLBACK and not (blocker := rollback_blocker()):
+    params.put_bool("UpdaterRollback", True, block=True)
+    params.put_bool("DoReboot", True, block=True)
+  elif request == UpdateRequest.ROLLBACK:
+    cloudlog.warning(f"not rolling back: {blocker}")
+
+def watch_update_requests(params, wait_helper: WaitTimeHelper) -> None:
+  while True:
+    try:
+      handle_update_request(params, wait_helper)
+    except Exception:
+      cloudlog.exception("update request failed")
+    time.sleep(1)
 
 def write_time_to_param(params, param) -> None:
   t = datetime.datetime.now(datetime.UTC).replace(tzinfo=None)
@@ -309,6 +362,16 @@ class Updater:
     self.params.put("UpdaterNewReleaseNotes", parse_release_notes(FINALIZED), block=True)
     self.params.put_bool("UpdateAvailable", self.update_ready, block=True)
 
+    # Roll back status: the running build drove clean (proven.py), and what Roll back would go to
+    proven = self.params.get("UpdaterProvenCommit")
+    self.params.put("UpdaterCurrentProven", "proven good" if proven and proven == self.get_commit_hash(BASEDIR) else "not proven yet", block=True)
+    previous = get_description(PREVIOUS)
+    if previous:
+      previous += " (unproven)" if os.path.isfile(f"{PREVIOUS}_unproven") else " (proven good)"
+      if blocker := rollback_blocker():
+        previous += f" - not possible: {blocker}"
+    self.params.put("UpdaterRollbackDescription", previous or "none", block=True)
+
     # Handle user prompt
     for alert in ("Offroad_UpdateFailed", "Offroad_ConnectivityNeeded", "Offroad_ConnectivityNeededPrompt"):
       set_offroad_alert(alert, False)
@@ -430,6 +493,7 @@ def main() -> None:
     updater = Updater()
     update_failed_count = 0 # TODO: Load from param?
     wait_helper = WaitTimeHelper()
+    threading.Thread(target=watch_update_requests, args=(params, wait_helper), daemon=True).start()
 
     # invalidate old finalized update
     set_consistent_flag(False)
@@ -470,6 +534,8 @@ def main() -> None:
           cloudlog.info("skipping fetch, connection metered")
         elif wait_helper.user_request == UserRequest.CHECK:
           cloudlog.info("skipping fetch, only checking")
+        elif not user_requested_fetch and updater.branches[updater.target_branch] == params.get("UpdaterSkipCommit"):
+          cloudlog.info("skipping fetch, this commit was rolled back")
         else:
           updater.fetch_update()
           write_time_to_param(params, "UpdaterLastFetchTime")

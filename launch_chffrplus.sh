@@ -4,6 +4,10 @@ DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null && pwd )"
 
 source "$DIR/launch_env.sh"
 
+# the last build that drove clean, kept for Roll back (system/updated/updated.py reads the same path)
+PREVIOUS="/data/openpilot_previous"
+ROLLED_BACK="/data/openpilot_rolled_back"
+
 # Identity of the current source tree: HEAD commit + uncommitted diffs
 # (including submodule commits/diffs). Used to skip rebuilds when nothing changed.
 # --no-optional-locks: reading must not write to .git.
@@ -49,6 +53,38 @@ function launch {
   # Remove orphaned git lock if it exists on boot
   [ -f "$DIR/.git/index.lock" ] && rm -f "$DIR/.git/index.lock"
 
+  # Roll back (settings or sunnylink sets UpdaterRollback): swap the kept previous build back in
+  # and never install the build we rolled back from again
+  if [ "$(cat /data/params/d/UpdaterRollback 2>/dev/null)" == "1" ]; then
+    rm -f /data/params/d/UpdaterRollback
+    if [ ! -d "$PREVIOUS" ]; then
+      echo "no previous build, not rolling back"
+    elif [ -n "$(git --no-optional-locks -C "$DIR" status --porcelain --untracked-files=no)" ]; then
+      echo "${DIR} has local changes, not rolling back"
+    elif [ -f /AGNOS ] && [ "$(unset AGNOS_VERSION; source "$PREVIOUS/launch_env.sh"; echo -n "$AGNOS_VERSION")" != "$(< /VERSION)" ]; then
+      # the AGNOS swap back would need a download, which may not be possible where the car is
+      echo "previous build needs another AGNOS, not rolling back"
+    else
+      echo "Rolling back to the previous build"
+      LAUNCHER_LOCATION="${BASH_SOURCE[0]}"
+      ROLLED_BACK_COMMIT="$(git --no-optional-locks -C "$DIR" rev-parse HEAD)"
+      sudo rm -rf "$STAGING_ROOT" "$ROLLED_BACK"
+      if mv "$DIR" "$ROLLED_BACK"; then
+        if mv "$PREVIOUS" "$DIR"; then
+          echo -n "$ROLLED_BACK_COMMIT" > /data/params/d/UpdaterSkipCommit
+          rm -f "${PREVIOUS}_unproven"
+          # a build from before Roll back can't skip that commit, so it must not update at all
+          grep -q UpdaterSkipCommit "$DIR/openpilot/system/updated/updated.py" || echo -n "1" > /data/params/d/DisableUpdates
+          cd "$DIR"
+          sudo rm -rf "$ROLLED_BACK" &
+          unset AGNOS_VERSION
+          exec "${LAUNCHER_LOCATION}"
+        fi
+        mv "$ROLLED_BACK" "$DIR"
+      fi
+    fi
+  fi
+
   # Check to see if there's a valid overlay-based update available. Conditions
   # are as follows:
   #
@@ -82,6 +118,19 @@ function launch {
           # TODO: restore backup? This means the updater didn't start after swapping
         fi
       fi
+    fi
+  fi
+
+  # Keep the build an update replaced as the rollback copy, but only one that drove clean
+  # (system/updated/proven.py), so two bad updates in a row still roll back to a working build.
+  # With no copy yet, keep it marked unproven.
+  OLD="${STAGING_ROOT}/old_openpilot"
+  if [ -d "$OLD" ]; then
+    OLD_COMMIT="$(git --no-optional-locks -C "$OLD" rev-parse HEAD 2>/dev/null)"
+    if [ -n "$OLD_COMMIT" ] && [ "$OLD_COMMIT" == "$(cat /data/params/d/UpdaterProvenCommit 2>/dev/null)" ]; then
+      sudo rm -rf "$PREVIOUS" && mv "$OLD" "$PREVIOUS" && rm -f "${PREVIOUS}_unproven"
+    elif [ ! -d "$PREVIOUS" ]; then
+      mv "$OLD" "$PREVIOUS" && touch "${PREVIOUS}_unproven"
     fi
   fi
 

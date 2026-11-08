@@ -11,6 +11,40 @@ sections:
   title: Updates
   description: Control software updates
   items:
+  - key: UpdaterState
+    widget: info
+    title: Updater Status
+  - key: UpdaterCurrentDescription
+    widget: info
+    title: Current Version
+  - key: UpdaterCurrentProven
+    widget: info
+    title: Current Version Drove Clean
+  - key: UpdaterNewDescription
+    widget: info
+    title: New Version
+  - key: UpdaterRollbackDescription
+    widget: info
+    title: Roll Back Goes To
+  - key: UpdateRequest
+    widget: multiple_button
+    title: Update Action
+    description: Check looks for a new version. Download fetches it now. Install reboots into the downloaded version.
+      Roll back reboots into the last version that drove clean (engaged 2+ minutes with no error) and skips the version
+      you leave until a newer one is pushed. Returns to Ready once the device acts. Does nothing while updates are disabled.
+    options:
+    - value: 0
+      label: Ready
+    - value: 1
+      label: Check
+    - value: 2
+      label: Download
+    - value: 3
+      label: Install
+    - value: 4
+      label: Roll back
+    enablement:
+    - $ref: '#/macros/offroad'
   - key: DisableUpdates
     widget: toggle
     title: Disable Updates
