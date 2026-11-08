@@ -1931,6 +1931,11 @@
               "title": "Updater Status"
             },
             {
+              "key": "UpdaterCheckResult",
+              "widget": "info",
+              "title": "Updater Message"
+            },
+            {
               "key": "UpdaterCurrentDescription",
               "widget": "info",
               "title": "Current Version"
@@ -1954,7 +1959,7 @@
               "key": "UpdateRequest",
               "widget": "multiple_button",
               "title": "Update Action",
-              "description": "Check looks for a new version. Download fetches it now. Install reboots into the downloaded version. Roll back reboots into the last version that drove clean (engaged 2+ minutes with no error) and skips the version you leave until a newer one is pushed. Returns to Ready once the device acts. Does nothing while updates are disabled.",
+              "description": "Check looks for a new version. Download fetches it now. Install reboots into the downloaded version. Roll back reboots into the last version that drove clean (engaged 2+ minutes with no error) and skips the version you leave until a newer one is pushed. Install and Roll back reboot the device, so select Confirm within 60 seconds after them (Updater Message says when). Returns to Ready once the device acts; refresh the page to see new status. While updates are disabled only Roll back works.",
               "options": [
                 {
                   "value": 0,
@@ -1975,6 +1980,10 @@
                 {
                   "value": 4,
                   "label": "Roll back"
+                },
+                {
+                  "value": 5,
+                  "label": "Confirm"
                 }
               ],
               "enablement": [
@@ -1987,7 +1996,7 @@
               "key": "DisableUpdates",
               "widget": "toggle",
               "title": "Disable Updates",
-              "description": "When enabled, software updates will be off. This requires a reboot to take effect.",
+              "description": "When enabled, software updates will be off. Takes effect within a few seconds, no reboot needed.",
               "enablement": [
                 {
                   "type": "offroad_only"

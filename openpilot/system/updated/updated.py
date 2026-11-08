@@ -74,6 +74,7 @@ class UpdateRequest:
   DOWNLOAD = 2
   INSTALL = 3
   ROLLBACK = 4
+  CONFIRM = 5
 
 def rollback_blocker() -> str:
   """Why launch_chffrplus.sh would refuse to roll back, or "" when it can."""
@@ -87,32 +88,81 @@ def rollback_blocker() -> str:
       return f"needs AGNOS {agnos}"
   return ""
 
+# Install and Roll back reboot, so sunnylink asks for Confirm next (the web shows no confirmation of its own, and
+# selecting the same option twice may send nothing while the page still shows it)
+CONFIRM_S = 60.
+armed: dict[str, float] = {}  # label of the armed request -> when it was selected
+
 def handle_update_request(params, wait_helper: WaitTimeHelper) -> None:
-  """Acts on the Check / Download / Install / Roll back buttons in sunnylink, then clears the request."""
+  """Acts on the Check / Download / Install / Roll back / Confirm buttons in sunnylink, then clears the request."""
   request = params.get("UpdateRequest", return_default=True)
   if request == UpdateRequest.NONE:
     return
   params.put("UpdateRequest", UpdateRequest.NONE, block=True)
   cloudlog.info(f"update request {request}")
 
+  def message(text: str) -> None:
+    params.put("UpdaterCheckResult", f"{datetime.datetime.now(datetime.UTC):%b %d %H:%M} UTC: {text}", block=True)
+
   if request == UpdateRequest.CHECK:
     wait_helper.check_now(signal.SIGUSR1, None)
-  elif request == UpdateRequest.DOWNLOAD:
+    return
+  if request == UpdateRequest.DOWNLOAD:
     wait_helper.update_now(signal.SIGHUP, None)
-  elif not params.get_bool("IsOffroad"):
-    cloudlog.warning("ignoring install / roll back request while onroad")
-  elif request == UpdateRequest.INSTALL and params.get_bool("UpdateAvailable"):
-    params.put_bool("DoReboot", True, block=True)
-  elif request == UpdateRequest.ROLLBACK and not (blocker := rollback_blocker()):
-    params.put_bool("UpdaterRollback", True, block=True)
-    params.put_bool("DoReboot", True, block=True)
+    return
+
+  if request == UpdateRequest.CONFIRM:
+    label, armed_t = armed.popitem() if armed else ("", 0.)
+    if not label or time.monotonic() - armed_t > CONFIRM_S:
+      message("nothing to confirm, select Install or Roll back first")
+      return
+  elif request == UpdateRequest.INSTALL:
+    label = "Install"
   elif request == UpdateRequest.ROLLBACK:
+    label = "Roll back"
+  else:
+    return
+
+  # checked again on Confirm: the state may have changed in the meantime
+  if not params.get_bool("IsOffroad"):
+    cloudlog.warning("ignoring install / roll back request while onroad")
+  elif label == "Install" and not params.get_bool("UpdateAvailable"):
+    message("nothing downloaded to install")
+  elif label == "Roll back" and (blocker := rollback_blocker()):
     cloudlog.warning(f"not rolling back: {blocker}")
+    message(f"roll back not possible: {blocker}")
+  elif request != UpdateRequest.CONFIRM:
+    armed.clear()
+    armed[label] = time.monotonic()
+    message(f"select Confirm within {CONFIRM_S:.0f} s to {label.lower()}, the device reboots")
+  else:
+    message(f"{label} confirmed, rebooting")
+    if label == "Roll back":
+      params.put_bool("UpdaterRollback", True, block=True)
+    params.put_bool("DoReboot", True, block=True)
+
+def check_result(updater, skip_commit: str | None) -> str:
+  """What the last check found, kept after the state goes back to idle (sunnylink shows it)."""
+  new_commit = updater.branches[updater.target_branch]
+  if updater.up_to_date:
+    found = "up to date"
+  elif not new_commit:
+    found = f"branch {updater.target_branch} not found"
+  elif new_commit == skip_commit:
+    found = f"{new_commit[:7]} available but rolled back, skipped"
+  else:
+    found = f"new version {new_commit[:7]} available"
+  return f"{datetime.datetime.now(datetime.UTC):%b %d %H:%M} UTC: {found}"
 
 def watch_update_requests(params, wait_helper: WaitTimeHelper) -> None:
+  disabled = params.get_bool("DisableUpdates")
   while True:
     try:
       handle_update_request(params, wait_helper)
+      # wake the main loop out of its long sleep when DisableUpdates changes, so it applies right away
+      if params.get_bool("DisableUpdates") != disabled:
+        disabled = not disabled
+        wait_helper.ready_event.set()
     except Exception:
       cloudlog.exception("update request failed")
     time.sleep(1)
@@ -478,10 +528,6 @@ class Updater:
 def main() -> None:
   params = Params()
 
-  if params.get_bool("DisableUpdates"):
-    cloudlog.warning("updates are disabled by the DisableUpdates param")
-    exit(0)
-
   with open(LOCK_FILE, 'w') as ov_lock_fd:
     try:
       fcntl.flock(ov_lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -509,8 +555,28 @@ def main() -> None:
 
     # Run the update loop
     first_run = True
+    disabled = False
     while True:
       wait_helper.ready_event.clear()
+
+      # DisableUpdates is read every loop, so turning it off or on needs no reboot
+      if params.get_bool("DisableUpdates"):
+        if not disabled:
+          cloudlog.warning("updates are disabled by the DisableUpdates param")
+          set_consistent_flag(False)
+          params.put_bool("UpdateAvailable", False, block=True)
+          params.put_bool("UpdaterFetchAvailable", False, block=True)
+          params.put("UpdateFailedCount", 0, block=True)
+          for alert in ("Offroad_UpdateFailed", "Offroad_ConnectivityNeeded", "Offroad_ConnectivityNeededPrompt"):
+            set_offroad_alert(alert, False)
+          params.put("UpdaterState", "updates disabled", block=True)
+          disabled = True
+        wait_helper.user_request = UserRequest.NONE
+        wait_helper.sleep(10)
+        continue
+      if disabled:
+        disabled = first_run = False
+        params.put("UpdaterState", "idle", block=True)
 
       # Attempt an update
       exception = None
@@ -531,6 +597,7 @@ def main() -> None:
         # check for update
         params.put("UpdaterState", "checking...", block=True)
         updater.check_for_update()
+        params.put("UpdaterCheckResult", check_result(updater, params.get("UpdaterSkipCommit")), block=True)
 
         # download update
         last_fetch = params.get("UpdaterLastFetchTime")
@@ -565,6 +632,8 @@ def main() -> None:
         OVERLAY_INIT.unlink(missing_ok=True)
 
       try:
+        if exception is not None:
+          params.put("UpdaterCheckResult", f"{datetime.datetime.now(datetime.UTC):%b %d %H:%M} UTC: update failed, will retry", block=True)
         params.put("UpdaterState", "idle", block=True)
         update_successful = (update_failed_count == 0)
         updater.set_params(update_successful, update_failed_count, exception)

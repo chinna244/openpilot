@@ -94,6 +94,12 @@ class CheckUpdateButtonSP(CheckUpdateButton):
 
   def _update_state(self):
     super()._update_state()
+    # with updates disabled the updater answers "updates disabled" instead of going back to idle
+    if self._state != UpdaterState.IDLE and ui_state.params.get("UpdaterState") == "updates disabled":
+      self.set_rotate_icon(False)
+      self.set_value("updates disabled")
+      self._state = UpdaterState.IDLE
+      self._hide_value_t = rl.get_time()
     if self._state == UpdaterState.IDLE and self.get_value() == "download update" and update_pending():
       self.set_value(self.READY)
       self.set_icon(self._txt_up_to_date_icon)

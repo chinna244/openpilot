@@ -105,15 +105,18 @@ class FakeWait:
 
 
 class TestUpdateRequest:
-  def run(self, request, tmp_path, monkeypatch, previous=True, **values):
+  def run(self, request, tmp_path, monkeypatch, previous=True, confirm=False, **values):
     prev = tmp_path / "previous"
     if previous:
       prev.mkdir(exist_ok=True)
     monkeypatch.setattr(updated, "PREVIOUS", str(prev))
     monkeypatch.setattr(updated, "BASEDIR", str(make_repo(tmp_path / "cur")))
-    params, wait = FakeParams(UpdateRequest=request, **values), FakeWait()
-    handle_update_request(params, wait)
-    assert params.values["UpdateRequest"] == UpdateRequest.NONE  # back to Ready
+    monkeypatch.setattr(updated, "armed", {})
+    params, wait = FakeParams(**values), FakeWait()
+    for r in (request, UpdateRequest.CONFIRM) if confirm else (request,):
+      params.values["UpdateRequest"] = r
+      handle_update_request(params, wait)
+      assert params.values["UpdateRequest"] == UpdateRequest.NONE  # back to Ready
     return params.values, wait.calls
 
   def test_none_does_nothing(self, tmp_path, monkeypatch):
@@ -126,25 +129,65 @@ class TestUpdateRequest:
 
   def test_install(self, tmp_path, monkeypatch):
     values, _ = self.run(UpdateRequest.INSTALL, tmp_path, monkeypatch, IsOffroad=True, UpdateAvailable=True)
+    assert "DoReboot" not in values and "select Confirm within 60 s" in values["UpdaterCheckResult"]  # first press only asks
+    values, _ = self.run(UpdateRequest.INSTALL, tmp_path, monkeypatch, confirm=True, IsOffroad=True, UpdateAvailable=True)
     assert values["DoReboot"] and "UpdaterRollback" not in values
 
   def test_install_needs_update_and_offroad(self, tmp_path, monkeypatch):
-    assert "DoReboot" not in self.run(UpdateRequest.INSTALL, tmp_path, monkeypatch, IsOffroad=True)[0]
-    assert "DoReboot" not in self.run(UpdateRequest.INSTALL, tmp_path, monkeypatch, IsOffroad=False, UpdateAvailable=True)[0]
+    assert "nothing downloaded" in self.run(UpdateRequest.INSTALL, tmp_path, monkeypatch, IsOffroad=True)[0]["UpdaterCheckResult"]
+    assert "DoReboot" not in self.run(UpdateRequest.INSTALL, tmp_path, monkeypatch, confirm=True, IsOffroad=True)[0]
+    assert "DoReboot" not in self.run(UpdateRequest.INSTALL, tmp_path, monkeypatch, confirm=True, IsOffroad=False, UpdateAvailable=True)[0]
 
   def test_rollback(self, tmp_path, monkeypatch):
     values, _ = self.run(UpdateRequest.ROLLBACK, tmp_path, monkeypatch, IsOffroad=True)
+    assert "DoReboot" not in values and "UpdaterRollback" not in values
+    values, _ = self.run(UpdateRequest.ROLLBACK, tmp_path, monkeypatch, confirm=True, IsOffroad=True)
     assert values["UpdaterRollback"] and values["DoReboot"]
+
+  def test_confirm_expires_and_needs_a_request(self, tmp_path, monkeypatch):
+    t = [1000.]
+    monkeypatch.setattr(updated.time, "monotonic", lambda: t[0])
+    prev = tmp_path / "previous"
+    prev.mkdir()
+    monkeypatch.setattr(updated, "PREVIOUS", str(prev))
+    monkeypatch.setattr(updated, "BASEDIR", str(make_repo(tmp_path / "cur")))
+    monkeypatch.setattr(updated, "armed", {})
+    params = FakeParams(IsOffroad=True)
+    def press(r, dt=0.):
+      t[0] += dt
+      params.values["UpdateRequest"] = r
+      handle_update_request(params, FakeWait())
+    press(UpdateRequest.CONFIRM)  # nothing armed
+    assert "nothing to confirm" in params.values["UpdaterCheckResult"]
+    press(UpdateRequest.ROLLBACK)
+    press(UpdateRequest.CONFIRM, 61.)  # too late
+    assert "DoReboot" not in params.values
+    press(UpdateRequest.ROLLBACK)
+    press(UpdateRequest.ROLLBACK)  # selecting it again only re-arms
+    assert "DoReboot" not in params.values
+    press(UpdateRequest.CONFIRM, 30.)
+    assert params.values["DoReboot"] and params.values["UpdaterRollback"]
+
+  def test_confirm_rechecks_state(self, tmp_path, monkeypatch):
+    monkeypatch.setattr(updated, "armed", {})
+    params = FakeParams(IsOffroad=True, UpdateAvailable=True)
+    params.values["UpdateRequest"] = UpdateRequest.INSTALL
+    handle_update_request(params, FakeWait())
+    params.values["IsOffroad"] = False  # car started before Confirm
+    params.values["UpdateRequest"] = UpdateRequest.CONFIRM
+    handle_update_request(params, FakeWait())
+    assert "DoReboot" not in params.values
 
   def test_rollback_needs_previous_and_offroad(self, tmp_path, monkeypatch):
     for kwargs in ({"previous": False, "IsOffroad": True}, {"IsOffroad": False}):
-      values, _ = self.run(UpdateRequest.ROLLBACK, tmp_path, monkeypatch, **kwargs)
+      values, _ = self.run(UpdateRequest.ROLLBACK, tmp_path, monkeypatch, confirm=True, **kwargs)
       assert "UpdaterRollback" not in values and "DoReboot" not in values
 
   def test_rollback_refused_with_local_changes(self, tmp_path, monkeypatch):
     (make_repo(tmp_path / "cur") / "f").write_text("patched")  # run() reuses this repo as BASEDIR
-    values, _ = self.run(UpdateRequest.ROLLBACK, tmp_path, monkeypatch, IsOffroad=True)
+    values, _ = self.run(UpdateRequest.ROLLBACK, tmp_path, monkeypatch, confirm=True, IsOffroad=True)
     assert "UpdaterRollback" not in values and "DoReboot" not in values
+    assert "not possible: local changes" in self.run(UpdateRequest.ROLLBACK, tmp_path, monkeypatch, IsOffroad=True)[0]["UpdaterCheckResult"]
 
 
 class TestRollbackBlocker:
@@ -211,3 +254,104 @@ class TestStagedUpdate:
     u.branches["develop"] = u.get_commit_hash(str(cur))
     monkeypatch.setattr(updated.Updater, "target_branch", property(lambda self: "release"))
     assert not u.up_to_date
+
+
+class StopLoop(Exception):
+  pass
+
+
+class TestDisableUpdatesLive:
+  """Turning DisableUpdates off resumes updating without a reboot (updated used to exit at startup)."""
+
+  def test_toggle_without_reboot(self, tmp_path, monkeypatch):
+    params = FakeParams(DisableUpdates=True)
+    states, calls = [], []
+    orig_put = params.put
+    def put(key, value, block=False):
+      if key == "UpdaterState":
+        states.append(value)
+      orig_put(key, value, block)
+    params.put = put
+
+    class Wait:
+      def __init__(self):
+        import threading
+        self.ready_event = threading.Event()
+        self.user_request = updated.UserRequest.NONE
+        self.sleeps = 0
+      def sleep(self, t):
+        self.sleeps += 1
+        calls.append(("sleep", t))
+        if self.sleeps == 2:
+          params.values["DisableUpdates"] = False  # user turns updates back on
+        if self.sleeps == 3:
+          raise StopLoop
+
+    class Updater:
+      branches = {"develop": "a" * 40}
+      target_branch = "develop"
+      up_to_date = True
+      def set_params(self, *args):
+        pass
+      def check_for_update(self):
+        calls.append("check")
+      def fetch_update(self):
+        calls.append("fetch")
+
+    monkeypatch.setattr(updated, "Params", lambda: params)
+    monkeypatch.setattr(updated, "WaitTimeHelper", Wait)
+    monkeypatch.setattr(updated, "Updater", Updater)
+    monkeypatch.setattr(updated, "init_overlay", lambda: calls.append("overlay"))
+    monkeypatch.setattr(updated, "system_time_valid", lambda: True)
+    monkeypatch.setattr(updated, "watch_update_requests", lambda *a: None)
+    monkeypatch.setattr(updated, "LOCK_FILE", str(tmp_path / "lock"))
+    monkeypatch.setattr(updated, "STAGING_ROOT", str(tmp_path / "staging"))
+    monkeypatch.setattr(updated, "FINALIZED", str(tmp_path / "finalized"))
+
+    try:
+      updated.main()
+    except StopLoop:
+      pass
+
+    # disabled: no overlay, no check, only short waits; then on again: checks without a reboot
+    assert calls[:2] == [("sleep", 10), ("sleep", 10)]
+    assert calls[2:] == ["overlay", "check", ("sleep", 1.5 * 60 * 60)]
+    assert states[:3] == ["idle", "updates disabled", "idle"] and states[-1] == "idle"
+    assert "up to date" in params.values["UpdaterCheckResult"]
+
+
+class TestCheckResult:
+  def make(self, up_to_date, commit):
+    class U:
+      branches = {"develop": commit}
+      target_branch = "develop"
+    u = U()
+    u.up_to_date = up_to_date
+    return u
+
+  def test_results(self):
+    assert updated.check_result(self.make(True, "a" * 40), None).endswith("UTC: up to date")
+    assert updated.check_result(self.make(False, "b" * 40), None).endswith("new version bbbbbbb available")
+    assert updated.check_result(self.make(False, "b" * 40), "b" * 40).endswith("bbbbbbb available but rolled back, skipped")
+    assert updated.check_result(self.make(False, ""), None).endswith("branch develop not found")
+
+
+class TestDisableWakesLoop:
+  def test_toggle_wakes_sleeping_loop(self, monkeypatch):
+    import threading
+    params = FakeParams(DisableUpdates=False)
+    wait = FakeWait()
+    wait.ready_event = threading.Event()
+    sleeps = []
+    def fake_sleep(t):
+      sleeps.append(t)
+      if len(sleeps) == 1:
+        params.values["DisableUpdates"] = True  # user disables while the loop sleeps 1.5 h
+      if len(sleeps) == 3:
+        raise StopLoop
+    monkeypatch.setattr(updated.time, "sleep", fake_sleep)
+    try:
+      updated.watch_update_requests(params, wait)
+    except StopLoop:
+      pass
+    assert wait.ready_event.is_set()
