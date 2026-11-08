@@ -166,3 +166,48 @@ class TestRollbackBlocker:
     assert updated.rollback_blocker() == "needs AGNOS 19.9"
     (prev / "launch_env.sh").write_text('export AGNOS_VERSION="20.3"\n')
     assert updated.rollback_blocker() == ""
+
+
+class TestStagedUpdate:
+  """A staged copy of the running version is no update: it would reboot into the same code and rebuild it."""
+
+  def setup(self, tmp_path, monkeypatch, remote_commit=None, staged_branch="develop", change_staged=False):
+    cur = make_repo(tmp_path / "cur")
+    subprocess.check_call(["git", "branch", "-qM", "develop"], cwd=cur)
+    fin = tmp_path / "finalized"
+    subprocess.check_call(["git", "clone", "-q", str(cur), str(fin)])
+    if staged_branch != "develop":
+      subprocess.check_call(["git", "checkout", "-qb", staged_branch], cwd=fin)
+    if change_staged:
+      (fin / "f").write_text("b")
+      subprocess.check_call(["git", "-c", "user.name=t", "-c", "user.email=t", "commit", "-qam", "b"], cwd=fin)
+    (fin / ".overlay_consistent").touch()
+    monkeypatch.setattr(updated, "BASEDIR", str(cur))
+    monkeypatch.setattr(updated, "FINALIZED", str(fin))
+    monkeypatch.setattr(updated.Updater, "target_branch", property(lambda self: "develop"))
+    u = updated.Updater()
+    u.branches["develop"] = remote_commit or u.get_commit_hash(str(cur))
+    return u, cur, fin
+
+  def test_same_commit_staged_is_not_ready(self, tmp_path, monkeypatch):
+    u, _, _ = self.setup(tmp_path, monkeypatch, remote_commit="f" * 40)  # remote moved on, staged copy is still the running one
+    assert not u.update_ready
+
+  def test_new_commit_staged_is_ready(self, tmp_path, monkeypatch):
+    u, _, fin = self.setup(tmp_path, monkeypatch, change_staged=True)
+    assert u.update_ready
+    (fin / ".overlay_consistent").unlink()
+    assert not u.update_ready
+
+  def test_staged_on_another_branch(self, tmp_path, monkeypatch):
+    u, _, _ = self.setup(tmp_path, monkeypatch, staged_branch="other")
+    assert not u.update_ready  # not the target branch
+
+  def test_up_to_date(self, tmp_path, monkeypatch):
+    u, cur, _ = self.setup(tmp_path, monkeypatch)
+    assert u.up_to_date
+    u.branches["develop"] = "f" * 40
+    assert not u.up_to_date
+    u.branches["develop"] = u.get_commit_hash(str(cur))
+    monkeypatch.setattr(updated.Updater, "target_branch", property(lambda self: "release"))
+    assert not u.up_to_date

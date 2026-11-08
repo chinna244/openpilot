@@ -292,11 +292,17 @@ class Updater:
   def update_ready(self) -> bool:
     consistent_file = Path(os.path.join(FINALIZED, ".overlay_consistent"))
     if consistent_file.is_file():
-      hash_mismatch = self.get_commit_hash(BASEDIR) != self.branches[self.target_branch]
-      branch_mismatch = self.get_branch(BASEDIR) != self.target_branch
+      # compare against the staged copy, not the remote: a staged copy of the running version is no update
+      hash_mismatch = self.get_commit_hash(BASEDIR) != self.get_commit_hash(FINALIZED)
+      branch_mismatch = self.get_branch(BASEDIR) != self.get_branch(FINALIZED)
       on_target_branch = self.get_branch(FINALIZED) == self.target_branch
       return ((hash_mismatch or branch_mismatch) and on_target_branch)
     return False
+
+  @property
+  def up_to_date(self) -> bool:
+    """The running version is the target branch's latest commit (check_for_update fills branches)."""
+    return self.get_branch(BASEDIR) == self.target_branch and self.get_commit_hash(BASEDIR) == self.branches[self.target_branch]
 
   @property
   def update_available(self) -> bool:
@@ -536,6 +542,10 @@ def main() -> None:
           cloudlog.info("skipping fetch, only checking")
         elif not user_requested_fetch and updater.branches[updater.target_branch] == params.get("UpdaterSkipCommit"):
           cloudlog.info("skipping fetch, this commit was rolled back")
+        elif not user_requested_fetch and updater.up_to_date:
+          # a staged copy of what is running would only reboot into the same version and rebuild it
+          cloudlog.info("skipping fetch, already running the latest version")
+          set_consistent_flag(False)
         else:
           updater.fetch_update()
           write_time_to_param(params, "UpdaterLastFetchTime")

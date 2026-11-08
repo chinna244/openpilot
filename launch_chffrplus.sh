@@ -100,7 +100,12 @@ function launch {
       echo "${DIR} has been modified, skipping overlay update installation"
     else
       if [ -f "${STAGING_ROOT}/finalized/.overlay_consistent" ]; then
-        if [ ! -d /data/safe_staging/old_openpilot ]; then
+        # a staged copy of the running version would only swap in the same code and rebuild it
+        RUNNING_VERSION="$(git --no-optional-locks -C "$DIR" rev-parse HEAD --abbrev-ref HEAD 2>/dev/null)"
+        if [ -n "$RUNNING_VERSION" ] && [ "$RUNNING_VERSION" == "$(git --no-optional-locks -C "${STAGING_ROOT}/finalized" rev-parse HEAD --abbrev-ref HEAD 2>/dev/null)" ]; then
+          echo "staged update is the running version, not installing"
+          rm -f "${STAGING_ROOT}/finalized/.overlay_consistent"
+        elif [ ! -d /data/safe_staging/old_openpilot ]; then
           echo "Valid overlay update found, installing"
           LAUNCHER_LOCATION="${BASH_SOURCE[0]}"
 
