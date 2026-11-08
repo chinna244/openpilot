@@ -7,7 +7,7 @@ import pytest
 from openpilot.cereal import messaging
 from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.controls.lib.firm_stop import (FirmStop, plan_stop_distance, T_IDXS, FIRM_STOP_SPEED, FIRM_STOP_RELEASE_SPEED,
-                                                        FIRM_STOP_MARGIN, FIRM_STOP_MIN_DIST, FIRM_STOP_PLAN_V, FIRM_STOP_ARM_FRAMES,
+                                                        FIRM_STOP_MARGIN, FIRM_STOP_MIN_DIST, FIRM_STOP_LEAD_GAP, FIRM_STOP_PLAN_V, FIRM_STOP_ARM_FRAMES,
                                                         FIRM_STOP_SETTLE_FRAMES, FIRM_STOP_JERK, FIRM_STOP_DECEL_BP, FIRM_STOP_DECEL_MAX)
 from openpilot.selfdrive.controls.tests import test_cruise_handover as H
 
@@ -26,9 +26,9 @@ def cruise_plan(v0):
   return np.full(len(T_IDXS), v0), v0 * T_IDXS
 
 
-def run(fs, v, vel, pos, n=WARM, active=True, a_candidate=0.):
+def run(fs, v, vel, pos, n=WARM, active=True, a_candidate=0., lead_d=math.inf):
   for _ in range(n):
-    a = fs.update(v, vel, pos, active, a_candidate)
+    a = fs.update(v, vel, pos, active, a_candidate, lead_d)
   return a
 
 
@@ -68,6 +68,16 @@ class TestFirmStop:
   def test_steady_decel_to_short_of_stop(self):
     v, dist = 1.5, 3.
     assert run(FirmStop(), v, *stop_plan(v, dist)) == pytest.approx(-v ** 2 / (2 * (dist - FIRM_STOP_MARGIN)), rel=0.05)
+
+  def test_stops_behind_the_lead_not_short_of_it(self):
+    # route 0000004b 827 s: model stop 3.2 m ahead, lead 7.4 m: aim FIRM_STOP_LEAD_GAP behind the lead
+    v, dist, lead_d = 1.5, 3.2, 9.0
+    assert run(FirmStop(), v, *stop_plan(v, dist), lead_d=lead_d) == pytest.approx(-v ** 2 / (2 * (lead_d - FIRM_STOP_LEAD_GAP)), rel=0.05)
+
+  def test_lead_never_brings_the_stop_closer(self):
+    v, dist = 1.5, 3.
+    want = -v ** 2 / (2 * (dist - FIRM_STOP_MARGIN))
+    assert run(FirmStop(), v, *stop_plan(v, dist), lead_d=FIRM_STOP_LEAD_GAP + 0.5) == pytest.approx(want, rel=0.05)
 
   def test_needs_consecutive_frames(self):
     fs = FirmStop()
@@ -156,8 +166,8 @@ class TestFirmStop:
     assert -0.15 < run(FirmStop(), 1.0, *stop_plan(1.0, 4.8)) < 0.
 
 
-def low_speed_sm(v, vel, pos, gas=False, model_a=0.):
-  sm = H.build_sm(v_cruise_kph=40., a_ego=-0.3, gas=gas, model_a=model_a)
+def low_speed_sm(v, vel, pos, gas=False, model_a=0., lead=None):
+  sm = H.build_sm(v_cruise_kph=40., a_ego=-0.3, gas=gas, model_a=model_a, lead=lead)
   cs = messaging.new_message('carState')
   cs.carState.vEgo, cs.carState.aEgo, cs.carState.vCruise, cs.carState.vCruiseCluster = v, -0.3, 40., 40.
   cs.carState.gasPressed = gas
@@ -182,6 +192,11 @@ class TestPlanner:
     v, dist = 1.5, 2.5
     p = self.run(low_speed_sm(v, *stop_plan(v, dist)))
     assert p.output_a_target <= -v ** 2 / (2 * (dist - FIRM_STOP_MARGIN)) + 1e-3
+
+  def test_lead_sets_the_stop(self):
+    v, lead_d = 1.5, 9.
+    p = self.run(low_speed_sm(v, *stop_plan(v, 3.), lead=lead_d))
+    assert p.firm_stop.a_target == pytest.approx(-v ** 2 / (2 * (lead_d - FIRM_STOP_LEAD_GAP)), rel=0.05)
 
   def test_stopping_state_under_stopping_speed(self):
     p = H.planner()

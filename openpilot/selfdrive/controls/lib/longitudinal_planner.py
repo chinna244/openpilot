@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import math
 import time
 import numpy as np
 
@@ -235,8 +236,10 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
 
     output_a_target_e2e = self.accel_boost.update(sm, output_a_target_e2e, output_a_target_mpc, self.a_cruise)
     # the model's planned stop, finished steadily instead of tapered: only ever lower than the e2e candidate
+    lead_one = sm['radarState'].leadOne
     a_firm = self.firm_stop.update(v_ego, sm['modelV2'].velocity.x, sm['modelV2'].position.x,
-                                   self.CP.openpilotLongitudinalControl and not reset_state, output_a_target_e2e)
+                                   self.CP.openpilotLongitudinalControl and not reset_state, output_a_target_e2e,
+                                   lead_one.dRel if lead_one.present else math.inf)
     output_a_target_e2e = min(output_a_target_e2e, a_firm)
     output_should_stop_e2e = output_should_stop_e2e or self.firm_stop.should_stop
 

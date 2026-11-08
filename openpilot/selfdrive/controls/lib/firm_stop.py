@@ -13,6 +13,9 @@ FIRM_STOP_SPEED = 2.24  # m/s, 5 mph
 FIRM_STOP_RELEASE_SPEED = 2.7  # m/s, once finishing a stop it lets go only above this
 FIRM_STOP_MARGIN = 0.5  # m
 FIRM_STOP_MIN_DIST = 0.3  # m
+# behind a lead it stops this far back (radarState dRel), not at the model's stop point: at 5 mph the model plans its stop
+# 2-3 m ahead with the lead 8-9 m ahead (routes 0000004a-0000004c), so firm stops ended 6-7.6 m back; the driver stops 3.9 m
+FIRM_STOP_LEAD_GAP = 4.0  # m
 FIRM_STOP_PLAN_V = 0.3  # m/s, plan speed that counts as stopped; under it longcontrol's stopping state finishes
 FIRM_STOP_GO_V = 0.5  # m/s, a plan this fast within FIRM_STOP_STAY of its stop point stops and goes: not a stop
 FIRM_STOP_STAY = 2.0  # s
@@ -49,9 +52,10 @@ class FirmStop:
     self.a_target = math.inf
     self.should_stop = False
 
-  def update(self, v_ego: float, vel, pos, active: bool, a_candidate: float) -> float:
+  def update(self, v_ego: float, vel, pos, active: bool, a_candidate: float, lead_d: float = math.inf) -> float:
     """The firm-stop candidate in m/s^2, inf while it has nothing to ask. a_candidate: the candidate it brakes under, the
-    starting point of its ramp. should_stop: finishing under FIRM_STOP_PLAN_V, for longcontrol's stopping state."""
+    starting point of its ramp. lead_d: distance to the lead, inf without one. should_stop: finishing under FIRM_STOP_PLAN_V,
+    for longcontrol's stopping state."""
     dist = plan_stop_distance(vel, pos)
     self.active_frames = self.active_frames + 1 if active else 0
     planned = math.isfinite(dist)
@@ -72,6 +76,7 @@ class FirmStop:
       self.a_target = math.inf
     elif v_ego >= FIRM_STOP_PLAN_V:
       cap = float(np.interp(v_ego, FIRM_STOP_DECEL_BP, FIRM_STOP_DECEL_MAX))
-      want = -min(v_ego ** 2 / (2. * max(dist - FIRM_STOP_MARGIN, FIRM_STOP_MIN_DIST)), cap) if planned else self.a_target
+      stop_at = max(dist - FIRM_STOP_MARGIN, lead_d - FIRM_STOP_LEAD_GAP if math.isfinite(lead_d) else -math.inf)
+      want = -min(v_ego ** 2 / (2. * max(stop_at, FIRM_STOP_MIN_DIST)), cap) if planned else self.a_target
       self.a_target = max(want, self.a_target - FIRM_STOP_JERK * self.dt) if want < self.a_target else want
     return self.a_target
