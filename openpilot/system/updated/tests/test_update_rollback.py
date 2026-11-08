@@ -393,3 +393,21 @@ class TestDriveInputs:
     from openpilot.system.updated.proven import drive_inputs
     assert drive_inputs(self.SM(True, enabled=True, alert="commIssue/softDisable")) == (True, "commIssue/softDisable")
     assert drive_inputs(self.SM(True, mads=True)) == (True, "")
+
+
+def test_rollback_blocker_leaves_git_untouched(tmp_path, monkeypatch):
+  """init_overlay and the boot script treat any change under .git as local edits: the check must not write there."""
+  import os
+  import time as _time
+  cur = make_repo(tmp_path / "cur")
+  (tmp_path / "previous").mkdir()
+  monkeypatch.setattr(updated, "PREVIOUS", str(tmp_path / "previous"))
+  monkeypatch.setattr(updated, "BASEDIR", str(cur))
+  monkeypatch.setattr(updated, "AGNOS", False)
+  past = _time.time() - 100
+  (cur / "f").touch()  # stale stat info: a locking git status would rewrite the index
+  for p in [cur / ".git", cur / ".git" / "index"]:
+    os.utime(p, (past, past))
+  before = [os.stat(p).st_mtime for p in (cur / ".git", cur / ".git" / "index")]
+  updated.rollback_blocker()
+  assert [os.stat(p).st_mtime for p in (cur / ".git", cur / ".git" / "index")] == before

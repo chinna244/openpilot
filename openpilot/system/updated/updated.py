@@ -80,7 +80,7 @@ def rollback_blocker() -> str:
   """Why launch_chffrplus.sh would refuse to roll back, or "" when it can."""
   if not os.path.isdir(PREVIOUS):
     return "no previous version"
-  if run(["git", "status", "--porcelain", "--untracked-files=no"], BASEDIR).strip():
+  if run(["git", "--no-optional-locks", "status", "--porcelain", "--untracked-files=no"], BASEDIR).strip():
     return "local changes on the device"
   if AGNOS:
     agnos = run(["bash", "-c", "unset AGNOS_VERSION && source launch_env.sh && echo -n $AGNOS_VERSION"], PREVIOUS).strip()
