@@ -51,14 +51,6 @@ class TestDriveProof:
     drive(p, 10, procs=[("mapd", False, True)])  # optional, selfdrived ignores it too
     assert p.proven()
 
-  def test_failed_drive(self):
-    p = DriveProof()
-    drive(p, 10, alert="controlsMismatch/immediateDisable")
-    assert p.failed() and not p.proven()
-    p = DriveProof()
-    drive(p, 10, enabled=False)
-    assert not p.failed() and not p.proven()
-
   def test_reset(self):
     p = DriveProof()
     drive(p, 300, alert="controlsMismatch/immediateDisable")
@@ -355,3 +347,23 @@ class TestDisableWakesLoop:
     except StopLoop:
       pass
     assert wait.ready_event.is_set()
+
+
+class TestDriveInputs:
+  """Route 4c (2026-11-08): the drive start read a controlsMismatch kept from before selfdrived was up."""
+
+  class SM(dict):
+    def __init__(self, alive, enabled=False, mads=False, alert=""):
+      from types import SimpleNamespace
+      super().__init__(selfdriveState=SimpleNamespace(enabled=enabled, alertType=alert),
+                       selfdriveStateSP=SimpleNamespace(mads=SimpleNamespace(enabled=mads)))
+      self.alive = {"selfdriveState": alive, "selfdriveStateSP": alive}
+
+  def test_stale_message_ignored(self):
+    from openpilot.system.updated.proven import drive_inputs
+    assert drive_inputs(self.SM(False, enabled=True, alert="controlsMismatch/immediateDisable")) == (False, "")
+
+  def test_live_message_used(self):
+    from openpilot.system.updated.proven import drive_inputs
+    assert drive_inputs(self.SM(True, enabled=True, alert="commIssue/softDisable")) == (True, "commIssue/softDisable")
+    assert drive_inputs(self.SM(True, mads=True)) == (True, "")

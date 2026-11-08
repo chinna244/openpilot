@@ -3,7 +3,7 @@
 rollback copy when the next update installs (launch_chffrplus.sh). A drive is clean when openpilot
 (or MADS steering) was engaged for at least ENGAGED_MIN_S and nothing disengaged it on an error: no
 soft or immediate disable alert and no process crashing mid-drive. It is judged when the drive ends;
-an engaged drive with an error takes the mark back."""
+one clean drive is enough, a later drive with an error does not take the mark back."""
 import openpilot.cereal.messaging as messaging
 from openpilot.common.basedir import BASEDIR
 from openpilot.common.git import get_commit
@@ -51,8 +51,14 @@ class DriveProof:
   def proven(self) -> bool:
     return self.engaged_s >= ENGAGED_MIN_S and not self.error
 
-  def failed(self) -> bool:
-    return self.engaged_s > 0. and bool(self.error)
+
+def drive_inputs(sm) -> tuple[bool, str]:
+  """Engaged and alert from live selfdrived data only: the last message kept from before the drive
+  (e.g. its shutdown alert) is not this drive's."""
+  if not sm.alive['selfdriveState']:
+    return False, ""
+  engaged = sm['selfdriveState'].enabled or (sm.alive['selfdriveStateSP'] and sm['selfdriveStateSP'].mads.enabled)
+  return engaged, sm['selfdriveState'].alertType
 
 
 def main():
@@ -69,16 +75,14 @@ def main():
 
     if sm['deviceState'].started:
       started = True
-      engaged = sm['selfdriveState'].enabled or sm['selfdriveStateSP'].mads.enabled
+      engaged, alert = drive_inputs(sm)
       procs = [(p.name, p.running, p.shouldBeRunning) for p in sm['managerState'].processes]
-      proof.update(0.5, engaged, sm['selfdriveState'].alertType, procs)
+      proof.update(0.5, engaged, alert, procs)
     elif started:
       started = False
       cloudlog.event("drive proof", commit=commit, engaged_s=proof.engaged_s, error=proof.error)
       if commit and proof.proven():
         params.put("UpdaterProvenCommit", commit, block=True)
-      elif commit and proof.failed() and params.get("UpdaterProvenCommit") == commit:
-        params.remove("UpdaterProvenCommit")
       proof.reset()
 
 
