@@ -344,6 +344,12 @@ STOP_SAMPLE_MAX_AGE_NS = 1_500_000_000
 # fork: STOP boxes whose red does not beat green/blue are dropped (75th percentile of R - max(G, B) over the middle);
 # on routes 18-2a it removed 2 of 16 false STOPs and kept all 33 real ones, a backlit sign included
 STOP_RED_DOMINANCE_MIN = 5
+# fork: after a pass that found a STOP box the next pass waits only that pass's own time, not the processing/CPU-busy
+# throttle: driving, passes took 0.3-0.9 s and the throttle spaced them 1.4-1.5 s near signs (routes 4a-4c), so the
+# second sighting StarPilot's 1.5 s STOP confirmation needs never came in time. Cores 0-2, normal priority: the
+# realtime location/monitoring processes there still come first.
+STOP_FOLLOWUP_ENABLED = True
+STOP_FOLLOWUP_MIN_SPEED = 1.0  # m/s
 US_DETECTOR_CLASSES = {
   0: "regulatory_speed_limit",
   1: "advisory_speed_limit",
@@ -612,6 +618,7 @@ class SpeedLimitVisionDaemon:
     self.last_force_stop_refresh_at = -float("inf")
     self.frame_meta = None
     self.pass_stop_boxes = None
+    self.stop_followup = False
     self.stop_sample = None
 
     self.digit_templates = self._build_digit_templates()
@@ -1212,6 +1219,9 @@ class SpeedLimitVisionDaemon:
         self.last_cpu_busy = True
         interval = max(interval, BUSY_INFERENCE_INTERVAL)
         reason = "cpu_busy"
+      if self._stop_followup_due():
+        interval = max(FOLLOWUP_INFERENCE_INTERVAL, self.last_frame_process_duration_s)
+        reason = "stop_followup"
     self.last_inference_interval = interval
     self.last_inference_interval_reason = reason
     return interval
@@ -1592,7 +1602,18 @@ class SpeedLimitVisionDaemon:
       return False
     return now - track.last_classified_at >= self._track_classification_interval(now)
 
+  def _stop_followup_due(self):
+    """Only while moving: standing at a STOP still in view would otherwise run passes back to back."""
+    if not (STOP_FOLLOWUP_ENABLED and getattr(self, "force_stop_enabled", False) and getattr(self, "stop_followup", False)):
+      return False
+    try:
+      return self.sm is not None and self.sm.valid.get("carState", False) and self.sm["carState"].vEgo > STOP_FOLLOWUP_MIN_SPEED
+    except (AttributeError, KeyError, TypeError):
+      return False
+
   def _detector_interval(self, inference_interval):
+    if self._stop_followup_due():
+      return inference_interval  # the STOP box comes from the detector pass, not a track classification
     if self.coexistence_mode:
       return max(inference_interval, self.track_detector_interval)
     if self.proposal_track is not None:
@@ -3208,6 +3229,7 @@ class SpeedLimitVisionDaemon:
         detection = self._detect_sign(frame_bgr)
         if getattr(self, "force_stop_enabled", False) and self.pass_stop_boxes is not None and self.frame_meta is not None:
           self.stop_sample = (self.frame_meta, sorted(self.pass_stop_boxes, reverse=True)[:4])
+        self.stop_followup = bool(getattr(self, "force_stop_enabled", False) and self.pass_stop_boxes)
         self._start_latest_detector_track(frame_bgr, now)
       else:
         detection = self._classify_proposal_track(frame_bgr, now)

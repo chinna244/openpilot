@@ -629,3 +629,57 @@ def test_latest_strong_read_keeps_the_low_speed_change_bar():
   daemon = daemon_with_history(40, [(40, 0.64)])
   daemon.history.append(HistoryEntry(25, 0.85, 1.0, strong_consensus=True))
   assert daemon._confirm_detection() != pytest.approx((25, 0.85))
+
+
+def interval_daemon(process_s, cpu_busy=False):
+  daemon = SpeedLimitVisionDaemon.__new__(SpeedLimitVisionDaemon)
+  daemon.followup_until = 0.0
+  daemon.last_live_pose_inputs_not_ok_at = -float("inf")
+  daemon.last_frame_process_duration_s = process_s
+  daemon.memory_pressure_state = "normal"
+  daemon.coexistence_mode = False
+  daemon.last_cpu_busy = False
+  daemon.proposal_track = object()  # a speed sign being tracked: detector passes at least TRACK_DETECTOR_INTERVAL apart
+  daemon._update_memory_pressure = lambda: "normal"
+  daemon._device_cpu_busy = lambda: cpu_busy
+  daemon.force_stop_enabled, daemon.stop_followup = True, True
+  daemon.sm = MovingSM(10.)
+  return daemon
+
+
+class MovingSM(dict):
+  def __init__(self, v_ego):
+    super().__init__(carState=SimpleNamespace(vEgo=v_ego))
+    self.valid = {"carState": True}
+
+
+def test_stop_followup_waits_only_the_pass_time():
+  # route 4b 1017 s: passes 0.6 s, CPU busy, interval 1.45 s; after a STOP box the next pass comes after the pass time
+  daemon = interval_daemon(0.6, cpu_busy=True)
+  interval = daemon._inference_interval(10.0)
+  assert interval == pytest.approx(0.6) and daemon.last_inference_interval_reason == "stop_followup"
+  assert daemon._detector_interval(interval) == pytest.approx(0.6)
+  daemon.last_frame_process_duration_s = 0.02
+  assert daemon._inference_interval(10.0) == pytest.approx(slv.FOLLOWUP_INFERENCE_INTERVAL)
+
+
+def test_no_stop_followup_without_a_stop_box_or_force_stop():
+  for force_stop, followup in ((True, False), (False, True)):
+    daemon = interval_daemon(0.6, cpu_busy=True)
+    daemon.force_stop_enabled, daemon.stop_followup = force_stop, followup
+    interval = daemon._inference_interval(10.0)
+    assert interval == pytest.approx(slv.BUSY_INFERENCE_INTERVAL) and daemon.last_inference_interval_reason == "cpu_busy"
+    assert daemon._detector_interval(interval) >= slv.TRACK_DETECTOR_INTERVAL
+
+
+def test_stop_followup_never_overrides_memory_pressure():
+  daemon = interval_daemon(0.6)
+  daemon._update_memory_pressure = lambda: "pressure"
+  assert daemon._inference_interval(10.0) == pytest.approx(slv.MEMORY_PRESSURE_INFERENCE_INTERVAL)
+
+
+def test_no_stop_followup_standing_still():
+  # stopped at a STOP still in view: no back-to-back passes
+  daemon = interval_daemon(0.6, cpu_busy=True)
+  daemon.sm = MovingSM(0.)
+  assert daemon._inference_interval(10.0) == pytest.approx(slv.BUSY_INFERENCE_INTERVAL)

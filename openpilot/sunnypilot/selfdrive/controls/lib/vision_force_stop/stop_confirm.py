@@ -8,7 +8,10 @@ from dataclasses import dataclass
 import math
 
 STOP_MAX_AGE_NS = 1_500_000_000
-CONTROL_STOP_MAX_AGE_NS = 750_000_000
+# fork: StarPilot's 750 ms counts from the camera frame and assumes its result lands ~0.25 s later; our reader's land
+# 0.3-0.9 s later while driving (routes 4a-4c), leaving 0-0.45 s. 1.2 s keeps StarPilot's usable time. Replay on routes
+# 18-2a (33 image-checked STOPs) at the busy cadence: 750 ms + follow-up 6/33, 1.2 s + follow-up 14/33, 0 false either way.
+CONTROL_STOP_MAX_AGE_NS = 1_200_000_000
 RECEIPT_MAX_AGE_NS = 1_000_000_000
 STOP_CONFIRM_CONFIDENCE = .7
 

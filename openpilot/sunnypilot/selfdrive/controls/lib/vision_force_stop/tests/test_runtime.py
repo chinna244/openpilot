@@ -134,3 +134,43 @@ def test_gas_away_from_a_sign_stop_does_not_rearm():
     step(v_ego=1., gas=True)  # the driver pulls away on the gas, the sign still in view
   plans = [step(v_ego=2.) for _ in range(60)]  # gas released, 3 s rolling past the sign
   assert not any(p.forcing or p.speed_ceiling_mps is not None for p in plans)
+
+
+def run_delayed(params, *, pass_s=0.6, delay_s=0.6, seconds=4.0):
+  """The reader as on the car driving (routes 4a-4c): a STOP pass every pass_s, each landing delay_s after its frame,
+  republished every 0.2 s until the next one lands."""
+  vfs, sm, CP = VisionForceStop(params), FakeSM(), car_params()
+  t0 = DRIVE_ID + 2_000_000_000 - (DRIVE_ID + 2_000_000_000) % (4 * DT_NS)
+  obs = [t0 + int(k * pass_s * 1e9) for k in range(int(seconds / pass_s) + 1)]
+  plans = []
+  for i in range(int(seconds / 0.05)):
+    t = t0 + i * DT_NS
+    frame(sm, t, horizon=40., v_ego=10., stop_box=False)
+    landed = [o for o in obs if o + delay_s * 1e9 <= t]
+    if landed and t % (4 * DT_NS) == 0:
+      msg = messaging.new_message('customReserved10')
+      out = msg.customReserved10
+      out.stopValid, out.stopObservedMonoTime, out.stopFrameId = True, landed[-1], landed[-1] // DT_NS
+      out.stopImageWidth, out.stopImageHeight = 1344, 760
+      out.stopConfidences, out.stopBoxes = [0.8], [900, 200, 940, 240]
+      sm.put('customReserved10', msg, t)
+    plans.append(vfs.sample(sm, CP, now_ns=t, drive_id=DRIVE_ID, follow_seconds=1.45))
+  return plans
+
+
+def test_late_reader_samples_still_force_a_stop():
+  # our reader's STOP samples land 0.3-0.9 s after their frame while driving: a sign 0.9 s old on arrival still counts
+  assert any(p.forcing for p in run_delayed(FakeParams(), pass_s=0.5, delay_s=0.9))
+
+
+def test_late_reader_samples_miss_at_starpilots_age(monkeypatch):
+  # why the age is 1.2 s: at StarPilot's 0.75 s the same samples arrive already too old and no stop is forced
+  import openpilot.sunnypilot.selfdrive.controls.lib.vision_force_stop.runtime as rt
+  monkeypatch.setattr(rt, 'CONTROL_STOP_MAX_AGE_NS', 750_000_000)
+  assert not any(p.forcing for p in run_delayed(FakeParams(), pass_s=0.5, delay_s=0.9))
+
+
+def test_control_age_stays_inside_the_confirmation_age():
+  # a sign is only steered on while its confirmation still holds: older samples are dropped at STOP_MAX_AGE_NS
+  from openpilot.sunnypilot.selfdrive.controls.lib.vision_force_stop.stop_confirm import CONTROL_STOP_MAX_AGE_NS, STOP_MAX_AGE_NS
+  assert 750_000_000 < CONTROL_STOP_MAX_AGE_NS < STOP_MAX_AGE_NS

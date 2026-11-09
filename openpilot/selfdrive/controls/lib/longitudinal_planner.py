@@ -65,6 +65,7 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
     self.firm_stop = FirmStop()
     self.vision_force_stop = VisionForceStop(params)
     self.force_stop_plan = StopPlan()
+    self.force_stop_logged = (False, False)  # (STOP sign confirmed, forcing) last logged
     self.drive_id = time.monotonic_ns()
 
     self.v_desired_filter = FirstOrderFilter(init_v, 2.0, self.dt)
@@ -159,6 +160,12 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
                                                          follow_seconds=get_T_FOLLOW(sm['selfdriveState'].personality))
     if reset_state or self.force_stop_plan.model_ns != sm.logMonoTime['modelV2']:
       self.force_stop_plan = StopPlan()
+    # on-car record of what Vision Force Stop decided, one line per change: drives show whether it confirmed and stopped
+    force_stop_state = (self.vision_force_stop.vision_stop.confirmed_ns > 0, self.force_stop_plan.forcing)
+    if force_stop_state != self.force_stop_logged:
+      self.force_stop_logged = force_stop_state
+      cloudlog.event("vision_force_stop", confirmed=force_stop_state[0], forcing=force_stop_state[1], v_ego=round(v_ego, 2),
+                     ceiling=self.force_stop_plan.speed_ceiling_mps, obstacle_m=self.force_stop_plan.obstacle_m)
     if self.force_stop_plan.speed_ceiling_mps is not None:
       v_cruise = min(v_cruise, self.force_stop_plan.speed_ceiling_mps)
 
