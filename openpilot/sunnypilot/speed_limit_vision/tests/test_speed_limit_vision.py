@@ -444,6 +444,52 @@ def test_detection_support_counts_independent_frames():
     assert daemon.params_memory.values["VisionSpeedLimitSupportSpeed"] == pytest.approx(15 * slv.CV.MPH_TO_MS)
 
 
+def reading_daemon(map_mph, car_mph, held_mph=0):
+  daemon = publishing_daemon(False)
+  daemon.followup_until = daemon.last_detection_at = daemon.last_candidate_at = 0.0
+  daemon.last_candidate_speed_limit_mph = 0
+  daemon.last_candidate_confidence = 0.0
+  daemon.last_logged_candidate = None
+  daemon._schedule_training_capture = lambda *_args, **_kwargs: None
+  daemon._publish_status = lambda status, clear_speed=False: setattr(daemon, "published_status", (status, clear_speed))
+  daemon.published_speed_limit_mph = held_mph
+  daemon.sm = {"liveMapDataSP": SimpleNamespace(speedLimit=map_mph * slv.CV.MPH_TO_MS, speedLimitValid=map_mph > 0),
+               "carStateSP": SimpleNamespace(speedLimit=car_mph * slv.CV.MPH_TO_MS)}
+  return daemon
+
+
+@pytest.mark.parametrize("map_mph, car_mph, read", [
+  (0, 0, 65),  # route 52: park lot, nothing else
+  (0, 0, 55),  # route 46: Costco pump
+  (25, 25, 75),  # routes 3e/3f: 25 street
+  (30, 20, 60),  # route 4b: 30 street
+])
+def test_a_read_far_above_map_and_car_is_ignored(map_mph, car_mph, read):
+  daemon = reading_daemon(map_mph, car_mph)
+  daemon._update_detection(slv.Detection(read, 0.95, True))
+  assert daemon.published_speed_limit_mph == 0 and not daemon.history
+  assert daemon.published_status == (f"Ignored {read} mph", map_mph == car_mph == 0)
+
+
+@pytest.mark.parametrize("map_mph, car_mph, held, read", [
+  (55, 0, 45, 55),  # crawling in traffic on a 55 road: the map agrees
+  (0, 55, 0, 55),  # routes 43/48/4a: no map limit, the car's sign agrees
+  (30, 0, 0, 45),  # 45 on a 30 map road at 22-31 mph: under 20 above
+  (0, 0, 0, 30),  # no map or car limit: a town limit stands alone
+])
+def test_a_read_the_map_or_car_supports_is_used(map_mph, car_mph, held, read):
+  daemon = reading_daemon(map_mph, car_mph, held)
+  daemon._update_detection(slv.Detection(read, 0.95, True))
+  assert daemon.published_speed_limit_mph == read
+
+
+def test_reads_without_map_or_car_context_are_not_judged():
+  daemon = reading_daemon(0, 0)
+  daemon.sm = None
+  daemon._update_detection(slv.Detection(65, 0.95, True))
+  assert daemon.published_speed_limit_mph == 65
+
+
 def test_speed_change_requires_two_matching_reads_below_single_read_threshold():
   daemon = daemon_with_history(40, [(55, 0.82)])
   assert daemon._confirm_detection() is None

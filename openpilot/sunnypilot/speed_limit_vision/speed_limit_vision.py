@@ -214,6 +214,11 @@ CHANGE_REPEAT_MIN_CONFIDENCE = 0.70
 LOW_SPEED_CHANGE_CONSISTENT_DETECTIONS = 2
 LOW_SPEED_CHANGE_MIN_CONFIDENCE = 0.90
 LOW_SPEED_CHANGE_ALLOW_STRONG_CONSENSUS = True
+# fork: a read this far above both the map and the car's sign is a misread (route 52 65 in a park lot, 46 55 at a Costco
+# pump, 3e/3f 75 on a 25 street, 4b 60 on a 30 street); with neither, only reads this high. On 54 routes these were the
+# only 5 of 200 camera limit changes it matched; every real high read had the map or the car within 5 mph.
+IMPLAUSIBLE_ABOVE_OTHERS_MS = 20 * CV.MPH_TO_MS
+IMPLAUSIBLE_ALONE_MIN_MS = 50 * CV.MPH_TO_MS
 MODEL_DETECTION_SHORT_CIRCUIT_CONFIDENCE = 0.65
 PUBLISHED_CHANGE_COOLDOWN_SECONDS = 1.4
 PUBLISHED_REVERT_CONFIDENCE = 0.97
@@ -3021,6 +3026,17 @@ class SpeedLimitVisionDaemon:
       return False
     return confidence < PUBLISHED_REVERT_CONFIDENCE
 
+  def _other_limit_ms(self):
+    """The higher of the map's and the car's limit (0 when neither has one), None without them."""
+    sm = getattr(self, "sm", None)
+    if sm is None:
+      return None
+    try:
+      map_data = sm["liveMapDataSP"]
+      return max(float(map_data.speedLimit) if map_data.speedLimitValid else 0., float(sm["carStateSP"].speedLimit))
+    except (KeyError, AttributeError, TypeError):
+      return None
+
   def _update_detection(self, detection):
     now = time.monotonic()
     self.last_detection_at = now
@@ -3041,6 +3057,15 @@ class SpeedLimitVisionDaemon:
         candidateConfidence=round(detection.confidence, 4),
         candidateStrongConsensus=detection.strong_consensus,
       )
+
+    other = self._other_limit_ms()
+    if other is not None:
+      read = self._speed_value_to_ms(detection.speed_limit_mph)
+      if read - other >= IMPLAUSIBLE_ABOVE_OTHERS_MS if other > 0. else read >= IMPLAUSIBLE_ALONE_MIN_MS:
+        self._write_debug_event("implausible", speedLimitMph=detection.speed_limit_mph, otherLimit=round(other, 2))
+        # with nothing else to go on, an older lower camera limit must not stay up past a sign it could not use
+        self._publish_status(f"Ignored {self._format_speed_value(detection.speed_limit_mph)}", clear_speed=other == 0.)
+        return
 
     self.history.append(HistoryEntry(detection.speed_limit_mph, detection.confidence, now, detection.strong_consensus))
     self._prune_history(now)
