@@ -7,6 +7,7 @@ import openpilot.cereal.messaging as messaging
 
 from openpilot.cereal import log, custom
 from opendbc.car.structs import car
+from opendbc.sunnypilot.car.mazda.values import MazdaFlagsSP
 from openpilot.cereal.visionipc import VisionStreamType
 from msgq.visionipc import VisionIpcClient
 
@@ -47,6 +48,7 @@ PandaType = log.PandaState.PandaType
 LaneChangeState = log.LaneChangeState
 LaneChangeDirection = log.LaneChangeDirection
 EventName = log.OnroadEvent.EventName
+EventNameZP = custom.OnroadEventZP.EventName
 ButtonType = car.CarState.ButtonEvent.Type
 SafetyModel = car.CarParams.SafetyModel
 AlertLevel = log.DriverMonitoringState.AlertLevel
@@ -183,6 +185,7 @@ class SelfdriveD:
     self.icbm = IntelligentCruiseButtonManagement(self.CP, self.CP_SP)
 
     self.car_events_sp = CarSpecificEventsSP(self.CP, self.CP_SP)
+    self.radar_camera_fallback = self.CP.brand == 'mazda' and bool(self.CP_SP.flags & MazdaFlagsSP.CAN_FILTER)
 
     self.button_state_tracker = ButtonStateTracker()
     self.selfdrived_zp = SelfdrivedZP(self.CP, self.params)
@@ -436,7 +439,11 @@ class SelfdriveD:
       if self.sm['radarState'].radarErrors.canError:
         self.events.add(EventName.canError)
       elif self.sm['radarState'].radarErrors.radarUnavailableTemporary:
-        self.events.add(EventName.radarTempUnavailable)
+        # Mazda's Smart CAN Filter: the camera's leads carry on (opendbc/car/mazda/radar_interface.py)
+        if self.radar_camera_fallback:
+          self.events_sp.zp.add(EventNameZP.radarLostCameraOnly)
+        else:
+          self.events.add(EventName.radarTempUnavailable)
       elif any(self.sm['radarState'].radarErrors.to_dict().values()):
         self.events.add(EventName.radarFault)
     if CS.canTimeout:

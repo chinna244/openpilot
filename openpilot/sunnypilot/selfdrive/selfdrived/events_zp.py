@@ -316,12 +316,19 @@ EVENTS_ZP: dict[int, dict[str, Alert | AlertCallbackType]] = {
       AlertStatus.userPrompt, AlertSize.mid,
       Priority.MID, VisualAlert.steerRequired, AudibleAlert.warningSoft, .2),
   },
+
+  # Behind Mazda's Smart CAN Filter the radar's tracks stopped: openpilot keeps driving on the
+  # camera's leads, and says so once. PERMANENT so it reaches a driver who is not engaged yet.
+  EventNameZP.radarLostCameraOnly: {
+    ET.PERMANENT: Alert("Radar lost", "camera only", AlertStatus.userPrompt, AlertSize.mid,
+                        Priority.LOW, VisualAlert.none, AudibleAlert.prompt, .2),
+  },
 }
 
 # The radar messages chime once: another alert shown over one (an engage chime, a gear change)
 # must not replay its sound when it comes back (route 00000133, 163.3 s and 271.2 s).
 for _event in (EventNameZP.stockEcuReady, EventNameZP.stockEcuHandedBack, EventNameZP.alphaLongNextStop,
-               EventNameZP.cameraLkasFaultOnset, EventNameZP.cameraLkasResumed):
+               EventNameZP.cameraLkasFaultOnset, EventNameZP.cameraLkasResumed, EventNameZP.radarLostCameraOnly):
   EVENTS_ZP[_event][ET.PERMANENT].sound_once = True
 
 

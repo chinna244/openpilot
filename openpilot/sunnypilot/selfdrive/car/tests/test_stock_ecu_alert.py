@@ -352,7 +352,7 @@ class TestStockEcuTextFits:
     for _title, line in STOCK_ECU_ALERT_TEXT.values():
       assert len(line) <= 12, line
     for event in (EventNameZP.stockEcuInitializing, EventNameZP.stockEcuReady, EventNameZP.stockEcuHandedBack,
-                  EventNameZP.alphaLongNextStop):
+                  EventNameZP.alphaLongNextStop, EventNameZP.radarLostCameraOnly):
       assert len(EVENTS_ZP[event][ET.PERMANENT].alert_text_1) <= 12
 class TestStockCruiseFailed:
   """A stop that went ahead on a failed hand-back leaves stock cruise blocked until ignition:

@@ -645,6 +645,7 @@ struct OnroadEventZP @0xeff60a9f4d5cb12f {
     cameraLkasFaultOnset @15;
     cameraLkasResumed @16;
     speedAssistSwitched @17;
+    radarLostCameraOnly @18;
   }
 }
 
