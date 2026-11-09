@@ -33,6 +33,11 @@ OVERLAY_INIT = Path(os.path.join(BASEDIR, ".overlay_init"))
 # the build kept for Roll back, swapped in by launch_chffrplus.sh
 PREVIOUS = os.getenv("UPDATER_PREVIOUS", "/data/openpilot_previous")
 
+# Versions page (mici settings): recent commits of the target branch, any of which can be pinned as the update target
+COMMIT_LIST_LEN = 15
+# the first commit with the update controls; going to an older one leaves no way back but SSH
+UPDATE_CONTROLS_COMMIT = "b15b994e94ebf14971c30b3caa8ff794db9e6196"
+
 # do not allow to engage after this many hours onroad and this many routes
 HOURS_NO_CONNECTIVITY_MAX = 27
 ROUTES_NO_CONNECTIVITY_MAX = 84
@@ -150,8 +155,11 @@ def handle_update_request(params, wait_helper: WaitTimeHelper) -> None:
 
 def check_result(updater, skip_commit: str | None) -> str:
   """What the last check found, kept after the state goes back to idle (sunnylink shows it)."""
-  new_commit = updater.branches[updater.target_branch]
-  if updater.up_to_date:
+  new_commit = updater.target_commit
+  if updater.pinned_commit:
+    latest = updater.branches[updater.target_branch]
+    found = f"pinned to {new_commit[:7]}" + (", running it" if updater.up_to_date else "") + f" (latest {latest[:7]})"
+  elif updater.up_to_date:
     found = "up to date"
   elif not new_commit:
     found = f"branch {updater.target_branch} not found"
@@ -359,14 +367,24 @@ class Updater:
     return False
 
   @property
+  def pinned_commit(self) -> str:
+    """A commit chosen on the Versions page, "" to follow the branch's latest."""
+    return self.params.get("UpdaterTargetCommit") or ""
+
+  @property
+  def target_commit(self) -> str:
+    """What updating goes to: the pinned commit, else the target branch's latest (check_for_update fills branches)."""
+    return self.pinned_commit or self.branches[self.target_branch]
+
+  @property
   def up_to_date(self) -> bool:
-    """The running version is the target branch's latest commit (check_for_update fills branches)."""
-    return self.get_branch(BASEDIR) == self.target_branch and self.get_commit_hash(BASEDIR) == self.branches[self.target_branch]
+    """The running version is the update target."""
+    return self.get_branch(BASEDIR) == self.target_branch and self.get_commit_hash(BASEDIR) == self.target_commit
 
   @property
   def update_available(self) -> bool:
     if os.path.isdir(OVERLAY_MERGED) and len(self.branches) > 0:
-      hash_mismatch = self.get_commit_hash(OVERLAY_MERGED) != self.branches[self.target_branch]
+      hash_mismatch = self.get_commit_hash(OVERLAY_MERGED) != self.target_commit
       branch_mismatch = self.get_branch(OVERLAY_MERGED) != self.target_branch
       return hash_mismatch or branch_mismatch
     return False
@@ -487,6 +505,31 @@ class Updater:
     else:
       cloudlog.info(f"up to date on {cur_branch} ({str(cur_commit)[:7]})")
 
+    try:
+      self.params.put("UpdaterCommitList", self.commit_list(), block=True)
+    except Exception:
+      cloudlog.exception("updater.commit_list")
+
+  def commit_list(self) -> list[dict]:
+    """The target branch's recent commits for the Versions page: fetches only objects, checks nothing out."""
+    branch = self.target_branch
+    run(["git", "fetch", "origin", branch], OVERLAY_MERGED)
+    log = run(["git", "log", f"-{COMMIT_LIST_LEN}", "--format=%H%x1f%ct%x1f%s", "FETCH_HEAD"], OVERLAY_MERGED)
+    # a pin from another branch (the target branch changed) would check out the wrong history: follow the branch again
+    pinned = self.pinned_commit
+    if pinned and subprocess.run(["git", "merge-base", "--is-ancestor", pinned, "FETCH_HEAD"], cwd=OVERLAY_MERGED,
+                                 capture_output=True).returncode != 0:
+      cloudlog.warning(f"pinned commit {pinned[:7]} is not on {branch}, following its latest")
+      self.params.remove("UpdaterTargetCommit")
+    commits = []
+    for line in log.splitlines():
+      sha, ts, title = line.split("\x1f", 2)
+      has_controls = subprocess.run(["git", "merge-base", "--is-ancestor", UPDATE_CONTROLS_COMMIT, sha], cwd=OVERLAY_MERGED,
+                                    capture_output=True).returncode == 0
+      commits.append({"sha": sha, "date": datetime.datetime.fromtimestamp(int(ts)).strftime("%b %d"), "title": title,
+                      "update_controls": has_controls})
+    return commits
+
   def fetch_update(self) -> None:
     cloudlog.info("attempting git fetch inside staging overlay")
 
@@ -507,8 +550,10 @@ class Updater:
     cloudlog.info("git reset in progress")
     # Check out without running the installed LFS client, the new checkout installs its own below
     nolfs = ["-c", "filter.lfs.process=", "-c", "filter.lfs.required=false", "-c", "core.hooksPath=/dev/null"]
+    # a commit pinned on the Versions page, else the branch's latest
+    target = self.pinned_commit or "FETCH_HEAD"
     cmds = [
-      ["git", *nolfs, "checkout", "--force", "--no-recurse-submodules", "-B", branch, "FETCH_HEAD"],
+      ["git", *nolfs, "checkout", "--force", "--no-recurse-submodules", "-B", branch, target],
       ["git", "branch", "--set-upstream-to", f"origin/{branch}"],
       ["git", *nolfs, "reset", "--hard"],
       ["git", "clean", "-xdff"],
@@ -616,7 +661,7 @@ def main() -> None:
           cloudlog.info("skipping fetch, connection metered")
         elif wait_helper.user_request == UserRequest.CHECK:
           cloudlog.info("skipping fetch, only checking")
-        elif not user_requested_fetch and updater.branches[updater.target_branch] == params.get("UpdaterSkipCommit"):
+        elif not user_requested_fetch and updater.target_commit == params.get("UpdaterSkipCommit"):
           cloudlog.info("skipping fetch, this commit was rolled back")
         elif not user_requested_fetch and updater.up_to_date:
           # a staged copy of what is running would only reboot into the same version and rebuild it

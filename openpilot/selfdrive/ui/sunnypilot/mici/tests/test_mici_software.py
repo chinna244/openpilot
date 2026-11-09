@@ -59,3 +59,46 @@ def test_a_downloaded_update_reads_ready_and_a_tap_downloads_again(gui, updater_
   with mock.patch("openpilot.selfdrive.ui.mici.layouts.settings.software.system_time_valid", return_value=True):
     btn._handle_mouse_release(None)
   assert signalled == [CheckUpdateButtonSP.DOWNLOAD_UPDATE]
+
+
+COMMITS = [{"sha": "c" * 40, "date": "Nov 08", "title": "newest", "update_controls": True},
+           {"sha": "b" * 40, "date": "Nov 08", "title": "running one", "update_controls": True},
+           {"sha": "a" * 40, "date": "Nov 07", "title": "before the menu", "update_controls": False}]
+
+
+def test_versions_page_lists_commits_with_tags(gui, updater_params):
+  from openpilot.selfdrive.ui.sunnypilot.mici.layouts.software import VersionsPage
+  updater_params.put("UpdaterCommitList", COMMITS, block=True)
+  updater_params.put("GitCommit", "b" * 40, block=True)
+  updater_params.put("UpdaterTargetCommit", "a" * 40, block=True)
+  page = VersionsPage(lambda c, latest: None)
+  values = [b.get_value() for b in page._scroller.items]
+  assert values == ["ccccccc · Nov 08", "bbbbbbb · Nov 08 · running", "aaaaaaa · Nov 07 · pinned · no update menu"]
+  assert [b.text for b in page._scroller.items] == ["newest", "running one", "before the menu"]
+
+
+def test_versions_button_pins_and_downloads(gui, updater_params):
+  from openpilot.selfdrive.ui.mici.layouts.settings.software import CheckUpdateButton
+  from openpilot.selfdrive.ui.sunnypilot.mici.layouts.software import CheckUpdateButtonSP, VersionsButton
+  check = CheckUpdateButtonSP()
+  signalled = []
+  check._signal_updater = lambda sig: signalled.append(sig)
+  btn = VersionsButton(check)
+  btn._go(COMMITS[2], latest=False)
+  assert updater_params.get("UpdaterTargetCommit") == "a" * 40 and signalled == [CheckUpdateButton.DOWNLOAD_UPDATE]
+  render(btn)
+  assert btn.get_value() == "pinned aaaaaaa"
+  updater_params.put("GitCommit", "c" * 40, block=True)
+  btn._go(COMMITS[0], latest=True)  # newest, already running: follow the branch again, only check
+  assert updater_params.get("UpdaterTargetCommit") is None
+  assert signalled == [CheckUpdateButton.DOWNLOAD_UPDATE, CheckUpdateButton.CHECK_FOR_UPDATE]
+  render(btn)
+  assert btn.get_value() == "latest"
+
+
+def test_versions_button_sits_after_target_branch(gui, updater_params):
+  from openpilot.selfdrive.ui.mici.layouts.settings.software import TargetBranchButton
+  from openpilot.selfdrive.ui.sunnypilot.mici.layouts.software import SoftwareLayoutSP, VersionsButton
+  items = SoftwareLayoutSP()._scroller.items
+  branch = next(i for i, it in enumerate(items) if isinstance(it, TargetBranchButton))
+  assert isinstance(items[branch + 1], VersionsButton)

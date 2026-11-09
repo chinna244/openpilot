@@ -84,6 +84,9 @@ class FakeParams:
   def put_bool(self, key, value, block=False):
     self.values[key] = value
 
+  def remove(self, key):
+    self.values.pop(key, None)
+
 
 class FakeWait:
   def __init__(self):
@@ -308,6 +311,8 @@ class TestDisableUpdatesLive:
     class Updater:
       branches = {"develop": "a" * 40}
       target_branch = "develop"
+      pinned_commit = ""
+      target_commit = "a" * 40
       up_to_date = True
       def set_params(self, *args):
         pass
@@ -343,6 +348,8 @@ class TestCheckResult:
     class U:
       branches = {"develop": commit}
       target_branch = "develop"
+      pinned_commit = ""
+      target_commit = commit
     u = U()
     u.up_to_date = up_to_date
     return u
@@ -398,16 +405,86 @@ class TestDriveInputs:
 def test_rollback_blocker_leaves_git_untouched(tmp_path, monkeypatch):
   """init_overlay and the boot script treat any change under .git as local edits: the check must not write there."""
   import os
-  import time as _time
   cur = make_repo(tmp_path / "cur")
   (tmp_path / "previous").mkdir()
   monkeypatch.setattr(updated, "PREVIOUS", str(tmp_path / "previous"))
   monkeypatch.setattr(updated, "BASEDIR", str(cur))
   monkeypatch.setattr(updated, "AGNOS", False)
-  past = _time.time() - 100
+  past = os.stat(cur / "f").st_mtime - 100
   (cur / "f").touch()  # stale stat info: a locking git status would rewrite the index
   for p in [cur / ".git", cur / ".git" / "index"]:
     os.utime(p, (past, past))
   before = [os.stat(p).st_mtime for p in (cur / ".git", cur / ".git" / "index")]
   updated.rollback_blocker()
   assert [os.stat(p).st_mtime for p in (cur / ".git", cur / ".git" / "index")] == before
+
+
+class TestVersions:
+  """The Versions page: recent commits of the branch, any of which can be pinned as the update target."""
+
+  def repos(self, tmp_path, n=5):
+    origin = tmp_path / "origin"
+    origin.mkdir()
+    def git(*a):
+      return subprocess.check_output(["git", "-c", "user.name=t", "-c", "user.email=t", *a], cwd=origin, text=True).strip()
+    git("init", "-q", "-b", "develop")
+    shas = []
+    for i in range(n):
+      (origin / "f").write_text(str(i))
+      git("add", "f")
+      git("commit", "-qm", f"change {i}")
+      shas.append(git("rev-parse", "HEAD"))
+    merged = tmp_path / "merged"
+    subprocess.check_call(["git", "clone", "-q", str(origin), str(merged)])
+    return origin, merged, shas
+
+  def updater(self, monkeypatch, merged, **values):
+    monkeypatch.setattr(updated, "OVERLAY_MERGED", str(merged))
+    monkeypatch.setattr(updated.Updater, "target_branch", property(lambda self: "develop"))
+    u = updated.Updater()
+    u.params = FakeParams(**values)
+    return u
+
+  def test_commit_list(self, tmp_path, monkeypatch):
+    _, merged, shas = self.repos(tmp_path)
+    monkeypatch.setattr(updated, "COMMIT_LIST_LEN", 3)
+    monkeypatch.setattr(updated, "UPDATE_CONTROLS_COMMIT", shas[3])
+    commits = self.updater(monkeypatch, merged).commit_list()
+    assert [c["sha"] for c in commits] == shas[::-1][:3]  # newest first, capped
+    assert [c["title"] for c in commits] == ["change 4", "change 3", "change 2"]
+    assert [c["update_controls"] for c in commits] == [True, True, False]  # change 2 predates the controls
+
+  def test_pin_from_another_branch_is_dropped(self, tmp_path, monkeypatch):
+    _, merged, shas = self.repos(tmp_path)
+    u = self.updater(monkeypatch, merged, UpdaterTargetCommit=shas[1])
+    u.commit_list()
+    assert u.params.values["UpdaterTargetCommit"] == shas[1]  # on the branch: kept
+    u = self.updater(monkeypatch, merged, UpdaterTargetCommit="f" * 40)
+    u.commit_list()
+    assert "UpdaterTargetCommit" not in u.params.values
+
+  def test_target_follows_pin(self, tmp_path, monkeypatch):
+    _, merged, shas = self.repos(tmp_path)
+    u = self.updater(monkeypatch, merged)
+    u.branches["develop"] = shas[-1]
+    assert u.target_commit == shas[-1] and u.pinned_commit == ""
+    u.params.values["UpdaterTargetCommit"] = shas[1]
+    assert u.target_commit == shas[1]
+    monkeypatch.setattr(updated, "BASEDIR", str(merged))  # running the latest, pinned to an older one: not up to date
+    assert not u.up_to_date
+    assert "pinned to " + shas[1][:7] in updated.check_result(u, None) and "latest " + shas[-1][:7] in updated.check_result(u, None)
+
+  def test_fetch_checks_out_the_pin(self, monkeypatch):
+    cmds = []
+    monkeypatch.setattr(updated, "run", lambda cmd, cwd=None: cmds.append(cmd) or "")
+    monkeypatch.setattr(updated, "set_consistent_flag", lambda c: None)
+    monkeypatch.setattr(updated, "finalize_update", lambda: None)
+    monkeypatch.setattr(updated, "AGNOS", False)
+    monkeypatch.setattr(updated.Updater, "target_branch", property(lambda self: "develop"))
+    for pin, expected in (("a" * 40, "a" * 40), (None, "FETCH_HEAD")):
+      cmds.clear()
+      u = updated.Updater()
+      u.params = FakeParams(UpdaterTargetCommit=pin)
+      u.fetch_update()
+      checkout = next(c for c in cmds if "checkout" in c)
+      assert checkout[-1] == expected and checkout[-2] == "develop"

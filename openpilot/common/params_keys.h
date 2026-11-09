@@ -146,6 +146,8 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"UpdaterRollback", {PERSISTENT, BOOL}},
     {"UpdaterCurrentProven", {CLEAR_ON_MANAGER_START, STRING}},
     {"UpdaterCheckResult", {PERSISTENT, STRING}},
+    {"UpdaterCommitList", {PERSISTENT, JSON}},
+    {"UpdaterTargetCommit", {PERSISTENT, STRING}},
     {"UpdaterRollbackDescription", {CLEAR_ON_MANAGER_START, STRING}},
     {"UptimeOffroad", {PERSISTENT, FLOAT, "0.0"}},
     {"UptimeOnroad", {PERSISTENT, FLOAT, "0.0"}},
