@@ -5,9 +5,9 @@ from openpilot.system.updated.proven import DriveProof, ENGAGED_MIN_S
 from openpilot.system.updated.updated import UpdateRequest, handle_update_request
 
 
-def drive(proof, seconds, enabled=True, alert="", procs=()):
+def drive(proof, seconds, enabled=True, alert="", procs=(), mads=False):
   for _ in range(int(seconds / 0.5)):
-    proof.update(0.5, enabled, alert, list(procs))
+    proof.update(0.5, enabled, mads, alert, list(procs))
 
 
 class TestDriveProof:
@@ -26,8 +26,26 @@ class TestDriveProof:
     for alert in ("controlsMismatch/immediateDisable", "commIssue/softDisable"):
       p = DriveProof()
       drive(p, 300)
-      drive(p, 1, alert=alert)
+      drive(p, 3 if "soft" in alert else 0.5, alert=alert)
+      drive(p, 0.5, enabled=False, alert=alert)
       assert not p.proven() and p.error == alert
+
+  def test_soft_disable_that_clears_is_not_an_error(self):
+    """Routes 4c, 4d: one dropped camera frame, softDisabling 0.5 s, enabled again, the driver disengages later."""
+    p = DriveProof()
+    drive(p, 300)
+    drive(p, 0.5, alert="commIssue/softDisable")
+    drive(p, 1.5, alert="locationdTemporaryError/softDisable")
+    drive(p, 60, alert="bigModelLinkLost/warning")
+    drive(p, 600, enabled=False, alert="buttonCancel/userDisable")
+    assert p.proven()
+
+  def test_error_disable_with_mads_still_steering_fails(self):
+    p = DriveProof()
+    drive(p, 300, mads=True)
+    drive(p, 3, alert="commIssue/softDisable", mads=True)
+    drive(p, 10, enabled=False, mads=True)
+    assert not p.proven() and p.error == "commIssue/softDisable"
 
   def test_driver_and_user_disables_are_not_errors(self):
     p = DriveProof()
@@ -53,7 +71,9 @@ class TestDriveProof:
 
   def test_reset(self):
     p = DriveProof()
-    drive(p, 300, alert="controlsMismatch/immediateDisable")
+    drive(p, 300)
+    drive(p, 0.5, enabled=False, alert="controlsMismatch/immediateDisable")
+    assert p.error
     p.reset()
     drive(p, ENGAGED_MIN_S)
     assert p.proven()
@@ -394,12 +414,12 @@ class TestDriveInputs:
 
   def test_stale_message_ignored(self):
     from openpilot.system.updated.proven import drive_inputs
-    assert drive_inputs(self.SM(False, enabled=True, alert="controlsMismatch/immediateDisable")) == (False, "")
+    assert drive_inputs(self.SM(False, enabled=True, alert="controlsMismatch/immediateDisable")) == (False, False, "")
 
   def test_live_message_used(self):
     from openpilot.system.updated.proven import drive_inputs
-    assert drive_inputs(self.SM(True, enabled=True, alert="commIssue/softDisable")) == (True, "commIssue/softDisable")
-    assert drive_inputs(self.SM(True, mads=True)) == (True, "")
+    assert drive_inputs(self.SM(True, enabled=True, alert="commIssue/softDisable")) == (True, False, "commIssue/softDisable")
+    assert drive_inputs(self.SM(True, mads=True)) == (False, True, "")
 
 
 def test_rollback_blocker_leaves_git_untouched(tmp_path, monkeypatch):
