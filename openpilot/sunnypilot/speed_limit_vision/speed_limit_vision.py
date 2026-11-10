@@ -349,6 +349,11 @@ STOP_SAMPLE_MAX_AGE_NS = 1_500_000_000
 # fork: STOP boxes whose red does not beat green/blue are dropped (75th percentile of R - max(G, B) over the middle);
 # on routes 18-2a it removed 2 of 16 false STOPs and kept all 33 real ones, a backlit sign included
 STOP_RED_DOMINANCE_MIN = 5
+# StarPilot's STOP identity veto (02bc500, model 8bb5e95): a box whose 64 px crop of the detector input scores below 5% on
+# stop_face_logit is dropped; routes 18-2a: real 33/33 kept, false 14 -> 11. Missing or failing model = no veto.
+STOP_IDENTITY_MODEL_PATH = MODEL_DIR / "traffic_sign_identity.onnx"
+STOP_IDENTITY_KEEP_LOGIT = math.log(0.05 / 0.95)
+STOP_IDENTITY_SIZE = 64
 # fork: after a pass that found a STOP box the next pass waits only that pass's own time, not the processing/CPU-busy
 # throttle: driving, passes took 0.3-0.9 s and the throttle spaced them 1.4-1.5 s near signs (routes 4a-4c), so the
 # second sighting StarPilot's 1.5 s STOP confirmation needs never came in time. Cores 0-2, normal priority: the
@@ -625,6 +630,8 @@ class SpeedLimitVisionDaemon:
     self.pass_stop_boxes = None
     self.stop_followup = False
     self.stop_sample = None
+    self.stop_identity_net = None
+    self.stop_identity_tried = False
 
     self.digit_templates = self._build_digit_templates()
     self.speed_value_templates = self._build_speed_value_templates()
@@ -1962,7 +1969,7 @@ class SpeedLimitVisionDaemon:
           stops = self.stop_net.forward(["output0", "stop/output0"])[1]
         if stops is not None:
           self.pass_stop_boxes = (self.pass_stop_boxes or []) + self._decode_stop_signs(
-            stops, frame_bgr, ratio, pad_width, pad_height, origin_x, origin_y, full_frame_width, full_frame_height)
+            stops, frame_bgr, ratio, pad_width, pad_height, origin_x, origin_y, full_frame_width, full_frame_height, blob=blob)
       except Exception as exc:
         cloudlog.exception(f"speed_limit_vision: STOP head failed, Vision Force Stop off: {exc}")
         self.force_stop_enabled, self.stop_net = False, None
@@ -2031,8 +2038,20 @@ class SpeedLimitVisionDaemon:
       self._restore_speed_detector()
     self.stop_net = None
     self.force_stop_enabled = wanted and getattr(self, "net_has_stop", False)
+    # one load try per Force Stop turn-on: a model that fails to load or later errors stays off, not reloaded every refresh
+    if self.force_stop_enabled and not getattr(self, "stop_identity_tried", False) and STOP_IDENTITY_MODEL_PATH.is_file():
+      self.stop_identity_tried = True
+      try:
+        identity = cv2.dnn.readNetFromONNX(str(STOP_IDENTITY_MODEL_PATH))
+        identity.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
+        identity.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
+        if "stop_face_logit" in identity.getUnconnectedOutLayersNames():
+          self.stop_identity_net = identity
+      except Exception:
+        pass
     if not self.force_stop_enabled:
       self.stop_sample = None
+      self.stop_identity_net, self.stop_identity_tried = None, False
 
   def _restore_speed_detector(self):
     if getattr(self, "speed_net", None) is not None:
@@ -2047,14 +2066,38 @@ class SpeedLimitVisionDaemon:
       return 0.0
     return float(np.percentile(middle[..., 2] - np.maximum(middle[..., 1], middle[..., 0]), 75))
 
-  def _decode_stop_signs(self, stops, region_bgr, ratio, pad_width, pad_height, origin_x, origin_y, full_frame_width, full_frame_height):
-    """StarPilot's decode_stop_signs (threshold, size bounds, NMS, 4 boxes), then the red dominance check."""
+  def _stop_identity_keeps(self, blob, anchor):
+    """StarPilot speed_face.crop + StopFaceVerifier.accept on one STOP anchor (cx, cy, w, h in detector input pixels)."""
+    rgb = blob[0]
+    size = rgb.shape[1]
+    cx, cy, width, height = anchor
+    box = np.clip(np.array([cx - width / 2, cy - height / 2, cx + width / 2, cy + height / 2], np.float32), 0, size)
+    if not (box[2:] - box[:2] >= 4).all():
+      return True  # too small to resolve: StarPilot keeps it
+    lo, hi = np.floor(box[:2]).astype(int), np.ceil(box[2:]).astype(int)
+    image = rgb[:, lo[1]:hi[1], lo[0]:hi[0]].transpose(1, 2, 0)
+    crop_height, crop_width = image.shape[:2]
+    scale = STOP_IDENTITY_SIZE / max(crop_width, crop_height)
+    new_width, new_height = max(1, round(crop_width * scale)), max(1, round(crop_height * scale))
+    patch = np.full((STOP_IDENTITY_SIZE, STOP_IDENTITY_SIZE, 3), np.float32(114 / 255), np.float32)
+    left, top = (STOP_IDENTITY_SIZE - new_width) // 2, (STOP_IDENTITY_SIZE - new_height) // 2
+    patch[top:top + new_height, left:left + new_width] = cv2.resize(image, (new_width, new_height), interpolation=cv2.INTER_LINEAR)
+    self.stop_identity_net.setInput(np.ascontiguousarray(np.clip(patch, 0, 1).transpose(2, 0, 1))[None])
+    names = list(self.stop_identity_net.getUnconnectedOutLayersNames())  # OpenCV 5 wants every output requested
+    logit = np.asarray(self.stop_identity_net.forward(names)[names.index("stop_face_logit")], np.float32).reshape(-1)
+    if logit.size != 1 or not np.isfinite(logit).all():
+      raise ValueError("invalid stop_face_logit")
+    return float(logit[0]) >= STOP_IDENTITY_KEEP_LOGIT
+
+  def _decode_stop_signs(self, stops, region_bgr, ratio, pad_width, pad_height, origin_x, origin_y, full_frame_width, full_frame_height,
+                         blob=None):
+    """StarPilot's decode_stop_signs (threshold, size bounds, NMS, 4 boxes, identity veto), then the red dominance check."""
     if stops is None or stops.shape != (1, 5, 4096) or not np.isfinite(stops).all():
       return []
     region_height, region_width = region_bgr.shape[:2]
     selected = np.flatnonzero(stops[0, 4] >= STOP_THRESHOLD)
     selected = selected[np.argsort(-stops[0, 4, selected], kind="stable")[:32]]
-    boxes, scores = [], []
+    boxes, scores, ids = [], [], []
     for index in selected:
       cx, cy, width, height = stops[0, :4, index]
       x1 = max(int((cx - width / 2 - pad_width) / ratio), 0)
@@ -2067,10 +2110,17 @@ class SpeedLimitVisionDaemon:
         continue
       boxes.append([x1 + origin_x, y1 + origin_y, x2 - x1, y2 - y1])
       scores.append(float(stops[0, 4, index]))
+      ids.append(int(index))
     if not boxes:
       return []
-    keep = np.asarray(cv2.dnn.NMSBoxes(boxes, scores, STOP_THRESHOLD, .4)).reshape(-1)
-    return [(scores[i], (boxes[i][0], boxes[i][1], boxes[i][0] + boxes[i][2], boxes[i][1] + boxes[i][3])) for i in keep[:4]]
+    keep = np.asarray(cv2.dnn.NMSBoxes(boxes, scores, STOP_THRESHOLD, .4)).reshape(-1)[:4]
+    if blob is not None and getattr(self, "stop_identity_net", None) is not None:
+      try:
+        keep = [i for i in keep if self._stop_identity_keeps(blob, stops[0, :4, ids[i]])]
+      except Exception as exc:  # the veto failing must not cost the STOP itself: back to no veto
+        cloudlog.exception(f"speed_limit_vision: STOP identity veto failed, off: {exc}")
+        self.stop_identity_net = None
+    return [(scores[i], (boxes[i][0], boxes[i][1], boxes[i][0] + boxes[i][2], boxes[i][1] + boxes[i][3])) for i in keep]
 
   def _collect_detector_classifier_proposals(self, frame_bgr):
     if self.net is None:

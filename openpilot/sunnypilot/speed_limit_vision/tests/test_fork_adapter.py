@@ -415,6 +415,98 @@ def test_decode_stop_signs_keeps_a_red_stop_and_drops_a_grey_box():
   assert abs(score - 0.9) < 1e-6 and (x1, y1, x2, y2) == (640, 50, 680, 90)
 
 
+class IdentityNet:
+  """traffic_sign_identity.onnx stand-in: stop_face_logit from the patch's mean red, so a red crop passes."""
+  def __init__(self, fail=False):
+    self.fail, self.patches = fail, []
+
+  def getUnconnectedOutLayersNames(self):
+    return ("object_features", "speed_face_logit", "stop_face_logit")
+
+  def setInput(self, patch):
+    self.patches.append(patch)
+
+  def forward(self, names):
+    if self.fail:
+      raise RuntimeError("boom")
+    red = float(self.patches[-1][0, 0].mean() - self.patches[-1][0, 1].mean())
+    return [np.zeros((1, 8), np.float32), np.zeros((1, 1), np.float32), np.full((1, 1), 5. if red > .2 else -5., np.float32)]
+
+
+def stop_region_and_blob():
+  """Two red boxes in a 256 region, the right one painted grey only in the detector input, so red dominance keeps both."""
+  region = np.full((256, 256, 3), 120, np.uint8)
+  region[40:80, 40:80] = region[40:80, 160:200] = (30, 30, 200)  # red (BGR)
+  blob = slv.cv2.dnn.blobFromImage(region, scalefactor=1 / 255.0, size=(256, 256), swapRB=True, crop=False)
+  blob[0, :, 40:80, 160:200] = 0.5
+  return region, blob, stop_output([(60, 60, 40, 40, 0.9), (180, 60, 40, 40, 0.8)])
+
+
+def test_stop_identity_veto_drops_a_box_that_is_not_a_stop_face():
+  """StarPilot 02bc500: routes 18-2a false STOPs 14 -> 11 with every real one kept."""
+  region, blob, stops = stop_region_and_blob()
+  d = daemon()
+  d.stop_identity_net = IdentityNet()
+  boxes = d._decode_stop_signs(stops, region, 1.0, 0, 0, 0, 0, 1344, 760, blob=blob)
+  assert [b for _, b in boxes] == [(40, 40, 80, 80)]
+  assert d.stop_identity_net.patches[0].shape == (1, 3, 64, 64)
+
+  d.stop_identity_net = None  # no model: today's boxes
+  assert len(d._decode_stop_signs(stops, region, 1.0, 0, 0, 0, 0, 1344, 760, blob=blob)) == 2
+
+
+def test_stop_identity_failure_keeps_the_stops_and_turns_the_veto_off():
+  region, blob, stops = stop_region_and_blob()
+  d = daemon()
+  d.stop_identity_net = IdentityNet(fail=True)
+  assert len(d._decode_stop_signs(stops, region, 1.0, 0, 0, 0, 0, 1344, 760, blob=blob)) == 2
+  assert d.stop_identity_net is None
+
+
+def test_detector_pass_hands_its_input_to_the_stop_identity_veto():
+  region, _, stops = stop_region_and_blob()
+
+  class Joint(JointNet):
+    def setInput(self, blob):
+      self.blob = blob
+
+    def forward(self, names):
+      return np.zeros((1, 7, 1344), np.float32), stops
+
+  d = daemon()
+  d.net, d.detector_input_size, d.net_has_stop, d.force_stop_enabled, d.stop_net = Joint(), 256, True, True, None
+  d.last_detector_forward_count, d.last_detector_forward_duration_s, d.pass_stop_boxes = 0, 0., None
+  d.stop_identity_net = IdentityNet()
+  d._collect_detector_classifier_proposals_from_region(region, 0, 0, 1344, 760, 0.5)
+  assert len(d.stop_identity_net.patches) == 2 and len(d.pass_stop_boxes) == 2  # both red in the real input
+
+
+def test_stop_identity_loads_with_force_stop_and_drops_with_it(monkeypatch, tmp_path):
+  identity = IdentityNet()
+  monkeypatch.setattr(slv.cv2.dnn, "readNetFromONNX", lambda path: identity if path.endswith("identity.onnx") else JointNet())
+  for name in ("joint.onnx", "identity.onnx"):
+    (tmp_path / name).touch()
+  monkeypatch.setattr(slv, "STOP_DETECTOR_MODEL_PATH", tmp_path / "joint.onnx")
+  monkeypatch.setattr(slv, "STOP_IDENTITY_MODEL_PATH", tmp_path / "identity.onnx")
+  monkeypatch.setattr(IdentityNet, "setPreferableBackend", lambda self, backend: None, raising=False)
+  monkeypatch.setattr(IdentityNet, "setPreferableTarget", lambda self, target: None, raising=False)
+  monkeypatch.setattr(SpeedLimitVisionDaemon, "_probe_input_size", staticmethod(lambda net, size, candidates: 256))
+  d = daemon()
+  d.net, d.detector_input_size, d.net_has_stop, d.stop_net = object(), 256, False, None
+  d.params = FakeParams({"VisionForceStop": True})
+  d._refresh_force_stop()
+  assert d.force_stop_enabled and d.stop_identity_net is identity
+  d.stop_identity_net = None  # failed at runtime: stays off, not reloaded on the next refresh
+  d._refresh_force_stop()
+  assert d.stop_identity_net is None
+  d.params = FakeParams({})
+  d._refresh_force_stop()
+  assert d.stop_identity_net is None and not d.stop_identity_tried
+  d.params = FakeParams({"VisionForceStop": True})  # toggled back on: one new try
+  d._refresh_force_stop()
+  assert d.stop_identity_net is identity
+
+
 def test_send_state_publishes_a_fresh_stop_sample():
   sent = []
   d = daemon()
