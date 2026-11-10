@@ -26,6 +26,13 @@ def cruise_plan(v0):
   return np.full(len(T_IDXS), v0), v0 * T_IDXS
 
 
+def rolling_stop_plan(v0=0.6):
+  # A near stop followed immediately by driving onward, as at route 57's STOP.
+  vel = np.interp(T_IDXS, [0., 1., 2., 10.], [v0, 0.1, 1., 4.])
+  pos = np.cumsum(np.diff(T_IDXS, prepend=0.) * vel)
+  return vel, pos
+
+
 def run(fs, v, vel, pos, n=WARM, active=True, a_candidate=0., lead_d=math.inf):
   for _ in range(n):
     a = fs.update(v, vel, pos, active, a_candidate, lead_d)
@@ -224,3 +231,171 @@ class TestPlanner:
     sm = low_speed_sm(v, *stop_plan(v, 2.5), gas=True)
     sm['controlsState'] = H.build_sm(override=True)['controlsState']
     assert self.run(sm).firm_stop.a_target == math.inf
+
+  def test_committed_stop_finishes_even_when_the_model_plans_to_roll_on(self, monkeypatch):
+    from openpilot.sunnypilot.selfdrive.controls.lib.vision_force_stop.force_stop import StopPlan
+
+    p = H.planner()
+    sm = low_speed_sm(0.6, *rolling_stop_plan(), model_a=-0.2)
+    monkeypatch.setattr(p.vision_force_stop, 'sample', lambda *args, **kwargs: StopPlan(model_ns=0, forcing=True))
+    for _ in range(WARM):
+      p.update(sm)
+    assert p.firm_stop.finishing
+    assert p.output_a_target < -0.2
+
+  @pytest.mark.parametrize('gas,stale', [(True, False), (False, True)])
+  def test_committed_stop_cannot_finish_during_override_or_on_a_stale_plan(self, monkeypatch, gas, stale):
+    from openpilot.sunnypilot.selfdrive.controls.lib.vision_force_stop.force_stop import StopPlan
+
+    p = H.planner()
+    sm = low_speed_sm(0.6, *rolling_stop_plan(), model_a=-0.2, gas=gas)
+    if gas:
+      sm['controlsState'] = H.build_sm(override=True)['controlsState']
+    monkeypatch.setattr(p.vision_force_stop, 'sample', lambda *args, **kwargs: StopPlan(model_ns=1 if stale else 0, forcing=True))
+    for _ in range(WARM):
+      p.update(sm)
+    assert not p.firm_stop.finishing
+
+
+class TestCommittedStop:
+  def test_near_stop_without_commitment_is_still_allowed_to_roll(self):
+    assert run(FirmStop(), 0.6, *rolling_stop_plan()) == math.inf
+
+  def test_committed_stop_needs_a_near_stop_in_the_model(self):
+    fs = FirmStop()
+    for _ in range(WARM):
+      assert fs.update(0.6, *cruise_plan(0.6), True, -0.1, committed_stop=True) == math.inf
+
+  def test_committed_stop_holds_the_finish_until_stopped(self):
+    fs = FirmStop()
+    for _ in range(WARM):
+      fs.update(0.6, *rolling_stop_plan(), True, -0.2, committed_stop=True)
+    assert fs.finishing
+    # The model's tiny dip disappears during the crawl, but STOP ownership remains.
+    assert fs.update(0.4, *cruise_plan(0.4), True, -0.1, committed_stop=True) < 0.
+    fs.update(0.2, *cruise_plan(1.), True, 0.1, committed_stop=True)
+    assert fs.should_stop
+    # Withdrawing the commitment permits the model's departure immediately.
+    assert fs.update(0.2, *cruise_plan(1.), True, 0.1, committed_stop=False) == math.inf
+    assert not fs.should_stop
+
+  def test_res_at_standstill_releases_a_committed_finish_on_a_slow_creep(self):
+    # the STOP ends (RES) and the model plans a gentle 0.4 m/s creep: under GO_V, but the finish only the STOP made goes too
+    fs = FirmStop()
+    for _ in range(WARM):
+      fs.update(0.6, *rolling_stop_plan(), True, -0.2, committed_stop=True)
+    standing = np.zeros(len(T_IDXS)), np.zeros(len(T_IDXS))
+    fs.update(0., *standing, True, 0., committed_stop=True)
+    assert fs.should_stop
+    creep = np.interp(T_IDXS, [0., 2., 10.], [0., 0.4, 0.4])
+    assert run(FirmStop(), 0., creep, np.cumsum(np.diff(T_IDXS, prepend=0.) * creep)) == math.inf  # baseline never holds it
+    assert fs.update(0., creep, np.cumsum(np.diff(T_IDXS, prepend=0.) * creep), True, 0.1, committed_stop=False) == math.inf
+    assert not fs.finishing and not fs.should_stop
+
+  def test_a_committed_finish_the_model_still_plans_stays_when_the_stop_ends(self):
+    # moving, the STOP ends while the model itself plans to stay stopped: an ordinary finish, kept as without the STOP
+    fs = FirmStop()
+    for _ in range(WARM):
+      fs.update(0.6, *stop_plan(0.6, 1.5), True, -0.2, committed_stop=True)
+    assert fs.update(0.6, *stop_plan(0.6, 1.5), True, -0.2, committed_stop=False) < 0.
+    assert fs.finishing
+
+  def test_a_committed_finish_the_model_owns_stays_at_standstill_when_the_stop_ends(self):
+    # an ordinary sustained stop under a STOP, standing with the model still planning zero: ending the STOP changes nothing
+    standing = np.zeros(len(T_IDXS)), np.zeros(len(T_IDXS))
+    fs, base = FirmStop(), FirmStop()
+    for _ in range(WARM):
+      fs.update(0.6, *stop_plan(0.6, 1.5), True, -0.2, committed_stop=True)
+      base.update(0.6, *stop_plan(0.6, 1.5), True, -0.2)
+    for committed in (True, True, False, False):
+      a = fs.update(0., *standing, True, 0.1, committed_stop=committed)
+      b = base.update(0., *standing, True, 0.1)
+      assert (a, fs.finishing, fs.should_stop) == (b, base.finishing, base.should_stop)
+    assert fs.finishing and fs.should_stop
+
+  @pytest.mark.parametrize('history', ['diverged target', 'invalid geometry'])
+  def test_once_the_stop_ends_the_finish_is_exactly_the_uncommitted_one(self, history):
+    # whatever the STOP's waiver did to the finish's history, without the STOP every output is the unwaived finish's
+    standing = np.zeros(len(T_IDXS)), np.zeros(len(T_IDXS))
+    backwards = stop_plan(0.6, 1.5)[0], stop_plan(0.6, 1.5)[1].copy()
+    backwards[1][1] = -1.  # one frame whose approach runs backwards: only the committed finish rejects it
+    frames = [(1.2, stop_plan(1.2, 1.5), -0.3)] * WARM
+    if history == 'diverged target':
+      # the model plans to roll on for a moment: the waiver holds its target while the unwaived finish lets go and re-arms
+      frames += [(1.1, rolling_stop_plan(1.1), -0.3)] * 3 + [(1.0, stop_plan(1.0, 0.6), -0.3)] * 4
+    else:
+      frames += [(0.6, stop_plan(0.6, 1.5), -0.2)] * WARM + [(0.6, backwards, -0.2), (0., standing, 0.1)]
+    fs, base = FirmStop(), FirmStop()
+    for v, plan, a_cand in frames:
+      fs.update(v, *plan, True, a_cand, committed_stop=True)
+      base.update(v, *plan, True, a_cand)
+    assert (fs.a_target, fs.finishing) != (base.a_target, base.finishing)  # the histories did diverge
+    after = [(1.0, stop_plan(1.0, 0.6), -0.3)] * 3 if history == 'diverged target' else [(0., standing, 0.1)] * 3
+    for v, plan, a_cand in after:
+      assert fs.update(v, *plan, True, a_cand, committed_stop=False) == base.update(v, *plan, True, a_cand)
+      assert (fs.finishing, fs.should_stop) == (base.finishing, base.should_stop)
+
+  def test_a_held_committed_target_keeps_the_speed_cap(self):
+    fs = FirmStop()
+    for _ in range(WARM):
+      a = fs.update(1.2, *stop_plan(1.2, 0.5), True, -1.5, committed_stop=True)
+    assert a == pytest.approx(-FIRM_STOP_DECEL_MAX[1])
+    # the model's dip disappears with the STOP still owning it: held, but no harder than 0.4 m/s allows
+    a = fs.update(0.4, *cruise_plan(0.4), True, -0.1, committed_stop=True)
+    assert a == pytest.approx(-np.interp(0.4, FIRM_STOP_DECEL_BP, FIRM_STOP_DECEL_MAX))
+
+  def test_override_clears_a_committed_finish(self):
+    fs = FirmStop()
+    for _ in range(WARM):
+      fs.update(0.6, *rolling_stop_plan(), True, -0.2, committed_stop=True)
+    assert fs.update(0.6, *rolling_stop_plan(), False, -0.2, committed_stop=True) == math.inf
+    assert not fs.finishing and not fs.should_stop
+
+  @pytest.mark.parametrize('v', [0.4, 0.2])
+  def test_invalid_geometry_cannot_retain_a_committed_finish(self, v):
+    fs = FirmStop()
+    for _ in range(WARM):
+      fs.update(0.6, *rolling_stop_plan(), True, -0.2, committed_stop=True)
+    vel, pos = cruise_plan(v)
+    pos[-1] = math.nan
+    assert fs.update(v, vel, pos, True, -0.1, committed_stop=True) == math.inf
+    assert not fs.finishing and not fs.should_stop
+
+  def test_backwards_geometry_cannot_retain_a_committed_finish(self):
+    fs = FirmStop()
+    for _ in range(WARM):
+      fs.update(0.6, *rolling_stop_plan(), True, -0.2, committed_stop=True)
+    vel, pos = rolling_stop_plan(0.4)
+    pos[1] = -1.  # the approach to the stop point runs backwards
+    assert fs.update(0.4, vel, pos, True, -0.1, committed_stop=True) == math.inf
+    assert not fs.finishing
+
+  @pytest.mark.parametrize('tail', ['stopped', 'horizon'])
+  def test_a_drifting_tail_does_not_drop_a_committed_finish(self, tail):
+    # real plans drift back by cm past the stop point and at the horizon's far end (every planned stop, routes 55-57)
+    fs = FirmStop()
+    vel, pos = stop_plan(0.6, 1.5) if tail == 'stopped' else rolling_stop_plan()
+    pos = pos.copy()
+    pos[-3:] -= [0.02, 0.05, 0.1]
+    for _ in range(WARM):
+      a = fs.update(0.6, vel, pos, True, -0.2, committed_stop=True)
+    assert fs.finishing and a < 0.
+    assert run(FirmStop(), 0.6, vel, pos) == (math.inf if tail == 'horizon' else run(FirmStop(), 0.6, *stop_plan(0.6, 1.5)))
+
+  @pytest.mark.parametrize('v', [0., 0.2, FIRM_STOP_RELEASE_SPEED])
+  def test_commitment_does_not_arm_a_standstill_or_above_the_finishing_speed(self, v):
+    fs = FirmStop()
+    for _ in range(WARM):
+      assert fs.update(v, *rolling_stop_plan(), True, -0.2, committed_stop=True) == math.inf
+
+  def test_cancellation_while_moving_releases_the_finish(self):
+    fs = FirmStop()
+    for _ in range(WARM):
+      fs.update(0.6, *rolling_stop_plan(), True, -0.2, committed_stop=True)
+    assert fs.update(0.4, *cruise_plan(0.4), True, 0.2, committed_stop=False) == math.inf
+
+  @pytest.mark.parametrize('vel,pos', [([], []), ([0.6, float('nan')], [0., 1.]), ([0.6, 0.], [0., float('inf')])])
+  def test_commitment_cannot_arm_on_invalid_geometry(self, vel, pos):
+    fs = FirmStop()
+    for _ in range(WARM):
+      assert fs.update(0.6, vel, pos, True, -0.2, committed_stop=True) == math.inf
