@@ -25,6 +25,11 @@ FIRM_STOP_JERK = 2.0  # m/s^3, into the brake from the candidate it starts under
 # eased into standstill: at 1.5 the car settles harder than the driver's own stops
 FIRM_STOP_DECEL_BP = [0.3, 1.0]  # m/s
 FIRM_STOP_DECEL_MAX = [0.8, 1.5]  # m/s^2
+# under a committed STOP the model often plans no stop at all, only a creep on (routes 57, 59, 4d, 58: 4.4-8.4 s under 2 mph,
+# two never stopping): once its braking is weaker than this the STOP finishes at the decel cap without a stop point
+FIRM_STOP_CREEP_A = 0.3  # m/s^2
+# only at a crawl: those four armed at 1.5-2.0 mph; at 4.5 mph route 55 was rolling past its sign into the junction
+FIRM_STOP_CREEP_SPEED = 1.12  # m/s, 2.5 mph
 T_IDXS = np.asarray(ModelConstants.T_IDXS)
 
 
@@ -70,7 +75,6 @@ class FirmStop:
     dist = plan_stop_distance(vel, pos, committed_stop=committed_stop)
     self.active_frames = self.active_frames + 1 if active else 0
     planned = math.isfinite(dist)
-    self.frames = self.frames + 1 if planned and FIRM_STOP_PLAN_V <= v_ego < FIRM_STOP_SPEED else 0
 
     # only the approach to the stop point counts as backwards: past it, and at the horizon's far end, real plans drift back by
     # cm (every planned stop on routes 55-57), which would drop the committed finish on an ordinary stop
@@ -78,6 +82,9 @@ class FirmStop:
     invalid_commitment = committed_stop and (len(vel_a) != len(T_IDXS) or len(pos_a) != len(T_IDXS) or
                                             not (np.isfinite(vel_a).all() and np.isfinite(pos_a).all()) or
                                             (planned and (np.diff(pos_a[:np.flatnonzero(vel_a < FIRM_STOP_PLAN_V)[0] + 1]) < 0.).any()))
+    creeping = (committed_stop and not planned and not invalid_commitment and a_candidate > -FIRM_STOP_CREEP_A and
+                v_ego < FIRM_STOP_CREEP_SPEED)
+    self.frames = self.frames + 1 if (planned or creeping) and FIRM_STOP_PLAN_V <= v_ego < FIRM_STOP_SPEED else 0
     if not active or v_ego >= FIRM_STOP_RELEASE_SPEED or not math.isfinite(v_ego) or invalid_commitment:
       self.finishing = False
     elif self.finishing and v_ego >= FIRM_STOP_PLAN_V and not planned and not committed_stop:
@@ -95,6 +102,12 @@ class FirmStop:
     elif v_ego >= FIRM_STOP_PLAN_V:
       cap = float(np.interp(v_ego, FIRM_STOP_DECEL_BP, FIRM_STOP_DECEL_MAX))
       stop_at = max(dist - FIRM_STOP_MARGIN, lead_d - FIRM_STOP_LEAD_GAP if math.isfinite(lead_d) else -math.inf)
-      want = -min(v_ego ** 2 / (2. * max(stop_at, FIRM_STOP_MIN_DIST)), cap) if planned else max(self.a_target, -cap)
+      # committed without a stop point (the model creeps on, or its dip is gone): at a crawl the STOP finishes at the cap, above
+      # one it holds what it asked. A lead never relaxes either: ForceStop commits only with no lead in 75 m, so one appearing
+      # mid-stop is a car pulling in, and the STOP stays
+      if planned:
+        want = -min(v_ego ** 2 / (2. * max(stop_at, FIRM_STOP_MIN_DIST)), cap)
+      else:
+        want = -cap if v_ego < FIRM_STOP_CREEP_SPEED else max(self.a_target, -cap)
       self.a_target = max(want, self.a_target - FIRM_STOP_JERK * self.dt) if want < self.a_target else want
     return self.a_target
