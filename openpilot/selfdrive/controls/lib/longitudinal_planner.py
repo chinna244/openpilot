@@ -10,7 +10,7 @@ from openpilot.common.filter_simple import FirstOrderFilter
 from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.modeld.constants import ModelConstants
 from openpilot.selfdrive.controls.lib.accel_boost import AccelBoost
-from openpilot.selfdrive.controls.lib.firm_stop import FirmStop
+from openpilot.selfdrive.controls.lib.firm_stop import FirmStop, FIRM_STOP_PLAN_V
 from openpilot.selfdrive.controls.lib.longcontrol import LongCtrlState
 from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import LongitudinalMpc, LongitudinalPlanSource, get_T_FOLLOW
 from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import T_IDXS as T_IDXS_MPC
@@ -258,7 +258,10 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
                   (output_a_target_e2e, LongitudinalPlanSource.e2e, output_should_stop_e2e)]
 
     output_a_target, self.mpc.source, _ = min(candidates, key=lambda c: c[0])
-    self.output_should_stop = self.force_stop_plan.should_stop or any(should_stop for _, _, should_stop in candidates)
+    # on Mazda ForceStop's stop asks for the stopping state only as slow as every other stop does: above it Mazda's STOPPING
+    # barely brakes (route 59 t=227.8, 0.64 m/s, -1.0 sent, 3.8 s to stand still), so its ceiling and the firm finish brake it down
+    force_should_stop = self.force_stop_plan.should_stop and (self.CP.brand != 'mazda' or v_ego < FIRM_STOP_PLAN_V)
+    self.output_should_stop = force_should_stop or any(should_stop for _, _, should_stop in candidates)
     self.output_a_target = np.clip(output_a_target, ACCEL_MIN, ACCEL_MAX)
     self.a_target_published, self.source_published = float(self.output_a_target), self.mpc.source
     if lift_published:
