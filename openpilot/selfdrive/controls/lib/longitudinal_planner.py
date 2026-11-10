@@ -246,7 +246,8 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
     lead_one = sm['radarState'].leadOne
     a_firm = self.firm_stop.update(v_ego, sm['modelV2'].velocity.x, sm['modelV2'].position.x,
                                    self.CP.openpilotLongitudinalControl and not reset_state, output_a_target_e2e,
-                                   lead_one.dRel if lead_one.present else math.inf)
+                                   lead_one.dRel if lead_one.present else math.inf,
+                                   committed_stop=self.force_stop_plan.forcing)
     output_a_target_e2e = min(output_a_target_e2e, a_firm)
     output_should_stop_e2e = output_should_stop_e2e or self.firm_stop.should_stop
 
