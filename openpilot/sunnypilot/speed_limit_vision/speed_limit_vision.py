@@ -506,6 +506,25 @@ class HistoryEntry:
   strong_consensus: bool = False
 
 
+def _primary_regulatory_panel(image):
+  """StarPilot model._primary_regulatory_panel: the upper sign panel of a stacked post, so a lower plate is not judged with it."""
+  height, width = image.shape[:2]
+  if image.dtype != np.uint8 or width < 24 or height < 1.8 * width:
+    return image
+
+  gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+  _, mask = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+  for foreground in (mask >= 128, mask < 128):
+    occupied = foreground[:, int(width * .2):int(width * .8)].mean(1) > .8
+    edges = np.diff(np.r_[False, occupied, False].astype(np.int8))
+    runs = list(zip(np.flatnonzero(edges == 1), np.flatnonzero(edges == -1), strict=False))
+    for (top, bottom), (next_top, next_bottom) in zip(runs, runs[1:], strict=False):
+      if (top <= .3 * width and .75 * width <= bottom - top <= 1.6 * width and
+          next_bottom - next_top >= .5 * width and .02 * width <= next_top - bottom <= .15 * width):
+        return image[:min(height, int(bottom + .03 * width))]
+  return image
+
+
 class SpeedLimitVisionDaemon:
   def __init__(self, use_runtime=True):
     self.use_runtime = use_runtime
@@ -1745,6 +1764,21 @@ class SpeedLimitVisionDaemon:
       return None
     return detection
 
+  @staticmethod
+  def _is_yellow_advisory(sign_crop):
+    """StarPilot 76d69dfc8: a box whose main panel is mostly yellow (not white) is an advisory (EXIT 25, RAMP 20), not a limit."""
+    if sign_crop.size == 0:
+      return False
+    sign_crop = _primary_regulatory_panel(sign_crop)
+    hsv = cv2.cvtColor(sign_crop, cv2.COLOR_BGR2HSV)
+    hue, saturation, value = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
+    white_mask = ((value >= REGULATORY_WHITE_VALUE_MIN) & (saturation <= REGULATORY_WHITE_SAT_MAX))
+    yellow_mask = ((hue >= REGULATORY_YELLOW_HUE_MIN) &
+                   (hue <= REGULATORY_YELLOW_HUE_MAX) &
+                   (saturation >= REGULATORY_YELLOW_SAT_MIN) &
+                   (value >= REGULATORY_YELLOW_VALUE_MIN))
+    return float((yellow_mask & ~white_mask).astype(np.uint8).mean()) > .5
+
   def _is_regulatory_speed_sign(self, sign_crop):
     if sign_crop.size == 0:
       return False
@@ -2261,10 +2295,21 @@ class SpeedLimitVisionDaemon:
     frame_height, frame_width = frame_bgr.shape[:2]
     best_detection = None
     best_score = 0.0
+    rejected_advisory_boxes: list[tuple[int, int, int, int]] = []
 
     for proposal_confidence, class_id, (x1, y1, x2, y2) in self._collect_detector_classifier_proposals(frame_bgr):
       if class_id == 1:
         continue
+      if class_id == 0:
+        duplicate_advisory = False
+        for rx1, ry1, rx2, ry2 in rejected_advisory_boxes:
+          overlap = max(0, min(x2, rx2) - max(x1, rx1)) * max(0, min(y2, ry2) - max(y1, ry1))
+          union = (x2 - x1) * (y2 - y1) + (rx2 - rx1) * (ry2 - ry1) - overlap
+          if union > 0 and overlap >= .75 * union:
+            duplicate_advisory = True
+            break
+        if duplicate_advisory:
+          continue
 
       box_width = x2 - x1
       box_height = y2 - y1
@@ -2287,6 +2332,10 @@ class SpeedLimitVisionDaemon:
         proposal_area_ratio < DETECTOR_CLASSIFIER_TINY_LOW_CONF_AREA_RATIO and
         proposal_confidence < DETECTOR_CLASSIFIER_TINY_LOW_CONF_MIN_CONFIDENCE
       )
+      if class_id == 0 and self._is_yellow_advisory(
+          frame_bgr[max(int(y1), 0):min(int(y2), frame_height), max(int(x1), 0):min(int(x2), frame_width)]):
+        rejected_advisory_boxes.append((x1, y1, x2, y2))
+        continue
       self._remember_detector_proposal(proposal_confidence, class_id, (x1, y1, x2, y2))
 
       if class_id == 2:
