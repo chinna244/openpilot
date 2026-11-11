@@ -25,6 +25,10 @@ FIRM_STOP_JERK = 2.0  # m/s^3, into the brake from the candidate it starts under
 # eased into standstill: at 1.5 the car settles harder than the driver's own stops
 FIRM_STOP_DECEL_BP = [0.3, 1.0]  # m/s
 FIRM_STOP_DECEL_MAX = [0.8, 1.5]  # m/s^2
+# Retain a gentle braking floor only near a planned stop, never harder than this finish has already requested.
+FIRM_STOP_FLOOR_SPEED = 0.983488  # m/s, 2.2 mph
+FIRM_STOP_FLOOR_DIST = 0.5  # m, effective stop point (including points behind the car)
+FIRM_STOP_FLOOR_DECEL = 0.9  # m/s^2, still bounded by the existing speed cap
 # under a committed STOP the model often plans no stop at all, only a creep on (routes 57, 59, 4d, 58: 4.4-8.4 s under 2 mph,
 # two never stopping): once its braking is weaker than this the STOP finishes at the decel cap without a stop point
 FIRM_STOP_CREEP_A = 0.3  # m/s^2
@@ -58,6 +62,7 @@ class FirmStop:
     self.active_frames = 0  # consecutive frames in control
     self.finishing = False  # armed on a planned stop, until it lets go
     self.a_target = math.inf
+    self.a_hardest = 0.  # hardest finite FirmStop request in this finish
     self.should_stop = False
 
   def update(self, v_ego: float, vel, pos, active: bool, a_candidate: float, lead_d: float = math.inf,
@@ -71,6 +76,7 @@ class FirmStop:
       if not committed_stop:  # without a STOP the finish is exactly the unwaived one, its history included
         u = self.uncommitted
         self.frames, self.active_frames, self.finishing, self.a_target, self.should_stop = u.frames, u.active_frames, u.finishing, u.a_target, u.should_stop
+        self.a_hardest = u.a_hardest
         return a_uncommitted
     dist = plan_stop_distance(vel, pos, committed_stop=committed_stop)
     self.active_frames = self.active_frames + 1 if active else 0
@@ -79,6 +85,11 @@ class FirmStop:
     # only the approach to the stop point counts as backwards: past it, and at the horizon's far end, real plans drift back by
     # cm (every planned stop on routes 55-57), which would drop the committed finish on an ordinary stop
     vel_a, pos_a = np.asarray(vel, dtype=float), np.asarray(pos, dtype=float)
+    # The model can reach its stopping speed before measured speed does. Retain an existing finish through that gap,
+    # but still release for an actual departure within the same horizon used below the measured stopping speed.
+    stopped_plan = (v_ego < FIRM_STOP_FLOOR_SPEED and len(vel_a) == len(T_IDXS) and len(pos_a) == len(T_IDXS) and
+                    np.isfinite(vel_a).all() and np.isfinite(pos_a).all() and vel_a[0] < FIRM_STOP_PLAN_V and
+                    vel_a[T_IDXS <= FIRM_STOP_STAY].max() < FIRM_STOP_GO_V)
     invalid_commitment = committed_stop and (len(vel_a) != len(T_IDXS) or len(pos_a) != len(T_IDXS) or
                                             not (np.isfinite(vel_a).all() and np.isfinite(pos_a).all()) or
                                             (planned and (np.diff(pos_a[:np.flatnonzero(vel_a < FIRM_STOP_PLAN_V)[0] + 1]) < 0.).any()))
@@ -87,7 +98,7 @@ class FirmStop:
     self.frames = self.frames + 1 if (planned or creeping) and FIRM_STOP_PLAN_V <= v_ego < FIRM_STOP_SPEED else 0
     if not active or v_ego >= FIRM_STOP_RELEASE_SPEED or not math.isfinite(v_ego) or invalid_commitment:
       self.finishing = False
-    elif self.finishing and v_ego >= FIRM_STOP_PLAN_V and not planned and not committed_stop:
+    elif self.finishing and v_ego >= FIRM_STOP_PLAN_V and not planned and not stopped_plan and not committed_stop:
       self.finishing = False  # the plan goes on: its stop is gone
     elif (self.finishing and v_ego < FIRM_STOP_PLAN_V and not committed_stop and
           np.asarray(vel, dtype=float)[T_IDXS[:len(vel)] <= FIRM_STOP_STAY].max(initial=0.) >= FIRM_STOP_GO_V):
@@ -99,6 +110,7 @@ class FirmStop:
     self.should_stop = self.finishing and v_ego < FIRM_STOP_PLAN_V
     if not self.finishing:
       self.a_target = math.inf
+      self.a_hardest = 0.
     elif v_ego >= FIRM_STOP_PLAN_V:
       cap = float(np.interp(v_ego, FIRM_STOP_DECEL_BP, FIRM_STOP_DECEL_MAX))
       stop_at = max(dist - FIRM_STOP_MARGIN, lead_d - FIRM_STOP_LEAD_GAP if math.isfinite(lead_d) else -math.inf)
@@ -107,7 +119,15 @@ class FirmStop:
       # mid-stop is a car pulling in, and the STOP stays
       if planned:
         want = -min(v_ego ** 2 / (2. * max(stop_at, FIRM_STOP_MIN_DIST)), cap)
+        if v_ego < FIRM_STOP_FLOOR_SPEED and stop_at <= FIRM_STOP_FLOOR_DIST:
+          # Retain current braking, never recover an earlier harder request after it has already eased.
+          floor = max(-min(FIRM_STOP_FLOOR_DECEL, -self.a_hardest, cap), min(self.a_target, a_candidate))
+          want = min(want, floor)
+      elif not committed_stop:
+        want = max(self.a_target, -cap)  # model already stopped: carry braking into should_stop without a new bite
       else:
         want = -cap if v_ego < FIRM_STOP_CREEP_SPEED else max(self.a_target, -cap)
       self.a_target = max(want, self.a_target - FIRM_STOP_JERK * self.dt) if want < self.a_target else want
+    if self.finishing and math.isfinite(self.a_target):
+      self.a_hardest = min(self.a_hardest, self.a_target)
     return self.a_target

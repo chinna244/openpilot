@@ -487,3 +487,165 @@ class TestCommittedStop:
     fs = FirmStop()
     for _ in range(WARM):
       assert fs.update(0.6, vel, pos, True, -0.2, committed_stop=True) == math.inf
+
+
+class TestTerminalFloor:
+  @staticmethod
+  def point_plan(v, effective_dist):
+    # Exact stop distance, independent of interpolation in stop_plan's velocity samples.
+    vel = np.zeros(len(T_IDXS))
+    vel[0] = v
+    pos = np.full(len(T_IDXS), effective_dist + FIRM_STOP_MARGIN)
+    pos[0] = 0.
+    return vel, pos
+
+  def armed(self, hard=1.2, committed=False):
+    fs = FirmStop()
+    v = 1.2
+    for _ in range(WARM):
+      fs.update(v, *self.point_plan(v, v ** 2 / (2 * hard)), True, -0.1, committed_stop=committed)
+    assert fs.a_target == pytest.approx(-hard)
+    return fs
+
+  @pytest.mark.parametrize('distance', [-0.4, 0., 0.5])
+  @pytest.mark.parametrize('committed', [False, True])
+  def test_floor_includes_negative_distance_and_upper_boundary(self, distance, committed):
+    fs = self.armed(committed=committed)
+    assert fs.update(0.4, *self.point_plan(0.4, distance), True, 0., committed_stop=committed) == pytest.approx(-0.9)
+
+  @pytest.mark.parametrize('v,distance,lead', [(0.4, 0.50001, math.inf), (0.983488, 0.5, math.inf),
+                                             (0.4, -0.4, FIRM_STOP_LEAD_GAP + 0.50001)])
+  def test_floor_only_inside_distance_speed_and_lead_gates(self, v, distance, lead):
+    fs = self.armed()
+    plan = self.point_plan(v, distance)
+    stop_at = max(distance, lead - FIRM_STOP_LEAD_GAP if math.isfinite(lead) else -math.inf)
+    expected = -min(v ** 2 / (2 * max(stop_at, FIRM_STOP_MIN_DIST)), float(np.interp(v, FIRM_STOP_DECEL_BP, FIRM_STOP_DECEL_MAX)))
+    assert fs.update(v, *plan, True, 0., lead) == pytest.approx(expected)
+
+  def test_floor_at_upper_eligible_speed(self):
+    fs = self.armed()
+    assert fs.update(0.94, *self.point_plan(0.94, 0.5), True, 0.) == pytest.approx(-0.9)
+
+  @pytest.mark.parametrize('hard', [0.4, 0.7])
+  def test_floor_preserves_a_weaker_stop_history(self, hard):
+    fs = self.armed(hard)
+    assert fs.update(0.4, *self.point_plan(0.4, 0.5), True, 0.) == pytest.approx(-hard)
+
+  @pytest.mark.parametrize('v', [0.3, 0.35])
+  def test_floor_stays_under_existing_cap(self, v):
+    fs = self.armed()
+    assert fs.update(v, *self.point_plan(v, -0.4), True, 0.) == pytest.approx(-np.interp(v, FIRM_STOP_DECEL_BP, FIRM_STOP_DECEL_MAX))
+
+  def test_ordinary_stop_braking_stronger_than_floor_is_kept(self):
+    fs = self.armed()
+    assert run(fs, 0.9, *self.point_plan(0.9, -0.4), n=2) == pytest.approx(-1.35)
+
+  @pytest.mark.parametrize('committed', [False, True])
+  @pytest.mark.parametrize('candidate', [0., 0.2, -0.5])
+  def test_late_gate_only_retains_current_braking(self, committed, candidate):
+    fs = self.armed(committed=committed)
+    # The distance gate is still off when the original finish eases to -0.16.
+    a = fs.update(0.8, *self.point_plan(0.8, 2.), True, 0., committed_stop=committed)
+    assert a == pytest.approx(-0.16)
+    # Slower speed and a nearer point make the ordinary request the same -0.16.
+    # The floor may retain a harder current candidate, but may not restore the old -0.9.
+    current = min(a, candidate)
+    for _ in range(10):
+      b = fs.update(0.4, *self.point_plan(0.4, 0.5), True, candidate, committed_stop=committed)
+      assert b >= current - 1e-9
+      assert b >= a - FIRM_STOP_JERK * DT_MDL - 1e-9
+      a = b
+    assert b == pytest.approx(current)
+
+  def test_floor_does_not_block_ordinary_increase_in_braking(self):
+    fs = self.armed()
+    a = fs.update(0.4, *self.point_plan(0.4, 2.), True, 0.)
+    # The original distance-based request can still get firmer, under its jerk limit.
+    b = fs.update(0.4, *self.point_plan(0.4, 0.5), True, 0.)
+    assert b == pytest.approx(a - FIRM_STOP_JERK * DT_MDL)
+    assert run(fs, 0.4, *self.point_plan(0.4, 0.5), n=4) == pytest.approx(-0.16)
+
+  def test_new_finish_does_not_inherit_previous_braking(self):
+    fs = self.armed()
+    fs.update(0.4, *self.point_plan(0.4, 0.5), False, 0.)
+    assert run(fs, 0.4, *self.point_plan(0.4, 0.5)) == pytest.approx(-0.16)
+
+  def test_no_floor_without_a_model_stop_point(self):
+    fs = self.armed()
+    assert fs.update(0.4, *cruise_plan(0.4), True, 0.) == math.inf
+    assert not fs.finishing
+
+  def test_ending_commitment_restores_uncommitted_history(self):
+    fs, base = self.armed(), self.armed()
+    for _ in range(WARM):
+      fs.update(0.6, *rolling_stop_plan(), True, -0.1, committed_stop=True)
+      base.update(0.6, *rolling_stop_plan(), True, -0.1)
+    # The shadow let go; commitment-only braking must not seed its next finish.
+    for _ in range(WARM):
+      a = fs.update(0.4, *self.point_plan(0.4, 0.5), True, 0.)
+      b = base.update(0.4, *self.point_plan(0.4, 0.5), True, 0.)
+      assert a == b
+    assert a == pytest.approx(-0.16)
+
+  def test_planner_keeps_a_stronger_candidate(self):
+    p = H.planner()
+    for _ in range(WARM):
+      p.update(low_speed_sm(1.2, *self.point_plan(1.2, 0.6), model_a=-1.2))
+    for _ in range(10):
+      p.update(low_speed_sm(0.4, *self.point_plan(0.4, 0.5), model_a=-1.5))
+    assert p.firm_stop.a_target == pytest.approx(-0.9)
+    assert p.output_a_target < -0.9
+
+  @pytest.mark.parametrize('v', [0.31, 0.39, 0.98])
+  def test_slow_starting_stopped_plan_keeps_finish_until_stopping_state(self, v):
+    fs = self.armed()
+    assert fs.update(0.4, *self.point_plan(0.4, 0.5), True, 0.) == pytest.approx(-0.9)
+    vel, pos = np.zeros(len(T_IDXS)), np.zeros(len(T_IDXS))
+    vel[0] = 0.2  # model starts below PLAN_V before measured speed crosses it
+    a = fs.update(v, vel, pos, True, -0.44)
+    assert fs.finishing and not fs.should_stop
+    assert a == pytest.approx(max(-0.9, -np.interp(v, FIRM_STOP_DECEL_BP, FIRM_STOP_DECEL_MAX)))
+    assert fs.update(0.29, vel, pos, True, -0.44) == pytest.approx(a)
+    assert fs.finishing and fs.should_stop
+
+  def test_slow_starting_plan_does_not_recover_previously_eased_braking(self):
+    fs = self.armed()
+    a = fs.update(0.8, *self.point_plan(0.8, 2.), True, 0.)
+    assert a == pytest.approx(-0.16)
+    vel = np.full(len(T_IDXS), 0.2)
+    assert fs.update(0.31, vel, np.zeros(len(T_IDXS)), True, 0.) == pytest.approx(a)
+    assert fs.finishing
+
+  @pytest.mark.parametrize('speed', [0.5, 0.6])
+  def test_slow_starting_plan_that_departs_within_two_seconds_releases(self, speed):
+    fs = self.armed()
+    vel = np.full(len(T_IDXS), 0.2)
+    vel[np.flatnonzero(T_IDXS <= 2.)[-1]] = speed
+    assert fs.update(0.31, vel, np.zeros(len(T_IDXS)), True, 0.) == math.inf
+    assert not fs.finishing and not fs.should_stop
+
+  def test_slow_starting_plan_departing_after_two_seconds_keeps_finish(self):
+    fs = self.armed()
+    fs.update(0.4, *self.point_plan(0.4, 0.5), True, 0.)
+    vel = np.full(len(T_IDXS), 0.2)
+    vel[T_IDXS > 2.] = 0.6
+    assert fs.update(0.31, vel, np.zeros(len(T_IDXS)), True, 0.) == pytest.approx(-0.81)
+    assert fs.finishing
+
+  @pytest.mark.parametrize('kind', ['empty', 'nan velocity', 'nan position', 'mismatched', 'above speed'])
+  def test_slow_starting_hold_rejects_invalid_or_faster_plans(self, kind):
+    fs = self.armed()
+    vel, pos = np.full(len(T_IDXS), 0.2), np.zeros(len(T_IDXS))
+    v = 0.31
+    if kind == 'empty':
+      vel, pos = [], []
+    elif kind == 'nan velocity':
+      vel[-1] = math.nan
+    elif kind == 'nan position':
+      pos[-1] = math.nan
+    elif kind == 'mismatched':
+      pos = pos[:-1]
+    else:
+      v = 0.983488
+    assert fs.update(v, vel, pos, True, 0.) == math.inf
+    assert not fs.finishing
