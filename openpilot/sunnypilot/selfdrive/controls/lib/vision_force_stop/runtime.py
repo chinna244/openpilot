@@ -1,9 +1,10 @@
 """Vision Force Stop: StarPilot's ForceStopRuntime (starpilot/longitudinal/force_stop_runtime.py, Dom 1d30dc3), sign path only.
 
 A camera STOP sign confirmed by the reader feeds StarPilot's ForceStop policy unchanged: it acts below 40 mph when the
-model's own plan ends within 50 m, with no curve, turn or slower lead, caps the speed toward a stop 6 m short of the sign
-(at most 27 m out) and holds the stop until the gas or RES. StarPilot's red-light path (StopLightDetector), the dashboard
-TSR sign and the distance offset are not part of this port.
+model's own plan ends within 50 m, with no curve, turn or slower lead, caps the speed toward the sign's camera range (box
+height, 2a854471f) and holds the stop until the gas or RES; stopped behind a car at a sign, it stops again at the line once
+that car leaves. StarPilot's red-light path (StopLightDetector), the dashboard TSR sign and the distance offset are not
+part of this port.
 """
 
 from openpilot.common.params import Params
@@ -42,6 +43,7 @@ class VisionForceStop:
     self.policy = ForceStop()
     self.resume = StopResume()
     self.vision_stop = StopConfirmation()
+    self.vision_ranged_ns = 0
     self.lead = LeadDetector()
     self.plan = StopPlan()
     self.enabled = False
@@ -49,6 +51,7 @@ class VisionForceStop:
 
   def reset(self):
     self.vision_stop.reset()
+    self.vision_ranged_ns = 0
     self.resume.reset()
     self.policy.reset()
     self.lead.reset()
@@ -95,16 +98,21 @@ class VisionForceStop:
       if not state.enabled or car.brakePressed or not (control.longActive or car.gasPressed):
         self.resume.reset()
         self.policy.reset()
+        self.vision_ranged_ns = 0  # fork: a confirmation still fresh after the reset is ranged again, not seeded at 27 m
         self.plan = StopPlan()
         return self.plan
       vision_sign = self.vision_stop.observe(read_stop_evidence(sm, now_ns=now_ns, drive_id=drive_id), now_ns=now_ns)
+      vision_fresh = bool(vision_sign and 0 <= now_ns - vision_sign <= CONTROL_STOP_MAX_AGE_NS)
+      vision_distance = None
+      if vision_fresh and vision_sign != self.vision_ranged_ns and self.vision_stop.distance_m is not None:
+        self.vision_ranged_ns = vision_sign
+        vision_distance = self.vision_stop.distance_m - float(car.vEgo) * (stamp - vision_sign) / 1e9
       frame = StopFrame(stamp, float(car.vEgo), horizon, False, horizon is not None and horizon < 50,
                         bool(model.action.shouldStop), bool(car.standstill), True, bool(car.gasPressed),
                         tracked is not None and tracked.tracked is True, bool(lead.present), float(lead.dRel), float(lead.vLead),
                         raw_curve[1] if raw_curve is not None else False, curvature[0] if curvature is not None else None,
                         bool(car.leftBlinker or car.rightBlinker), float(car.steeringAngleDeg), resume_requested=resume_requested,
-                        perception_available=perception_available,
-                        sign=bool(vision_sign and 0 <= now_ns - vision_sign <= CONTROL_STOP_MAX_AGE_NS))
+                        perception_available=perception_available, sign=vision_fresh, vision_distance_m=vision_distance)
       self.plan = self.policy.step(frame, vehicle_tune(str(cp.carFingerprint)), 0)
       return self.plan
     except (AttributeError, KeyError, TypeError, ValueError, OverflowError, RuntimeError):
