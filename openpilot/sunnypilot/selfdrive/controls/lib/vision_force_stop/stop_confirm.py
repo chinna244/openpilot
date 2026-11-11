@@ -7,6 +7,8 @@ monotonic receipt time only.
 from dataclasses import dataclass
 import math
 
+from openpilot.common.transformations.camera import DEVICE_CAMERAS
+
 STOP_MAX_AGE_NS = 1_500_000_000
 # fork: StarPilot's 750 ms counts from the camera frame and assumes its result lands ~0.25 s later; our reader's land
 # 0.3-0.9 s later while driving (routes 4a-4c), leaving 0-0.45 s. 1.2 s keeps StarPilot's usable time. Replay on routes
@@ -14,6 +16,10 @@ STOP_MAX_AGE_NS = 1_500_000_000
 CONTROL_STOP_MAX_AGE_NS = 1_200_000_000
 RECEIPT_MAX_AGE_NS = 1_000_000_000
 STOP_CONFIRM_CONFIDENCE = .7
+STOP_SIGN_HEIGHT_M = .762
+# Fitted on 17 confirmed sign approaches: where the car stops relative to the box range. (StarPilot 2a854471f)
+STOP_RANGE_OFFSET_M = 2.0
+ROAD_FOCAL_PX = {camera.narrow_road.size: camera.narrow_road.focal_length for camera in DEVICE_CAMERAS.values()}
 
 
 @dataclass(frozen=True)
@@ -61,6 +67,16 @@ def read_stop_evidence(sm, *, now_ns: int, drive_id: int) -> StopEvidence | None
     return None
 
 
+def stop_distance(sample: StopEvidence, box: StopBox) -> float | None:
+  focal = ROAD_FOCAL_PX.get((sample.width, sample.height)) if sample.stream == 'road' else None
+  x1, y1, x2, y2 = box.bbox
+  if not focal or y2 <= y1:
+    return None
+  across = ((x1 + x2) / 2 - sample.width / 2) / focal
+  up = ((y1 + y2) / 2 - sample.height / 2) / focal
+  return focal * STOP_SIGN_HEIGHT_M / (y2 - y1) / math.sqrt(1 + across ** 2 + up ** 2) + STOP_RANGE_OFFSET_M
+
+
 def _matches(a: StopBox, b: StopBox) -> bool:
   ax, ay, ar, ab = a.bbox
   bx, by, br, bb = b.bbox
@@ -78,6 +94,7 @@ class StopConfirmation:
     self.previous: StopEvidence | None = None
     self.confirmed_ns = 0
     self.first_seen_ns = 0
+    self.distance_m: float | None = None
 
   def observe(self, sample: StopEvidence | None, *, now_ns: int) -> int:
     if sample is None or not 0 <= now_ns - sample.observed_ns < STOP_MAX_AGE_NS:
@@ -97,13 +114,15 @@ class StopConfirmation:
       self.reset()
       return 0
     candidates = tuple(box for box in sample.boxes if box.confidence >= STOP_CONFIRM_CONFIDENCE)
-    coherent = (previous is not None and 100_000_000 <= sample.observed_ns - previous.observed_ns < STOP_MAX_AGE_NS and
-                any(_matches(old, new) for old in previous.boxes if old.confidence >= STOP_CONFIRM_CONFIDENCE for new in candidates))
+    matched = tuple(new for new in candidates if previous is not None and
+                    100_000_000 <= sample.observed_ns - previous.observed_ns < STOP_MAX_AGE_NS and
+                    any(_matches(old, new) for old in previous.boxes if old.confidence >= STOP_CONFIRM_CONFIDENCE))
     if not candidates:
       self.first_seen_ns = 0
-    elif not coherent:
+    elif not matched:
       self.first_seen_ns = sample.observed_ns
     self.previous = sample
-    self.confirmed_ns = (sample.observed_ns if candidates and coherent and
+    self.confirmed_ns = (sample.observed_ns if matched and
                          sample.observed_ns - self.first_seen_ns >= 500_000_000 else 0)
+    self.distance_m = stop_distance(sample, max(matched, key=lambda box: box.confidence)) if self.confirmed_ns else None
     return self.confirmed_ns

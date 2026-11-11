@@ -174,3 +174,46 @@ def test_control_age_stays_inside_the_confirmation_age():
   # a sign is only steered on while its confirmation still holds: older samples are dropped at STOP_MAX_AGE_NS
   from openpilot.sunnypilot.selfdrive.controls.lib.vision_force_stop.stop_confirm import CONTROL_STOP_MAX_AGE_NS, STOP_MAX_AGE_NS
   assert 750_000_000 < CONTROL_STOP_MAX_AGE_NS < STOP_MAX_AGE_NS
+
+
+def test_confirmed_road_box_carries_forward_distance():
+  # StarPilot 2a854471f: a confirmed box is ranged by its height (0.762 m sign) on the narrow road camera, plus 2 m
+  from openpilot.sunnypilot.selfdrive.controls.lib.vision_force_stop.stop_confirm import StopBox, StopConfirmation, StopEvidence
+  box = StopBox(.875, (1214, 400, 1294, 480))
+  for stream, expected in (('road', 27.025), ('wideRoad', None)):
+    owner = StopConfirmation()
+    owner.observe(StopEvidence('reader', stream, DRIVE_ID + 100, 0, 1, 1928, 1208, (box,)), now_ns=DRIVE_ID + 100)
+    assert owner.distance_m is None
+    second = StopEvidence('reader', stream, DRIVE_ID + 700_000_100, 0, 15, 1928, 1208, (box,))
+    assert owner.observe(second, now_ns=DRIVE_ID + 800_000_000) == second.observed_ns
+    assert (owner.distance_m is None) if expected is None else abs(owner.distance_m - expected) < .01
+    owner.observe(None, now_ns=DRIVE_ID + 900_000_000)
+    assert owner.distance_m is None
+
+
+def test_sign_stop_target_uses_the_box_range_not_the_27_m_seed():
+  # the 40 px box at 1344x760 ranges ~23 m: the stop target starts there, not at the 27 m seed
+  plans = [p for p in run(FakeParams()) if p.forcing]
+  assert plans and all(p.tracked_distance_m < 23.5 for p in plans)
+
+
+def test_reset_between_reader_samples_still_ranges_the_sign():
+  # fork: a brake tap while the reader republishes its last pass resets the policy; that still-fresh confirmation is
+  # ranged again instead of the sign being seeded at 27 m and averaged with the range for the rest of the approach
+  vfs, sm, CP = VisionForceStop(FakeParams()), FakeSM(), car_params()
+  start = DRIVE_ID + 2_000_000_000 - (DRIVE_ID + 2_000_000_000) % (4 * DT_NS)
+  after = []
+  for i in range(60):
+    t = start + i * DT_NS
+    frame(sm, t, horizon=40., v_ego=10., stop_box=True)
+    if 20 < i < 40 and i % 4 == 0:  # a slow reader pass: the tick-20 sample is republished for 1 s
+      msg = sm['customReserved10']
+      msg.stopObservedMonoTime, msg.stopFrameId = start + 20 * DT_NS, (start + 20 * DT_NS) // DT_NS
+    if i == 21:
+      ss = messaging.new_message('selfdriveState')
+      ss.selfdriveState.enabled = False
+      sm.put('selfdriveState', ss, t)
+    plan = vfs.sample(sm, CP, now_ns=t, drive_id=DRIVE_ID, follow_seconds=1.45)
+    if i > 21 and plan.forcing:
+      after.append(plan)
+  assert after and all(p.tracked_distance_m < 23.5 for p in after)
