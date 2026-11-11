@@ -729,3 +729,47 @@ def test_no_stop_followup_standing_still():
   daemon = interval_daemon(0.6, cpu_busy=True)
   daemon.sm = MovingSM(0.)
   assert daemon._inference_interval(10.0) == pytest.approx(slv.BUSY_INFERENCE_INTERVAL)
+
+
+# StarPilot 76d69dfc8: yellow advisory panels (EXIT 25, RAMP 20) are dropped before reading.
+# Routes 1e t=84 (EXIT 25 on a 50 road, 29 s) and 1f t=141 (EXIT 15, 25 s) published them before.
+YELLOW_BGR = (0, 255, 255)
+
+
+def test_yellow_advisory_needs_a_strict_yellow_majority():
+  assert not SpeedLimitVisionDaemon._is_yellow_advisory(np.empty((0, 0, 3), np.uint8))
+  for yellow_rows, expected in ((30, False), (50, False), (51, True), (100, True)):
+    crop = np.full((100, 100, 3), 255, np.uint8)
+    crop[:yellow_rows] = YELLOW_BGR
+    assert SpeedLimitVisionDaemon._is_yellow_advisory(crop) == expected
+  for color in ((255, 255, 255), (90, 90, 90), (170, 210, 210)):  # white, gray, a yellow tint
+    assert not SpeedLimitVisionDaemon._is_yellow_advisory(np.full((100, 100, 3), color, np.uint8))
+
+
+def test_yellow_plate_under_a_white_panel_is_judged_by_the_white_panel():
+  compound = np.zeros((248, 100, 3), np.uint8)  # the yellow plate is most of the box: only the panel split keeps it
+  compound[:100] = 255
+  compound[108:] = YELLOW_BGR
+  assert slv._primary_regulatory_panel(compound).shape[0] < compound.shape[0]
+  assert not SpeedLimitVisionDaemon._is_yellow_advisory(compound)
+  assert SpeedLimitVisionDaemon._is_yellow_advisory(compound[108:])
+
+
+def test_yellow_proposal_is_not_read_and_its_near_duplicate_is_skipped(model_only_runtime):
+  frame = np.zeros((480, 960, 3), np.uint8)
+  frame[100:220, 700:780] = YELLOW_BGR
+  daemon = detector_classifier_daemon(regulatory=True, model_read=lambda _crop: pytest.fail("a yellow advisory must not be read"))
+  daemon._collect_detector_classifier_proposals = lambda _frame: [(.80, 0, (700, 100, 780, 220)), (.79, 0, (701, 101, 781, 221))]
+  calls = []
+  original = SpeedLimitVisionDaemon._is_yellow_advisory
+  daemon._is_yellow_advisory = lambda crop: calls.append(1) or original(crop)
+  assert daemon._detect_sign_from_detector_classifier(frame) is None
+  assert len(calls) == 1
+
+
+def test_white_proposal_is_still_read(model_only_runtime):
+  frame = np.zeros((480, 960, 3), np.uint8)
+  frame[100:220, 700:780] = 255
+  daemon = detector_classifier_daemon(regulatory=True, model_read=(40, 0.99))
+  detection = daemon._detect_sign_from_detector_classifier(frame)
+  assert detection is not None and detection.speed_limit_mph == 40
