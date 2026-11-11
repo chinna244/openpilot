@@ -37,6 +37,8 @@ class CarSpecificEventsSP:
   # the camera's fault holds lateral this long past its clear, so a fault flickering as it clears
   # cannot toggle steering or replay the onset alert
   CAMERA_FAULT_CLEAR_FRAMES = int(1.0 / DT_CTRL)
+  # a stand-in lost this soon after cruise was engaged is an engaged loss: carStateSP can trail carState by a frame
+  LOST_ENGAGED_FRAMES = int(0.5 / DT_CTRL)
 
   def __init__(self, CP: structs.CarParams, CP_SP: structs.CarParamsSP, params=None):
     self.CP = CP
@@ -47,6 +49,8 @@ class CarSpecificEventsSP:
     self.low_speed_alert = False
     self.stock_ecu_prev = StockEcuState.notNeeded
     self.stock_ecu_off_prev = False
+    self.stock_ecu_lost_prev = False
+    self.frames_since_cruise_enabled = self.LOST_ENGAGED_FRAMES + 1
     self.alpha_long_announced = False
     self.camera_fault_clear_frames = self.CAMERA_FAULT_CLEAR_FRAMES
     # set by the stop that ended the last session; selfdrived starts fresh every session
@@ -146,6 +150,14 @@ class CarSpecificEventsSP:
     if self.stock_ecu_off_prev and not off and not CS_SP.zoompilot.aebSettingOff:
       events_sp.zp.add(EventNameZP.stockEcuHandedBack)
     self.stock_ecu_off_prev = off
+    # The stand-in lost for the drive (Mazda's Smart CAN Filter): the car's cruise just dropped with no fault, and
+    # with MADS on pcmDisable's chime is stripped, so say it. Loud if it was engaged; a hand-back never sets it.
+    self.frames_since_cruise_enabled = 0 if CS.cruiseState.enabled else self.frames_since_cruise_enabled + 1
+    lost = CS_SP.zoompilot.stockEcuLost
+    if lost and not self.stock_ecu_lost_prev:
+      engaged = self.frames_since_cruise_enabled <= self.LOST_ENGAGED_FRAMES
+      events_sp.zp.add(EventNameZP.stockEcuLost if engaged else EventNameZP.stockEcuLostIdle)
+    self.stock_ecu_lost_prev = lost
     # The request registered, said once per request while driving: the takeover waits for the
     # next stop. Pressed at a stop, it is said on pulling away if no takeover started first.
     if not CS_SP.zoompilot.alphaLongRequested:

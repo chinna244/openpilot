@@ -352,7 +352,8 @@ class TestStockEcuTextFits:
     for _title, line in STOCK_ECU_ALERT_TEXT.values():
       assert len(line) <= 12, line
     for event in (EventNameZP.stockEcuInitializing, EventNameZP.stockEcuReady, EventNameZP.stockEcuHandedBack,
-                  EventNameZP.alphaLongNextStop, EventNameZP.radarLostCameraOnly):
+                  EventNameZP.alphaLongNextStop, EventNameZP.radarLostCameraOnly, EventNameZP.stockEcuLost,
+                  EventNameZP.stockEcuLostIdle):
       assert len(EVENTS_ZP[event][ET.PERMANENT].alert_text_1) <= 12
 class TestStockCruiseFailed:
   """A stop that went ahead on a failed hand-back leaves stock cruise blocked until ignition:
@@ -374,3 +375,110 @@ class TestStockCruiseFailed:
   def test_shows_with_nothing_engaged(self):
     events_sp = _update(_car_events(**{FAILED_KEY: True}), "notNeeded")
     assert _shown(events_sp, "notNeeded") == ["stockCruiseFailed/permanent"]
+
+
+def _lost_update(car_events: CarSpecificEventsSP, state: str, lost: bool, engaged: bool):
+  CS = structs.CarState()
+  CS.cruiseState.enabled = engaged
+  CS_SP = messaging.new_message('carStateSP').carStateSP
+  CS_SP.zoompilot.stockEcu = state
+  CS_SP.zoompilot.stockEcuLost = lost
+  return car_events.update(CS, Events(), CS_SP)
+
+
+class TestStockEcuLost:
+  """Behind Mazda's Smart CAN Filter a lost board drops the car's cruise with no fault, and MADS strips pcmDisable's
+  chime: the loss is said once, loud if openpilot was engaged on the frame before."""
+
+  def _events(self, engaged: bool):
+    car_events = _car_events(sp_flags=MazdaFlagsSP.CAN_FILTER)
+    assert not _lost_update(car_events, "ready", False, engaged).zp.events
+    # the loss frame: carstate already shows the cruise dropped
+    first = _lost_update(car_events, "restoring", True, False)
+    later = [_lost_update(car_events, s, True, False) for s in ("restoring", "restored", "restored")]
+    return first, later
+
+  def test_loud_once_when_engaged(self):
+    first, later = self._events(engaged=True)
+    assert first.zp.has(EventNameZP.stockEcuLost) and not first.zp.has(EventNameZP.stockEcuLostIdle)
+    assert not any(e.zp.has(EventNameZP.stockEcuLost) or e.zp.has(EventNameZP.stockEcuLostIdle) for e in later)
+
+  def test_loud_when_carstatesp_trails_carstate(self):
+    # selfdrived reads carState first; carStateSP can be a frame behind it, after the cruise already dropped
+    car_events = _car_events(sp_flags=MazdaFlagsSP.CAN_FILTER)
+    _lost_update(car_events, "ready", False, True)
+    assert not _lost_update(car_events, "ready", False, False).zp.events
+    assert _lost_update(car_events, "restoring", True, False).zp.has(EventNameZP.stockEcuLost)
+
+  def test_quiet_past_the_window(self):
+    car_events = _car_events(sp_flags=MazdaFlagsSP.CAN_FILTER)
+    _lost_update(car_events, "ready", False, True)
+    for _ in range(CarSpecificEventsSP.LOST_ENGAGED_FRAMES):
+      _lost_update(car_events, "ready", False, False)
+    assert _lost_update(car_events, "restoring", True, False).zp.has(EventNameZP.stockEcuLostIdle)
+
+  def test_window_is_half_a_second(self):
+    assert CarSpecificEventsSP.LOST_ENGAGED_FRAMES == int(0.5 / DT_CTRL)
+
+  def test_quiet_once_when_not_engaged(self):
+    # also the board that never confirmed: 10 s of starting, then lost
+    first, later = self._events(engaged=False)
+    assert first.zp.has(EventNameZP.stockEcuLostIdle) and not first.zp.has(EventNameZP.stockEcuLost)
+    assert not any(e.zp.has(EventNameZP.stockEcuLostIdle) for e in later)
+
+  def test_a_handback_says_nothing(self):
+    car_events = _car_events(sp_flags=MazdaFlagsSP.CAN_FILTER)
+    for state in ("ready", "restoring", "restored", "notNeeded"):
+      events = _lost_update(car_events, state, False, False)
+      assert not events.zp.has(EventNameZP.stockEcuLost) and not events.zp.has(EventNameZP.stockEcuLostIdle)
+
+  def test_shapes(self):
+    loud = EVENTS_ZP[EventNameZP.stockEcuLost][ET.PERMANENT]
+    assert loud.audible_alert == AudibleAlert.warningImmediate and loud.alert_text_1 == "Cruise Lost"
+    quiet = EVENTS_ZP[EventNameZP.stockEcuLostIdle][ET.PERMANENT]
+    assert quiet.audible_alert == AudibleAlert.prompt
+
+  @pytest.mark.parametrize("event", ["stockEcuLost", "stockEcuLostIdle"])
+  def test_shows_with_nothing_engaged(self, event):
+    # MADS lateral on, selfdrived already disengaged by the dropped cruise: PERMANENT still reaches the driver
+    events_sp = EventsSP()
+    events_sp.zp.add(getattr(EventNameZP, event))
+    assert _shown(events_sp, "restoring") == [f"{event}/permanent"]
+
+
+class TestCardPublishesTheLoss:
+  """card copies the controller's stock_ecu_lost into carStateSP, the alert's only input."""
+
+  class _Helper:
+    def __init__(self):
+      self.cruise_arbiter = type("Arbiter", (), {"fill_msg": lambda self, CS_SP: None})()
+      self.icbm_latch = type("Latch", (), {"activation": "unset"})()
+
+    def update_plan_regime(self, *args):
+      pass
+
+    def reconcile_setpoint_with_dash(self, CS):
+      pass
+
+  @pytest.mark.parametrize("lost", [False, True])
+  def test_published(self, lost):
+    from openpilot.sunnypilot.selfdrive.car.card_ext import CardExt
+    ext = CardExt.__new__(CardExt)
+    ext.sm = {'longitudinalPlanSP': None, 'carControlSP': None}
+    ext.v_cruise_helper = self._Helper()
+    ext.controller = type("CC", (), {"stock_ecu_lost": lost})()
+    ext.car_state = object()
+    CS_SP = messaging.new_message('carStateSP').carStateSP
+    ext.update_v_cruise_post(structs.CarState(), CS_SP)
+    assert CS_SP.zoompilot.stockEcuLost == lost
+
+  def test_a_controller_without_it_publishes_false(self):
+    from openpilot.sunnypilot.selfdrive.car.card_ext import CardExt
+    ext = CardExt.__new__(CardExt)
+    ext.sm = {'longitudinalPlanSP': None, 'carControlSP': None}
+    ext.v_cruise_helper = self._Helper()
+    ext.controller = object()
+    ext.car_state = object()
+    CS_SP = messaging.new_message('carStateSP').carStateSP
+    ext.update_v_cruise_post(structs.CarState(), CS_SP)
+    assert not CS_SP.zoompilot.stockEcuLost

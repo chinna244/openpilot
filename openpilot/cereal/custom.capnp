@@ -646,6 +646,8 @@ struct OnroadEventZP @0xeff60a9f4d5cb12f {
     cameraLkasResumed @16;
     speedAssistSwitched @17;
     radarLostCameraOnly @18;
+    stockEcuLost @19;
+    stockEcuLostIdle @20;
   }
 }
 
@@ -679,6 +681,9 @@ struct CarStateZP @0xc879af11c43cb400 {
   # The driver asked for alpha long (Mazda: RES before the car's own cruise ran); the radar is
   # taken at the next stop.
   alphaLongRequested @7 :Bool;
+  # The stock ECU stand-in was lost, or never confirmed, for the drive (Mazda's Smart CAN Filter): unlike a
+  # hand-back, nothing asked for it, and the car's cruise dropped without a fault.
+  stockEcuLost @8 :Bool;
 
   enum StockEcuState {
     notNeeded @0;

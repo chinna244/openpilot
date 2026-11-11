@@ -317,6 +317,19 @@ EVENTS_ZP: dict[int, dict[str, Alert | AlertCallbackType]] = {
       Priority.MID, VisualAlert.steerRequired, AudibleAlert.warningSoft, .2),
   },
 
+  # Behind Mazda's Smart CAN Filter the board stopped confirming openpilot's cruise while engaged: the car's cruise
+  # let go of gas and brake with no fault (MADS keeps steering). As loud as an immediate disable, for 3 s.
+  EventNameZP.stockEcuLost: {
+    ET.PERMANENT: Alert("Cruise Lost", "CAN filter dropped", AlertStatus.critical, AlertSize.mid,
+                        Priority.HIGH, VisualAlert.none, AudibleAlert.warningImmediate, 3.),
+  },
+
+  # The same loss while not engaged, or a board that never confirmed (10 s): alpha long is off for the drive.
+  EventNameZP.stockEcuLostIdle: {
+    ET.PERMANENT: Alert("Stock Cruise", "CAN filter lost", AlertStatus.normal, AlertSize.mid,
+                        Priority.LOW, VisualAlert.none, AudibleAlert.prompt, 5.),
+  },
+
   # Behind Mazda's Smart CAN Filter the radar's tracks stopped: openpilot keeps driving on the
   # camera's leads, and says so once. PERMANENT so it reaches a driver who is not engaged yet.
   EventNameZP.radarLostCameraOnly: {
@@ -328,7 +341,8 @@ EVENTS_ZP: dict[int, dict[str, Alert | AlertCallbackType]] = {
 # The radar messages chime once: another alert shown over one (an engage chime, a gear change)
 # must not replay its sound when it comes back (route 00000133, 163.3 s and 271.2 s).
 for _event in (EventNameZP.stockEcuReady, EventNameZP.stockEcuHandedBack, EventNameZP.alphaLongNextStop,
-               EventNameZP.cameraLkasFaultOnset, EventNameZP.cameraLkasResumed, EventNameZP.radarLostCameraOnly):
+               EventNameZP.cameraLkasFaultOnset, EventNameZP.cameraLkasResumed, EventNameZP.radarLostCameraOnly,
+               EventNameZP.stockEcuLost, EventNameZP.stockEcuLostIdle):
   EVENTS_ZP[_event][ET.PERMANENT].sound_once = True
 
 

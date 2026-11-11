@@ -49,6 +49,8 @@ class CardExt:
     CS_SP.zoompilot.aebSettingOff = bool(getattr(self.car_state, "aeb_setting_off", False))
     # alpha long asked for and not yet taken over, for the "next stop" line
     CS_SP.zoompilot.alphaLongRequested = bool(getattr(self.controller, "alpha_long_requested", False))
+    # the stock ECU stand-in lost for the drive, for the loss alert
+    CS_SP.zoompilot.stockEcuLost = bool(getattr(self.controller, "stock_ecu_lost", False))
 
   @property
   def stock_ecu_state(self) -> StockEcuState:
