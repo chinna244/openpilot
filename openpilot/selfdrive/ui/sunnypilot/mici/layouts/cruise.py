@@ -70,6 +70,10 @@ class CruiseLayoutMici(NavScroller):
                                                                "Takes effect at the next drive initialization."))
     self._can_filter_toggle.set_enabled(ui_state.is_offroad)
     self._can_filter_toggle.set_visible(ui_state.mazda_can_filter_available)
+    # stored value is the index into curve_speed_profile.SCALES
+    self._curve_speed = BigMultiParamToggleSP(tr("curve speed"), "CurveSpeedProfile", [tr("gentle"), tr("normal"), tr("sporty")],
+                                              description=tr("How fast slow for curves takes turns.\n" +
+                                                             "Gentle slows more. Sporty slows less."))
     self._custom_acc_btn = BigButtonSP(tr("custom increments"))
     self._speed_limit_btn = BigButtonSP(tr("speed limit"))
 
@@ -79,7 +83,7 @@ class CruiseLayoutMici(NavScroller):
     self._scroller.add_widgets([
       *self._alpha_long.items,
       self._can_filter_toggle,
-      self._scc_v_toggle, self._scc_m_toggle,
+      self._scc_v_toggle, self._scc_m_toggle, self._curve_speed,
       self._speed_limit_btn, self._custom_acc_btn,
     ])
 
@@ -134,6 +138,7 @@ class CruiseLayoutMici(NavScroller):
     self._scc_v_toggle.refresh()
     self._scc_m_toggle.refresh()
     self._can_filter_toggle.refresh()
+    self._curve_speed.refresh()
 
     cp_ready = ui_state.CP is not None and ui_state.CP_SP is not None
     has_long = cp_ready and ui_state.has_longitudinal_control
@@ -141,6 +146,8 @@ class CruiseLayoutMici(NavScroller):
 
     for toggle in (self._scc_v_toggle, self._scc_m_toggle):
       toggle.set_superseded(not (has_long or has_icbm))
+    # nothing reads it with both curve features off
+    self._curve_speed.set_superseded(not (has_long or has_icbm) or not (self._scc_v_toggle._checked or self._scc_m_toggle._checked))
     # has_long and has_icbm are False until CP is ready, so CP is not read before then
     custom_acc_available = (has_long and not ui_state.CP.pcmCruise) or has_icbm
     self._custom_acc_toggle.set_superseded(not custom_acc_available)

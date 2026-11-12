@@ -10,7 +10,7 @@ from openpilot.common.filter_simple import FirstOrderFilter
 from openpilot.selfdrive.ui.mici.onroad.hud_renderer import HudRenderer
 from openpilot.selfdrive.ui.sunnypilot.onroad.blind_spot_indicators import BlindSpotIndicators
 from openpilot.selfdrive.ui.sunnypilot.onroad.speed_assist_badge import GAUGE_ASPECT, draw_gauge_centered
-from openpilot.selfdrive.ui.ui_state import UIStatus, ui_state
+from openpilot.selfdrive.ui.ui_state import ui_state
 from openpilot.sunnypilot.selfdrive.controls.lib.e2e_set_speed.approach import approach_ceiling
 from openpilot.system.ui.lib.application import gui_app
 
@@ -57,9 +57,9 @@ class HudRendererSP(HudRenderer):
     return rl.Rectangle(*(c + s * (b - c) for c, b in zip((corner.x, corner.y, corner.width, corner.height), beside, strict=True)))
 
   def _draw_speed_assist(self, rect: rl.Rectangle) -> None:
-    # comes and goes with the wheel
+    # comes and goes with the long indicator (not under MADS lateral-only)
     wheel = self._txt_wheel
-    shown = (ui_state.speed_assist_active and ui_state.status != UIStatus.DISENGAGED and
+    shown = (ui_state.speed_assist and ui_state.long_engaged and
              not self.blind_spot_indicators.right_detected)
     lift = self._speed_assist_lift_filter.update(self._speed_assist_lift_fraction() if shown else 0.0)
     alpha = self._speed_assist_shown_filter.update(float(shown)) * \
