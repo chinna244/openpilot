@@ -18,14 +18,15 @@ This lifts the e2e candidate toward what chill mode would do and never lowers it
 floor is chill mode's answer, the lower of the planner's own lead MPC and cruise candidates
 (upstream's cruise law with SCC and SLA's targets), so with nothing to slow for experimental mode
 drives and follows as chill does. gain fades the lift out as the model eases off (its own
-acceleration and its throttle probability) and below walking pace, and fade as the road ahead bends
-at the current speed. Every slowdown is the model's: the lift only lets go of it, and a lead that
-brakes binds through the MPC candidate at once.
+acceleration and its throttle probability), now or over its plan (a stop, a light, a closing
+lead), and below walking pace, and fade as the road ahead bends at the current speed. Every
+slowdown is the model's: the lift only lets go of it, and a lead that brakes binds through the
+MPC candidate at once.
 
 A lift that could go negative made the car pump on a straight road: the plan's far end flickers
 by several mph from one frame to the next, and handing back added speed on each flicker
-alternated throttle and brake every 15-20 s. Read only through the model's own acceleration and
-probability, and the road's geometry, the lift has no such input to chase. Design and data:
+alternated throttle and brake every 15-20 s. The lift reads the plan's speeds only for a slowdown
+well past that flicker, and only to let go, so it has no such input to chase. Design and data:
 docs/zoompilot/e2e-set-speed.md.
 """
 import math
@@ -54,7 +55,11 @@ FULL_SPEED = 8.0  # m/s
 GAIN_BP = [-0.3, -0.1]  # m/s^2
 # No lift where the road ahead bends harder than this at the current speed.
 FADE_LAT_BP = [0.6, 1.0]  # m/s^2
-LAT_HORIZON = 10.0  # s
+HORIZON = 10.0  # s
+# The planned slowdown, read through GAIN_BP as its mean over HORIZON: the plan ending 1-3 m/s under
+# the current speed (its far end flickers by about 1 m/s on a straight road), or a lead closing this
+# fast. A lead counts in full under 15 s to contact and not at all past 25 s.
+LEAD_TTC_BP = [15., 25.]  # s
 
 # The lift rises at upstream's cruise jerk, as the cruise candidate it stands in for. This is the
 # slowest it eases off, e.g. on a lane change or a bend.
@@ -97,7 +102,17 @@ PLB_JERK = 1.0  # m/s^3, into the brake
 PLB_RELEASE = 1.0  # m/s^3, out of it
 
 T_IDXS = np.asarray(ModelConstants.T_IDXS)
-LAT_MASK = T_IDXS <= LAT_HORIZON
+HORIZON_MASK = T_IDXS <= HORIZON
+
+
+def planned_slowdown(v_ego: float, plan_v: np.ndarray, lead) -> float:
+  """m/s the car is set to shed over the horizon: down to the plan's lowest speed, or a closing
+  lead's closing speed as it nears contact."""
+  drop = v_ego - float(np.min(plan_v[HORIZON_MASK]))
+  if lead.present and math.isfinite(lead.vRel) and math.isfinite(lead.dRel) and lead.vRel < 0.:
+    ttc = max(lead.dRel, 0.) / -lead.vRel
+    drop = max(drop, -lead.vRel * float(np.interp(ttc, LEAD_TTC_BP, [1., 0.])))
+  return drop
 
 
 def floor_max(v_ego: float) -> float:
@@ -134,6 +149,7 @@ class E2ESetSpeedController:
   def _reset(self, reason) -> None:
     self.gain = 0.
     self.fade = 0.
+    self.plan_fade = 0.
     self.floor = 0.
     self.lift = 0.
     self.plb_count = 0
@@ -153,6 +169,7 @@ class E2ESetSpeedController:
     """Report into LongitudinalPlanZP.e2eSetSpeed."""
     msg.gain = float(self.gain)
     msg.fade = float(self.fade)
+    msg.planFade = float(self.plan_fade)
     msg.floor = float(self.floor)
     msg.boost = float(self.lift)
     msg.inhibit = self.inhibit
@@ -192,13 +209,16 @@ class E2ESetSpeedController:
 
     # the road's geometry ahead at the current speed, not the plan's speeds, which flicker
     lat_now = max(abs(curvature) * v_ego ** 2, abs(steer_lat_accel))
-    kappa_ahead = float(np.max((np.abs(yaw_rate) / np.maximum(vel, 1.))[LAT_MASK]))
+    kappa_ahead = float(np.max((np.abs(yaw_rate) / np.maximum(vel, 1.))[HORIZON_MASK]))
     lat_ahead = max(lat_now, kappa_ahead * v_ego ** 2)
 
     approach = float(np.clip((v_cruise - v_ego) / TAU, 0., floor_max(v_ego))) if math.isfinite(v_cruise) else floor_max(v_ego)
     self.floor = min(a_chill, approach)
+    # the model's decision, now and over its plan: a gentle coast toward a stop still lets go
+    self.plan_fade = float(np.interp(-planned_slowdown(v_ego, vel, sm['radarState'].leadOne) / HORIZON, GAIN_BP, [0., 1.]))
     # stop-and-go stays the model's: the gain fades in above walking pace
-    model_gain = float(np.interp(a_model, GAIN_BP, [0., 1.])) * float(np.interp(v_ego, [MIN_SPEED, FULL_SPEED], [0., 1.]))
+    model_gain = (min(float(np.interp(a_model, GAIN_BP, [0., 1.])), self.plan_fade) *
+                  float(np.interp(v_ego, [MIN_SPEED, FULL_SPEED], [0., 1.])))
     self.gain = model_gain * float(np.clip(throttle_prob, 0., 1.))
     self.fade = float(np.interp(lat_ahead, FADE_LAT_BP, [1., 0.]))
 

@@ -131,9 +131,10 @@ def test_no_lift_once_the_plan_holds_a_slowdown():
   run(ctl, SETTLE, build_sm(V_EGO))  # settled on the floor
   assert ctl.lift == pytest.approx(0.7)
   sm = build_sm(V_EGO, plan_v=EASING)
-  run(ctl, ARM - 1, sm, a_model=-0.15)
-  assert ctl.lift > 0.5  # not before 0.5 s (gain 0.75 at -0.15 eases it toward 0.64)
-  run(ctl, 20, sm, a_model=-0.15)
+  run(ctl, 1, sm, a_model=-0.15)
+  # 4.5 m/s down over 10 s: plan_fade (upstream, 2026-11-12) lets go at once, before the 0.5 s slowing gate
+  assert ctl.plan_fade == 0. and ctl.lift == 0.
+  run(ctl, ARM + 20, sm, a_model=-0.15)
   assert ctl.lift == 0.
   assert run(ctl, 1, sm, a_model=-0.15) == pytest.approx(-0.15)
 
