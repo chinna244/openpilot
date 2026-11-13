@@ -169,15 +169,15 @@ EVENTS_ZP: dict[int, dict[str, Alert | AlertCallbackType]] = {
     **({ET.PERMANENT: NormalPermanentAlert("Lateral Disabled", "LKAS is off", priority=Priority.LOW)} if IS_MICI else {}),
   },
 
-  # Mazda: steerUnavailable (the camera's fault) is swapped for this when MADS is on
+  # Mazda: steerUnavailable (the EPS's LKAS_FAULT) is swapped for this when MADS is on
   # (CarSpecificEventsSP); MADS holds lateral paused on it and cruise stays engaged.
   EventNameZP.cameraLkasFault: {
     ET.NO_ENTRY: Alert(
       "Lateral Disabled",
-      "Camera blocked",
+      "Steering fault",
       AlertStatus.normal, AlertSize.mid,
       Priority.LOW, VisualAlert.none, AudibleAlert.refuse, 3.),
-    ET.PERMANENT: NormalPermanentAlert("Steering Paused", "Camera blocked", priority=Priority.LOW),
+    ET.PERMANENT: NormalPermanentAlert("Steering Paused", "Steering fault", priority=Priority.LOW),
   },
 
   # The fault's first frame while MADS is on (mads.py): as loud as a soft disable for 3 s, but
@@ -185,7 +185,7 @@ EVENTS_ZP: dict[int, dict[str, Alert | AlertCallbackType]] = {
   EventNameZP.cameraLkasFaultOnset: {
     ET.PERMANENT: Alert(
       "Steering Paused: Steer Now",
-      "Camera blocked",
+      "Steering fault",
       AlertStatus.userPrompt, AlertSize.mid,
       Priority.MID, VisualAlert.steerRequired, AudibleAlert.warningSoft, 3.),
   },
