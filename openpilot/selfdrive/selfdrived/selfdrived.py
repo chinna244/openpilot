@@ -138,6 +138,7 @@ class SelfdriveD:
     self.mismatch_counter = 0
     self.cruise_mismatch_counter = 0
     self.last_steering_pressed_frame = 0
+    self.steer_help_cnt = 0
     self.distance_traveled = 0
     self.last_functional_fan_frame = 0
     self.events_prev = []
@@ -497,7 +498,13 @@ class SelfdriveD:
         self.events.add(EventName.cruiseMismatch)
 
     # Send a "steering required alert" if saturation count has reached the limit
-    if CS.steeringPressed:
+    # Mazda: a light push in the direction openpilot is steering (below the 15 steeringPressed
+    # threshold) is the driver helping the turn; count it so the saturation alert stops
+    if self.CP.brand == 'mazda':
+      steer_cmd = self.sm['carControl'].actuators.torque
+      helping = abs(steer_cmd) > 0.05 and abs(CS.steeringTorque) >= 8 and (CS.steeringTorque > 0) == (steer_cmd > 0)
+      self.steer_help_cnt = min(max(self.steer_help_cnt + (1 if helping else -1), 0), 11)
+    if CS.steeringPressed or self.steer_help_cnt > 5:
       self.last_steering_pressed_frame = self.sm.frame
     recent_steer_pressed = (self.sm.frame - self.last_steering_pressed_frame)*DT_CTRL < 2.0
     controlstate = self.sm['controlsState']
