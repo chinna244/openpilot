@@ -20,7 +20,8 @@ def plan_ramp(v_ego: float, drop: float) -> np.ndarray:
 
 
 def build_sm(v_ego: float, plan_v=None, yaw_rate=0., curvature=0., gas=False, brake=False, should_stop=False,
-             hard_brake=False, force_decel=False, lane_change=False, throttle_prob=1., lead=None) -> dict:
+             hard_brake=False, force_decel=False, lane_change=False, throttle_prob=1., lead=None, steer_deg=0.,
+             blinker=False) -> dict:
   """Readers for the four services the controller reads. plan_v and yaw_rate take a scalar or a
   33-point trajectory on the model's T_IDXS. lead: (dRel, vRel) of a present leadOne, or True for a
   present one at rest relative to us."""
@@ -28,6 +29,8 @@ def build_sm(v_ego: float, plan_v=None, yaw_rate=0., curvature=0., gas=False, br
   cs.carState.vEgo = v_ego
   cs.carState.gasPressed = gas
   cs.carState.brakePressed = brake
+  cs.carState.steeringAngleDeg = steer_deg
+  cs.carState.leftBlinker = blinker
 
   md = messaging.new_message('modelV2')
   vel = np.full(len(T_IDXS), v_ego) if plan_v is None else np.broadcast_to(np.asarray(plan_v, dtype=float), T_IDXS.shape)

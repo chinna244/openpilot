@@ -38,6 +38,7 @@ import openpilot.cereal.messaging as messaging
 from openpilot.cereal import custom, log
 from openpilot.common.params import Params
 from openpilot.common.realtime import DT_MDL
+from openpilot.selfdrive.controls.lib.firm_stop import plan_stop_distance
 from openpilot.selfdrive.modeld.constants import ModelConstants
 from openpilot.sunnypilot import PARAMS_UPDATE_PERIOD
 
@@ -101,6 +102,23 @@ PLB_DROP = 0.5  # m/s, plan speeds this far under the start count as slowing
 PLB_JERK = 1.0  # m/s^3, into the brake
 PLB_RELEASE = 1.0  # m/s^3, out of it
 
+# Departure. After an engaged stop the model can crawl at 2-5 mph for seconds across an empty intersection: route
+# 00000066 t=251 a stop-sign departure held 3.7-4.7 mph for 3 s with the plan at -0.1..0.0, 00000037 t=257 2 mph for
+# 7 s, both until the driver pressed again. When the driver presses the gas within DEPART_STOP_T of an engaged stop
+# and lets go under DEPART_MAX_V, straight, no blinker and no lead within DEPART_LEAD_D, the lift works below walking
+# pace and without the throttle probability for DEPART_T or until FULL_SPEED; the model's own braking still lets go
+# at once. A brake, a lead, a blinker, a turn or a planned stop ends it at once, otherwise it eases out at LIFT_FALL. Over 231
+# engaged releases under 8 mph in 195 drives it armed 33 times and acted 11, the driver braking in none; with
+# blinkers allowed two waits to turn (00000060 t=946, 00000180 t=135) pushed and the driver braked.
+DEPART_STOP_V = 0.1  # m/s
+DEPART_STOP_T = 5.0  # s
+DEPART_MAX_V = 3.6  # m/s, 8 mph
+DEPART_T = 4.0  # s
+DEPART_REENGAGE_T = 1.0  # s, longitudinal control back after the press
+DEPART_LEAD_D = 30.  # m
+DEPART_STEER_ARM = 30.  # deg
+DEPART_STEER_END = 45.  # deg
+
 T_IDXS = np.asarray(ModelConstants.T_IDXS)
 HORIZON_MASK = T_IDXS <= HORIZON
 
@@ -144,6 +162,13 @@ class E2ESetSpeedController:
     self.plb_arm_frames = int(round(PLB_ARM / dt))
     self.frame = -1
     self.enabled = False
+    # departure tracking runs through resets: a gas override resets the controller every frame
+    self.since_stop = math.inf
+    self.gas_prev = False
+    self.prev_reset = True
+    self.press_from_stop = False
+    self.depart_t: float | None = None  # s into a departure window
+    self.depart_ease = False  # a window that ran out, its lift easing off
     self._reset(Inhibit.disabled)
 
   def _reset(self, reason) -> None:
@@ -155,11 +180,40 @@ class E2ESetSpeedController:
     self.plb_count = 0
     self.plb_armed = False
     self.slowing_count = 0
+    self.depart_ease = False
     # an invalid model frame lets an active plan-lead brake ease out instead of dropping it
     if reason != Inhibit.invalid:
       self.plb = 0.
       self.plb_active = False
     self.inhibit = reason
+
+  def _update_departure(self, sm: messaging.SubMaster, reset_state: bool) -> None:
+    cs = sm['carState']
+    lead = sm['radarState'].leadOne
+    # only an engaged stop counts
+    self.since_stop = 0. if cs.vEgo < DEPART_STOP_V and not reset_state else self.since_stop + self.dt
+    lead_near = lead.present and not lead.dRel >= DEPART_LEAD_D  # a NaN distance counts as near
+    blinker = cs.leftBlinker or cs.rightBlinker
+    turning = abs(cs.steeringAngleDeg) > DEPART_STEER_END
+    if cs.gasPressed and not self.gas_prev:
+      # a press from an engaged stop: the frame before it was engaged
+      self.press_from_stop = self.since_stop <= DEPART_STOP_T and not self.prev_reset
+      self.depart_t, self.depart_ease = None, False
+    elif self.gas_prev and not cs.gasPressed:
+      if (self.press_from_stop and cs.vEgo < DEPART_MAX_V and not lead_near and not blinker and
+          abs(cs.steeringAngleDeg) < DEPART_STEER_ARM):
+        self.depart_t = 0.
+      self.press_from_stop = False
+    elif self.depart_t is not None:
+      self.depart_t += self.dt
+      if cs.brakePressed or lead_near or blinker or turning or (reset_state and self.depart_t > DEPART_REENGAGE_T):
+        self.depart_t, self.depart_ease = None, False
+      elif self.depart_t > DEPART_T or cs.vEgo >= FULL_SPEED:
+        self.depart_t, self.depart_ease = None, True
+    if cs.brakePressed or lead_near or blinker or turning:
+      self.depart_ease = False
+    self.gas_prev = cs.gasPressed
+    self.prev_reset = reset_state
 
   def _update_params(self) -> None:
     if self.frame % self.params_frames == 0:
@@ -182,6 +236,7 @@ class E2ESetSpeedController:
     v_cruise: this frame's cruise target after SCC and SLA, which the floor approaches over TAU."""
     self.frame += 1
     self._update_params()
+    self._update_departure(sm, reset_state)
 
     # switched off with a lift on: it goes out at LIFT_FALL below, then the controller idles; so does a
     # plan-lead brake, at PLB_RELEASE
@@ -207,6 +262,11 @@ class E2ESetSpeedController:
       self._reset(Inhibit.invalid)
       return self._plan_lead(a_model, None) if math.isfinite(a_model) else a_model
 
+    # a departure ends at once when the model plans a stop: at a crawl a planned stop sheds too little speed for
+    # plan_fade, and too gently for the slowing gate, to let go of it
+    if self.depart_t is not None and math.isfinite(plan_stop_distance(vel, pos)):
+      self.depart_t, self.depart_ease = None, False
+
     # the road's geometry ahead at the current speed, not the plan's speeds, which flicker
     lat_now = max(abs(curvature) * v_ego ** 2, abs(steer_lat_accel))
     kappa_ahead = float(np.max((np.abs(yaw_rate) / np.maximum(vel, 1.))[HORIZON_MASK]))
@@ -216,10 +276,12 @@ class E2ESetSpeedController:
     self.floor = min(a_chill, approach)
     # the model's decision, now and over its plan: a gentle coast toward a stop still lets go
     self.plan_fade = float(np.interp(-planned_slowdown(v_ego, vel, sm['radarState'].leadOne) / HORIZON, GAIN_BP, [0., 1.]))
-    # stop-and-go stays the model's: the gain fades in above walking pace
-    model_gain = (min(float(np.interp(a_model, GAIN_BP, [0., 1.])), self.plan_fade) *
-                  float(np.interp(v_ego, [MIN_SPEED, FULL_SPEED], [0., 1.])))
-    self.gain = model_gain * float(np.clip(throttle_prob, 0., 1.))
+    # stop-and-go stays the model's: the gain fades in above walking pace, except in a departure window
+    model_term = min(float(np.interp(a_model, GAIN_BP, [0., 1.])), self.plan_fade)
+    speed_fade = float(np.interp(v_ego, [MIN_SPEED, FULL_SPEED], [0., 1.]))
+    window = self.depart_t is not None
+    model_gain = model_term * (1. if window else speed_fade)
+    self.gain = model_gain * (1. if window else float(np.clip(throttle_prob, 0., 1.)))
     self.fade = float(np.interp(lat_ahead, FADE_LAT_BP, [1., 0.]))
 
     if not self.enabled:
@@ -238,8 +300,12 @@ class E2ESetSpeedController:
     # Normally the lift eases off at LIFT_FALL. When the model starts to brake the gain drops, and
     # the lift may drop with it in one frame, so at gain 0 the model's braking is not delayed. Only the
     # model's own easing off counts here: a flickering throttle probability eases out at LIFT_FALL.
-    fall = max(LIFT_FALL * self.dt, (1. - model_gain) * self.lift)
+    # A departure window that ran out eases off at LIFT_FALL instead of dropping with the speed fade.
+    fall_gain = model_term * (1. if window or self.depart_ease else speed_fade)
+    fall = max(LIFT_FALL * self.dt, (1. - fall_gain) * self.lift)
     self.lift = rate_limit(target, self.lift, -fall, lift_rise(v_ego) * self.dt)
+    if self.lift == 0.:
+      self.depart_ease = False
 
     # Arms on PLB_ARM of consecutive need, only at speed; once armed it stays through the final approach under
     # MIN_SPEED, where the model's lag would otherwise leave it the hardest braking.
