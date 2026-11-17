@@ -9,7 +9,8 @@ part of this port.
 
 from openpilot.common.params import Params
 from openpilot.sunnypilot.selfdrive.controls.lib.vision_force_stop.curve import frozen_raw_curve
-from openpilot.sunnypilot.selfdrive.controls.lib.vision_force_stop.force_stop import ForceStop, StopFrame, StopPlan, vehicle_tune
+from openpilot.sunnypilot.selfdrive.controls.lib.vision_force_stop.force_stop import (SIGN_MODEL_AGREE_M, ForceStop, StopFrame, StopPlan,
+                                                                                     vehicle_tune)
 from openpilot.sunnypilot.selfdrive.controls.lib.vision_force_stop.lead_tracking import LeadDetector
 from openpilot.sunnypilot.selfdrive.controls.lib.vision_force_stop.model_geometry import normalized_origin, road_curvature, _finite
 from openpilot.sunnypilot.selfdrive.controls.lib.vision_force_stop.stop_confirm import (CONTROL_STOP_MAX_AGE_NS, StopConfirmation,
@@ -17,6 +18,7 @@ from openpilot.sunnypilot.selfdrive.controls.lib.vision_force_stop.stop_confirm 
 from openpilot.sunnypilot.selfdrive.controls.lib.vision_force_stop.stop_resume import StopResume
 
 KEY = 'VisionForceStop'
+MODEL_SLOWING_RATIO = .8  # the model slowing: its path ends this far short of the speed held over 10 s
 SOURCE_AGE_NS = 150_000_000
 SERVICES = ('modelV2', 'carState', 'carControl', 'controlsState', 'selfdriveState', 'radarState')
 
@@ -101,7 +103,11 @@ class VisionForceStop:
         self.vision_ranged_ns = 0  # fork: a confirmation still fresh after the reset is ranged again, not seeded at 27 m
         self.plan = StopPlan()
         return self.plan
-      vision_sign = self.vision_stop.observe(read_stop_evidence(sm, now_ns=now_ns, drive_id=drive_id), now_ns=now_ns)
+      # the model slowing: its 10 s path ends within SIGN_MODEL_AGREE_M and well short of the speed held (under ~11 mph
+      # the path is shorter than 50 m at any steady speed)
+      model_slowing = horizon is not None and horizon < min(SIGN_MODEL_AGREE_M, MODEL_SLOWING_RATIO * 10. * float(car.vEgo))
+      vision_sign = self.vision_stop.observe(read_stop_evidence(sm, now_ns=now_ns, drive_id=drive_id), now_ns=now_ns,
+                                             model_agrees=model_slowing)
       vision_fresh = bool(vision_sign and 0 <= now_ns - vision_sign <= CONTROL_STOP_MAX_AGE_NS)
       vision_distance = None
       if vision_fresh and vision_sign != self.vision_ranged_ns and self.vision_stop.distance_m is not None:

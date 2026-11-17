@@ -97,8 +97,24 @@ class StopConfirmation:
     self.confirmed_ns = 0
     self.first_seen_ns = 0
     self.distance_m: float | None = None
+    self._rejected = False
 
-  def observe(self, sample: StopEvidence | None, *, now_ns: int) -> int:
+  def observe(self, sample: StopEvidence | None, *, now_ns: int, model_agrees: bool = False) -> int:
+    """model_agrees: the driving model plans to slow within SIGN_MODEL_AGREE_M. fork: two independent sources agreeing
+    is the evidence StarPilot's second camera hit stands for. At 18-26 mph the sign is first seen 15-25 m out and the
+    0.5 s second-hit wait cost 5-8 m (home junction, routes 51-6c); acting on the first hit there commits ~5 m earlier
+    (replay of routes 45-6c: braking needed 1.59 -> 1.39 m/s2 median, the same 2 non-STOP episodes)."""
+    self._rejected = False
+    confirmed = self._observe(sample, now_ns=now_ns)
+    if not confirmed and model_agrees and not self._rejected and sample is not None and 0 <= now_ns - sample.observed_ns < STOP_MAX_AGE_NS:
+      candidates = [box for box in sample.boxes if box.confidence >= STOP_CONFIRM_CONFIDENCE]
+      if candidates:
+        self.confirmed_ns = sample.observed_ns
+        self.distance_m = stop_distance(sample, max(candidates, key=lambda box: box.confidence))
+        confirmed = self.confirmed_ns
+    return confirmed
+
+  def _observe(self, sample: StopEvidence | None, *, now_ns: int) -> int:
     if sample is None or not 0 <= now_ns - sample.observed_ns < STOP_MAX_AGE_NS:
       self.reset()
       return 0
@@ -110,10 +126,12 @@ class StopConfirmation:
     if previous is not None and sample.observed_ns == previous.observed_ns and sample.frame_id == previous.frame_id:
       if sample != previous:
         self.reset()
+        self._rejected = True
         return 0
       return self.confirmed_ns
     if previous is not None and (sample.observed_ns <= previous.observed_ns or sample.frame_id <= previous.frame_id):
       self.reset()
+      self._rejected = True
       return 0
     candidates = tuple(box for box in sample.boxes if box.confidence >= STOP_CONFIRM_CONFIDENCE)
     matched = tuple(new for new in candidates if previous is not None and

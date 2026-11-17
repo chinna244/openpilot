@@ -54,6 +54,26 @@ class ForceStopTests(unittest.TestCase):
           self.assertIsNone(plan.speed_ceiling_mps)
           self.assertIsNone(plan.obstacle_m)
 
+  def test_lead_beyond_the_sign_does_not_veto_the_sign_stop(self):
+    # route 6c t=102: a car 45 m ahead had gone through the junction; the sign's stop point was 16 m away
+    lead = {'lead_present': True, 'lead_distance_m': 45., 'lead_speed_mps': 9.}
+    for tick in range(15):
+      plan = self.owner.step(frame(tick, horizon_m=40., sign=True, vision_distance_m=16. if tick == 0 else None, **lead), self.tune)
+    self.assertTrue(plan.forcing)
+
+  def test_lead_before_the_sign_still_vetoes_the_sign_stop(self):
+    lead = {'lead_present': True, 'lead_distance_m': 12., 'lead_speed_mps': 9.}
+    for tick in range(15):
+      plan = self.owner.step(frame(tick, horizon_m=40., sign=True, vision_distance_m=16. if tick == 0 else None, **lead), self.tune)
+      self.assertFalse(plan.forcing)
+
+  def test_lead_vetoes_without_a_camera_range_to_the_sign(self):
+    # review: the 27 m seed (no camera range) is not enough to tell the lead has gone through
+    lead = {'lead_present': True, 'lead_distance_m': 45., 'lead_speed_mps': 9.}
+    for tick in range(15):
+      plan = self.owner.step(frame(tick, horizon_m=40., sign=True, **lead), self.tune)
+      self.assertFalse(plan.forcing)
+
   def test_lead_appearing_does_not_abandon_committed_stop(self):
     for tick in range(15):
       self.owner.step(frame(tick), self.tune)
