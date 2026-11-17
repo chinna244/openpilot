@@ -69,6 +69,7 @@ class SpeedLimitResolver:
     self._gps_location_service = get_gps_location_service(self.params)
     self.limit_solutions = {}  # Store for speed limit solutions from different sources
     self._map_vote_limit = 0.
+    self._map_held = 0.  # the map's last own limit, kept through a blank (no limit, fix and mapd current)
     self.distance_solutions = {}  # Store for distance to current speed limit start for different sources
 
     self.policy = self.params.get("SpeedLimitPolicy", return_default=True)
@@ -210,14 +211,18 @@ class SpeedLimitResolver:
     map_data = sm['liveMapDataSP']
 
     if self._gps_fix_age(sm) is None:
+      self._map_held = 0.
       return
 
     # plannerd ignores liveMapDataSP liveness: a mapd that stopped publishing leaves its last limit in the SubMaster
     map_data_age = self._message_age(sm, 'liveMapDataSP')
     if map_data_age is None:
+      self._map_held = 0.
       return
 
     speed_limit = map_data.speedLimit if map_data.speedLimitValid else 0.
+    if speed_limit > 0.:
+      self._map_held = speed_limit
     next_speed_limit = map_data.speedLimitAhead if map_data.speedLimitAheadValid else 0.
 
     self._calculate_map_data_limits(sm, speed_limit, next_speed_limit, map_data_age)
@@ -274,6 +279,15 @@ class SpeedLimitResolver:
     source = self._get_source_solution_according_to_policy()
     speed_limit = self.limit_solutions[source] if source else 0.
     distance = self.distance_solutions[source] if source else 0.
+
+    # mapd blanks at junctions: routes 54/66/67/6a "Press + for 41" from the car's 35 alone on a 25 road. While the map
+    # is blank, a lone source may lower the limit but not raise it above the map's last limit; it waits for the map to
+    # return or a second source to agree
+    if (Policy(self.policy) == Policy.combined and self.limit_solutions[SpeedLimitSource.map] <= 0. and
+        0. < self._map_held < speed_limit - VOTE_TOLERANCE and not any(
+          abs(speed_limit - self.limit_solutions[other]) <= VOTE_TOLERANCE
+          for other in ALL_SOURCES if other != source and self.limit_solutions[other] > 0.)):
+      return self._map_held, 0., SpeedLimitSource.map
 
     return speed_limit, distance, source
 
