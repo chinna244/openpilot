@@ -508,3 +508,48 @@ class TestSpeedLimitResolverVision(OpenpilotTestCase):
     self._feed(resolver, mocker, 25 * MPH, LAST_LIMIT_SETTLE + 0.5)
     self._feed(resolver, mocker, 0., 1.)
     assert resolver.speed_limit_last == 25 * MPH
+
+
+class TestSpeedLimitResolverMapBlank(OpenpilotTestCase):
+  """Combined: mapd blanks at junctions; a lone source may lower the limit then, not raise it (routes 54/66/67/6a)."""
+
+  def _blank(self, mocker, car, vision=0., before=25 * MPH, has_fix=True):
+    resolver = SpeedLimitResolver()
+    resolver.policy = Policy.combined
+    resolver.update_params = lambda: None  # keep the policy across updates
+    resolver.update(10., gps_sm(mocker, 0., before))
+    resolver.update(10., gps_sm(mocker, car, 0., has_fix=has_fix, vision=vision))
+    return resolver
+
+  def test_lone_car_raise_waits_for_the_map(self, mocker):
+    resolver = self._blank(mocker, 35 * MPH)
+    assert resolver.source == SpeedLimitSource.map and resolver.speed_limit == 25 * MPH
+
+  def test_lone_car_may_lower(self, mocker):
+    resolver = self._blank(mocker, 20 * MPH)
+    assert resolver.source == SpeedLimitSource.car and resolver.speed_limit == 20 * MPH
+
+  def test_two_agreeing_sources_raise(self, mocker):
+    resolver = self._blank(mocker, 35 * MPH, vision=35 * MPH)
+    assert resolver.speed_limit == 35 * MPH and resolver.source != SpeedLimitSource.map
+
+  def test_lone_camera_raise_waits_too(self, mocker):
+    resolver = self._blank(mocker, 0., vision=65 * MPH)
+    assert resolver.source == SpeedLimitSource.map and resolver.speed_limit == 25 * MPH
+
+  def test_map_back_with_a_new_limit_raises(self, mocker):
+    resolver = self._blank(mocker, 55 * MPH)
+    resolver.update(10., gps_sm(mocker, 55 * MPH, 50 * MPH))
+    assert resolver.source == SpeedLimitSource.map and resolver.speed_limit == 50 * MPH
+
+  def test_no_fix_drops_the_held_map_limit(self, mocker):
+    resolver = self._blank(mocker, 35 * MPH, has_fix=False)
+    assert resolver.source == SpeedLimitSource.car and resolver.speed_limit == 35 * MPH
+
+  def test_other_policies_unchanged(self, mocker):
+    resolver = SpeedLimitResolver()
+    resolver.policy = Policy.map_data_priority
+    resolver.update_params = lambda: None
+    resolver.update(10., gps_sm(mocker, 0., 25 * MPH))
+    resolver.update(10., gps_sm(mocker, 35 * MPH, 0.))
+    assert resolver.source == SpeedLimitSource.car and resolver.speed_limit == 35 * MPH
