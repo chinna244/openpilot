@@ -43,6 +43,8 @@ class CardExt:
     CS_SP.zoompilot.distanceFarther = bool(getattr(self.car_state, "distance_more_button", 0))
     # the EPS re-arming after the car's lane keep came back on, on the brands that track it
     CS_SP.zoompilot.lkasArming = bool(getattr(self.car_state, "lkas_arming", False))
+    # the camera's own TJA still on after openpilot's press-offs, on the brands that press it (Mazda)
+    CS_SP.zoompilot.cameraTjaStuck = bool(getattr(self.car_state, "camera_tja_stuck", False))
     # the stock ECU's own functions off or not yet back (Mazda: AEB), for the UI's marker and "AEB on"
     CS_SP.zoompilot.stockEcuOff = bool(getattr(self.controller, "stock_ecu_off", False))
     # the driver's own setting has AEB off (Mazda: Smart Brake Support), for the same marker

@@ -648,6 +648,7 @@ struct OnroadEventZP @0xeff60a9f4d5cb12f {
     radarLostCameraOnly @18;
     stockEcuLost @19;
     stockEcuLostIdle @20;
+    cameraTjaStuck @21;
   }
 }
 
@@ -684,6 +685,9 @@ struct CarStateZP @0xc879af11c43cb400 {
   # The stock ECU stand-in was lost, or never confirmed, for the drive (Mazda's Smart CAN Filter): unlike a
   # hand-back, nothing asked for it, and the car's cruise dropped without a fault.
   stockEcuLost @8 :Bool;
+  # Mazda: the camera's own TJA stayed on through openpilot's camera-only press-offs while
+  # openpilot steers (opendbc mads.update_camera_tja); its steering stays blocked by the panda.
+  cameraTjaStuck @9 :Bool;
 
   enum StockEcuState {
     notNeeded @0;

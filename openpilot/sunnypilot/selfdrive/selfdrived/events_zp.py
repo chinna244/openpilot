@@ -282,6 +282,17 @@ EVENTS_ZP: dict[int, dict[str, Alert | AlertCallbackType]] = {
       Priority.LOW, VisualAlert.none, AudibleAlert.prompt, .2),
   },
 
+  # Mazda: the camera's own TJA stayed on through openpilot's three camera-only press-offs while
+  # openpilot steers (opendbc mads.update_camera_tja). openpilot keeps steering and the panda keeps
+  # the camera's steering blocked; it clears when the camera's TJA goes off or openpilot stops steering.
+  EventNameZP.cameraTjaStuck: {
+    ET.PERMANENT: Alert(
+      "Camera Lane Keep Still On",
+      "openpilot is steering",
+      AlertStatus.userPrompt, AlertSize.mid,
+      Priority.MID, VisualAlert.none, AudibleAlert.prompt, .2),
+  },
+
   # Set Speed Assist switched, from the distance button or the UI (selfdrived_zp)
   EventNameZP.speedAssistSwitched: {
     ET.WARNING: speed_assist_switched_alert,
@@ -336,7 +347,7 @@ EVENTS_ZP: dict[int, dict[str, Alert | AlertCallbackType]] = {
 # must not replay its sound when it comes back (route 00000133, 163.3 s and 271.2 s).
 for _event in (EventNameZP.stockEcuReady, EventNameZP.stockEcuHandedBack, EventNameZP.alphaLongNextStop,
                EventNameZP.cameraLkasFaultOnset, EventNameZP.cameraLkasResumed, EventNameZP.radarLostCameraOnly,
-               EventNameZP.stockEcuLost, EventNameZP.stockEcuLostIdle):
+               EventNameZP.stockEcuLost, EventNameZP.stockEcuLostIdle, EventNameZP.cameraTjaStuck):
   EVENTS_ZP[_event][ET.PERMANENT].sound_once = True
 
 

@@ -199,3 +199,24 @@ class TestMazdaCameraFault:
     car_events.update(self._cs(True), _events(EventName.steerUnavailable), _car_state_sp(), True)
     for _ in range(clear - 1):
       assert car_events.update(self._cs(False), _events(), _car_state_sp(), True).zp.has(EventNameZP.cameraLkasFault)
+
+
+class TestMazdaCameraTjaStuck:
+  """The camera's own TJA still on after openpilot's camera-only press-offs (opendbc
+  mads.update_camera_tja): a prompt that never disengages or blocks engagement."""
+
+  def test_flag_raises_the_prompt_only(self):
+    car_events = _car_events('mazda', MazdaFlags.GEN1)
+    events = Events()
+    cs_sp = _car_state_sp()
+    cs_sp.zoompilot.cameraTjaStuck = True
+    events_sp = car_events.update(structs.CarState(), events, cs_sp)
+    assert events_sp.zp.has(EventNameZP.cameraTjaStuck)
+    assert events_sp.zp.contains(ET.PERMANENT)
+    for et in (ET.SOFT_DISABLE, ET.IMMEDIATE_DISABLE, ET.NO_ENTRY, ET.USER_DISABLE):
+      assert not events_sp.zp.contains(et)
+
+  def test_no_flag_no_prompt(self):
+    car_events = _car_events('mazda', MazdaFlags.GEN1)
+    events_sp = car_events.update(structs.CarState(), Events(), _car_state_sp())
+    assert not events_sp.zp.has(EventNameZP.cameraTjaStuck)

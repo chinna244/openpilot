@@ -107,6 +107,9 @@ class CarSpecificEventsSP:
       if mads_enabled and CS_SP.zoompilot.lkasArming:
         # LKA back on with lateral coming back, the EPS not delivering yet
         events_sp.zp.add(EventNameZP.stockLkasArming)
+      if CS_SP.zoompilot.cameraTjaStuck:
+        # the camera's own TJA did not switch off for openpilot's camera-only presses
+        events_sp.zp.add(EventNameZP.cameraTjaStuck)
 
     self.update_stock_ecu(CS, CS_SP, events_sp)
     return events_sp
