@@ -156,7 +156,7 @@ class TestSpeedLimitResolverValidation(OpenpilotTestCase):
 MPH = 0.44704
 
 
-def gps_sm(mocker, car_limit, map_limit, has_fix=True, fix_age=0., ahead_limit=0., ahead_distance=0., map_age=0.):
+def gps_sm(mocker, car_limit, map_limit, has_fix=True, fix_age=0., ahead_limit=0., ahead_distance=0., map_age=0., vision=0.):
   """carStateSP, liveMapDataSP and gpsLocation as the resolver reads them; fix_age: seconds since the GPS message
   was logged, on the monotonic clock (negative: logged in the future); map_age: the same for liveMapDataSP."""
   car_state_sp = create_mock({'speedLimit': car_limit}, mocker)
@@ -173,7 +173,7 @@ def gps_sm(mocker, car_limit, map_limit, has_fix=True, fix_age=0., ahead_limit=0
     'carStateSP': car_state_sp,
     'liveMapDataSP': live_map_data,
     'gpsLocation': gps_data,
-    'customReserved10': create_mock({'speedLimit': 0.}, mocker),
+    'customReserved10': create_mock({'speedLimit': vision}, mocker),
   }[key]
   sm_mock.logMonoTime = {'gpsLocation': int((time.monotonic() - fix_age) * 1e9),
                          'liveMapDataSP': int((time.monotonic() - map_age) * 1e9),
@@ -420,6 +420,28 @@ class TestSpeedLimitResolverVision(OpenpilotTestCase):
   def test_vision_priority_has_no_vote(self, mocker):
     resolver = self._resolve(mocker, Policy.vision_priority, 55 * MPH, 55 * MPH, 40 * MPH)
     assert resolver.source == SpeedLimitSource.vision
+
+  def test_combined_votes_on_the_map_limit_not_the_one_ahead(self, mocker):
+    # route 6a t=195: map 30 with 25 just ahead (already taken), car 30, camera read a school 20 -> map and car agree
+    resolver = SpeedLimitResolver()
+    resolver.policy = Policy.combined
+    resolver.update(35 * MPH, gps_sm(mocker, 30 * MPH, 30 * MPH, ahead_limit=25 * MPH, ahead_distance=10., vision=20 * MPH))
+    assert resolver.source == SpeedLimitSource.map
+    assert resolver.speed_limit == 25 * MPH  # the early slow-down for the limit ahead stays
+
+  def test_combined_car_agreeing_with_the_limit_ahead_keeps_the_early_slow_down(self, mocker):
+    # routes 43-67 t~117: car 25, map 30 with 25 ahead, camera 30 -> the slow-down for the 25 ahead stays
+    resolver = SpeedLimitResolver()
+    resolver.policy = Policy.combined
+    resolver.update(35 * MPH, gps_sm(mocker, 25 * MPH, 30 * MPH, ahead_limit=25 * MPH, ahead_distance=10., vision=30 * MPH))
+    assert resolver.source == SpeedLimitSource.map and resolver.speed_limit == 25 * MPH
+
+  def test_combined_limit_ahead_alone_still_votes(self, mocker):
+    # no current map limit: the lower limit ahead is the map's value in the vote, as before
+    resolver = SpeedLimitResolver()
+    resolver.policy = Policy.combined
+    resolver.update(35 * MPH, gps_sm(mocker, 25 * MPH, 0., ahead_limit=25 * MPH, ahead_distance=10., vision=20 * MPH))
+    assert resolver.source == SpeedLimitSource.map and resolver.speed_limit == 25 * MPH
 
   def test_combined_falls_back_to_map_then_car(self, mocker):
     resolver = self._resolve(mocker, Policy.combined, 15., 20., 0.)

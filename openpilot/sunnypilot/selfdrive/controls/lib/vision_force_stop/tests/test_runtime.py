@@ -217,3 +217,15 @@ def test_reset_between_reader_samples_still_ranges_the_sign():
     if i > 21 and plan.forcing:
       after.append(plan)
   assert after and all(p.tracked_distance_m < 23.5 for p in after)
+
+
+def test_backlit_stop_hits_below_starpilots_bar_still_confirm():
+  # route 68 t=58-59: the reader's boxes on a backlit STOP (observed times, confidences); at 0.7 the 0.66 reset the track
+  from openpilot.sunnypilot.selfdrive.controls.lib.vision_force_stop.stop_confirm import StopBox, StopConfirmation, StopEvidence
+  hits = ((0, .68, (1059, 221, 1103, 266)), (410, .80, (1119, 203, 1163, 253)), (750, .79, (1191, 186, 1236, 233)),
+          (1090, .66, (1278, 157, 1332, 220)))
+  owner, confirmed = StopConfirmation(), []
+  for i, (ms, conf, box) in enumerate(hits):
+    t = DRIVE_ID + 100 + ms * 1_000_000
+    confirmed.append(owner.observe(StopEvidence('reader', 'road', t, 0, i + 1, 1928, 1208, (StopBox(conf, box),)), now_ns=t + 300_000_000))
+  assert confirmed[:2] == [0, 0] and confirmed[2] and confirmed[3]

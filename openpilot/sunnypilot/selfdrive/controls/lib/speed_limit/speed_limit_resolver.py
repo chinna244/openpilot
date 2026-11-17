@@ -68,6 +68,7 @@ class SpeedLimitResolver:
 
     self._gps_location_service = get_gps_location_service(self.params)
     self.limit_solutions = {}  # Store for speed limit solutions from different sources
+    self._map_vote_limit = 0.
     self.distance_solutions = {}  # Store for distance to current speed limit start for different sources
 
     self.policy = self.params.get("SpeedLimitPolicy", return_default=True)
@@ -186,6 +187,7 @@ class SpeedLimitResolver:
 
   def _get_from_map_data(self, sm: messaging.SubMaster) -> None:
     self._reset_limit_sources(SpeedLimitSource.map)
+    self._map_vote_limit = 0.
     self._process_map_data(sm)
 
   @staticmethod
@@ -229,6 +231,7 @@ class SpeedLimitResolver:
     distance_since_publish = self.v_ego * max(map_data_age, 0.)
     distance_to_speed_limit_ahead = max(0., map_data.speedLimitAheadDistance - distance_since_publish)
 
+    self._map_vote_limit = speed_limit  # the vote compares the road's own limit, not one swapped in early from ahead
     self.limit_solutions[SpeedLimitSource.map] = speed_limit
     self.distance_solutions[SpeedLimitSource.map] = 0.
 
@@ -251,6 +254,11 @@ class SpeedLimitResolver:
       for source in found:
         if any(abs(self.limit_solutions[source] - self.limit_solutions[other]) <= VOTE_TOLERANCE for other in found if other != source):
           return source
+      # route 6a t=195: map had already taken its 25 ahead while map and car both said 30 -> no agreement, a school 20 won.
+      # With no other majority, a source agreeing with the map's own limit (not the one ahead) still backs the map
+      if SpeedLimitSource.map in found and self._map_vote_limit > 0. and any(
+          abs(self._map_vote_limit - self.limit_solutions[other]) <= VOTE_TOLERANCE for other in found if other != SpeedLimitSource.map):
+        return SpeedLimitSource.map
     # They are ordered in the order of preference, so we pick the first that's non-zero
     for source in sources:
       if self.limit_solutions[source] > 0.:

@@ -15,7 +15,9 @@ STOP_MAX_AGE_NS = 1_500_000_000
 # 18-2a (33 image-checked STOPs) at the busy cadence: 750 ms + follow-up 6/33, 1.2 s + follow-up 14/33, 0 false either way.
 CONTROL_STOP_MAX_AGE_NS = 1_200_000_000
 RECEIPT_MAX_AGE_NS = 1_000_000_000
-STOP_CONFIRM_CONFIDENCE = .7
+# fork: StarPilot 0.7 missed backlit STOPs (routes 5b/68, same intersection: hits 0.68/0.80/0.79/0.66 never spanned 0.5 s).
+# The reader publishes boxes >= 0.6 only; live replay of routes 45-69 at 0.6: +6 confirmations, all image-checked real STOPs.
+STOP_CONFIRM_CONFIDENCE = .6
 STOP_SIGN_HEIGHT_M = .762
 # Fitted on 17 confirmed sign approaches: where the car stops relative to the box range. (StarPilot 2a854471f)
 STOP_RANGE_OFFSET_M = 2.0
