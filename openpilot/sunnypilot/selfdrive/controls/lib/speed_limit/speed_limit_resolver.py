@@ -42,6 +42,16 @@ VISION_MAX_AGE = 1.  # s
 # Combined policy: two sources this close agree on the limit (map and car round differently).
 VOTE_TOLERANCE = 2 * CV.MPH_TO_MS  # m/s
 
+# Combined policy: a source dropping out is no evidence of a new limit. When the map goes blank (mapd at a junction, a
+# lost fix), the limit it gave holds until the map returns, two sources agree, or the car reads a sign since the dropout.
+MAP_SETTLE_S = 3.  # a map limit is held through a dropout only once it held this long (a cross street shows for 2-4 s)
+DROPOUT_FRESH_S = 1.  # a car reading this close before the dropout came with it (the junction's own sign)
+DROPOUT_HOLD_MAX_M = 1000.  # backstop: driven this far with no map, the held limit gives way
+# a map limit far below the speed driven, that the car's reading contradicts, is an overpass or cross street matched
+# for a few seconds (routes 138/186: 25-30 for 4-14 s at 52-67 mph on a freeway); it waits for the car or this long
+CROSS_MATCH_GAP = 20 * CV.MPH_TO_MS  # m/s
+CROSS_MATCH_S = 15.
+
 
 class SpeedLimitResolver:
   limit_solutions: dict[custom.LongitudinalPlanSP.SpeedLimit.Source, float]
@@ -69,7 +79,7 @@ class SpeedLimitResolver:
     self._gps_location_service = get_gps_location_service(self.params)
     self.limit_solutions = {}  # Store for speed limit solutions from different sources
     self._map_vote_limit = 0.
-    self._map_held = 0.  # the map's last own limit, kept through a blank (no limit, fix and mapd current)
+    self._reset_hold()
     self.distance_solutions = {}  # Store for distance to current speed limit start for different sources
 
     self.policy = self.params.get("SpeedLimitPolicy", return_default=True)
@@ -211,18 +221,14 @@ class SpeedLimitResolver:
     map_data = sm['liveMapDataSP']
 
     if self._gps_fix_age(sm) is None:
-      self._map_held = 0.
       return
 
     # plannerd ignores liveMapDataSP liveness: a mapd that stopped publishing leaves its last limit in the SubMaster
     map_data_age = self._message_age(sm, 'liveMapDataSP')
     if map_data_age is None:
-      self._map_held = 0.
       return
 
     speed_limit = map_data.speedLimit if map_data.speedLimitValid else 0.
-    if speed_limit > 0.:
-      self._map_held = speed_limit
     next_speed_limit = map_data.speedLimitAhead if map_data.speedLimitAheadValid else 0.
 
     self._calculate_map_data_limits(sm, speed_limit, next_speed_limit, map_data_age)
@@ -280,15 +286,85 @@ class SpeedLimitResolver:
     speed_limit = self.limit_solutions[source] if source else 0.
     distance = self.distance_solutions[source] if source else 0.
 
-    # mapd blanks at junctions: routes 54/66/67/6a "Press + for 41" from the car's 35 alone on a 25 road. While the map
-    # is blank, a lone source may lower the limit but not raise it above the map's last limit; it waits for the map to
-    # return or a second source to agree
-    if (Policy(self.policy) == Policy.combined and self.limit_solutions[SpeedLimitSource.map] <= 0. and
-        0. < self._map_held < speed_limit - VOTE_TOLERANCE and not any(
-          abs(speed_limit - self.limit_solutions[other]) <= VOTE_TOLERANCE
-          for other in ALL_SOURCES if other != source and self.limit_solutions[other] > 0.)):
-      return self._map_held, 0., SpeedLimitSource.map
+    if Policy(self.policy) == Policy.combined:
+      return self._hold_on_evidence(speed_limit, distance, source)
+    self._reset_hold()
 
+    return speed_limit, distance, source
+
+  def _usable_in_dropout(self, source: custom.LongitudinalPlanSP.SpeedLimit.Source) -> bool:
+    """While the map is blank: a source another one agrees with, or the car having read a sign since (or just before)."""
+    limit = self.limit_solutions[source]
+    backed = any(abs(limit - self.limit_solutions[other]) <= VOTE_TOLERANCE
+                 for other in ALL_SOURCES if other != source and self.limit_solutions[other] > 0.)
+    fresh = source == SpeedLimitSource.car and self._car_read_frame >= self._dropout_frame - int(DROPOUT_FRESH_S / DT_MDL)
+    return limit > 0. and (backed or fresh)
+
+  def _reset_hold(self) -> None:
+    self._out, self._out_frame, self._out_settled = 0., 0, 0.  # the limit given, since when, and the last one that held
+    self._map_own, self._map_own_frame, self._map_settled = 0., 0, 0.  # the same for the map's own limit
+    self._dropout_frame: int | None = None
+    self._dropout_m = 0.
+    self._dropout_limit = 0.
+    self._cross: tuple[int, float, float] | None = None  # (since, the map limit waited on, the limit held)
+    self._car_reading = 0.
+    self._car_read_frame = -10 ** 9  # when the car last read a new limit
+
+  def _hold_on_evidence(self, speed_limit: float, distance: float, source: custom.LongitudinalPlanSP.SpeedLimit.Source):
+    """Combined: the limit changes on evidence of a new one, not on a source dropping out. Routes 54/66/67/6a "Press +
+    for 41" and 6c "Press - for 29": mapd blanked at a junction and the car's older reading, outvoted until then, took over."""
+    settle = int(MAP_SETTLE_S / DT_MDL)
+    car, own = self.limit_solutions[SpeedLimitSource.car], self._map_vote_limit
+    if car > 0. and abs(car - self._car_reading) > .1:
+      self._car_read_frame = self.frame
+    if car > 0.:
+      self._car_reading = car
+    # the map's own limit settles on its own clock: which source won the vote (the camera agreeing with it) does not matter
+    # a limit settles only while shown without a break: a blank restarts its clock (review: 50, blank, 50 for a frame)
+    if own <= 0.:
+      self._map_own = 0.
+    elif abs(own - self._map_own) > .1:
+      self._map_own, self._map_own_frame = own, self.frame
+    elif self.frame - self._map_own_frame >= settle:
+      self._map_settled = own
+
+    dropout = self.limit_solutions[SpeedLimitSource.map] <= 0. and self._map_settled > 0. and self._out_settled > 0.
+    if not dropout:
+      self._dropout_frame = None
+      self._dropout_m = 0.
+    else:
+      if self._dropout_frame is None:
+        self._dropout_frame, self._dropout_limit = self.frame, self._out_settled
+      self._dropout_m += self.v_ego * DT_MDL
+      if self._dropout_m >= DROPOUT_HOLD_MAX_M:
+        self._map_settled = 0.  # no map this far: what the sources give now stands
+      elif source not in (SpeedLimitSource.map, SpeedLimitSource.none):
+        usable = [s for s in self._policy_to_sources_map[Policy.combined] if self._usable_in_dropout(s)]
+        if not usable:
+          self._out = 0.
+          return self._dropout_limit, 0., SpeedLimitSource.map
+        source = usable[0]
+        speed_limit, distance = self.limit_solutions[source], self.distance_solutions[source]
+
+    # once waiting on a cross match, it waits until the car agrees, the map moves on, or CROSS_MATCH_S: not re-judged
+    # every frame on a speed or a car reading that flickers
+    if self._cross is not None:
+      since, waited_on, _ = self._cross
+      if abs(own - waited_on) > .1 or (car > 0. and abs(car - own) <= VOTE_TOLERANCE) or self.frame - since >= int(CROSS_MATCH_S / DT_MDL):
+        self._cross = None
+    if (self._cross is None and source == SpeedLimitSource.map and self._out_settled > 0. and 0. < own < self._map_settled - VOTE_TOLERANCE and
+        own < self.v_ego - CROSS_MATCH_GAP and abs(car - self._map_settled) <= VOTE_TOLERANCE):
+      self._cross = (self.frame, own, self._out_settled)
+    if self._cross is not None:
+      self._out = 0.
+      return self._cross[2], 0., SpeedLimitSource.map
+
+    if source == SpeedLimitSource.none:
+      self._out = 0.
+    elif abs(speed_limit - self._out) > .1:
+      self._out, self._out_frame = speed_limit, self.frame
+    elif self.frame - self._out_frame >= settle:
+      self._out_settled = speed_limit
     return speed_limit, distance, source
 
   def update(self, v_ego: float, sm: messaging.SubMaster) -> None:

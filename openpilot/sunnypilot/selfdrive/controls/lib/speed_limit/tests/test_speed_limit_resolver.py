@@ -510,46 +510,164 @@ class TestSpeedLimitResolverVision(OpenpilotTestCase):
     assert resolver.speed_limit_last == 25 * MPH
 
 
-class TestSpeedLimitResolverMapBlank(OpenpilotTestCase):
-  """Combined: mapd blanks at junctions; a lone source may lower the limit then, not raise it (routes 54/66/67/6a)."""
+class TestSpeedLimitResolverMapDropout(OpenpilotTestCase):
+  """Combined: a source dropping out is no evidence of a new limit (routes 54/66/67/6a +41, 6c -29)."""
 
-  def _blank(self, mocker, car, vision=0., before=25 * MPH, has_fix=True):
+  def _resolver(self):
     resolver = SpeedLimitResolver()
     resolver.policy = Policy.combined
     resolver.update_params = lambda: None  # keep the policy across updates
-    resolver.update(10., gps_sm(mocker, 0., before))
-    resolver.update(10., gps_sm(mocker, car, 0., has_fix=has_fix, vision=vision))
     return resolver
 
-  def test_lone_car_raise_waits_for_the_map(self, mocker):
-    resolver = self._blank(mocker, 35 * MPH)
+  def _feed(self, resolver, mocker, seconds, v=10., **kw):
+    for _ in range(max(1, int(seconds / DT_MDL))):
+      resolver.update(v, gps_sm(mocker, **kw))
+
+  def _settled_map(self, mocker, car, map_limit=25 * MPH, v=10.):
+    resolver = self._resolver()
+    self._feed(resolver, mocker, 4., v=v, car_limit=car, map_limit=map_limit)
+    assert resolver.source == SpeedLimitSource.map and resolver.speed_limit == map_limit
+    return resolver
+
+  def test_an_outvoted_car_reading_does_not_raise_at_a_dropout(self, mocker):
+    resolver = self._settled_map(mocker, 35 * MPH)
+    self._feed(resolver, mocker, 5., car_limit=35 * MPH, map_limit=0.)
     assert resolver.source == SpeedLimitSource.map and resolver.speed_limit == 25 * MPH
 
-  def test_lone_car_may_lower(self, mocker):
-    resolver = self._blank(mocker, 20 * MPH)
-    assert resolver.source == SpeedLimitSource.car and resolver.speed_limit == 20 * MPH
+  def test_an_outvoted_car_reading_does_not_lower_at_a_dropout(self, mocker):
+    # route 6c t=322: map 30, the car's 25 from 28 s before, map blank in the turn -> "Press - for 29"
+    resolver = self._settled_map(mocker, 25 * MPH, map_limit=30 * MPH)
+    self._feed(resolver, mocker, 3., car_limit=25 * MPH, map_limit=0.)
+    assert resolver.speed_limit == 30 * MPH
 
-  def test_two_agreeing_sources_raise(self, mocker):
-    resolver = self._blank(mocker, 35 * MPH, vision=35 * MPH)
+  def test_a_sign_read_at_the_dropout_takes_over(self, mocker):
+    # routes 45/4a/5e: onto a faster road, the car reads its 55 as the map goes blank
+    resolver = self._settled_map(mocker, 30 * MPH, map_limit=30 * MPH)
+    self._feed(resolver, mocker, 1., car_limit=55 * MPH, map_limit=0.)
+    assert resolver.source == SpeedLimitSource.car and resolver.speed_limit == 55 * MPH
+
+  def test_a_sign_read_just_before_the_dropout_takes_over(self, mocker):
+    # route 69 t=897: the car read the 30 0.9 s before the junction
+    resolver = self._settled_map(mocker, 35 * MPH, map_limit=35 * MPH)
+    self._feed(resolver, mocker, .5, car_limit=30 * MPH, map_limit=35 * MPH)
+    self._feed(resolver, mocker, 1., car_limit=30 * MPH, map_limit=0.)
+    assert resolver.speed_limit == 30 * MPH
+
+  def test_two_agreeing_sources_take_over(self, mocker):
+    resolver = self._settled_map(mocker, 35 * MPH)
+    self._feed(resolver, mocker, 1., car_limit=35 * MPH, map_limit=0., vision=35 * MPH)
     assert resolver.speed_limit == 35 * MPH and resolver.source != SpeedLimitSource.map
 
-  def test_lone_camera_raise_waits_too(self, mocker):
-    resolver = self._blank(mocker, 0., vision=65 * MPH)
+  def test_a_lone_camera_reading_waits(self, mocker):
+    resolver = self._settled_map(mocker, 0.)
+    self._feed(resolver, mocker, 1., car_limit=0., map_limit=0., vision=65 * MPH)
     assert resolver.source == SpeedLimitSource.map and resolver.speed_limit == 25 * MPH
 
-  def test_map_back_with_a_new_limit_raises(self, mocker):
-    resolver = self._blank(mocker, 55 * MPH)
-    resolver.update(10., gps_sm(mocker, 55 * MPH, 50 * MPH))
-    assert resolver.source == SpeedLimitSource.map and resolver.speed_limit == 50 * MPH
+  def test_the_map_back_with_a_new_limit_takes_over(self, mocker):
+    resolver = self._settled_map(mocker, 35 * MPH)
+    self._feed(resolver, mocker, 2., car_limit=35 * MPH, map_limit=0.)
+    self._feed(resolver, mocker, .1, car_limit=35 * MPH, map_limit=30 * MPH)
+    assert resolver.source == SpeedLimitSource.map and resolver.speed_limit == 30 * MPH
 
-  def test_no_fix_drops_the_held_map_limit(self, mocker):
-    resolver = self._blank(mocker, 35 * MPH, has_fix=False)
+  def test_a_map_limit_shown_briefly_is_not_held(self, mocker):
+    # routes 119/14a: a 50 cross street named for 3-4 s before the blank; the 30 before it holds
+    resolver = self._settled_map(mocker, 30 * MPH, map_limit=30 * MPH)
+    self._feed(resolver, mocker, 2., car_limit=30 * MPH, map_limit=50 * MPH)
+    self._feed(resolver, mocker, 1., car_limit=30 * MPH, map_limit=0.)
+    assert resolver.speed_limit == 30 * MPH
+
+  def test_the_hold_gives_way_after_the_backstop_distance(self, mocker):
+    resolver = self._settled_map(mocker, 35 * MPH)
+    self._feed(resolver, mocker, 45., v=20., car_limit=35 * MPH, map_limit=0.)
+    assert resolver.speed_limit == 25 * MPH  # 900 m
+    self._feed(resolver, mocker, 10., v=20., car_limit=35 * MPH, map_limit=0.)
+    assert resolver.source == SpeedLimitSource.car and resolver.speed_limit == 35 * MPH
+
+  def test_all_sources_gone_is_not_held_as_a_live_limit(self, mocker):
+    resolver = self._settled_map(mocker, 0.)
+    self._feed(resolver, mocker, 1., car_limit=0., map_limit=0.)
+    assert resolver.source == SpeedLimitSource.none and resolver.speed_limit_last == 25 * MPH
+
+  def test_a_cross_match_far_below_the_speed_waits_for_the_car(self, mocker):
+    # route 138 t=1160: on a 55 freeway at 67 mph the map named a 30 cross street for 14 s; the car still read 55
+    v = 67 * MPH
+    resolver = self._settled_map(mocker, 55 * MPH, map_limit=55 * MPH, v=v)
+    self._feed(resolver, mocker, 14., v=v, car_limit=55 * MPH, map_limit=30 * MPH)
+    assert resolver.speed_limit == 55 * MPH
+    self._feed(resolver, mocker, 2., v=v, car_limit=55 * MPH, map_limit=30 * MPH)
+    assert resolver.speed_limit == 30 * MPH  # it held past 15 s: taken
+
+  def test_a_cross_match_the_car_agrees_with_is_taken_at_once(self, mocker):
+    v = 67 * MPH
+    resolver = self._settled_map(mocker, 55 * MPH, map_limit=55 * MPH, v=v)
+    self._feed(resolver, mocker, .1, v=v, car_limit=30 * MPH, map_limit=30 * MPH)
+    assert resolver.speed_limit == 30 * MPH
+
+  def test_a_lower_limit_ahead_is_not_a_cross_match(self, mocker):
+    # route 18f t=2196: the expressway ending into a 35 street; the early slow-down stays
+    v = 67 * MPH
+    resolver = self._settled_map(mocker, 55 * MPH, map_limit=55 * MPH, v=v)
+    self._feed(resolver, mocker, .1, v=v, car_limit=55 * MPH, map_limit=55 * MPH, ahead_limit=35 * MPH, ahead_distance=50.)
+    assert resolver.speed_limit == 35 * MPH
+
+  def test_a_map_limit_the_camera_agreed_with_is_held(self, mocker):
+    # review: the camera winning the vote for the same 25 must not leave the map's 25 unprotected
+    resolver = self._resolver()
+    self._feed(resolver, mocker, 10., car_limit=35 * MPH, map_limit=25 * MPH, vision=25 * MPH)
+    self._feed(resolver, mocker, 1., car_limit=35 * MPH, map_limit=25 * MPH)
+    self._feed(resolver, mocker, 2., car_limit=35 * MPH, map_limit=0.)
+    assert resolver.speed_limit == 25 * MPH
+
+  def test_a_map_limit_shown_briefly_twice_is_not_held(self, mocker):
+    # review: a cross street's 50 for 2 s, a blank, then the 50 again for a frame must not count as 3 s held
+    resolver = self._settled_map(mocker, 30 * MPH, map_limit=30 * MPH)
+    self._feed(resolver, mocker, 2., car_limit=30 * MPH, map_limit=50 * MPH)
+    self._feed(resolver, mocker, 1., car_limit=30 * MPH, map_limit=0.)
+    self._feed(resolver, mocker, .05, car_limit=30 * MPH, map_limit=50 * MPH)
+    self._feed(resolver, mocker, 1., car_limit=30 * MPH, map_limit=0.)
+    assert resolver.speed_limit == 30 * MPH
+
+  def test_a_cross_match_wait_survives_a_blank(self, mocker):
+    v = 67 * MPH
+    resolver = self._settled_map(mocker, 55 * MPH, map_limit=55 * MPH, v=v)
+    self._feed(resolver, mocker, 2., v=v, car_limit=55 * MPH, map_limit=30 * MPH)
+    self._feed(resolver, mocker, 1., v=v, car_limit=55 * MPH, map_limit=0.)
+    self._feed(resolver, mocker, 2., v=v, car_limit=55 * MPH, map_limit=30 * MPH)
+    assert resolver.speed_limit == 55 * MPH
+
+  def test_a_lost_fix_is_a_dropout_too(self, mocker):
+    resolver = self._settled_map(mocker, 35 * MPH)
+    self._feed(resolver, mocker, 2., car_limit=35 * MPH, map_limit=25 * MPH, has_fix=False)
+    assert resolver.speed_limit == 25 * MPH
+
+  def test_an_old_reading_back_after_every_source_dropped_is_still_held(self, mocker):
+    resolver = self._settled_map(mocker, 35 * MPH)
+    self._feed(resolver, mocker, 1., car_limit=0., map_limit=0.)
+    self._feed(resolver, mocker, 1., car_limit=35 * MPH, map_limit=0.)
+    assert resolver.speed_limit == 25 * MPH
+
+  def test_a_cross_match_wait_does_not_flicker(self, mocker):
+    # review: vEgo either side of the 20 mph gap, and one frame with no car reading, must not release the wait
+    resolver = self._settled_map(mocker, 55 * MPH, map_limit=55 * MPH, v=67 * MPH)
+    seen = set()
+    for i in range(100):
+      v = (49.5 if i % 2 else 50.5) * MPH
+      resolver.update(v, gps_sm(mocker, 0. if i == 50 else 55 * MPH, 30 * MPH))
+      seen.add(round(resolver.speed_limit / MPH))
+    assert seen == {55}
+
+  def test_leaving_combined_forgets_the_hold(self, mocker):
+    resolver = self._settled_map(mocker, 35 * MPH)
+    resolver.policy = Policy.map_data_priority
+    self._feed(resolver, mocker, .1, car_limit=35 * MPH, map_limit=25 * MPH)
+    resolver.policy = Policy.combined
+    self._feed(resolver, mocker, .1, car_limit=35 * MPH, map_limit=0.)
     assert resolver.source == SpeedLimitSource.car and resolver.speed_limit == 35 * MPH
 
   def test_other_policies_unchanged(self, mocker):
     resolver = SpeedLimitResolver()
     resolver.policy = Policy.map_data_priority
     resolver.update_params = lambda: None
-    resolver.update(10., gps_sm(mocker, 0., 25 * MPH))
-    resolver.update(10., gps_sm(mocker, 35 * MPH, 0.))
+    self._feed(resolver, mocker, 4., car_limit=0., map_limit=25 * MPH)
+    self._feed(resolver, mocker, 1., car_limit=35 * MPH, map_limit=0.)
     assert resolver.source == SpeedLimitSource.car and resolver.speed_limit == 35 * MPH
