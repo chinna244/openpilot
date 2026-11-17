@@ -229,3 +229,71 @@ def test_backlit_stop_hits_below_starpilots_bar_still_confirm():
     t = DRIVE_ID + 100 + ms * 1_000_000
     confirmed.append(owner.observe(StopEvidence('reader', 'road', t, 0, i + 1, 1928, 1208, (StopBox(conf, box),)), now_ns=t + 300_000_000))
   assert confirmed[:2] == [0, 0] and confirmed[2] and confirmed[3]
+
+
+def test_one_stop_hit_confirms_when_the_model_plans_to_slow():
+  # home junction at 18-26 mph: the sign is first seen 15-25 m out; waiting 0.5 s for a second hit cost 5-8 m
+  from openpilot.sunnypilot.selfdrive.controls.lib.vision_force_stop.stop_confirm import StopBox, StopConfirmation, StopEvidence
+  box = StopBox(.66, (1214, 400, 1294, 480))
+  sample = StopEvidence('reader', 'road', DRIVE_ID + 100, 0, 1, 1928, 1208, (box,))
+  assert StopConfirmation().observe(sample, now_ns=DRIVE_ID + 300_000_000) == 0
+  owner = StopConfirmation()
+  assert owner.observe(sample, now_ns=DRIVE_ID + 300_000_000, model_agrees=True) == sample.observed_ns
+  assert owner.distance_m is not None and abs(owner.distance_m - 27.025) < .01
+  assert owner.observe(sample, now_ns=DRIVE_ID + 350_000_000, model_agrees=True) == sample.observed_ns  # the same sample again
+  weak = StopEvidence('reader', 'road', DRIVE_ID + 100, 0, 1, 1928, 1208, (StopBox(.59, box.bbox),))
+  assert StopConfirmation().observe(weak, now_ns=DRIVE_ID + 300_000_000, model_agrees=True) == 0
+  assert StopConfirmation().observe(sample, now_ns=DRIVE_ID + 1_600_000_000, model_agrees=True) == 0  # too old
+
+
+def test_a_single_reader_hit_forces_only_with_the_model_slowing():
+  # one reader pass with a box, republished until the next pass ~0.8 s later finds nothing
+  def single(horizon):
+    vfs, sm, CP = VisionForceStop(FakeParams()), FakeSM(), car_params()
+    plans, observed = [], None
+    for i in range(40):
+      t = DRIVE_ID + 2_000_000_000 + i * DT_NS - (DRIVE_ID + 2_000_000_000) % (4 * DT_NS)
+      frame(sm, t, horizon=horizon, v_ego=10., stop_box=False)
+      if t % (4 * DT_NS) == 0 and i < 16:
+        observed = observed or t
+        msg = messaging.new_message('customReserved10')
+        out = msg.customReserved10
+        out.stopValid, out.stopObservedMonoTime, out.stopFrameId = True, observed, observed // DT_NS
+        out.stopImageWidth, out.stopImageHeight = 1344, 760
+        out.stopConfidences, out.stopBoxes = [0.66], [900, 200, 940, 240]
+        sm.put('customReserved10', msg, t)
+      plans.append(vfs.sample(sm, CP, now_ns=t, drive_id=DRIVE_ID, follow_seconds=1.45))
+    return plans
+  assert any(p.forcing for p in single(40.))
+  assert not any(p.forcing for p in single(80.))
+
+
+def test_a_rejected_sample_is_not_confirmed_by_the_model():
+  # review: an out-of-order sample is dropped by the integrity checks; the model agreeing must not revive it
+  from openpilot.sunnypilot.selfdrive.controls.lib.vision_force_stop.stop_confirm import StopBox, StopConfirmation, StopEvidence
+  owner = StopConfirmation()
+  owner.observe(StopEvidence('reader', 'road', DRIVE_ID + 2_000_000_000, 0, 20, 1928, 1208, ()), now_ns=DRIVE_ID + 2_100_000_000)
+  late = StopEvidence('reader', 'road', DRIVE_ID + 1_900_000_000, 0, 19, 1928, 1208, (StopBox(.8, (1214, 400, 1294, 480)),))
+  assert owner.observe(late, now_ns=DRIVE_ID + 2_150_000_000, model_agrees=True) == 0
+
+
+def test_a_single_hit_at_a_crawl_needs_the_model_to_slow():
+  # review: under ~11 mph the 10 s path is shorter than 50 m at any steady speed; that alone is not the model slowing
+  def single(horizon, v):
+    vfs, sm, CP = VisionForceStop(FakeParams()), FakeSM(), car_params()
+    plans, observed = [], None
+    for i in range(40):
+      t = DRIVE_ID + 2_000_000_000 + i * DT_NS - (DRIVE_ID + 2_000_000_000) % (4 * DT_NS)
+      frame(sm, t, horizon=horizon, v_ego=v, stop_box=False)
+      if t % (4 * DT_NS) == 0 and i < 16:
+        observed = observed or t
+        msg = messaging.new_message('customReserved10')
+        out = msg.customReserved10
+        out.stopValid, out.stopObservedMonoTime, out.stopFrameId = True, observed, observed // DT_NS
+        out.stopImageWidth, out.stopImageHeight = 1344, 760
+        out.stopConfidences, out.stopBoxes = [0.66], [900, 200, 940, 240]
+        sm.put('customReserved10', msg, t)
+      plans.append(vfs.sample(sm, CP, now_ns=t, drive_id=DRIVE_ID, follow_seconds=1.45))
+    return plans
+  assert not any(p.forcing for p in single(30., 3.))  # holding 3 m/s: the path is 30 m
+  assert any(p.forcing for p in single(15., 3.))  # slowing

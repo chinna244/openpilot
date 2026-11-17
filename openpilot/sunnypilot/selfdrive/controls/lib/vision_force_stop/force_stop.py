@@ -10,6 +10,9 @@ STANDSTILL_HOLD_NS = 2_000_000_000
 STANDSTILL_CLEAR_NS = 750_000_000
 SIGN_MAX_SPEED_MPS = 17.88
 SIGN_MODEL_AGREE_M = 50.0
+# fork: a lead this far beyond the sign's stop point has gone through the junction and does not cancel the stop for it
+# (route 6c t=102: lead 45 m ahead, stop point 16 m, StarPilot's 90 m lead veto dropped the stop)
+LEAD_PAST_SIGN_M = 5.0
 SIGN_SEED_M = 27.0
 SIGN_ESTIMATE_HOLD_NS = 2_000_000_000
 # Over a long model path a sign is only believed if stopping at its estimate would be a normal stop.
@@ -189,8 +192,11 @@ class ForceStop:
     curved = available and abs(curvature) >= .003 and not stop_then_turn
     model_active = available and horizon < (108.0 if self.activation_gate and frame.light else 100.0)
     self.activation_gate = model_active and frame.light
+    # only against a fresh camera range to the sign: not the 27 m seed, not an estimate worn down after passing it
+    lead_before_stop = lead and not (frame.sign and self.vision_distance is not None and self.vision_distance > 0. and
+                                     frame.lead_distance_m >= self.vision_distance + LEAD_PAST_SIGN_M)
     permitted = (available and now >= self.override_until_ns and not frame.driving_in_curve and not turn and
-                 not frame.tracking_lead and not lead)
+                 not frame.tracking_lead and not lead_before_stop)
     model_path = frame.light and model_active and permitted and not curved
     plausible = sign_estimate is None or speed * speed <= 2 * SIGN_LONG_PATH_MAX_DECEL * max(sign_estimate, 1.0)
     sign_path = (frame.sign and permitted and speed < SIGN_MAX_SPEED_MPS and
