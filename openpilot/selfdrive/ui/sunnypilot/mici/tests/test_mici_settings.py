@@ -687,19 +687,10 @@ class TestLayoutsSurviveRender:
       assert home._speed_assist_icon.is_visible == assist_shown
     render(home)
 
-  def test_home_long_press_switches_speed_assist(self, params, monkeypatch):
+  def test_home_long_press_does_nothing(self):
+    # user 2026-11-18: an accidental hold on home switched Set Speed Assist off, the next one back on
     from openpilot.selfdrive.ui.sunnypilot.mici.layouts.home import MiciHomeLayoutSP
-    from openpilot.selfdrive.ui.ui_state import ui_state
-
-    monkeypatch.setattr(ui_state, "has_longitudinal_control", True)
-    try:
-      for start in (True, False):
-        ui_state.set_speed_assist(start)
-        MiciHomeLayoutSP()._long_press_callback()
-        assert params.get_bool("ExperimentalModeSetSpeed") is (not start)
-        assert ui_state.speed_assist is (not start)
-    finally:
-      params.remove("ExperimentalModeSetSpeed")
+    assert MiciHomeLayoutSP()._long_press_callback is None
 
   def test_home_knows_the_port_jetlink_holds(self, params, monkeypatch):
     # a Jetson enumerates as nothing comma knows; with the link holding the port it is not unknown

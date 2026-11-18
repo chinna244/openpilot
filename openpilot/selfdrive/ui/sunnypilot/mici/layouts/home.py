@@ -24,8 +24,8 @@ class MiciHomeLayoutSP(MiciHomeLayout):
   def __init__(self):
     super().__init__()
     self._openpilot_label = UnifiedLabel("zoompilot", font_size=88, font_weight=FontWeight.AUDIOWIDE, max_width=480, wrap_text=False)
-    # upstream's retired long press, which switched experimental mode, switches Set Speed Assist
-    self.set_long_press_callback(ui_state.toggle_speed_assist)
+    # fork: no long press here; it switched Set Speed Assist on an accidental hold (user 2026-11-18).
+    # The distance-button hold and the cruise setting still switch it.
     # after the network icon, where upstream showed experimental mode: alpha longitudinal, then
     # Set Speed Assist, each 40 px of ink like upstream's footer icons
     self._long_icon = LongitudinalIcon()
