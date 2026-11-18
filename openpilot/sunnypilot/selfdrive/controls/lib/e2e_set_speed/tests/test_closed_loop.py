@@ -50,7 +50,8 @@ def simulate(enabled, seconds=60., tau=50., brake_at=None, coast_at=None, plan_d
       a_model = -0.05
       plan_v = plan_ramp(v, plan_drop)
     # the host passes last frame's cruise candidate, then builds this frame's
-    e2e = ctl.update(build_sm(v, plan_v=plan_v), a_model, a_cruise, **ENGAGED)
+    # the planner passes its cruise target (output_v_target), which the floor approaches over TAU
+    e2e = ctl.update(build_sm(v, plan_v=plan_v), a_model, a_cruise, **ENGAGED, v_cruise=V_CRUISE)
     a_cruise = get_cruise_accel(V_CRUISE, v, a_cruise, out, DT)
     out = min(e2e, a_cruise)
     a_act += DT / ACTUATOR_TAU * (out - a_act)
@@ -122,15 +123,17 @@ def test_holds_the_set_speed_without_oscillating(wander):
   hold = log[log[:, 0] >= 40.]
   assert np.median(V_CRUISE - hold[:, 1]) < 0.1
   # the tones line up to -0.2 m/s^2 now and then, where the gain hands the slowdown to the model
-  assert (V_CRUISE - hold[:, 1]).max() < 0.3 and (hold[:, 1] - V_CRUISE).max() < 0.1
+  # with the cruise target passed the floor's TAU approach dips 0.306 at most, with or without #39266
+  assert (V_CRUISE - hold[:, 1]).max() < 0.32 and (hold[:, 1] - V_CRUISE).max() < 0.1
   # no throttle-brake changes of its own: steady, at most one; wandering, no more than the model's
   assert flips(hold[:, 4]) <= (flips(hold[:, 2]) if wander else 1)
 
 
 def test_closes_a_shortfall_without_overshoot():
-  # 5 m/s under the set speed: within 0.2 m/s in about 10 s, never past it, no harder than the ceiling
+  # 5 m/s under the set speed: within 0.2 m/s in 13.4 s on the floor's TAU approach (with or without #39266),
+  # never past it, no harder than the ceiling
   log = simulate(True, seconds=40., v0=V_CRUISE - 5.)
   within = log[np.abs(V_CRUISE - log[:, 1]) < 0.2, 0]
-  assert within[0] < 13.
+  assert within[0] < 14.
   assert log[:, 1].max() - V_CRUISE < 0.02  # 0.033 without the gap line
   assert log[:, 4].max() <= approach_ceiling(V_CRUISE - 5., STANDARD) + 1e-6

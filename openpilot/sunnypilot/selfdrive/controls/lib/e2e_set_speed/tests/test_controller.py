@@ -236,7 +236,7 @@ def test_bend_flicker_moves_the_lift_on_the_jerk_budget(a_cruise):
 def test_bend_ahead_eases_the_lift_off_on_the_jerk_budget():
   ctl = settled(a_cruise=1.5)
   lifts = [run(ctl, 1, build_sm(V_EGO, yaw_rate=bend_ahead(1.2)), a_cruise=1.5) for _ in range(SETTLE_FRAMES)]
-  assert lifts[0] == pytest.approx(1.5 - c.FADE_JERK * DT)
+  assert lifts[0] == pytest.approx(CAP - c.FADE_JERK * DT)  # chill's 1.5 is held to the speed's ceiling (local tuning)
   assert lifts[-1] == 0.
 
 

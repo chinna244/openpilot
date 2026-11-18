@@ -36,7 +36,9 @@ def _plan(f):
 def test_floor_ceiling_and_rise_by_speed(v, rise, ceiling, lift):
   ctl = new_controller()
   lifts = [run(ctl, 1, build_sm(v), v_cruise=v + 10.) for _ in range(SETTLE)]
-  assert lifts[0] == pytest.approx(rise * DT)
+  # the first rise is the slower of the lift's own and the authority's re-engage budget (upstream's jerk budget)
+  first = min(rise, c.REENGAGE_JERK)
+  assert lifts[0] == pytest.approx(first * DT)
   assert max(np.diff([0.] + lifts)) <= rise * DT + 1e-9
   assert ctl.floor == pytest.approx(ceiling)
   assert lifts[-1] == pytest.approx(lift, abs=1e-5)

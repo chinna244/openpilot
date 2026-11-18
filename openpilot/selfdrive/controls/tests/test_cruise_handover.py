@@ -174,11 +174,14 @@ def test_a_target_that_turns_restrictive_after_release_brakes_at_least_as_it_ask
 
 
 def test_the_committed_braking_is_kept_one_cycle_after_release():
-  p = planner()
-  press(p, gas=True, a_ego=-0.6)
-  p.update(build_sm(a_ego=-0.6))
-  p.update(build_sm(v_cruise_kph=(V_EGO - 1.0) * 3.6, a_ego=-0.6))
-  assert sent(p) <= -0.5
+  # as committed: the reference brakes the same; since #39266 the cruise law eases into it over 1 s (-0.49 here)
+  def run(p):
+    press(p, gas=True, a_ego=-0.6)
+    p.update(build_sm(a_ego=-0.6))
+    p.update(build_sm(v_cruise_kph=(V_EGO - 1.0) * 3.6, a_ego=-0.6))
+    return sent(p)
+  assert run(planner()) == pytest.approx(run(reference()), abs=1e-6)
+  assert run(planner()) <= -0.45
 
 
 def test_repeated_short_gas_presses_each_hand_over_clean():
@@ -353,7 +356,17 @@ def test_the_settle_ends_once_back_at_the_set_speed():
     p.update(build_sm(a_ego=0.0, v_cruise_kph=FAST, model_a=0.5))
   for _ in range(30):
     p.update(build_sm(a_ego=0.0, v_cruise_kph=kph, model_a=0.5))
-  assert sent(p) <= -0.45
+  # as committed: the reference brakes the same (since #39266 the cruise law eases in over 1 s, -0.24 here)
+  q = reference()
+  engage(q, a_ego=0.6, v_cruise_kph=kph)
+  for _ in range(5):
+    q.update(build_sm(a_ego=0.6, v_cruise_kph=kph, model_a=0.5))
+  for _ in range(5):
+    q.update(build_sm(a_ego=0.0, v_cruise_kph=FAST, model_a=0.5))
+  for _ in range(30):
+    q.update(build_sm(a_ego=0.0, v_cruise_kph=kph, model_a=0.5))
+  assert sent(p) == pytest.approx(sent(q), abs=1e-6)
+  assert sent(p) < -0.2
 
 
 def test_set_with_the_gas_held_settles_after_the_release():
@@ -494,6 +507,9 @@ def test_a_curve_target_mid_window_brakes_from_the_cruise_state_at_once(monkeypa
   scc['on'] = True
   p.update(build_sm(a_ego=0.0, v_cruise_kph=kph, model_a=0.5))
   assert sent(p) == pytest.approx(p.a_cruise, abs=1e-6)
+  assert sent(p) <= -0.35
+  # SCC's own budget, jerk-limited from the smoothed cruise state (#39266): full braking 0.1 s later
+  p.update(build_sm(a_ego=0.0, v_cruise_kph=kph, model_a=0.5))
   assert sent(p) <= -0.45
 
 
