@@ -120,6 +120,21 @@ _IN_TURN_LAT_ACC = 1.6  # m/s2, current lateral acceleration that counts as turn
 _IN_TURN_A_MIN = -0.5  # m/s2
 _IN_TURN_ESCAPE_LAT = 3.5  # m/s2, lateral acceleration past the actuation lead that restores full braking
 
+# Turn exit (openpilot long, town speed). Once the corner opens, the near field still holds the bend the car is leaving
+# and the profile held ~0 or braked while the wheel unwound and the model asked to pull away: route 00000166 t=395 braked
+# -0.3 at 14.5 mph with the model at +1.44 and the lateral acceleration falling 2.9 -> 2.5. The turn is handed back
+# to the plan once the car has turned, the lateral acceleration has fallen _EXIT_DROP below the turn's peak, the turn
+# past the actuation lead stays under _EXIT_LAT_AHEAD, and the model itself asks for more than _EXIT_MODEL_A.
+# Full-planner replay of 160 op turns (75 drives): 23 changed, +0.6 mph median out of the turn, no turn's lateral
+# acceleration over 2.8, no frame with less acceleration, 5 short changes elsewhere (curve exits, model +1.1..1.3).
+# The wheel must be unwinding (curvature _EXIT_UNWIND below its peak), not just the car slower in a steady curve; no
+# bend ahead may need committed braking (a second corner past the near window); once handed back it stays so until
+# the solver lets go, a bend ahead tightens past _EXIT_LAT_AHEAD or needs committed braking, or the model brakes.
+_EXIT_DROP = 0.3  # m/s2 below the turn's peak lateral acceleration
+_EXIT_UNWIND = 0.9  # of the turn's peak curvature
+_EXIT_LAT_AHEAD = 2.8  # m/s2
+_EXIT_MODEL_A = 0.1  # m/s2
+
 # UI state thresholds do not affect control output.
 _TURNING_LAT_ACC_TH = 1.6  # current lat acc above this displays as turning
 _LEAVING_LAT_ACC_TH = 1.3  # turning displays as leaving below this
@@ -166,6 +181,12 @@ class SmartCruiseControlVision(VisionProfile, UpstreamVision):
     self.max_pred_lat_acc = 0.
     self.lat_ahead = 0.  # lateral acceleration past the actuation lead, _FLOOR_TURN_PROJ_T on
     self.floor_turn = False  # the curve is a floor turn left to the plan
+    self.turn_peak_lat = 0.  # highest lateral acceleration of this cycle
+    self.turn_peak_curv = 0.  # and highest curvature
+    self.current_curv = 0.
+    self.turn_exit = False  # the turn is opening and the model pulls away: handed back to the plan
+    self.a_required_far = 0.
+    self.model_accel = 0.
 
   def _update_calculations(self, sm: messaging.SubMaster) -> None:
     if not self.long_enabled or not self.enabled:
@@ -181,7 +202,9 @@ class SmartCruiseControlVision(VisionProfile, UpstreamVision):
       self._reset_solver()
       return
 
-    self.current_lat_acc = self.v_ego ** 2 * abs(sm['controlsState'].curvature)
+    self.current_curv = abs(sm['controlsState'].curvature)
+    self.current_lat_acc = self.v_ego ** 2 * self.current_curv
+    self.model_accel = model.action.desiredAcceleration
     # the planner hands this controller its filtered speed but builds the cruise candidate on carState.vEgo
     self.v_ego_car = sm['carState'].vEgo
 
@@ -221,6 +244,8 @@ class SmartCruiseControlVision(VisionProfile, UpstreamVision):
     self.lat_ahead = v_soon ** 2 * float(np.max(kappa[past_lead])) if np.any(past_lead) else 0.
 
     self.a_required = required_decel(self.v_ego, v_allowed, dist, d_lead)
+    # bends past the near window only: the turn the car is in or leaving does not count (turn exit)
+    self.a_required_far = required_decel(self.v_ego, np.where(near, np.inf, v_allowed), dist, d_lead)
     # What the car must still shed from here. The commit gate budgets the stock dash walk in
     # d_lead, but once committed the servo is already walking, so only the ECU's response is
     # still ahead. Past the budget it means the car is late, which only measured geometry may
@@ -320,12 +345,28 @@ class SmartCruiseControlVision(VisionProfile, UpstreamVision):
 
     enabled = self.state in ENABLED_STATES
     active = self.state in ACTIVE_STATES
+    self._update_turn_exit()
 
     return enabled, active
 
+  def _update_turn_exit(self) -> None:
+    if not self.solver_active:
+      self.turn_peak_lat, self.turn_peak_curv, self.turn_exit = 0., 0., False
+      return
+    self.turn_peak_lat = max(self.turn_peak_lat, self.current_lat_acc)
+    self.turn_peak_curv = max(self.turn_peak_curv, self.current_curv)
+    committed = self.a_required_far >= COMMIT_FRAC * self.limits.a_budget  # a further bend that needs braking
+    keep = (self.limits.op_long and self.v_ego < _IN_TURN_V_MAX and self.lat_ahead < _EXIT_LAT_AHEAD and not committed)
+    if self.turn_exit:
+      self.turn_exit = keep and self.model_accel >= 0.
+    else:
+      opening = (self.turn_peak_lat >= _IN_TURN_LAT_ACC and self.current_lat_acc <= self.turn_peak_lat - _EXIT_DROP and
+                 self.current_curv <= _EXIT_UNWIND * self.turn_peak_curv)
+      self.turn_exit = keep and opening and self.model_accel > _EXIT_MODEL_A
+
   @property
   def _controlling(self) -> bool:
-    return self.is_active and self.solver_active
+    return self.is_active and self.solver_active and not self.turn_exit
 
   @property
   def v_ahead_min(self) -> float:
