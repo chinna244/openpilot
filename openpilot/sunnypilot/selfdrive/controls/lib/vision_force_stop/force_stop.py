@@ -5,6 +5,20 @@ from dataclasses import dataclass
 import math
 
 from openpilot.common.realtime import DT_MDL
+from openpilot.sunnypilot.selfdrive.controls.lib.vision_force_stop.stop_confirm import CONTROL_STOP_MAX_AGE_NS
+
+STOP_RESERVE_M = .5
+DISTANCE_TARGET_MIN_ACCEL = -3.5
+
+
+def distance_target(speed, acceleration, distance, delay):
+  """StarPilot force_stop_braking.distance_target: the accel that stops `distance` ahead after `delay`."""
+  if (not all(math.isfinite(x) for x in (speed, acceleration, distance, delay)) or
+      speed < 0 or distance < 0 or not 0 <= delay <= 2):
+    return DISTANCE_TARGET_MIN_ACCEL
+  remaining = distance - speed * delay - .5 * max(acceleration, 0.) * delay**2 - STOP_RESERVE_M
+  future_speed = speed + max(acceleration, 0.) * delay
+  return max(DISTANCE_TARGET_MIN_ACCEL, -future_speed**2 / (2 * max(remaining, .01)))
 
 STANDSTILL_HOLD_NS = 2_000_000_000
 STANDSTILL_CLEAR_NS = 750_000_000
@@ -72,6 +86,9 @@ class StopFrame:
   sign: bool = False
   dashboard_sign: bool = False
   vision_distance_m: float | None = None
+  acceleration_mps2: float | None = None
+  actuator_delay_s: float | None = None
+  vision_source_ns: int = 0
 
 
 @dataclass(frozen=True)
@@ -109,6 +126,7 @@ class ForceStop:
     self.standstill_clear_ns = 0
     self.standstill_reason = None
     self.sign_confirmed = False
+    self.ranged_stop = False
     self.previously_enabled = False
     self.distance = 0.0
     self.distance_cap = 0.0
@@ -120,6 +138,7 @@ class ForceStop:
     self.dash_distance = None
     self.vision_distance = None
     self.vision_samples = 0
+    self.vision_sample_ns = 0
     self.sign_evidence_ns = 0
 
   def _sign_estimate(self, frame: StopFrame, now: int, travel: float) -> float | None:
@@ -130,7 +149,12 @@ class ForceStop:
     if self.vision_distance is not None:
       self.vision_distance = max(0.0, self.vision_distance - travel)
     vision = frame.vision_distance_m
-    if vision is not None and math.isfinite(vision) and vision >= 0:
+    # each camera sample is averaged once: the runtime now passes the range every frame while a confirmation is fresh
+    new_vision = (type(frame.vision_source_ns) is int and
+                  (frame.vision_source_ns == 0 or frame.vision_source_ns > self.vision_sample_ns))
+    if vision is not None and math.isfinite(vision) and vision >= 0 and new_vision:
+      if frame.vision_source_ns > 0:
+        self.vision_sample_ns = frame.vision_source_ns
       self.vision_samples += 1
       self.vision_distance = vision if self.vision_distance is None else (
         self.vision_distance + (vision - self.vision_distance) / self.vision_samples)
@@ -195,11 +219,22 @@ class ForceStop:
     # only against a fresh camera range to the sign: not the 27 m seed, not an estimate worn down after passing it
     lead_before_stop = lead and not (frame.sign and self.vision_distance is not None and self.vision_distance > 0. and
                                      frame.lead_distance_m >= self.vision_distance + LEAD_PAST_SIGN_M)
-    permitted = (available and now >= self.override_until_ns and not frame.driving_in_curve and not turn and
-                 not frame.tracking_lead and not lead_before_stop)
+    spatial_permitted = available and now >= self.override_until_ns and not frame.driving_in_curve and not turn
+    permitted = spatial_permitted and not frame.tracking_lead and not lead_before_stop
     model_path = frame.light and model_active and permitted and not curved
     plausible = sign_estimate is None or speed * speed <= 2 * SIGN_LONG_PATH_MAX_DECEL * max(sign_estimate, 1.0)
-    sign_path = (frame.sign and permitted and speed < SIGN_MAX_SPEED_MPS and
+    # StarPilot 8124d8170: behind a braking lead, keep a confirmed sign whose fresh camera range the car's current
+    # braking already covers (never for a light alone)
+    current_range = frame.vision_distance_m
+    ranged_sign = (not frame.standstill and offset_ft == 0 and tune.distance_bias_m == 0 and not frame.dashboard_sign and
+                   type(frame.vision_source_ns) is int and 0 < frame.vision_source_ns <= now and
+                   now - frame.vision_source_ns <= CONTROL_STOP_MAX_AGE_NS and
+                   frame.vision_source_ns == self.vision_sample_ns and current_range is not None and
+                   frame.acceleration_mps2 is not None and frame.acceleration_mps2 < 0 and frame.actuator_delay_s is not None and
+                   0 <= frame.actuator_delay_s <= 2 - DT_MDL and
+                   distance_target(speed, frame.acceleration_mps2, current_range, frame.actuator_delay_s + DT_MDL) >=
+                   max(-SIGN_LONG_PATH_MAX_DECEL, frame.acceleration_mps2))
+    sign_path = (frame.sign and spatial_permitted and (permitted or ranged_sign) and speed < SIGN_MAX_SPEED_MPS and
                  (horizon < SIGN_MODEL_AGREE_M or self.forcing and plausible))
     line_blocked = (self.queue_line is not None and frame.lead_present and
                     frame.lead_distance_m < self.queue_line + QUEUE_CLEAR_M)
@@ -278,6 +313,8 @@ class ForceStop:
     approach = 0.0
     ceiling = None
     if force and not overridden:
+      if sign_path and not permitted:
+        self.ranged_stop = True
       if self.entry_speed is None and not frame.standstill:
         self.entry_speed = speed
       self.forcing |= not frame.standstill or held
@@ -295,10 +332,16 @@ class ForceStop:
         self.distance_cap = max(0.0, self.distance_cap - speed * dt)
         cap = self.distance_cap + 15 * min(self.distance_cap / 60, 1)
         self.distance = min(self.distance, cap)
+        terminal_distance = self.distance
         if sign_estimate is not None and (self.sign_confirmed or frame.sign and available and horizon < SIGN_MODEL_AGREE_M):
           self.distance = min(sign_estimate, cap)
         if self.queue_line is not None and self.sign_confirmed:
           self.distance = self.queue_line
+        if (self.ranged_stop and current_range is not None and math.isfinite(current_range) and current_range >= 0 and
+            frame.vision_source_ns == self.vision_sample_ns and frame.sign):
+          self.distance = min(self.distance, max(0., current_range))
+        if self.ranged_stop:  # StarPilot: a lead-retained stop never runs past the model's own stop distance
+          self.distance = min(self.distance, terminal_distance)
         effective = self.distance + offset + tune.distance_bias_m
         decel = SIGN_APPROACH_DECEL if frame.sign else MODEL_APPROACH_DECEL
         ceiling = math.sqrt(2 * decel * max(0, effective - tune.handoff_m))
@@ -306,6 +349,7 @@ class ForceStop:
       self.forcing = False
       self.entry_speed = None
       self.sign_confirmed = False
+      self.ranged_stop = False
       self._clear_standstill()
       self.distance = self.distance_cap = horizon if available else 0.0
       if frame.light and permitted and not curved and not overridden:

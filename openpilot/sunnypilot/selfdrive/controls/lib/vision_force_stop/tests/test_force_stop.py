@@ -74,6 +74,40 @@ class ForceStopTests(unittest.TestCase):
       plan = self.owner.step(frame(tick, horizon_m=40., sign=True, **lead), self.tune)
       self.assertFalse(plan.forcing)
 
+  def _ranged(self, tick, *, age_ns=100_000_000, **changes):
+    # a braking lead 12 m ahead, before the sign: vetoes the sign unless the car's own braking covers the camera range
+    base = {'speed_mps': 5., 'horizon_m': 40., 'sign': True, 'lead_present': True, 'lead_distance_m': 12.,
+            'lead_speed_mps': 4., 'tracking_lead': True, 'vision_distance_m': 20., 'acceleration_mps2': -1.5,
+            'actuator_delay_s': .2, 'vision_source_ns': BASE + tick * TICK - age_ns}
+    base.update(changes)
+    return frame(tick, **base)
+
+  def test_braking_behind_lead_keeps_a_ranged_sign(self):
+    # StarPilot 8124d8170: routes 47 t=44, 4b t=1116, 5e, 5f: real STOP signs behind a braking lead
+    for tick in range(15):
+      plan = self.owner.step(self._ranged(tick), self.tune)
+    self.assertTrue(plan.forcing)
+    self.assertTrue(self.owner.ranged_stop)
+
+  def test_ranged_sign_needs_the_car_braking_enough(self):
+    for changes in ({'acceleration_mps2': 0.}, {'acceleration_mps2': -1., 'vision_distance_m': 6.},
+                    {'age_ns': 1_300_000_000}, {'vision_source_ns': 0}, {'actuator_delay_s': None}):
+      with self.subTest(changes=changes):
+        self.owner.reset()
+        for tick in range(15):
+          plan = self.owner.step(self._ranged(tick, **changes), self.tune)
+          self.assertFalse(plan.forcing)
+
+  def test_ranged_sign_is_never_kept_in_a_curve(self):
+    for tick in range(15):
+      plan = self.owner.step(self._ranged(tick, driving_in_curve=True), self.tune)
+      self.assertFalse(plan.forcing)
+
+  def test_a_repeated_camera_sample_is_averaged_once(self):
+    for tick in range(3):
+      self.owner.step(self._ranged(tick, vision_source_ns=BASE), self.tune)
+    self.assertEqual(self.owner.vision_samples, 1)
+
   def test_lead_appearing_does_not_abandon_committed_stop(self):
     for tick in range(15):
       self.owner.step(frame(tick), self.tune)
