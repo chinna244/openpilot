@@ -51,6 +51,10 @@ DROPOUT_HOLD_MAX_M = 1000.  # backstop: driven this far with no map, the held li
 # for a few seconds (routes 138/186: 25-30 for 4-14 s at 52-67 mph on a freeway); it waits for the car or this long
 CROSS_MATCH_GAP = 20 * CV.MPH_TO_MS  # m/s
 CROSS_MATCH_S = 15.
+# a map limit just shown that the car's reading contradicts, with nothing backing it, is often a cross street matched at
+# a junction for 1-4 s (route 6d t=36: East Norwich 25 on a 30 road at the start of the drive, nothing settled yet);
+# the limit given so far stays until the map's has held this long or the car or camera agrees
+NEW_MAP_WAIT_S = 5.
 
 
 class SpeedLimitResolver:
@@ -287,7 +291,9 @@ class SpeedLimitResolver:
     distance = self.distance_solutions[source] if source else 0.
 
     if Policy(self.policy) == Policy.combined:
-      return self._hold_on_evidence(speed_limit, distance, source)
+      out = self._hold_on_evidence(speed_limit, distance, source)
+      self._given, self._given_distance, self._given_source = out
+      return out
     self._reset_hold()
 
     return speed_limit, distance, source
@@ -308,6 +314,10 @@ class SpeedLimitResolver:
     self._dropout_limit = 0.
     self._cross: tuple[int, float, float] | None = None  # (since, the map limit waited on, the limit held)
     self._car_reading = 0.
+    self._given, self._given_distance, self._given_source = 0., 0., SpeedLimitSource.none  # the limit given last, held ones included
+    self._wait_since: int | None = None  # the new-map wait: its first frame, the last frame it applied, the limit it holds
+    self._wait_last = 0
+    self._wait_held = 0.
     self._car_read_frame = -10 ** 9  # when the car last read a new limit
 
   def _hold_on_evidence(self, speed_limit: float, distance: float, source: custom.LongitudinalPlanSP.SpeedLimit.Source):
@@ -358,6 +368,25 @@ class SpeedLimitResolver:
     if self._cross is not None:
       self._out = 0.
       return self._cross[2], 0., SpeedLimitSource.map
+
+    # a new map limit the car contradicts, that nothing backs, waits NEW_MAP_WAIT_S (the limit given so far stays). The
+    # clock is per limit held: the map changing value or blanking for less than the wait does not restart it, another
+    # source agreeing with the map ends it, and holding a different limit starts a new one (review: junctions < 5 s apart).
+    # Not while a limit ahead is in play (review: an off-ramp's early slow-down, a car agreeing with the ahead, an ahead
+    # limit held as the current one)
+    wait = int(NEW_MAP_WAIT_S / DT_MDL)
+    backed = own > 0. and any(abs(own - self.limit_solutions[o]) <= VOTE_TOLERANCE
+                              for o in ALL_SOURCES if o != SpeedLimitSource.map and self.limit_solutions[o] > 0.)
+    if backed:
+      self._wait_since = None
+    if (source == SpeedLimitSource.map and own > 0. and not backed and abs(speed_limit - own) <= .1 and self._given_distance <= 0. and
+        self.frame - self._map_own_frame < wait and car > 0. and abs(car - own) > VOTE_TOLERANCE):
+      keep, keep_source = (self._given, self._given_source) if self._given > 0. else (car, SpeedLimitSource.car)
+      if self._wait_since is None or self.frame - self._wait_last > wait or abs(keep - self._wait_held) > .1:
+        self._wait_since, self._wait_held = self.frame, keep
+      self._wait_last = self.frame
+      if self.frame - self._wait_since < wait:
+        return keep, 0., keep_source
 
     if source == SpeedLimitSource.none:
       self._out = 0.
