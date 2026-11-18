@@ -503,6 +503,16 @@ class TestCruiseBadges:
       for key in ("CarParamsPersistent", "CarParamsSPPersistent", "AlphaLongitudinalEnabled", "SpeedLimitMode"):
         params.remove(key)
 
+  def test_camera_vision_toggles_on_the_main_cruise_list(self, params):
+    # user 2026-11-18: camera signs and stop at signs sit on the cruise list, not inside speed limit
+    from openpilot.selfdrive.ui.sunnypilot.mici.layouts.cruise import CruiseLayoutMici
+    layout = CruiseLayoutMici()
+    render(layout)
+    main = [getattr(w, 'param', None) for w in layout._scroller._items]
+    assert main.index("SpeedLimitVision") + 1 == main.index("VisionForceStop")
+    sub = [getattr(w, 'param', None) for w in layout._sl_view._scroller._items]
+    assert "SpeedLimitVision" not in sub and "VisionForceStop" not in sub
+
 
 class TestSubtitleAreaRenders:
   """BigButtonSP's three subtitle modes are drawn, not stored, so each needs a real frame."""
