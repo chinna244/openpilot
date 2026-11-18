@@ -110,7 +110,7 @@ class VisionForceStop:
                                              model_agrees=model_slowing)
       vision_fresh = bool(vision_sign and 0 <= now_ns - vision_sign <= CONTROL_STOP_MAX_AGE_NS)
       vision_distance = None
-      if vision_fresh and vision_sign != self.vision_ranged_ns and self.vision_stop.distance_m is not None:
+      if vision_fresh and self.vision_stop.distance_m is not None:
         self.vision_ranged_ns = vision_sign
         vision_distance = self.vision_stop.distance_m - float(car.vEgo) * (stamp - vision_sign) / 1e9
       frame = StopFrame(stamp, float(car.vEgo), horizon, False, horizon is not None and horizon < 50,
@@ -118,7 +118,9 @@ class VisionForceStop:
                         tracked is not None and tracked.tracked is True, bool(lead.present), float(lead.dRel), float(lead.vLead),
                         raw_curve[1] if raw_curve is not None else False, curvature[0] if curvature is not None else None,
                         bool(car.leftBlinker or car.rightBlinker), float(car.steeringAngleDeg), resume_requested=resume_requested,
-                        perception_available=perception_available, sign=vision_fresh, vision_distance_m=vision_distance)
+                        perception_available=perception_available, sign=vision_fresh, vision_distance_m=vision_distance,
+                        acceleration_mps2=float(car.aEgo), actuator_delay_s=float(cp.longitudinalActuatorDelay),
+                        vision_source_ns=int(vision_sign) if vision_fresh else 0)
       self.plan = self.policy.step(frame, vehicle_tune(str(cp.carFingerprint)), 0)
       return self.plan
     except (AttributeError, KeyError, TypeError, ValueError, OverflowError, RuntimeError):
