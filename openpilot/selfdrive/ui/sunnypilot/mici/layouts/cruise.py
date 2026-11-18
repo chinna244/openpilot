@@ -67,6 +67,13 @@ class CruiseLayoutMici(NavScroller):
     self._curve_speed = BigMultiParamToggleSP(tr("curve speed"), "CurveSpeedProfile", [tr("gentle"), tr("normal"), tr("sporty")],
                                               description=tr("How fast slow for curves takes turns.\n" +
                                                              "Gentle slows more. Sporty slows less."))
+    self._vision_signs = BigParamControlSP(tr("camera signs"), "SpeedLimitVision",
+                                           description=tr("Reads speed limit signs with the road camera.\n" +
+                                                          "Combined and vision-first use it. Off: car and map only."))
+    self._vision_force_stop = BigParamControlSP(tr("stop at signs"), "VisionForceStop",
+                                                description=tr("Stops for STOP signs the camera reads, as StarPilot's Force Stop does.\n" +
+                                                               "Only under 40 mph, when the driving model also slows. Gas or RES to go.\n" +
+                                                               "Needs camera signs on. Street lights at night can read as STOP signs."))
     self._custom_acc_btn = BigButtonSP(tr("custom increments"))
     self._speed_limit_btn = BigButtonSP(tr("speed limit"))
 
@@ -76,6 +83,7 @@ class CruiseLayoutMici(NavScroller):
     self._scroller.add_widgets([
       *self._alpha_long.items,
       self._scc_v_toggle, self._scc_m_toggle, self._curve_speed,
+      self._vision_signs, self._vision_force_stop,
       self._speed_limit_btn, self._custom_acc_btn,
     ])
 
@@ -103,21 +111,13 @@ class CruiseLayoutMici(NavScroller):
                                                            "Combined uses the camera sign, else map, else car.\n" +
                                                            "Vision-first uses the camera sign, else car, else map.\n" +
                                                            "On a Mazda, car needs a nav SD card."))
-    self._sl_vision = BigParamControlSP(tr("camera signs"), "SpeedLimitVision",
-                                        description=tr("Reads speed limit signs with the road camera.\n" +
-                                                       "Combined and vision-first use it. Off: car and map only."))
-    self._sl_force_stop = BigParamControlSP(tr("stop at signs"), "VisionForceStop",
-                                            description=tr("Stops for STOP signs the camera reads, as StarPilot's Force Stop does.\n" +
-                                                           "Only under 40 mph, when the driving model also slows. Gas or RES to go.\n" +
-                                                           "Needs camera signs on. Street lights at night can read as STOP signs."))
     self._sl_offset_type = BigMultiParamToggleSP(tr("offset type"), "SpeedLimitOffsetType", [tr("none"), tr("fixed"), "%"], off_index=0,
                                                  description=tr("Adds an offset to the speed limit.\n" +
                                                                 "Fixed adds a set amount of speed. % adds a percentage of the limit."))
     self._sl_offset_value = BigParamOption(tr("offset value"), "SpeedLimitValueOffset",
                                            min_value=-30, max_value=30, label_callback=_offset_label, picker_unit=_offset_unit,
                                            description=tr("The amount added to the speed limit. Negative values go below it."))
-    self._sl_view = self._speed_limit_btn.link_sub_panel([self._sl_mode, self._sl_source, self._sl_vision, self._sl_force_stop,
-                                                         self._sl_offset_type, self._sl_offset_value])
+    self._sl_view = self._speed_limit_btn.link_sub_panel([self._sl_mode, self._sl_source, self._sl_offset_type, self._sl_offset_value])
 
   def show_event(self):
     super().show_event()
@@ -130,6 +130,8 @@ class CruiseLayoutMici(NavScroller):
     self._scc_v_toggle.refresh()
     self._scc_m_toggle.refresh()
     self._curve_speed.refresh()
+    self._vision_signs.refresh()
+    self._vision_force_stop.refresh()
 
     cp_ready = ui_state.CP is not None and ui_state.CP_SP is not None
     has_long = cp_ready and ui_state.has_longitudinal_control
