@@ -26,7 +26,7 @@ class AlphaLongitudinalTogglesMici:
                                                description=tr("The driving model often cruises below your set speed and follows farther back.\n" +
                                                               "This drives toward them whenever the model holds back.\n" +
                                                               "The model still makes every slowdown.\n" +
-                                                              "Long press home or hold the distance button to switch it."))
+                                                              "Hold the distance button to switch it."))
 
     self._refresh_toggles = (
       ("AlphaLongitudinalEnabled", self._alpha_long_toggle),
