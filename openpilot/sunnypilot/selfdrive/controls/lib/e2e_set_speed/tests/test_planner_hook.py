@@ -9,7 +9,7 @@ The planner hook: off is upstream behaviour, on raises the e2e candidate, and th
 import numpy as np
 import pytest
 
-from openpilot.cereal import log, messaging
+from openpilot.cereal import messaging
 from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import T_IDXS as T_IDXS_MPC
 from openpilot.selfdrive.controls.lib.longitudinal_planner import LongitudinalPlanner, LongitudinalPlanSource
 from openpilot.sunnypilot.selfdrive.car.tests.fakes import FakeParams
@@ -62,8 +62,7 @@ def run_planner(enabled: bool, frames: int = 200) -> LongitudinalPlanner:
 def test_off_is_upstream():
   planner = run_planner(False)
   assert planner.mpc.source == LongitudinalPlanSource.e2e
-  # upstream's boost starts at its aggressive minimum (the fixture's personality)
-  assert planner.output_a_target == pytest.approx(MODEL_ACCEL + planner.accel_boost.total_boost)
+  assert planner.output_a_target == pytest.approx(MODEL_ACCEL)
   assert planner.e2e_set_speed.inhibit == Inhibit.disabled
 
 
@@ -111,25 +110,3 @@ def test_throttle_probability_reaches_the_floor():
   assert planner.e2e_set_speed.gain == pytest.approx(0.25)
   assert planner.e2e_set_speed.lift == pytest.approx(0.25 * 0.7, rel=1e-3)
 
-
-def gas_pressed_planner(enabled: bool) -> LongitudinalPlanner:
-  """Model-limited with the gas held: upstream's boost latches eligibility, then learns."""
-  planner = run_planner(enabled, frames=1)  # the first frame installs the gated boost
-  planner.accel_boost.total_boost = 0.1
-  planner.accel_boost.boost_eligible = True
-  sm = planner_sm()
-  car_state = sm['carState'].as_builder()
-  car_state.gasPressed = True
-  sm['carState'] = car_state.as_reader()
-  for _ in range(50):
-    planner.update(sm)
-  return planner
-
-
-def test_gas_boost_only_without_the_floor():
-  # the fixture drives on aggressive, where upstream's boost starts at 0.1 without any gas press
-  assert planner_sm()['selfdriveState'].personality == log.LongitudinalPersonality.aggressive
-  assert gas_pressed_planner(False).accel_boost.total_boost > 0.1
-  on = gas_pressed_planner(True)
-  assert (on.accel_boost.total_boost, on.accel_boost.boost_eligible) == (0., False)
-  assert on.output_a_target == pytest.approx(on.e2e_set_speed.lift + MODEL_ACCEL)

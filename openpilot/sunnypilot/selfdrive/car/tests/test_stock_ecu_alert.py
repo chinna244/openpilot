@@ -434,7 +434,7 @@ class TestStockEcuLost:
 
   def test_shapes(self):
     loud = EVENTS_ZP[EventNameZP.stockEcuLost][ET.PERMANENT]
-    assert loud.audible_alert == AudibleAlert.warningImmediate and loud.alert_text_1 == "Cruise Lost"
+    assert loud.audible_alert == AudibleAlert.warningImmediateSystem and loud.alert_text_1 == "Cruise Lost"  # the system take-control sound
     quiet = EVENTS_ZP[EventNameZP.stockEcuLostIdle][ET.PERMANENT]
     assert quiet.audible_alert == AudibleAlert.prompt
 

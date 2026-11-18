@@ -20,7 +20,9 @@ V_EGO = 20.
 A_CRUISE = 0.5  # the planner's cruise candidate
 RISE = 0.375  # m/s^3, the lift's rise at V_EGO: 0.5 in town easing to 0.25 by 25 m/s (local tuning)
 CAP = 0.7  # m/s^2, the floor's ceiling at V_EGO: 0.9 in town easing to 0.5 by 25 m/s (local tuning)
-SETTLE_FRAMES = round(2. / (op_long_cruise_jerk(40.) * DT)) + 10
+# the lift's first rise: the slower of its own rise and the authority's re-engage budget
+FIRST_RISE = min(RISE, c.REENGAGE_JERK)
+SETTLE_FRAMES = round(2. / (min(c.REENGAGE_JERK, op_long_cruise_jerk(40.)) * DT)) + 10  # a 2 m/s^2 gap
 
 
 def run(ctl, n, sm, a_model=0., a_cruise=A_CRUISE, **kwargs):
@@ -64,13 +66,22 @@ def test_idle_resets_at_once(kwargs):
   assert (ctl.inhibit, ctl.lift) == (Inhibit.inactive, 0.)
 
 
-def test_lifts_from_the_first_frame_at_the_rate_limit():
+def test_lifts_from_the_first_frame_on_the_jerk_budget():
+  # the gap holds still, so the lift moves only with its authority, at the re-engage budget
   ctl = new_controller()
   lifts = [run(ctl, 1, build_sm(V_EGO), a_cruise=1.5) for _ in range(SETTLE_FRAMES)]
-  assert lifts[0] == pytest.approx(RISE * DT)
-  assert max(np.diff([0.] + lifts)) <= RISE * DT + 1e-9
+  assert lifts[0] == pytest.approx(FIRST_RISE * DT)
+  assert max(np.diff([0.] + lifts)) <= FIRST_RISE * DT + 1e-9
   assert lifts[-1] == pytest.approx(CAP)  # chill's 1.5 held to the ceiling for the speed
   assert ctl.inhibit == Inhibit.none
+
+
+def test_lift_never_rises_past_the_cruise_jerk():
+  # a small gap re-engages faster, but the lift still rises no faster than the cruise candidate
+  ctl = new_controller()
+  lifts = [run(ctl, 1, build_sm(V_EGO), a_cruise=0.1) for _ in range(SETTLE_FRAMES)]
+  assert max(np.diff([0.] + lifts)) <= RISE * DT + 1e-9
+  assert lifts[-1] == pytest.approx(0.1)
 
 
 def test_floor_is_the_cruise_candidate():
@@ -207,6 +218,26 @@ def test_a_bend_ahead_fades_the_lift(lat, fade):
   run(ctl, SETTLE_FRAMES, build_sm(V_EGO, yaw_rate=bend_ahead(lat)))
   assert ctl.fade == pytest.approx(fade)
   assert ctl.lift == pytest.approx(fade * A_CRUISE)
+
+
+@pytest.mark.parametrize("a_cruise", [0.5, 1.5])
+def test_bend_flicker_moves_the_lift_on_the_jerk_budget(a_cruise):
+  # the path's bend over 10 s flickering frame to frame across the fade's band: the lift follows on
+  # the fade's budget, not at the frame rate
+  ctl = settled(a_cruise=a_cruise)
+  lifts = [ctl.lift]
+  for i in range(200):
+    lat = 0.9 if i % 2 else 0.7
+    lifts.append(run(ctl, 1, build_sm(V_EGO, yaw_rate=bend_ahead(lat)), a_cruise=a_cruise))
+  assert max(np.abs(np.diff(lifts))) <= c.FADE_JERK * DT + 1e-9
+  assert 0.25 * a_cruise - 1e-9 <= ctl.lift <= 0.75 * a_cruise + 1e-9  # inside the flicker's fades, 0.25-0.75
+
+
+def test_bend_ahead_eases_the_lift_off_on_the_jerk_budget():
+  ctl = settled(a_cruise=1.5)
+  lifts = [run(ctl, 1, build_sm(V_EGO, yaw_rate=bend_ahead(1.2)), a_cruise=1.5) for _ in range(SETTLE_FRAMES)]
+  assert lifts[0] == pytest.approx(CAP - c.FADE_JERK * DT)  # chill's 1.5 is held to the speed's ceiling (local tuning)
+  assert lifts[-1] == 0.
 
 
 def test_lane_change_drops_the_lift():

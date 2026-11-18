@@ -9,12 +9,11 @@ from openpilot.common.constants import CV
 from openpilot.common.filter_simple import FirstOrderFilter
 from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.modeld.constants import ModelConstants
-from openpilot.selfdrive.controls.lib.accel_boost import AccelBoost
 from openpilot.selfdrive.controls.lib.firm_stop import FirmStop, FIRM_STOP_PLAN_V
 from openpilot.selfdrive.controls.lib.longcontrol import LongCtrlState
 from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import LongitudinalMpc, LongitudinalPlanSource, get_T_FOLLOW
 from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import T_IDXS as T_IDXS_MPC
-from openpilot.selfdrive.controls.lib.drive_helpers import CONTROL_N, get_accel_from_plan, should_stop
+from openpilot.selfdrive.controls.lib.drive_helpers import CONTROL_N, get_accel_from_plan, should_stop, smooth_value
 from openpilot.selfdrive.car.cruise import V_CRUISE_MAX, V_CRUISE_UNSET
 from openpilot.common.swaglog import cloudlog
 
@@ -47,7 +46,8 @@ CONTROL_N_T_IDX = ModelConstants.T_IDXS[:CONTROL_N]
 
 
 def get_cruise_accel(v_cruise, v_ego, a_cruise_prev, a_target_prev, dt):
-  target_accel = np.clip(v_cruise - v_ego, A_CRUISE_MIN, ACCEL_MAX)
+  target_accel = smooth_value(v_cruise - v_ego, a_cruise_prev, tau=1.0, dt=dt)
+  target_accel = np.clip(target_accel, A_CRUISE_MIN, ACCEL_MAX)
   j_cruise = np.interp(v_ego, J_CRUISE_BP, J_CRUISE_VALS)
   target_accel = float(np.clip(target_accel, min(a_cruise_prev, a_target_prev) - j_cruise * dt, a_cruise_prev + j_cruise * dt))
 
@@ -61,7 +61,6 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
     LongitudinalPlannerSP.__init__(self, self.CP, CP_SP, self.mpc)
     self.fcw = False
     self.dt = dt
-    self.accel_boost = AccelBoost()
     self.firm_stop = FirmStop()
     self.vision_force_stop = VisionForceStop(params)
     self.force_stop_plan = StopPlan()
@@ -241,7 +240,6 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
       self.a_settle = None
     cruise_should_stop = should_stop(v_ego, self.a_cruise)
 
-    output_a_target_e2e = self.accel_boost.update(sm, output_a_target_e2e, output_a_target_mpc, self.a_cruise)
     # the model's planned stop, finished steadily instead of tapered: only ever lower than the e2e candidate
     lead_one = sm['radarState'].leadOne
     a_firm = self.firm_stop.update(v_ego, sm['modelV2'].velocity.x, sm['modelV2'].position.x,
@@ -290,7 +288,6 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
     longitudinalPlan.fcw = self.fcw
 
     longitudinalPlan.aTarget = float(self.a_target_published)
-    longitudinalPlan.accelBoost = float(self.accel_boost.total_boost)
     longitudinalPlan.shouldStop = bool(self.output_should_stop)
     longitudinalPlan.allowBrake = True
 

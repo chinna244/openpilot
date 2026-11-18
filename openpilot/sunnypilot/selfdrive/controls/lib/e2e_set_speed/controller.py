@@ -13,13 +13,14 @@ min() keeps the car at the model's pace either way.
 
 This lifts the e2e candidate toward what chill mode would do and never lowers it:
 
-  e2e = a_model + lift,  lift -> gain * fade * max(0, floor - a_model)
+  e2e = a_model + lift,  lift -> authority * max(0, floor - a_model),  authority -> gain * fade
 
 floor is chill mode's answer, the lower of the planner's own lead MPC and cruise candidates
 (upstream's cruise law with SCC and SLA's targets), so with nothing to slow for experimental mode
 drives and follows as chill does. gain fades the lift out as the model eases off (its own
 acceleration and its throttle probability), now or over its plan (a stop, a light, a closing
-lead), and below walking pace, and fade as the road ahead bends at the current speed. Every
+lead), and below walking pace, and fade as the road ahead bends at the current speed. The
+authority moves on a jerk budget, except to let go for the model (REENGAGE_JERK). Every
 slowdown is the model's: the lift only lets go of it, and a lead that brakes binds through the
 MPC candidate at once.
 
@@ -118,6 +119,15 @@ DEPART_REENGAGE_T = 1.0  # s, longitudinal control back after the press
 DEPART_LEAD_D = 30.  # m
 DEPART_STEER_ARM = 30.  # deg
 DEPART_STEER_END = 45.  # deg
+# With k = gain * fade, e2e = a_model + k * gap = (1 - k) * a_model + k * floor (gap = floor - a_model):
+# a blend of two smooth signals, plus k' * gap. That term is all the jerk the lift adds, and k is read
+# each frame from flickering inputs (the path's bends over 10 s, the model's wander), so k moves on a
+# jerk budget: it re-engages at most REENGAGE_JERK / gap a second, and the fade, a comfort gate (curve
+# speed is SCC's, through the floor), moves at most FADE_JERK / gap either way. Letting go for the
+# model (the gain, a lane change) is still at once. docs/zoompilot/e2e-set-speed.md, "Authority".
+REENGAGE_JERK = 0.3  # m/s^3
+FADE_JERK = 0.3  # m/s^3
+MIN_GAP = 0.05  # m/s^2, only to bound the step at a closed gap
 
 T_IDXS = np.asarray(ModelConstants.T_IDXS)
 HORIZON_MASK = T_IDXS <= HORIZON
@@ -169,6 +179,8 @@ class E2ESetSpeedController:
     self.press_from_stop = False
     self.depart_t: float | None = None  # s into a departure window
     self.depart_ease = False  # a window that ran out, its lift easing off
+    self.reengage_jerk = REENGAGE_JERK
+    self.fade_jerk = FADE_JERK
     self._reset(Inhibit.disabled)
 
   def _reset(self, reason) -> None:
@@ -176,6 +188,7 @@ class E2ESetSpeedController:
     self.fade = 0.
     self.plan_fade = 0.
     self.floor = 0.
+    self.authority = 0.
     self.lift = 0.
     self.plb_count = 0
     self.plb_armed = False
@@ -186,6 +199,7 @@ class E2ESetSpeedController:
       self.plb = 0.
       self.plb_active = False
     self.inhibit = reason
+    self._fresh = True  # the fade starts from the road as it is, with nothing to smooth yet
 
   def _update_departure(self, sm: messaging.SubMaster, reset_state: bool) -> None:
     cs = sm['carState']
@@ -282,7 +296,11 @@ class E2ESetSpeedController:
     window = self.depart_t is not None
     model_gain = model_term * (1. if window else speed_fade)
     self.gain = model_gain * (1. if window else float(np.clip(throttle_prob, 0., 1.)))
-    self.fade = float(np.interp(lat_ahead, FADE_LAT_BP, [1., 0.]))
+    gap = max(0., self.floor - a_model)
+    fade = float(np.interp(lat_ahead, FADE_LAT_BP, [1., 0.]))
+    fade_step = self.fade_jerk * self.dt / max(gap, MIN_GAP)
+    self.fade = fade if self._fresh else float(np.clip(fade, self.fade - fade_step, self.fade + fade_step))
+    self._fresh = False
 
     if not self.enabled:
       self.inhibit = Inhibit.disabled
@@ -296,7 +314,9 @@ class E2ESetSpeedController:
     req = plan_decel(vel, pos)
     self.slowing_count = self.slowing_count + 1 if req <= PLB_OFF else 0
     slowing = self.slowing_count >= self.plb_arm_frames
-    target = min(self.gain * self.fade * max(0., self.floor - a_model), lift_max(v_ego)) if self.inhibit == Inhibit.none and not slowing else 0.
+    authority = self.gain * self.fade if self.inhibit == Inhibit.none and not slowing else 0.
+    self.authority = min(authority, self.authority + self.reengage_jerk * self.dt / max(gap, MIN_GAP))
+    target = min(self.authority * gap, lift_max(v_ego))
     # Normally the lift eases off at LIFT_FALL. When the model starts to brake the gain drops, and
     # the lift may drop with it in one frame, so at gain 0 the model's braking is not delayed. Only the
     # model's own easing off counts here: a flickering throttle probability eases out at LIFT_FALL.
