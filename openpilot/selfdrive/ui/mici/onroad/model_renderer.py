@@ -262,7 +262,7 @@ class ModelRenderer(BaseModelRenderer, ModelRendererSP):
       return
 
     if ui_state.rainbow_path:
-      self.rainbow_path.draw_rainbow_path(self._rect, self._path)
+      self.rainbow_path.draw_rainbow_path(self._rect, self._path, self._draw_offset())
       return
 
     path_pts = self._path.projected_points + self._draw_offset()

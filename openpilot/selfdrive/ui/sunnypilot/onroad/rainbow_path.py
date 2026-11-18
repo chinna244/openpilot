@@ -74,6 +74,7 @@ class RainbowPath:
       int(a * 255)
     )
 
-  def draw_rainbow_path(self, rect, path):
+  def draw_rainbow_path(self, rect, path, offset):
+    # offset: the renderer's draw offset; projected points are rect-origin (mici's camera sits right of its side panel)
     gradient = self.get_gradient()
-    draw_polygon(rect, path.projected_points, gradient=gradient)
+    draw_polygon(rect, path.projected_points + offset, gradient=gradient)

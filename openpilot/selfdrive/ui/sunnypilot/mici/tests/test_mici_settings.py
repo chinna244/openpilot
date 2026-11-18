@@ -1350,6 +1350,31 @@ class TestModelPathMode:
     assert len(drawn) == 1
     assert drawn[0] is {"lat_only": model_renderer.LAT_ONLY_PATH_GRADIENT, "stock": model_renderer.STOCK_PATH_GRADIENT, "accel": accel}[expected]
 
+  @pytest.mark.parametrize("rainbow", [False, True])
+  def test_path_drawn_at_the_camera_offset(self, params, monkeypatch, rainbow):
+    # user 2026-11-18: the camera now sits right of the 72 px side panel; the rainbow path skipped the offset and
+    # drew one panel-width left, in the next lane
+    import numpy as np
+    import raylib_nb as rl
+    from openpilot.selfdrive.ui.mici.onroad import model_renderer
+    from openpilot.selfdrive.ui.sunnypilot.onroad import rainbow_path
+    from openpilot.selfdrive.ui.ui_state import UIState, UIStatus, ui_state
+
+    monkeypatch.setattr(ui_state, "status", UIStatus.ENGAGED)
+    monkeypatch.setattr(ui_state, "rainbow_path", rainbow)
+    monkeypatch.setattr(UIState, "cruise_engaged", property(lambda _: True))
+    drawn = []
+    record = lambda rect, pts, color=None, gradient=None: drawn.append(np.array(pts))  # noqa: E731
+    monkeypatch.setattr(model_renderer, "draw_polygon", record)
+    monkeypatch.setattr(rainbow_path, "draw_polygon", record)
+    renderer = model_renderer.ModelRenderer()
+    renderer._rect = rl.Rectangle(72, 10, 464, 240)
+    renderer._path.projected_points = np.array([[100, 200], [120, 100], [140, 100], [160, 200]], dtype=np.float32)
+    renderer._visible = 1.0
+    renderer._draw_path()
+    assert len(drawn) == 1
+    np.testing.assert_allclose(drawn[0], renderer._path.projected_points + [72, 10])
+
   @pytest.mark.parametrize(("status", "dimmed"), [("ENGAGED", False), ("LAT_ONLY", False), ("OVERRIDE", False),
                                                   ("LONG_ONLY", True), ("DISENGAGED", True)])
   def test_wheel_dims_unless_steering(self, monkeypatch, status, dimmed):

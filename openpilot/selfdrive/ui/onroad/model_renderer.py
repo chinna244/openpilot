@@ -285,7 +285,7 @@ class ModelRenderer(Widget, ChevronMetrics, ModelRendererSP):
       return
 
     if ui_state.rainbow_path and self._lateral_active:
-      self.rainbow_path.draw_rainbow_path(self._rect, self._path)
+      self.rainbow_path.draw_rainbow_path(self._rect, self._path, self._draw_offset())
       return
 
     if not self._longitudinal_control:
