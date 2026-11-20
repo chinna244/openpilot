@@ -16,6 +16,7 @@ from openpilot.common.simple_kalman import KF1D
 from opendbc.car import structs
 from opendbc.car.hyundai.values import HyundaiFlags
 from opendbc.sunnypilot.car.hyundai.values import HyundaiFlagsSP
+from opendbc.sunnypilot.car.mazda.values import MazdaFlagsSP
 
 
 # Default lead acceleration decay set to 50% at 1s
@@ -28,6 +29,15 @@ SPEED, ACCEL = 0, 1     # Kalman filter states enum
 V_EGO_STATIONARY = 4.   # no stationary object flag below this speed
 
 RADAR_TO_CAMERA = 1.52  # RADAR is ~ 1.5m ahead from center of mesh frame
+
+# Behind the Mazda Smart CAN Filter the radar drops the lead's track for a burst or a few (median 0.1 s), and the lead
+# falls back to the camera's estimate, often meters and m/s off (routes 0000007a-00000080: 39 of 75 radar-to-camera
+# flips). For up to RADAR_COAST_T after the matched track goes, each lead value is the lower of the camera's and the
+# radar's carried forward, so a gap can only add braking: a closing speed the camera misses is kept, and a nearer
+# camera car still wins. A carried car far nearer than the camera's is taken as gone.
+RADAR_COAST_T = 0.5  # s since the radar message that last carried the track (a late or repeated message does not stretch it)
+RADAR_COAST_NEAR_FRAC, RADAR_COAST_NEAR_MIN = 0.4, 8.0  # m, the farthest the carried car may be nearer than the camera's
+RADAR_COAST_KEYS = ('dRel', 'vRel', 'vLead', 'vLeadK', 'aLeadK')
 
 
 class KalmanParams:
@@ -210,6 +220,11 @@ class RadarD:
 
     self.ready = False
 
+    self.coast_enabled = CP.brand == "mazda" and bool(CP_SP.flags & MazdaFlagsSP.CAN_FILTER)
+    self.coast_lead: dict[str, float] | None = None
+    self.coast_track_id = -1
+    self.coast_seen_t = 0.  # s, time of the radar message that last carried the lead's track
+
   def update(self, sm: messaging.SubMaster, rr: car.RadarData):
     self.ready = sm.seen['modelV2']
 
@@ -259,8 +274,31 @@ class RadarD:
 
       self.radar_state.leadOne = get_lead(self.v_ego, self.ready, self.tracks, leads_v3[0], model_v_ego, self.lead_prob_filters[0].x,
                                           self.CP, self.CP_SP, low_speed_override=True)
+      self.coast(self.radar_state.leadOne, sm.logMonoTime['modelV2'] * 1e-9, sm.logMonoTime['radarTracks'] * 1e-9)
       self.radar_state.leadTwo = get_lead(self.v_ego, self.ready, self.tracks, leads_v3[1], model_v_ego, self.lead_prob_filters[1].x,
                                           self.CP, self.CP_SP, low_speed_override=False)
+
+  def coast(self, lead, t: float, radar_t: float) -> None:
+    """leadOne through a short loss of its radar track, as the lower of the camera's values and the radar's carried.
+    t: this model frame's time, s. radar_t: the time of the radar message the tracks came from, s."""
+    if not self.coast_enabled:
+      return
+    if lead.radar:
+      self.coast_lead = {k: float(getattr(lead, k)) for k in RADAR_COAST_KEYS}
+      self.coast_track_id, self.coast_seen_t = lead.radarTrackId, radar_t
+      return
+    seen = self.coast_lead
+    elapsed = t - self.coast_seen_t
+    # only the camera's lead with the track gone (not one the matcher let go of), within the window since it was seen
+    if seen is None or not lead.present or self.coast_track_id in self.tracks or not (0. < elapsed <= RADAR_COAST_T + 1e-6):
+      self.coast_lead = None
+      return
+    carried = dict(seen, dRel=seen['dRel'] + seen['vRel'] * elapsed)
+    if lead.dRel - carried['dRel'] >= max(lead.dRel * RADAR_COAST_NEAR_FRAC, RADAR_COAST_NEAR_MIN):
+      self.coast_lead = None
+      return
+    for k in RADAR_COAST_KEYS:
+      setattr(lead, k, min(float(getattr(lead, k)), carried[k]))
 
   def publish(self, pm: messaging.PubMaster):
     assert self.radar_state is not None
