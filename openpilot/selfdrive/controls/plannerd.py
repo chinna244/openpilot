@@ -14,7 +14,7 @@ import openpilot.cereal.messaging as messaging
 
 
 def main():
-  config_realtime_process(5, Priority.CTRL_LOW)
+  config_realtime_process(6, Priority.CTRL_LOW)
 
   cloudlog.info("plannerd is waiting for CarParams")
   params = Params()
@@ -33,7 +33,7 @@ def main():
   # every carState, not only the one sm holds at the model tick: Vision Force Stop's RES press (StarPilot collect_resume)
   stop_resume_sock = messaging.sub_sock("carState", conflate=False) if CP.openpilotLongitudinalControl else None
   pm = messaging.PubMaster(['longitudinalPlan', 'driverAssistance', 'longitudinalPlanSP'])
-  sm = messaging.SubMaster(['carControl', 'carState', 'controlsState', 'radarState', 'modelV2', 'selfdriveState',
+  sm = messaging.SubMaster(['carControl', 'carState', 'controlsState', 'radarState', 'modelV2', 'selfdriveState', 'vehicleParameters',
                             'liveMapDataSP', 'carStateSP', 'selfdriveStateSP', 'customReserved10', gps_location_service],
                            poll='modelV2', ignore_alive=ignore_services, ignore_avg_freq=ignore_services, ignore_valid=ignore_services)
 
