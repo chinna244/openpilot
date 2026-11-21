@@ -22,6 +22,12 @@ TURN_STOPPED_SPEED = 0.5  # m/s, stopped at the turn (red light, stop sign): the
 # stop on the model's own plan (the green, the stop sign done) sends it.
 MODEL_TURN_PROB = 0.35  # model's own prediction that a turn starts within the next horizons
 MODEL_TURN_HORIZONS = 2  # desirePrediction horizons checked, soonest first
+# fork: the model's turn prediction only sends the desire while the model's own plan drives on (end of the plan above
+# this). Braking to a red it predicts the turn too, and the desire made it go: route 00000084 t=232.8 and t=528.8 (plan
+# 0.2 -> 13.6 mph, driver braked). At the trigger frame, 8 red lights in routes 40-84 had plans ending -0.1-2.7 mph
+# (3.3 max in the second before), green turns 4.5-9.3 mph (one at 2.2 where the model itself held). Stopped there,
+# moving off (or a nudge) still sends it.
+MODEL_TURN_MIN_PLAN_END_SPEED = 3.5 * CV.MPH_TO_MS
 DESIRE_PRED_WIDTH = 8
 WAIT_FOR_TURN = True  # always on in this build: prebuilt branches can't add a param for it
 
@@ -59,7 +65,8 @@ class LaneTurnController:
     self.param_read_counter += 1
 
   def update_lane_turn(self, blindspot_left: bool, blindspot_right: bool, left_blinker: bool, right_blinker: bool, v_ego: float,
-                       steering_pressed: bool = False, steering_torque: float = 0., turn_probs: tuple[float, float] = (0., 0.)) -> None:
+                       steering_pressed: bool = False, steering_torque: float = 0., turn_probs: tuple[float, float] = (0., 0.),
+                       plan_end_speed: float = float('inf')) -> None:
     if left_blinker and not right_blinker and v_ego < self.lane_turn_value and not blindspot_left:
       requested = TurnDirection.turnLeft
     elif right_blinker and not left_blinker and v_ego < self.lane_turn_value and not blindspot_right:
@@ -80,9 +87,12 @@ class LaneTurnController:
       self.stopped_armed = self.nudge_latched = False
 
     left = requested == TurnDirection.turnLeft
-    nudged = steering_pressed and (steering_torque > 0 if left else steering_torque < 0)
-    model_sees_turn = (turn_probs[0] if left else turn_probs[1]) >= MODEL_TURN_PROB
     stopped = v_ego < TURN_STOPPED_SPEED
+    plan_drives_on = plan_end_speed >= MODEL_TURN_MIN_PLAN_END_SPEED
+    # a nudge while rolling up to the red is gated too: in route 00000084 both triggers were light hand torque
+    # (Mazda steeringPressed at 15-19, t=232.5 and t=528.7). Stopped, a nudge still sends it (right on red).
+    nudged = steering_pressed and (steering_torque > 0 if left else steering_torque < 0) and (stopped or plan_drives_on)
+    model_sees_turn = (turn_probs[0] if left else turn_probs[1]) >= MODEL_TURN_PROB and plan_drives_on
     if stopped:
       self.stopped_armed = True
       if not self.nudge_latched:

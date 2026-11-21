@@ -234,6 +234,33 @@ class TestWaitForTurn(OpenpilotTestCase):
     controller.update_lane_turn(False, False, True, False, 1.0)
     assert controller.get_turn_direction() == TurnDirection.turnLeft
 
+  def test_model_turn_waits_while_the_plan_stops(self):
+    # route 00000084 t=232.8: braking to a red, the model predicted the turn; the desire made it drive into the junction
+    controller = make_wait_controller()
+    for v_ego in (6, 4, 2, 1):
+      controller.update_lane_turn(False, False, True, False, v_ego, turn_probs=(0.9, 0.), plan_end_speed=0.1)
+      assert controller.get_turn_direction() == TurnDirection.none
+    # the model's plan drives on again (the green) while still rolling: the turn goes
+    controller.update_lane_turn(False, False, True, False, 1, turn_probs=(0.9, 0.), plan_end_speed=4.)
+    assert controller.get_turn_direction() == TurnDirection.turnLeft
+
+  def test_nudge_while_rolling_to_a_stop_waits(self):
+    # route 00000084 t=232.5: light hand torque (steeringPressed) sent the turn while the plan stopped at a red
+    controller = make_wait_controller()
+    controller.update_lane_turn(False, False, True, False, 6, steering_pressed=True, steering_torque=16., plan_end_speed=0.)
+    assert controller.get_turn_direction() == TurnDirection.none
+    controller.update_lane_turn(False, False, True, False, 6, steering_pressed=True, steering_torque=16., plan_end_speed=4.)
+    assert controller.get_turn_direction() == TurnDirection.turnLeft
+
+  def test_plan_stop_does_not_block_stopped_nudge_or_moving_off(self):
+    controller = make_wait_controller()
+    controller.update_lane_turn(False, False, True, False, 0., steering_pressed=True, steering_torque=1.5, plan_end_speed=0.)
+    assert controller.get_turn_direction() == TurnDirection.turnLeft
+    controller = make_wait_controller()
+    controller.update_lane_turn(False, False, True, False, 0., plan_end_speed=0.)
+    controller.update_lane_turn(False, False, True, False, 0.6, plan_end_speed=0.)  # the driver's gas after the stop
+    assert controller.get_turn_direction() == TurnDirection.turnLeft
+
   def test_nudge_sends_the_turn_while_stopped(self):
     controller = make_wait_controller()
     controller.update_lane_turn(False, False, True, False, 0.)
@@ -282,5 +309,7 @@ class TestWaitForTurnDesireHelper(OpenpilotTestCase):
     assert dh.desire == log.Desire.none
 
     pred[log.Desire.turnLeft] = 0.9
+    dh.update(carstate, True, 0., desire_prediction=pred, plan_end_speed=0.5)  # the plan stops: wait
+    assert dh.desire == log.Desire.none
     dh.update(carstate, True, 0., desire_prediction=pred)
     assert dh.desire == log.Desire.turnLeft
