@@ -55,6 +55,13 @@ CROSS_MATCH_S = 15.
 # a junction for 1-4 s (route 6d t=36: East Norwich 25 on a 30 road at the start of the drive, nothing settled yet);
 # the limit given so far stays until the map's has held this long or the car or camera agrees
 NEW_MAP_WAIT_S = 5.
+# an on-ramp has no limit of its own in the map: the town limit held through the blank stayed until the car read the
+# freeway's sign near the merge (route 86 t=480-498: "50 ahead @ 611 m" for 18 s while 30 held). A fast road's limit
+# ahead, shown this long with the map blank and above the limit given, is given as the limit now (Combined only)
+AHEAD_RAISE_S = 4.
+AHEAD_RAISE_MIN = 50 * CV.MPH_TO_MS  # m/s; a slower road's limit ahead is not raised to before its sign (town streets)
+AHEAD_RAISE_MAX_M = 800.  # only a fast road this close (ramps 478-701 m: routes 44/86/18f); not one kilometres on
+AHEAD_RAISE_GAP_S = 1.  # the ahead value missing this briefly (a mapd frame) neither ends the raise nor restarts its clock
 
 
 class SpeedLimitResolver:
@@ -225,11 +232,13 @@ class SpeedLimitResolver:
     map_data = sm['liveMapDataSP']
 
     if self._gps_fix_age(sm) is None:
+      self._reset_ahead_raise()
       return
 
     # plannerd ignores liveMapDataSP liveness: a mapd that stopped publishing leaves its last limit in the SubMaster
     map_data_age = self._message_age(sm, 'liveMapDataSP')
     if map_data_age is None:
+      self._reset_ahead_raise()
       return
 
     speed_limit = map_data.speedLimit if map_data.speedLimitValid else 0.
@@ -259,6 +268,34 @@ class SpeedLimitResolver:
       if distance_to_speed_limit_ahead <= adapt_distance:
         self.limit_solutions[SpeedLimitSource.map] = next_speed_limit
         self.distance_solutions[SpeedLimitSource.map] = distance_to_speed_limit_ahead
+
+    # the on-ramp raise: its clock runs per value shown with the map blank; it starts raising only above the limit given,
+    # and then keeps raising while that value shows (the limit given becomes the raised one)
+    # a sign the car reads after the raise began ends it (review: a work-zone 40 on the ramp), until the ahead value changes
+    car = self.limit_solutions[SpeedLimitSource.car]
+    if speed_limit > 0.:
+      self._reset_ahead_raise()
+    elif next_speed_limit >= AHEAD_RAISE_MIN - .1 and distance_to_speed_limit_ahead <= AHEAD_RAISE_MAX_M:
+      self._ahead_raise_seen = self.frame
+      if abs(next_speed_limit - self._ahead_raise) > .1:
+        self._reset_ahead_raise()
+        self._ahead_raise, self._ahead_raise_frame, self._ahead_raise_seen = next_speed_limit, self.frame, self.frame
+    elif self.frame - self._ahead_raise_seen > int(AHEAD_RAISE_GAP_S / DT_MDL):
+      self._reset_ahead_raise()
+    if self._ahead_raising and car > 0. and abs(car - self._ahead_raise_car) > VOTE_TOLERANCE:
+      self._ahead_raising, self._ahead_raise_done = False, True
+    if (Policy(self.policy) == Policy.combined and self._ahead_raise > 0. and not self._ahead_raise_done and
+        not self._ahead_raising and self.frame - self._ahead_raise_frame >= int(AHEAD_RAISE_S / DT_MDL) and
+        self._ahead_raise > self._given + VOTE_TOLERANCE):
+      self._ahead_raising, self._ahead_raise_car = True, car
+    if self._ahead_raising:
+      self.limit_solutions[SpeedLimitSource.map] = self._ahead_raise
+      self.distance_solutions[SpeedLimitSource.map] = 0.
+
+  def _reset_ahead_raise(self) -> None:
+    """The on-ramp raise (AHEAD_RAISE_S): the ahead limit, since when, last seen, raising, the car's reading then, ended."""
+    self._ahead_raise, self._ahead_raise_frame, self._ahead_raise_seen = 0., 0, -10 ** 9
+    self._ahead_raising, self._ahead_raise_car, self._ahead_raise_done = False, 0., False
 
   def _get_source_solution_according_to_policy(self) -> custom.LongitudinalPlanSP.SpeedLimit.Source:
     sources = self._policy_to_sources_map[Policy(self.policy)]
@@ -319,6 +356,7 @@ class SpeedLimitResolver:
     self._wait_last = 0
     self._wait_held = 0.
     self._car_read_frame = -10 ** 9  # when the car last read a new limit
+    self._reset_ahead_raise()
 
   def _hold_on_evidence(self, speed_limit: float, distance: float, source: custom.LongitudinalPlanSP.SpeedLimit.Source):
     """Combined: the limit changes on evidence of a new one, not on a source dropping out. Routes 54/66/67/6a "Press +

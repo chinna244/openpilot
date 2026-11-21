@@ -14,7 +14,7 @@ from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit import LIMIT_MAX_MA
 
 from openpilot.common.realtime import DT_MDL
 from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.speed_limit_resolver import SpeedLimitResolver, ALL_SOURCES, CAR_LIMIT_MIN, \
-  LAST_LIMIT_SETTLE, NEW_MAP_WAIT_S
+  LAST_LIMIT_SETTLE, NEW_MAP_WAIT_S, AHEAD_RAISE_S
 from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.common import Policy
 from openpilot.common.test import OpenpilotTestCase
 
@@ -596,6 +596,69 @@ class TestSpeedLimitResolverMapDropout(OpenpilotTestCase):
     resolver = self._settled_map(mocker, 0.)
     self._feed(resolver, mocker, 1., car_limit=0., map_limit=0.)
     assert resolver.source == SpeedLimitSource.none and resolver.speed_limit_last == 25 * MPH
+
+  def test_an_on_ramp_raises_to_the_fast_road_ahead(self, mocker):
+    # route 86 t=480: ramp with no map limit, "50 ahead @ 611 m", the town 30 held until the car read 50 at 498
+    resolver = self._settled_map(mocker, 30 * MPH, map_limit=30 * MPH)
+    ramp = dict(car_limit=30 * MPH, map_limit=0., ahead_limit=50 * MPH, ahead_distance=600.)
+    self._feed(resolver, mocker, AHEAD_RAISE_S - .5, **ramp)
+    assert resolver.speed_limit == 30 * MPH
+    self._feed(resolver, mocker, 1., **ramp)
+    assert resolver.source == SpeedLimitSource.map and resolver.speed_limit == 50 * MPH and resolver.distance == 0.
+    self._feed(resolver, mocker, 5., **ramp)  # keeps raising once it gives the 50 (no flip back to 30)
+    assert resolver.speed_limit == 50 * MPH
+
+  def test_an_on_ramp_raise_needs_the_ahead_shown_long_enough(self, mocker):
+    resolver = self._settled_map(mocker, 30 * MPH, map_limit=30 * MPH)
+    self._feed(resolver, mocker, AHEAD_RAISE_S - 1., car_limit=30 * MPH, map_limit=0., ahead_limit=55 * MPH, ahead_distance=8.)
+    self._feed(resolver, mocker, 2., car_limit=30 * MPH, map_limit=0.)
+    self._feed(resolver, mocker, AHEAD_RAISE_S - 1., car_limit=30 * MPH, map_limit=0., ahead_limit=55 * MPH, ahead_distance=8.)
+    assert resolver.speed_limit == 30 * MPH
+
+  def test_a_slow_road_ahead_is_not_raised_to_early(self, mocker):
+    # route 5e t=1075: town 35, "40 ahead" at 234-474 m: the 35 stays until its sign
+    resolver = self._settled_map(mocker, 35 * MPH, map_limit=35 * MPH)
+    self._feed(resolver, mocker, AHEAD_RAISE_S + 2., car_limit=35 * MPH, map_limit=0., ahead_limit=40 * MPH, ahead_distance=300.)
+    assert resolver.speed_limit == 35 * MPH
+
+  def test_a_lower_limit_ahead_does_not_take_over_the_ramp(self, mocker):
+    # routes 45/184: the car read the ramp's 55, the map has 50 ahead: the 55 stays
+    resolver = self._settled_map(mocker, 30 * MPH, map_limit=30 * MPH)
+    self._feed(resolver, mocker, AHEAD_RAISE_S + 2., car_limit=55 * MPH, map_limit=0., ahead_limit=50 * MPH, ahead_distance=450.)
+    assert resolver.source == SpeedLimitSource.car and resolver.speed_limit == 55 * MPH
+
+  def test_a_sign_read_after_the_on_ramp_raise_takes_over(self, mocker):
+    # review: a work-zone 40 the car reads on the ramp beat the raised 50
+    resolver = self._settled_map(mocker, 30 * MPH, map_limit=30 * MPH)
+    self._feed(resolver, mocker, AHEAD_RAISE_S + 1., car_limit=30 * MPH, map_limit=0., ahead_limit=50 * MPH, ahead_distance=600.)
+    assert resolver.speed_limit == 50 * MPH
+    self._feed(resolver, mocker, 1., car_limit=40 * MPH, map_limit=0., ahead_limit=50 * MPH, ahead_distance=500.)
+    assert resolver.source == SpeedLimitSource.car and resolver.speed_limit == 40 * MPH
+    self._feed(resolver, mocker, AHEAD_RAISE_S + 1., car_limit=40 * MPH, map_limit=0., ahead_limit=50 * MPH, ahead_distance=400.)
+    assert resolver.speed_limit == 40 * MPH
+
+  def test_a_fast_road_far_ahead_is_not_raised_to(self, mocker):
+    # review: an untagged stretch with "70 ahead @ 3000 m" gave 70 kilometres before its sign
+    resolver = self._settled_map(mocker, 30 * MPH, map_limit=30 * MPH)
+    self._feed(resolver, mocker, AHEAD_RAISE_S + 2., car_limit=30 * MPH, map_limit=0., ahead_limit=70 * MPH, ahead_distance=3000.)
+    assert resolver.speed_limit == 30 * MPH
+
+  def test_an_ahead_missing_for_a_frame_does_not_flip_the_raise(self, mocker):
+    resolver = self._settled_map(mocker, 30 * MPH, map_limit=30 * MPH)
+    ramp = dict(car_limit=30 * MPH, map_limit=0., ahead_limit=50 * MPH, ahead_distance=600.)
+    self._feed(resolver, mocker, AHEAD_RAISE_S + .5, **ramp)
+    seen = []
+    for i in range(int(4. / DT_MDL)):
+      blip = i % 40 == 0
+      resolver.update(10., gps_sm(mocker, car_limit=30 * MPH, map_limit=0., ahead_limit=0. if blip else 50 * MPH, ahead_distance=0. if blip else 500.))
+      seen.append(round(resolver.speed_limit / MPH))
+    assert set(seen) == {50}
+
+  def test_the_on_ramp_raise_is_combined_only(self, mocker):
+    resolver = self._resolver()
+    resolver.policy = Policy.map_data_only
+    self._feed(resolver, mocker, AHEAD_RAISE_S + 2., car_limit=0., map_limit=0., ahead_limit=50 * MPH, ahead_distance=600.)
+    assert resolver.speed_limit == 0.
 
   def test_a_cross_match_far_below_the_speed_waits_for_the_car(self, mocker):
     # route 138 t=1160: on a 55 freeway at 67 mph the map named a 30 cross street for 14 s; the car still read 55
