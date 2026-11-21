@@ -46,6 +46,18 @@ CONFIRM_FOLLOW_PERIOD = 5.  # s
 REPROMPT_HOLD = 2.      # s the condition must hold
 REPROMPT_COOLDOWN = 25.  # s after a prompt closes unanswered, about 30 s from one prompt to the next
 REPROMPT_MAX = 2
+# Right after a turn onto a new street the re-ask does not wait for the car to come up near the speed: route 00000084
+# (Howard -> Iowa Ave, both 25, set 35, 29 asked twice unanswered) the wheel was straight at 395 s and the re-ask came
+# only at ~403 s (24 mph); the driver tapped - from 396 s. A turn: the wheel past TURN_STEER_DEG below TURN_MAX_SPEED,
+# then back under TURN_STRAIGHT_DEG. Routes 40-84: town turns 86-430 deg at <= 16 mph, freeway renames <= 27 deg.
+TURN_STEER_DEG = 60.
+TURN_STRAIGHT_DEG = 20.
+TURN_MAX_SPEED = 25. * CV.MPH_TO_MS
+TURN_REPROMPT_WINDOW = 15.  # s after the wheel straightens
+# The new street's limit can still be on its way (route 00000054 167.3 s: asked for the old street's 29 0.3 s before
+# the map's 35 for South Clement Ave settled): the re-ask waits this long after the turn and for a limit reading held
+# LIMIT_SETTLE; a different limit then asks through the new-limit prompt instead.
+TURN_MAP_SETTLE = 1.  # s
 # A new limit counts only once the resolver has held it this long: in route 00000167 the map came back on the road
 # just left (30 for 1.0 s inside a 25 the driver had confirmed) and flicked 30-25-30 for 0.9 s, the camera read 25 for
 # 1.8 s in a map gap, and each asked the driver again; in route 00000166 the camera flipped 5-35 in under 0.5 s.
@@ -109,6 +121,8 @@ class CruiseArbiter:
     self._reprompts_left = 0
     self._reprompt_cooldown = 0
     self._reprompt_hold = 0
+    self._turning = False
+    self._after_turn_timer = 0  # frames left in which a re-ask does not wait for the car to come up near the speed
     self._late_answer_timer = 0  # frames since a prompt closed unanswered in which its direction still confirms
     self._confirm_follow_timer = 0  # frames after a confirm in which a press toward the target is still the confirm
     self._adopted_dir = 0  # +1/-1: the last confirm moved the setpoint onto the limit, so the dash walks that way
@@ -367,7 +381,9 @@ class CruiseArbiter:
     or near the lower of the two (the one that holds it)."""
     target = self._target_conv()
     off_limit = self._cluster_conv > 0 and abs(self._cluster_conv - target) > REPROMPT_MARGIN
-    near = round(CS.vEgo * self._conv) > min(self._cluster_conv, target) - REPROMPT_NEAR
+    after_turn = (0 < self._after_turn_timer <= int((TURN_REPROMPT_WINDOW - TURN_MAP_SETTLE) / DT_CTRL)
+                  and self._limit_seen_frames >= int(LIMIT_SETTLE / DT_CTRL))
+    near = round(CS.vEgo * self._conv) > min(self._cluster_conv, target) - REPROMPT_NEAR or after_turn
     due = (self._ignored_prompt and self._reprompts_left > 0 and self._has_limit and target > 0
            and off_limit and near and not CS.gasPressed and not CS.standstill)
     self._reprompt_hold = self._reprompt_hold + 1 if due else 0
@@ -392,6 +408,13 @@ class CruiseArbiter:
     self._reprompt_cooldown = max(0, self._reprompt_cooldown - 1)
     self._late_answer_timer = max(0, self._late_answer_timer - 1)
     self._confirm_follow_timer = max(0, self._confirm_follow_timer - 1)
+    self._after_turn_timer = max(0, self._after_turn_timer - 1)
+    steer = abs(CS.steeringAngleDeg)
+    if steer >= TURN_STEER_DEG and CS.vEgo < TURN_MAX_SPEED:
+      self._turning = True
+    elif self._turning and steer < TURN_STRAIGHT_DEG:
+      self._turning = False
+      self._after_turn_timer = int(TURN_REPROMPT_WINDOW / DT_CTRL)
     if not self._ignored_prompt or self._limit_changed:
       self._late_answer_timer = 0  # answered, or the limit it asked about is gone
 

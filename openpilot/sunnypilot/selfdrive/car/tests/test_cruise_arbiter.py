@@ -65,11 +65,12 @@ class TestCruiseArbiterNonPcm:
     lp.speedLimit.resolver.speedLimitValid = has_limit if current is None else current
     return lp
 
-  def frame(self, cluster_mph, limit_mph, has_limit=True, events=None, v_mph=0., gas=False, current=None):
+  def frame(self, cluster_mph, limit_mph, has_limit=True, events=None, v_mph=0., gas=False, current=None, steer_deg=0.):
     self.arb.update_limit(self._lp(limit_mph, has_limit, current))
     CS = car_struct.CarState()
     CS.buttonEvents = events or []
     CS.vEgo = v_mph * self.MPH
+    CS.steeringAngleDeg = steer_deg
     CS.gasPressed = gas
     CS.standstill = v_mph < 0.1
     self.v_cruise_kph = self.arb.step(CS, True, self.v_cruise_kph, cluster_mph * CV.MPH_TO_KPH)
@@ -421,9 +422,59 @@ class TestCruiseArbiterNonPcm:
 
   # a prompt nobody answered asks again while the set speed and the car are still over the limit's target
 
-  def run(self, seconds, cluster_mph, limit_mph, v_mph, gas=False):
+  def run(self, seconds, cluster_mph, limit_mph, v_mph, gas=False, steer_deg=0.):
     for _ in range(int(seconds / DT_CTRL)):
-      self.frame(cluster_mph, limit_mph, v_mph=v_mph, gas=gas)
+      self.frame(cluster_mph, limit_mph, v_mph=v_mph, gas=gas, steer_deg=steer_deg)
+
+  # route 00000084: 29 asked twice unanswered on a 25 street, then a left turn onto another 25 street at set 35; the
+  # re-ask waited for 24 mph (~403 s) while the driver tapped - from 396 s, 1 s after the wheel was straight
+  def test_a_turn_onto_a_street_asks_without_waiting_for_speed(self):
+    self.ignored_prompt(cluster_mph=35, limit_mph=25, v_mph=25.)
+    self.run(REPROMPT_COOLDOWN, 35, 25, 3.)
+    self.run(2., 35, 25, 5., steer_deg=390.)  # the turn
+    self.run(cruise_arbiter.TURN_MAP_SETTLE + REPROMPT_HOLD + 0.1, 35, 25, 15.)  # straight again, pulling away at 15 mph
+    assert self.arb.state == SpeedLimitAssistState.preActive
+
+  def test_a_turn_onto_a_street_with_another_limit_asks_for_the_new_one(self):
+    # route 00000054 167.3 s: the turn re-ask came 0.3 s before the new street's limit settled and asked the old target
+    self.ignored_prompt(cluster_mph=35, limit_mph=25, v_mph=25.)
+    self.run(REPROMPT_COOLDOWN, 35, 25, 3.)
+    self.run(2., 35, 25, 5., steer_deg=390.)
+    self.run(0.8, 35, 25, 15.)  # straight; the map still has the old street
+    asked = []
+    for _ in range(int(5. / DT_CTRL)):
+      self.frame(35, 45, v_mph=15.)
+      if self.arb.state == SpeedLimitAssistState.preActive:
+        asked.append(self.arb._target_conv())
+    assert asked and set(asked) == {45}
+
+  def test_no_turn_still_waits_for_speed(self):
+    self.ignored_prompt(cluster_mph=35, limit_mph=25, v_mph=25.)
+    self.run(REPROMPT_COOLDOWN + 2 * REPROMPT_HOLD, 35, 25, 15.)
+    assert self.arb.state == SpeedLimitAssistState.inactive
+
+  @pytest.mark.parametrize("v_mph, steer_deg", [
+    (60., 27.),  # a freeway interchange curve (routes 45-60 renames: <= 27 deg at >= 41 mph)
+    (30., 90.),  # a wide sweep above the turn speed
+  ])
+  def test_not_a_turn(self, v_mph, steer_deg):
+    self.ignored_prompt(cluster_mph=63, limit_mph=30, v_mph=30.)
+    self.run(REPROMPT_COOLDOWN, 63, 30, 3.)
+    self.run(REPROMPT_HOLD - 0.5, 63, 30, v_mph, steer_deg=steer_deg)  # shorter than the plain near re-ask's hold
+    self.run(2 * REPROMPT_HOLD, 63, 30, 10.)
+    assert self.arb.state == SpeedLimitAssistState.inactive
+
+  def test_the_turn_window_ends(self):
+    self.ignored_prompt(cluster_mph=35, limit_mph=25, v_mph=25.)
+    self.run(2., 35, 25, 5., steer_deg=390.)  # turned during the cooldown
+    self.run(REPROMPT_COOLDOWN + 2 * REPROMPT_HOLD, 35, 25, 15.)  # the window is long over once the cooldown ends
+    assert self.arb.state == SpeedLimitAssistState.inactive
+
+  def test_a_turn_does_not_skip_the_cooldown(self):
+    self.ignored_prompt(cluster_mph=35, limit_mph=25, v_mph=25.)
+    self.run(2., 35, 25, 5., steer_deg=390.)
+    self.run(REPROMPT_HOLD + 0.1, 35, 25, 15.)
+    assert self.arb.state == SpeedLimitAssistState.inactive
 
   def ignored_prompt(self, cluster_mph=63, limit_mph=30, v_mph=30.):
     self.go_pre_active(cluster_mph, limit_mph)
