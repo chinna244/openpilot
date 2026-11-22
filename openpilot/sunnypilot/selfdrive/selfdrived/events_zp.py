@@ -13,6 +13,7 @@ import openpilot.cereal.messaging as messaging
 from openpilot.cereal import log, custom
 from opendbc.car.structs import car
 from opendbc.sunnypilot.car.stock_ecu import StockEcuState
+from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.helpers import ramp_prompt_speed
 from openpilot.common.constants import CV
 from openpilot.common.hardware import HARDWARE
 from openpilot.selfdrive.selfdrived.events import EVENTS, EventName, get_display_speed, personality_changed_alert
@@ -111,7 +112,8 @@ def speed_limit_pre_active_alert(CP: car.CarParams, CS: car.CarState, sm: messag
   speed_conv = CV.MS_TO_KPH if metric else CV.MS_TO_MPH
   set_speed_conv = round(_set_speed_ms(CS, sm) * speed_conv)
 
-  speed_limit_final_last = sm['longitudinalPlanSP'].speedLimit.resolver.speedLimitFinalLast
+  ramp_speed = ramp_prompt_speed(sm)
+  speed_limit_final_last = ramp_speed or sm['longitudinalPlanSP'].speedLimit.resolver.speedLimitFinalLast
   speed_limit_final_last_conv = round(speed_limit_final_last * speed_conv)
   alert_1_str = ""
   alert_size = AlertSize.small
@@ -119,7 +121,7 @@ def speed_limit_pre_active_alert(CP: car.CarParams, CS: car.CarState, sm: messag
   # only the cruise arbiter prompts: the pcm machine needs no confirming (speed_limit_assist_zp)
   if IS_MICI:
     # the target is the limit plus any offset; the break keeps the unit with its number
-    if set_speed_conv < speed_limit_final_last_conv:
+    if not ramp_speed and set_speed_conv < speed_limit_final_last_conv:
       alert_1_str = f"Press + for\n{get_display_speed(speed_limit_final_last, metric)}"
     elif set_speed_conv > speed_limit_final_last_conv:
       alert_1_str = f"Press - for\n{get_display_speed(speed_limit_final_last, metric)}"

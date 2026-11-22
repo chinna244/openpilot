@@ -73,3 +73,10 @@ def set_speed_limit_assist_availability(CP: car.CarParams, CP_SP: custom.CarPara
       params.put("SpeedLimitMode", int(SpeedLimitMode.warning), block=True)
 
   return allowed
+
+
+def ramp_prompt_speed(sm) -> float:
+  try:
+    return float(sm['carStateSP'].zoompilot.cruiseSession.rampPromptSpeed)
+  except (KeyError, AttributeError):
+    return 0.

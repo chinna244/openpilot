@@ -19,7 +19,7 @@ from openpilot.sunnypilot.selfdrive.selfdrived.events_base import ET, AlertSize
 EventNameSP = custom.OnroadEventSP.EventName
 
 
-def _alert(event, target: float, set_speed: float, metric: bool = False, pcm_long: bool = False, adapting: bool = False):
+def _alert(event, target: float, set_speed: float, metric: bool = False, pcm_long: bool = False, adapting: bool = False, ramp: float = 0.):
   """target and set_speed in display units; the resolver carries m/s, carState kph."""
   to_ms = CV.KPH_TO_MS if metric else CV.MPH_TO_MS
   lp_sp = messaging.new_message('longitudinalPlanSP').longitudinalPlanSP
@@ -32,6 +32,7 @@ def _alert(event, target: float, set_speed: float, metric: bool = False, pcm_lon
     'controlsState': messaging.new_message('controlsState').controlsState,
     'carStateSP': messaging.new_message('carStateSP').carStateSP,
   }
+  sm['carStateSP'].zoompilot.cruiseSession.rampPromptSpeed = ramp * to_ms
   CP = structs.CarParams()
   CP.openpilotLongitudinalControl = pcm_long
   CP.pcmCruise = pcm_long
@@ -49,6 +50,9 @@ class TestPreActivePrompt:
   @pytest.mark.parametrize("set_speed, text", [(40, "Press + for\n45 mph"), (55, "Press - for\n45 mph")])
   def test_names_the_target(self, mici, set_speed, text):
     assert _alert(EventNameSP.speedLimitPreActive, 45, set_speed).alert_text_1 == text
+
+  def test_ramp_names_the_unoffset_advisory(self, mici):
+    assert _alert(EventNameSP.speedLimitPreActive, 75, 70, ramp=50).alert_text_1 == "Press - for\n50 mph"
 
   def test_metric(self, mici):
     assert _alert(EventNameSP.speedLimitPreActive, 80, 100, metric=True).alert_text_1 == "Press - for\n80 km/h"
