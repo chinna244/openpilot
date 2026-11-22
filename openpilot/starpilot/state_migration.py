@@ -34,6 +34,8 @@ VEHICLE_PREFERENCE_KEYS = frozenset({
   'JeepBrakeHold', 'DriveModeProfiles', 'DriveModeAcceleration',
   'DriveModeDeceleration', 'NostalgiaMode', 'RemapCancelToDistance',
   'FordHandsFreeCluster',
+  # Mazda hardware setup carried over from develop/filter-dev: the TJA button and the Smart CAN Filter board
+  'MazdaTjaButton', 'MazdaCanFilter',
 })
 OPERATIONAL_KEYS = frozenset({
   'DongleId', 'HardwareSerial', 'GithubSshKeys', 'GithubUsername', 'SshEnabled',

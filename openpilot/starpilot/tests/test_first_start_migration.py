@@ -244,6 +244,14 @@ class TestFirstStartMigration(unittest.TestCase):
     self.start()
     self.assertEqual(self.values(), changed)
 
+  def test_develop_mazda_hardware_choices_survive_first_start(self):
+    # route 00000000--0d5a86eda7: the first start archived filter-dev's MazdaCanFilter=1 / MazdaTjaButton=1,
+    # so the board session never ran and the stock radar kept cruise
+    self.types.update({'MazdaCanFilter': 'BOOL', 'MazdaTjaButton': 'BOOL', 'GreenLightAlert': 'BOOL'})
+    self.write({'MazdaCanFilter': b'1', 'MazdaTjaButton': b'1', 'GreenLightAlert': b'1', 'AlphaLongitudinalEnabled': b'1'})
+    self.start()
+    self.assertEqual(self.values(), {'MazdaCanFilter': b'1', 'MazdaTjaButton': b'1', 'AlphaLongitudinalEnabled': b'1'})
+
   def test_invalid_vehicle_preferences_are_archived_without_enabling_them(self):
     self.types.update(dict.fromkeys(migration.VEHICLE_PREFERENCE_KEYS, 'BOOL'))
     original = dict.fromkeys(migration.VEHICLE_PREFERENCE_KEYS, b'true')
