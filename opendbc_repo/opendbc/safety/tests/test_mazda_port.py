@@ -158,3 +158,22 @@ def test_aol_cruise_active_bits_need_native_long_permission(safety, word):
   assert fixture.safety.aol_get_permission_mask() == 1
   for name, fields in frames:
     assert not fixture.safety.safety_tx_hook(fixture.packet(name, fields)), (name, fields)
+
+
+@pytest.mark.parametrize('word', [11, 27])
+def test_aol_camera_press_off_needs_the_lateral_grant(safety, word):
+  """The car's config (word 27 under AOL): the camera-only TJA press-off (mads update_camera_tja) is refused until
+  the AOL lateral grant and passes with it. Active camera TJA alongside openpilot steering faults the FSC (0000013b)."""
+  import unittest
+  from opendbc.safety.tests.test_mazda_measured_profiles import MazdaAolHarness
+  h = MazdaAolHarness(unittest.TestCase(), word)
+  idle = {'TJA_BUTTON': 1, 'DISTANCE_LESS_INV': 1, 'BIT1': 1, 'BIT2': 1, 'BIT3': 1, 'CAN_OFF_INV': 1, 'RES_INV': 1,
+          'SET_P_INV': 1, 'SET_M_INV': 1, 'DISTANCE_MORE_INV': 1, 'MODE_X_INV': 1, 'MODE_Y_INV': 1}
+  h.prime()
+  assert not h.safety.safety_tx_hook(h.msg('CRZ_BTNS', dict(idle, CTR=5), 2))
+  h.arm()
+  for _ in range(30):
+    h.tick()
+    h.feed()
+  assert h.lat() == 1
+  assert h.safety.safety_tx_hook(h.msg('CRZ_BTNS', dict(idle, CTR=6), 2))
