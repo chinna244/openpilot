@@ -393,7 +393,8 @@ class SelfdriveD:
         (CS.regenBraking and (not previous.regenBraking or not CS.standstill)):
         self.events.add(EventName.pedalPressed)
 
-    self.add_mazda_stock_ecu_events(CS)
+    if self.CP.brand == 'mazda':
+      self.add_mazda_stock_ecu_events(CS)
     self.add_mazda_tja_events(CS)
 
   def add_mazda_tja_events(self, CS):
@@ -456,7 +457,18 @@ class SelfdriveD:
     # "AEB off" only where it is: a stock ECU kept online is ready with AEB on
     if state == StockEcuState.READY and self.mazda_stock_state_prev != StockEcuState.READY and off:
       self.mazda_events.add('stockEcuReady')
+    # develop: the car plays nothing when its own cruise engages or ends; openpilot's chimes, sound-only. A
+    # restored edge is the end-of-drive hand-back answered under the car's still-engaged cruise: no chime
+    stock_cruise, stock_cruise_prev = state == StockEcuState.STOCK_CRUISE_ON, self.mazda_stock_state_prev == StockEcuState.STOCK_CRUISE_ON
+    if stock_cruise and not stock_cruise_prev:
+      self.mazda_events.add('longitudinalEnableChime')
+    elif stock_cruise_prev and not stock_cruise and state != StockEcuState.RESTORED:
+      self.mazda_events.add('longitudinalDisableChime')
     self.mazda_stock_state_prev = state
+    # LKA back on with lateral latched, the EPS not delivering yet
+    intent = getattr(self, 'aol_last_intent', None)
+    if record.get('lkasArming', False) and intent is not None and intent.allowedLatch:
+      self.mazda_events.add('stockLkasArming')
     # The stand-in lost for the drive (the filter): the car's cruise just dropped with no fault. Loud if it was
     # engaged (cruise on within LOST_ENGAGED_FRAMES, as the record can trail carState); a hand-back never sets it.
     self.mazda_cruise_off_frames = 0 if CS.cruiseState.enabled else getattr(self, 'mazda_cruise_off_frames', 0) + 1

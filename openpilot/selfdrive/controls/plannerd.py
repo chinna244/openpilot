@@ -209,6 +209,9 @@ def apply_conditional_stop_hold(host, planner, sm, CP, now_ns: int, drive_id: in
     return False
   planner.output_should_stop = True
   planner.output_a_target = min(planner.output_a_target, 0.)
+  # Mazda publishes a_target_published (the plan lifted while a gas override is held): the hold lowers that too
+  if hasattr(planner, 'a_target_published'):
+    planner.a_target_published = min(planner.a_target_published, 0.)
   return True
 
 
@@ -387,6 +390,15 @@ def starpilot_main():
     optional_slc.append('slcVisionObservation')
   subscribed_services.extend(optional_slc)
   subscribed_services.append('starpilotNavigation')
+  if longitudinal_planner.scc is not None:
+    # Mazda Smart Cruise Control's map targets: the GPS fix and StarPilot mapd's path
+    from openpilot.common.gps import get_gps_location_service
+    from openpilot.starpilot.longitudinal.scc.mapd_targets import MAPD_SERVICE
+    for service in (get_gps_location_service(params), MAPD_SERVICE):
+      if service not in subscribed_services:
+        subscribed_services.append(service)
+      if service not in optional_slc:
+        optional_slc.append(service)
   optional_conditional = ['starpilotNavigation'] + (['starpilotRadarState'] if conditional_host is not None else []) + optional_slc
   sm = messaging.SubMaster(subscribed_services, poll='modelV2',
                            ignore_alive=optional_conditional, ignore_valid=optional_conditional,

@@ -85,6 +85,10 @@ def manager_init() -> None:
     if default_value is not None and not os.path.lexists(params.get_param_path(k)):
       params.put(k, default_value, block=True)
 
+  # Mazda torque-control seeds from the last drive's CarParams, after the defaults above (develop's params_migration_zp)
+  from openpilot.starpilot.car.mazda.lateral.seed import seed_car_defaults_offroad
+  seed_car_defaults_offroad(params)
+
   # Create folders needed for msgq
   try:
     os.mkdir(Paths.shm_path())

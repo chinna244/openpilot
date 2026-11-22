@@ -36,10 +36,20 @@ def current(record, cp, now_ns):
   return bool(cp is not None and fresh(record, now_ns) and record['fingerprint'] == cp.carFingerprint)
 
 
+def can_filter(cp) -> bool:
+  """The Smart CAN Filter is in this CarParams' safety word (bit 16)."""
+  configs = getattr(cp, 'safetyConfigs', None) or []
+  return bool(configs) and bool(int(configs[-1].safetyParam) & 16)
+
+
 def notice(native, cp, record, restore_failed, now_ns):
   if native.size != AlertSize.NONE or cp is None or getattr(cp, 'brand', '') != 'mazda' or cp.notCar or cp.dashcamOnly:
     return native
   if restore_failed or cp.openpilotLongitudinalControl and current(record, cp, now_ns) and record['state'] == StockEcuState.FAILED:
+    if can_filter(cp) and not (current(record, cp, now_ns) and record['radarOff']):
+      # the Smart CAN Filter keeps the radar online (radarOff False): only the cruise hand-back is unconfirmed
+      return OnroadAlert(AlertSize.SMALL, 'Mazda cruise hand-back failed', 'Factory cruise may be off; restart the vehicle',
+                         alert_type='mazdaRadarRestore/permanent')
     # a failed radar is never openpilot's: whatever radarOff says, AEB is off and nothing owns it
     return OnroadAlert(AlertSize.SMALL, 'Mazda radar restore failed', 'Factory AEB off; restart the vehicle',
                        alert_type='mazdaRadarRestore/permanent')

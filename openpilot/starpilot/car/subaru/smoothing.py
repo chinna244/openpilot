@@ -172,6 +172,10 @@ def filter_action(action, previous, speed, tau):
   from openpilot.selfdrive.controls.lib.drive_helpers import smooth_value
   if tau > 0. and speed > .3:
     action.desiredCurvature = float(smooth_value(action.desiredCurvature, previous.desiredCurvature, tau))
+  # Mazda: develop's Blendful and big model smoothing, at the same join (modeld.py itself is pinned)
+  import sys
+  from openpilot.starpilot.car.mazda.lateral.model_settings import model_join
+  model_join(action, previous, sys._getframe(1))
 
 
 

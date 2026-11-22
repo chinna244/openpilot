@@ -3,6 +3,8 @@ import math
 import time
 
 GPS_SOURCES = {"gpsLocationExternal": "ublox", "gpsLocation": "qcomdiag", "starpilotCarState": "car", "phoneGps": "phone"}
+# ubloxd publishes the Jetson's USB GPS fix (system/ubloxd/gps_arbiter.py) as the comma's own while the ublox has none
+EXTRA_SOURCES = {"gpsLocationExternal": ("external",)}
 GPS_PRIORITY = {"gpsLocationExternal": 2, "gpsLocation": 2, "starpilotCarState": 1, "phoneGps": 0}
 WRAPPED_SOURCES = ("starpilotCarState", "phoneGps")
 MAX_HORIZONTAL_ACCURACY = 25.0
@@ -57,7 +59,7 @@ def observation(sm, service, now_ns):
     stamp = int(gps.sourceMonoTime) if service in WRAPPED_SOURCES else envelope
     if not sm.valid[carrier] or valid_fix(gps, stamp, envelope, now_ns, max_age_ns(service)) is None:
       return None
-    if service not in WRAPPED_SOURCES and str(gps.source) != GPS_SOURCES[service]:
+    if service not in WRAPPED_SOURCES and str(gps.source) not in (GPS_SOURCES[service], *EXTRA_SOURCES.get(service, ())):
       return None
     return stamp, gps
   except (AttributeError, KeyError, TypeError, ValueError, OverflowError, RuntimeError):

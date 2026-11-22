@@ -190,9 +190,56 @@ def hooks():
   try:
     if not supported_device():
       return Off(UNSUPPORTED, link_on=link_on)
-    return Hooks(API, adapter, link_on=link_on, log=_cloudlog)
+    return _gps_hooks(Hooks)(API, adapter, link_on=link_on, log=_cloudlog)
   except Exception as e:
     return Off(str(e), link_on=link_on)
+
+
+def _mazda() -> bool:
+  """The Jetson GPS fallback is the Mazda port's (develop's); any other car keeps StarPilot's GPS. modeld has read
+  CarParams by the time the model attaches."""
+  try:
+    from openpilot.common.params import Params
+    from openpilot.starpilot.car.mazda.last_car import is_mazda
+    return is_mazda(Params())
+  except Exception:
+    _cloudlog().exception("jetlink.jetson_gps_car_check_failed")
+    return False
+
+
+def _gps_hooks(hooks_class):
+  """jetlink's Hooks, plus the Jetson's USB GPS (starpilot/gps/jetson.py, port of zoompilot develop's fallback): the
+  joined model asks for telemetry about once a second, and each frame's new fix goes to ubloxd. Never at the frame
+  loop's expense."""
+  from openpilot.starpilot.gps.jetson import JetsonGpsHook
+
+  class GpsHooks(hooks_class):
+    def __init__(self, *args, **kwargs):
+      super().__init__(*args, **kwargs)
+      self._jetson_gps = JetsonGpsHook()
+      self._gps_on = None  # Mazdas only; decided once, at attach or the first frame
+
+    def attach(self, model, small, cam_w, cam_h):
+      joined = super().attach(model, small, cam_w, cam_h)
+      self._gps_on = _mazda()
+      if self._gps_on and joined is not model and joined is not small:
+        try:
+          self._jetson_gps.bind(joined)
+        except Exception:
+          _cloudlog().exception("jetlink.jetson_gps_bind_failed")
+      return joined
+
+    def handed_over(self, model) -> bool:
+      try:
+        if self._gps_on is None:
+          self._gps_on = _mazda()
+        if self._gps_on:
+          self._jetson_gps.frame(model)
+      except Exception:
+        _cloudlog().exception("jetlink.jetson_gps_failed")
+      return super().handed_over(model)
+
+  return GpsHooks
 
 
 class _NoJetlink:

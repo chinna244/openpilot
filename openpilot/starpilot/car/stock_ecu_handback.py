@@ -164,6 +164,11 @@ class StockEcuHandBackServer:
       return
     request_id = self.request["id"]
     if state == StockEcuState.NOT_NEEDED:
+      # nothing to hand back, but a takeover must not start once the stop has its answer (the filter could
+      # request ownership in this very tick): assert from here until the request clears or card exits.
+      # Nothing is owned, so this revokes nothing under an engaged driver.
+      self.started = True
+      CC_SP.stockEcuHandBack = True
       self._answer(request_id, state)
       return
     # Never start on an engaged car: the hand-back revokes availability under the driver.
@@ -204,6 +209,6 @@ def mazda_handback_required(params) -> bool:
     with structs.CarParams.from_bytes(raw) as cp:
       return bool(cp.brand == "mazda" and cp.openpilotLongitudinalControl and not cp.passive and
                   len(cp.safetyConfigs) == 1 and cp.safetyConfigs[0].safetyModel == structs.CarParams.SafetyModel.mazda and
-                  cp.safetyConfigs[0].safetyParam in (3, 11))
+                  cp.safetyConfigs[0].safetyParam in (3, 11, 19, 27))  # 19/27: with the Smart CAN Filter
   except (ValueError, RuntimeError, capnp.KjException):
     return params.get("MazdaStockEcuState") in set(StockEcuState) - {StockEcuState.NOT_NEEDED}

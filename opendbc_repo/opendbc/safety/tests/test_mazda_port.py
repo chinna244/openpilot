@@ -114,3 +114,47 @@ def test_physical_cruise_grant_retains_only_lateral_after_brake(safety, word):
   fixture.safety.safety_rx_hook(fixture.packet('PEDALS', {'BRAKE_ON': 1, 'ACC_ACTIVE': 1}))
   assert not fixture.safety.get_controls_allowed()
   assert fixture.safety.aol_get_permission_mask() == 1
+
+
+@pytest.mark.parametrize('word', [3, 11, 19, 27])
+def test_can_filter_word_keeps_aol_lateral(safety, word):
+  """develop keeps MADS under the Smart CAN Filter: alpha long words with the filter bit (16) arm AOL lateral and
+  steer as the same words without it do."""
+  import unittest
+  from opendbc.safety.tests.test_mazda_measured_profiles import MazdaAolHarness
+  h = MazdaAolHarness(unittest.TestCase(), word)
+  h.arm()  # asserts the lateral grant
+  assert h.lat() == 1
+
+
+@pytest.mark.parametrize('word', [3, 11, 19, 27])
+def test_aol_cruise_active_bits_need_native_long_permission(safety, word):
+  """Under AOL, physical cruise permission alone cannot keep cruise active or release a standstill hold: ACC_ACTIVE,
+  the standstill bits and CRZ_ACTIVE need the host's current native long permission, like a nonzero accel does."""
+  from opendbc.safety.tests.test_mazda_stock_aol import TestMazdaStockAol
+  fixture = TestMazdaStockAol()
+  fixture.configure(word=word)
+  fixture.safety.set_aol_test_heartbeat(False)
+  for _ in range(20):
+    fixture.time += 10_000
+    fixture.safety.set_timer(fixture.time)
+    fixture.feed()
+    fixture.safety.aol_set_host_request(0)
+  fixture.safety.safety_rx_hook(fixture.packet('CRZ_BTNS', {'RES': 1}))
+  fixture.safety.safety_rx_hook(fixture.packet('PEDALS', {'ACC_ACTIVE': 1}))
+  assert fixture.safety.get_controls_allowed()
+  fixture.time += 10_000
+  fixture.safety.set_timer(fixture.time)
+  fixture.safety.set_aol_test_heartbeat(True)
+
+  frames = [('CRZ_INFO', {'ACC_ACTIVE': 1, 'ACCEL_CMD': 0.0}), ('CRZ_INFO', {'ACC_ACTIVE': 1, 'STOPPING': 1, 'ACCEL_CMD': 0.0}),
+            ('CRZ_INFO', {'ACC_ACTIVE': 1, 'RESUME_UNLATCHING': 1, 'ACCEL_CMD': 0.0}), ('CRZ_CTRL', {'CRZ_ACTIVE': 1})]
+  fixture.safety.aol_set_host_request(3)
+  assert fixture.safety.aol_get_permission_mask() == 3
+  for name, fields in frames:
+    assert fixture.safety.safety_tx_hook(fixture.packet(name, fields)), (name, fields)
+  fixture.safety.aol_set_host_request(1)  # the host withdraws long, lateral stays
+  assert fixture.safety.get_controls_allowed()
+  assert fixture.safety.aol_get_permission_mask() == 1
+  for name, fields in frames:
+    assert not fixture.safety.safety_tx_hook(fixture.packet(name, fields)), (name, fields)

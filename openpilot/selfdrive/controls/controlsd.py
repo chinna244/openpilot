@@ -63,6 +63,7 @@ from openpilot.starpilot.flm.evidence_hooks import control_message
 from openpilot.starpilot.flm.application_wire import write_application
 from openpilot.starpilot.longitudinal.inputs import LongitudinalInputs
 from openpilot.starpilot.longitudinal.output_max import final_output
+from openpilot.starpilot.car.mazda.lateral import qualified as mazda_lateral_qualified
 
 State = log.SelfdriveState.OpenpilotState
 LaneChangeState = log.LaneChangeState
@@ -149,9 +150,11 @@ class Controls:
     self.lane_centering_host = LaneCenteringHost(
       self.params, settings_reader=(lambda: preferences.current.lane_centering) if preferences is not None else None,
     ) if lane_runtime_supported(self.CP) else None
+    # Mazda steers on develop's torque stack (starpilot/car/mazda/lateral), none of StarPilot's torque owners
+    mazda_lateral = mazda_lateral_qualified(self.CP)
     self.torque_host = (
       TorqueHost(self.params, self.CP, allow_learning=(self.torque_learning_allowed if self.lateral_controller_selection.policy is not None else None))
-      if torque_runtime_enabled(self.CP, self.params)
+      if not mazda_lateral and torque_runtime_enabled(self.CP, self.params)
       else None
     )
     self.last_lane_centering_result: LaneCenteringResult | None = None
@@ -164,10 +167,17 @@ class Controls:
     self.LoC = LongControl(self.CP, startup_preferences=self.vehicle_startup_preferences)
     self.VM = VehicleModel(self.CP)
     self.LaC: LatControl
-    self.LaC = create_lateral_controller(
-      self.CP, self.CI, DT_CTRL, mode=self.lateral_controller_selection.mode, turn_assist=self.vehicle_startup_preferences.turn_assist
-    )
-    self.lateral_gain_owner = create_gain_owner(self.params, self.CP, self.LaC)
+    self.mazda_lateral = None
+    if mazda_lateral:
+      from openpilot.starpilot.car.mazda.lateral.controls import MazdaLateral
+      self.mazda_lateral = MazdaLateral(self.CP, self.CI, self.params)
+      self.LaC = self.mazda_lateral.LaC
+      self.torque_learning_allowed = False  # torqued and the Mazda stack own torque learning
+    else:
+      self.LaC = create_lateral_controller(
+        self.CP, self.CI, DT_CTRL, mode=self.lateral_controller_selection.mode, turn_assist=self.vehicle_startup_preferences.turn_assist
+      )
+    self.lateral_gain_owner = create_gain_owner(self.params, self.CP, self.LaC) if self.mazda_lateral is None else None
     if isinstance(self.LaC, LatControlTorque):
       # Only the actual startup owner reads configuration; replay clones stay pure.
       if manual_effects is not None and (manual_effects.profile.context[1] != str(self.LaC.controller_mode) or
@@ -198,10 +208,13 @@ class Controls:
     from openpilot.starpilot.lateral.learning_preferences import read_preference
 
     preference = read_preference(self.params, self.CP)
-    _, self.route_flm_status = self._configure_route_tune(manual_status)
+    if self.mazda_lateral is None:
+      _, self.route_flm_status = self._configure_route_tune(manual_status)
+    else:
+      self.LaC.route_flm_effects, self.route_flm_status = None, 'not_configured'
     self.global_learning = (
       GlobalRuntime(self.CP, self.CI, self.LaC, confirmed_live_history=load_confirmed_history(self.params))
-      if preference.valid and preference.enabled else None
+      if preference.valid and preference.enabled and self.mazda_lateral is None else None
     )
     # Load optional capture and live-trial code before the first control command.
     # Engagement must not compile/import replay and feedback modules in the loop.
@@ -315,6 +328,9 @@ class Controls:
     self.curvature = -self.VM.calc_curvature(steer_angle_without_offset, CS.vEgo, lp.roll)
 
     # Update Torque Params
+    mazda_lateral = getattr(self, 'mazda_lateral', None)
+    if mazda_lateral is not None:
+      mazda_lateral.update_inputs(self.sm)
     if isinstance(self.LaC, LatControlTorque) and self.torque_host is None and self.torque_learning_allowed:
       torque_params = self.sm['lateralTorqueParameters']
       if self.sm.all_checks(['lateralTorqueParameters']) and torque_params.useParams:
@@ -472,6 +488,8 @@ class Controls:
       CC.leftBlinker = model_v2.meta.laneChangeDirection == LaneChangeDirection.left
       CC.rightBlinker = model_v2.meta.laneChangeDirection == LaneChangeDirection.right
 
+    if mazda_lateral is not None:
+      mazda_lateral.note_lat_active(CC.latActive)
     if not CC.latActive:
       self.LaC.reset()
     if not CC.longActive:
@@ -919,6 +937,10 @@ class Controls:
       diagnostic_observer.emit(cloudlog.event, cc_send)
     if publish_timing is not None:
       publish_timing.mark()
+    mazda_lateral = getattr(self, 'mazda_lateral', None)
+    if mazda_lateral is not None:
+      # develop's run_lateral_zp: the classifier's flag for the next frame, the speed bins, the tune swap
+      self.LaC, self.steer_limited_by_safety = mazda_lateral.run(self.sm, self.steer_limited_by_safety)
 
   def run(self):
     rk = Ratekeeper(100, print_delay_threshold=None)

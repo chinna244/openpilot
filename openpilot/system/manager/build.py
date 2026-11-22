@@ -17,12 +17,12 @@ from openpilot.common.hardware import HARDWARE, AGNOS
 # other state discards .sconsign and every target is rebuilt (the CacheDir still serves unchanged ones).
 STAMP = ".build_stamp.json"
 SCONSIGN = ".sconsign.dblite"
-OUTPUT_SUFFIXES = (".so", ".a", ".o", ".bin", ".signed", ".elf")
+OUTPUT_SUFFIXES = (".so", ".a", ".o", ".bin", ".signed", ".elf", ".pkl")  # .pkl: tinygrad models (modeld, dmonitoringmodeld)
 VERSIONED_SO = re.compile(r"\.so(\.\d+)+$")
 
 
 def build_state(basedir: str = BASEDIR) -> dict | None:
-  """HEAD and every tracked build output as (size, mtime); None when git cannot say."""
+  """HEAD and every build output, tracked or not, as (size, mtime); None when git cannot say."""
   try:
     head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=basedir, text=True).strip()
     staged = subprocess.check_output(["git", "ls-files", "-s", "-z"], cwd=basedir, text=True).split("\0")
@@ -40,6 +40,21 @@ def build_state(basedir: str = BASEDIR) -> dict | None:
         outputs[name] = [st.st_size, st.st_mtime_ns]
       except FileNotFoundError:
         outputs[name] = None
+  # Untracked build products too (generated libraries, objects, executables): one deleted since the stamp makes the tree
+  # differ from what the last build left, so the boot fast path does not skip a build it needs.
+  try:
+    untracked = subprocess.check_output(["git", "ls-files", "--others", "-z"], cwd=basedir, text=True).split("\0")
+  except (OSError, subprocess.CalledProcessError):
+    return None
+  for name in filter(None, untracked):
+    base = os.path.basename(name)
+    path = os.path.join(basedir, name)
+    try:
+      st = os.stat(path)
+    except FileNotFoundError:
+      continue
+    if name.endswith(OUTPUT_SUFFIXES) or VERSIONED_SO.search(base) or ("." not in base and st.st_mode & 0o111):
+      outputs[name] = [st.st_size, st.st_mtime_ns]
   return {"head": head, "outputs": outputs}
 
 

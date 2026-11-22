@@ -324,6 +324,9 @@ class Car:
                         forced_candidate=startup_candidate(self.params, developer_fingerprint=bool(os.getenv('FINGERPRINT'))))
       self.RI = interfaces[self.CI.CP.carFingerprint].RadarInterface(self.CI.CP)
       self.CP = self.CI.CP
+      # Mazda torque-control defaults, before CarParams reaches controlsd and torqued (develop's setup_interfaces)
+      from openpilot.starpilot.car.mazda.lateral.seed import seed_mazda_torque_defaults
+      seed_mazda_torque_defaults(self.CP, self.params)
 
       # continue onto next fingerprinting step in pandad
       self.params.put_bool("FirmwareQueryDone", True, block=True)
@@ -1703,7 +1706,9 @@ class Car:
                "aebSettingOff": bool(getattr(self.CI.CS, 'aeb_setting_off', False)),
                # Mazda's Smart CAN Filter: the stand-in lost for the drive, and the camera's own TJA stuck on
                "stockEcuLost": bool(getattr(controller, 'stock_ecu_lost', False)),
-               "cameraTjaStuck": bool(getattr(self.CI.CS, 'camera_tja_stuck', False))}
+               "cameraTjaStuck": bool(getattr(self.CI.CS, 'camera_tja_stuck', False)),
+               # LKA back on, the EPS not re-armed yet (develop's stockLkasArming)
+               "lkasArming": bool(getattr(self.CI.CS, 'lkas_arming', False))}
     now_ns = time.monotonic_ns()
     if payload != self.mazda_status_payload or now_ns - self.mazda_status_written_ns >= 1_000_000_000:
       self.params.put("MazdaStockEcuStatus", {**payload, "monoTime": now_ns})
@@ -1711,7 +1716,8 @@ class Car:
 
   def controls_update(self, CS: car.CarState, CC: car.CarControl, *, initialize_only=False):
     """control update loop, driven by carControl"""
-    self.mazda_handback_update(CC)
+    if getattr(getattr(self, 'CP', None), 'brand', None) == 'mazda':
+      self.mazda_handback_update(CC)
 
     if initialize_only:
       ioniq6_startup = self.ioniq6_startup_keepalive()

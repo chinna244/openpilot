@@ -9,7 +9,7 @@ import requests
 
 import openpilot.cereal.messaging as messaging
 from openpilot.cereal import log
-from openpilot.common.konik_api import KonikApi, register
+from openpilot.common.konik_api import KonikApi, backup_permitted, register
 from openpilot.common.hardware.hw import Paths
 from openpilot.common.params import Params
 from openpilot.common.swaglog import cloudlog
@@ -41,7 +41,7 @@ class KonikUploader:
   def allowed(self) -> bool:
     device = self.device_state()
     return (device is not None and not self.exit_event.is_set() and self.params.get_bool('KonikUploadsEnabled') and self.params.get_bool('IsOffroad')
-            and device.networkType == NetworkType.wifi and not device.networkMetered)
+            and device.networkType == NetworkType.wifi and not device.networkMetered and backup_permitted())
 
   def _check_policy(self, *_, force: bool = False):
     if not self.allowed():
@@ -170,6 +170,8 @@ class KonikUploader:
 
 def main(exit_event: threading.Event | None = None):
   exit_event = exit_event or threading.Event()
+  if os.getenv('STARPILOT_CLOUD_DISABLED') == '1':
+    return  # manager turned cloud services off for this session
   params = Params()
   params.put('KonikCurrentUpload', {}, block=True)
   sm = messaging.SubMaster(['deviceState'])

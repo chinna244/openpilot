@@ -6,6 +6,7 @@ from dataclasses import replace
 import numpy as np
 
 import openpilot.cereal.messaging as messaging
+from openpilot.cereal import log
 from opendbc.car.interfaces import ACCEL_MIN, ACCEL_MAX
 from openpilot.starpilot.longitudinal.lead_takeoff_preferences import MAX_ACCEL as TAKEOFF_ACCEL_MAX
 from openpilot.common.constants import CV
@@ -13,14 +14,16 @@ from openpilot.common.filter_simple import FirstOrderFilter
 from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.modeld.constants import ModelConstants
 from openpilot.selfdrive.controls.lib.accel_boost import AccelBoost
+from openpilot.selfdrive.controls.lib.curve_speed import CurveSpeed
+from openpilot.selfdrive.controls.lib.firm_stop import FirmStop
 from openpilot.starpilot.longitudinal.encouragement import Encouragement
-from openpilot.starpilot.longitudinal.set_speed_assist import E2ESetSpeedController
+from openpilot.starpilot.longitudinal.set_speed_assist import FIRM_STOP_PLAN_V, E2ESetSpeedController
 from openpilot.starpilot.longitudinal.lead_forecast import LeadForecast
 from openpilot.selfdrive.controls.lib.longcontrol import LongCtrlState
 from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import (LongitudinalMpc, LongitudinalPlanSource, get_T_FOLLOW, get_jerk_factor,
                                                                                       qualified_model_leads, ModelLeadHistory, should_trigger_planner_fcw)
 from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import T_IDXS as T_IDXS_MPC
-from openpilot.selfdrive.controls.lib.drive_helpers import CONTROL_N, get_accel_from_plan, should_stop
+from openpilot.selfdrive.controls.lib.drive_helpers import CONTROL_N, get_accel_from_plan, should_stop, smooth_value
 from openpilot.selfdrive.car.cruise import V_CRUISE_MAX, V_CRUISE_UNSET
 from openpilot.common.swaglog import cloudlog
 from openpilot.starpilot.navigation.intent import NAVIGATION_BRAKE_MAGNITUDE, cruise_ceiling as navigation_ceiling
@@ -46,6 +49,7 @@ from openpilot.starpilot.car.volkswagen.stopped_lead import owner_for as vw_stop
 from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import STOP_DISTANCE
 from openpilot.starpilot.longitudinal.lead_approach import LeadApproach, LeadApproachKey, project as project_approach
 from openpilot.starpilot.lateral.lane_change_preferences import LaneChangePolicy
+from openpilot.starpilot.longitudinal.scc.planner import SccSource
 
 A_CRUISE_MAX_VALS = [1.6, 1.2, 0.8, 0.6]
 A_CRUISE_MAX_BP = [0., 10.0, 25., 40.]
@@ -89,6 +93,20 @@ ENGAGE_SETTLE_TIME = 5.0  # s
 GAS_COAST_BAND = 0.5  # m/s over the set speed
 GAS_COAST_ACCEL = -0.3  # m/s^2
 GAS_COAST_JERK = 0.3  # m/s^3
+# Mazda, develop's e2e candidate: on aggressive with Set Speed Assist off the model's accel gets this (develop
+# AGGRESSIVE_ACCEL_BOOST), faded in from 5 to 10 m/s and out as the model brakes past -0.5
+AGGRESSIVE_ACCEL_BOOST = 0.1  # m/s^2
+
+
+def get_mazda_cruise_accel(v_cruise, v_ego, a_cruise_prev, a_target_prev, dt, cruise_min=A_CRUISE_MIN, max_accel=ACCEL_MAX):
+  """Mazda: develop's cruise law (upstream #39266): the set speed error smoothed over 1 s, clipped to [cruise_min,
+  max_accel], jerk-limited by J_CRUISE_VALS from the lower of the last candidate and the last plan. The bounds are
+  develop's A_CRUISE_MIN and ACCEL_MAX unless a StarPilot profile, braking response or wheel coast the driver chose
+  sets them."""
+  target_accel = smooth_value(v_cruise - v_ego, a_cruise_prev, tau=1.0, dt=dt)
+  target_accel = np.clip(target_accel, cruise_min, max_accel)
+  j_cruise = np.interp(v_ego, A_CRUISE_MAX_BP, J_CRUISE_VALS)
+  return float(np.clip(target_accel, min(a_cruise_prev, a_target_prev) - j_cruise * dt, a_cruise_prev + j_cruise * dt))
 
 
 def get_cruise_accel(e2e, v_cruise, v_ego, a_cruise_prev, angle_steers, CP, dt, accel_coast, allow_throttle,
@@ -157,6 +175,7 @@ class LongitudinalPlanner:
     self.gas_coast_v_cruise = 0.  # the set speed the coast started on: lowering it ends the coast
     self.a_coast = 0.  # the coast's own ramp, lifted onto the candidate while above it
     self.a_target_published = init_a  # the plan sent: the internal one, lifted while a gas override is held
+    self.source_published = LongitudinalPlanSource.cruise
     # Mazda: develop's Set Speed Assist stands in for the nudge, on the same toggle
     self.set_speed_assist = E2ESetSpeedController() if getattr(self.CP, 'brand', '') == 'mazda' else None
     # Mazda: develop's lead forecast as the MPC's obstacle, in place of StarPilot's model-lead path
@@ -164,6 +183,17 @@ class LongitudinalPlanner:
     if getattr(self.CP, 'brand', '') == 'mazda':
       self.lead_forecast = LeadForecast()
       self.lead_forecast.install(self.mpc)
+    # Mazda: develop's planner around the MPC. The model (e2e) candidate, with develop's curve offset and firm stop, is
+    # always in the minimum and the cruise candidate follows develop's law, whatever experimentalMode says (develop's
+    # planner never reads it); the MPC follows at develop's town gap; Smart Cruise Control's vision and map targets
+    # lower the cruise target (scc/); StarPilot's AccelBoost is not used.
+    self.mazda = self.cruise_handover
+    self.curve_speed = CurveSpeed(dt) if self.mazda else None
+    self.firm_stop = FirmStop(dt) if self.mazda else None
+    self.scc = None
+    if self.mazda and CP.openpilotLongitudinalControl:
+      from openpilot.starpilot.longitudinal.scc.planner import SmartCruiseTargets
+      self.scc = SmartCruiseTargets(CP)
     self.plan_drive_id = 0
     self.throttle_gate = ModelThrottleGate()
     self.ioniq6_throttle_gate_enabled = ioniq6_long_eligible(CP)
@@ -267,12 +297,26 @@ class LongitudinalPlanner:
       self.v_desired_filter.x = v_ego
       self.output_a_target = np.clip(sm['carState'].aEgo, ACCEL_MIN, ACCEL_MAX)
       self.a_cruise = self.output_a_target
+      if self.curve_speed is not None:
+        self.curve_speed.reset()
 
     # Prevent divergence, smooth in current v_ego
     self.v_desired_filter.x = max(0.0, self.v_desired_filter.update(v_ego))
 
     # No change cost when user is controlling the speed, or when standstill
     prev_accel_constraint = not (reset_state or sm['carState'].standstill)
+
+    # Mazda: the cruise law's lower bound, before Smart Cruise Control reseeds the plan; the cruise target the model's Set
+    # Speed Assist approaches (develop's output_v_target: after SCC and the speed limit, before Force Stop's ceiling)
+    prev_output_a_target = self.output_a_target
+    a_cruise_prev = self.a_cruise
+    scc_v_target = v_cruise
+    if self.scc is not None:
+      # develop's update_targets on the filtered speed: SCC's vision and map targets against the cruise target, and the MPC seed
+      v_set = 0. if sm['controlsState'].forceDecel else v_cruise_kph * CV.KPH_TO_MS
+      scc_v_target, self.output_a_target = self.scc.update_targets(
+        sm, self.v_desired_filter.x, self.output_a_target, 0. if sm['controlsState'].forceDecel else v_cruise, v_set, self.a_cruise)
+      v_cruise = min(v_cruise, scc_v_target)
 
     if self.CP.openpilotLongitudinalControl:
       self.mpc.set_cur_state(self.v_desired_filter.x, self.output_a_target)
@@ -337,7 +381,8 @@ class LongitudinalPlanner:
                     (self.last_profile.follow_seconds if self.last_profile is not None else None),
                     acceleration_max=acceleration_cap, faster_takeoffs=faster_takeoffs,
                     extra_stopped_gap_m=(selected_profiles.extra_stopped_gap_m if profile_eligible and selected_profiles is not None else 0.0),
-                    stop_line_m=self.force_stop_plan.obstacle_m, modelV2=qualified_model_leads(sm, sample_now_ns, self.model_lead_history))
+                    stop_line_m=self.force_stop_plan.obstacle_m, modelV2=qualified_model_leads(sm, sample_now_ns, self.model_lead_history),
+                    city_follow=self.mazda)
 
     # MPC has selected the actual follow time for this model cycle. Its solve
     # does not use the Curve cruise cap, so a provider may now evaluate the
@@ -400,6 +445,9 @@ class LongitudinalPlanner:
       self.CP, self.v_desired_trajectory, CONTROL_N_T_IDX, action_t,
       fallback=should_stop(v_ego, output_a_target_mpc))
     output_a_target_e2e = sm['modelV2'].action.desiredAcceleration
+    if self.curve_speed is not None:
+      # develop's curve offset: -0.5 at a jerk of 0.5 while 2.8 m/s^2 lateral is predicted within 6 s
+      output_a_target_e2e += self.curve_speed.update(sm['modelV2'], sm['vehicleParameters'].roll)
     output_should_stop_e2e = sm['modelV2'].action.shouldStop
     if (self.force_stop_plan.resume_override and not self.force_stop_plan.forcing and
         not self.force_stop_plan.should_stop and not reset_state and not self.fcw and self.allow_throttle and
@@ -463,12 +511,22 @@ class LongitudinalPlanner:
       self._track_cruise_handover(sm, reset_state, v_ego, v_cruise)
     cruise_args = (accel_coast, self.allow_throttle, cruise_profile)
     cruise_kwargs = {'base_brake_floor': global_floor, 'selected_acceleration_max': selected_acceleration, 'faster_takeoffs': faster_takeoffs}
-    self.a_cruise = get_cruise_accel(sm['selfdriveState'].experimentalMode, v_cruise, v_ego,
-                                     self.a_cruise, steer_angle_without_offset, self.CP, self.dt,
-                                     accel_coast, self.allow_throttle, cruise_profile,
-                                     base_brake_floor=global_floor, selected_acceleration_max=selected_acceleration, faster_takeoffs=faster_takeoffs,
-                                     a_target_prev=self.output_a_target,
-                                     ease_slc_braking=v_cruise == ceiling.effective_mps and not relevant_lead)
+    if self.mazda:
+      # develop's law, whatever experimentalMode says; then Smart Cruise Control's rebuild while it is the target
+      mazda_min = max(ACCEL_MIN, -cruise_profile.cruise_brake_magnitude) if cruise_profile is not None else max(ACCEL_MIN, global_floor)
+      mazda_max = min(x for x in (ACCEL_MAX, cruise_profile.acceleration_max if cruise_profile is not None else None,
+                                  selected_acceleration) if x is not None)
+      def mazda_cruise(a_prev, a_target_prev, dt, unlimited=False):
+        a = get_mazda_cruise_accel(v_cruise, v_ego, a_prev, a_target_prev, dt, cruise_min=mazda_min, max_accel=mazda_max)
+        return self.scc.update_cruise_accel(a, unlimited=unlimited) if self.scc is not None else a
+      self.a_cruise = mazda_cruise(self.a_cruise, prev_output_a_target, self.dt)
+    else:
+      self.a_cruise = get_cruise_accel(sm['selfdriveState'].experimentalMode, v_cruise, v_ego,
+                                       self.a_cruise, steer_angle_without_offset, self.CP, self.dt,
+                                       accel_coast, self.allow_throttle, cruise_profile,
+                                       base_brake_floor=global_floor, selected_acceleration_max=selected_acceleration, faster_takeoffs=faster_takeoffs,
+                                       a_target_prev=self.output_a_target,
+                                       ease_slc_braking=v_cruise == ceiling.effective_mps and not relevant_lead)
     button_target = None
     if self.button_cruise is not None:
       button_target = self.button_cruise.sample(
@@ -484,12 +542,18 @@ class LongitudinalPlanner:
     cruise_should_stop = should_stop(v_ego, self.a_cruise)
     a_cruise = self.a_cruise
     if self.cruise_handover:
-      # the plain set speed owns the cruise target: no SLC, curve, navigation, wheel-coast, Force Stop or button target
+      # the plain set speed owns the cruise target: no SLC, SCC, curve, navigation, wheel-coast, Force Stop or button
+      # target. The wheel-coast owner hands in a plan every frame: only one that acts (a ceiling, a brake floor or a
+      # forced decel) takes the target
+      coast_acting = coast_plan is not None and (coast_plan.force_decel or coast_plan.brake_floor is not None or
+                                                 coast_plan.speed_ceiling_mps is not None)
       cruise_owned = (ceiling.effective_mps is None and curve.effective_mps is None and navigation_target is None and
-                      coast_plan is None and self.force_stop_plan.speed_ceiling_mps is None and button_target is None and
-                      not sm['controlsState'].forceDecel)
+                      not coast_acting and self.force_stop_plan.speed_ceiling_mps is None and button_target is None and
+                      (self.scc is None or self.scc.source == SccSource.cruise) and not sm['controlsState'].forceDecel)
       def unlimited_ask():
-        # what the target asks this cycle: the cruise accel without its jerk limit, never above 0
+        # what the target asks this cycle: the cruise accel without its jerk limit (SCC's budget included), never above 0
+        if self.mazda:
+          return min(mazda_cruise(0., 0., 1e3, unlimited=True), 0.)
         return min(get_cruise_accel(sm['selfdriveState'].experimentalMode, v_cruise, v_ego, 0., steer_angle_without_offset,
                                     self.CP, 1e3, *cruise_args, **cruise_kwargs), 0.)
       a_cruise = self._lift_cruise(sm, v_ego, v_cruise, cruise_owned, unlimited_ask)
@@ -504,14 +568,33 @@ class LongitudinalPlanner:
       blocked=bool(experimental_speed_nudge is not True or reset_state or self.fcw or not self.allow_throttle or self.force_stop_plan.forcing or
                    output_should_stop_mpc or cruise_should_stop or self.mpc.solution_status != 0 or
                    curve.effective_mps is not None or traffic_mode is not False))
-    manual_model = self.accel_boost.update(sm, output_a_target_e2e, output_a_target_mpc, self.a_cruise)
+    if self.mazda:
+      # develop's e2e candidate: no AccelBoost; its aggressive boost only with Set Speed Assist off
+      manual_model = output_a_target_e2e
+      if sm['selfdriveState'].personality == log.LongitudinalPersonality.aggressive and not self.set_speed_assist.enabled:
+        speed_scale = np.interp(v_ego, [5.0, 10.0], [0.0, 1.0])
+        accel_scale = np.interp(manual_model, [-1.0, -0.5], [0.0, 1.0])
+        manual_model += AGGRESSIVE_ACCEL_BOOST * speed_scale * accel_scale
+    else:
+      manual_model = self.accel_boost.update(sm, output_a_target_e2e, output_a_target_mpc, self.a_cruise)
     if self.set_speed_assist is not None:
-      # develop's law: lift the model toward chill's answer (lead MPC, cruise after CSC/SLC), never past it,
-      # and brake ahead of a stop the plan sees before the model's action does
+      # develop's law: lift the model toward chill's answer (lead MPC, and the cruise candidate as it stood before this
+      # frame's, as develop builds it after the e2e candidate), never past it, and brake ahead of a stop the plan sees
+      # before the model's action does. Active on openpilot long whatever experimentalMode says, as in develop.
       output_a_target_e2e = self.set_speed_assist.update(
-        sm, manual_model, min(output_a_target_mpc, self.a_cruise),
-        bool(sm['selfdriveState'].experimentalMode and self.CP.openpilotLongitudinalControl), bool(reset_state),
-        sm['controlsState'].curvature * v_ego ** 2, v_cruise, enabled=experimental_speed_nudge is True)
+        sm, manual_model, min(output_a_target_mpc, a_cruise_prev),
+        bool(self.CP.openpilotLongitudinalControl), bool(reset_state),
+        sm['controlsState'].curvature * v_ego ** 2, scc_v_target, enabled=experimental_speed_nudge is True)
+      if not self.CP.openpilotLongitudinalControl:
+        output_a_target_e2e, output_should_stop_e2e = ACCEL_MAX, False
+      # develop's firm stop: the model's planned stop under 5 mph finished at a steady decel; only ever lower
+      lead_one = sm['radarState'].leadOne
+      a_firm = self.firm_stop.update(v_ego, sm['modelV2'].velocity.x, sm['modelV2'].position.x,
+                                     bool(self.CP.openpilotLongitudinalControl and not reset_state), output_a_target_e2e,
+                                     lead_one.dRel if lead_one.present else math.inf,
+                                     committed_stop=self.force_stop_plan.forcing)
+      output_a_target_e2e = min(output_a_target_e2e, a_firm)
+      output_should_stop_e2e = output_should_stop_e2e or self.firm_stop.should_stop
     else:
       output_a_target_e2e = max(manual_model, encouraged_model)
 
@@ -521,7 +604,7 @@ class LongitudinalPlanner:
     if self.force_stop_distance_braking and self.force_stop_plan.forcing and self.force_stop_plan.obstacle_m is not None:
       stop_target = distance_target(v_ego, sm['carState'].aEgo, self.force_stop_plan.obstacle_m, action_t)
       candidates.append((stop_target, LongitudinalPlanSource.cruise, False))
-    if sm['selfdriveState'].experimentalMode:
+    if sm['selfdriveState'].experimentalMode or self.mazda:
       candidates.append((output_a_target_e2e, LongitudinalPlanSource.e2e, output_should_stop_e2e))
 
     mpc_source = self.mpc.source
@@ -530,8 +613,14 @@ class LongitudinalPlanner:
     # an equal or lower SLC ceiling retain their own attribution.
     self.last_curve_ceiling_applied = (curve.effective_mps is not None and self.a_cruise < output_a_target_mpc and
                                       (not sm['selfdriveState'].experimentalMode or self.a_cruise < output_a_target_e2e))
-    self.output_should_stop = self.force_stop_plan.should_stop or any(should_stop for _, _, should_stop in candidates)
-    if conditional_handoff is None:
+    # Mazda (develop): Force Stop asks for the stopping state only as slow as every other stop does; above it Mazda's
+    # STOPPING barely brakes (develop route 59 t=227.8: 0.64 m/s, 3.8 s to stand still), so its ceiling and the firm
+    # finish brake it down
+    force_should_stop = self.force_stop_plan.should_stop and (self.CP.brand != 'mazda' or v_ego < FIRM_STOP_PLAN_V)
+    self.output_should_stop = force_should_stop or any(should_stop for _, _, should_stop in candidates)
+    # Mazda: the model candidate is always in (develop), so there is no Experimental mode exit to restrain and no
+    # Experimental-only lead departure floor; CEM's mode choice changes nothing in this planner
+    if conditional_handoff is None or self.mazda:
       self.experimental_release.reset()
     else:
       mpc_lead_index = {LongitudinalPlanSource.lead0: 0, LongitudinalPlanSource.lead1: 1}.get(mpc_source)
@@ -543,7 +632,7 @@ class LongitudinalPlanner:
       if release_cap is not None:
         output_a_target = min(output_a_target, release_cap)
     output_a_target = adjust_lead_behavior(
-      target=output_a_target, sm=sm, cp=self.CP, now_ns=sample_now_ns, key=conditional_handoff,
+      target=output_a_target, sm=sm, cp=self.CP, now_ns=sample_now_ns, key=None if self.mazda else conditional_handoff,
       follow_seconds=float(self.mpc.params[0, 4]), mpc_target=output_a_target_mpc,
       cruise_target=self.a_cruise, model_target=output_a_target_e2e, stopping=self.output_should_stop,
       force_stop=self.force_stop_plan.forcing, traffic_mode=traffic_mode, accel_min=ACCEL_MIN)
@@ -587,10 +676,12 @@ class LongitudinalPlanner:
         stopping=self.output_should_stop, accel_min=ACCEL_MIN, active=profile_eligible and not reset_state)
     self.output_a_target = np.clip(output_a_target, ACCEL_MIN, accel_ceiling)
     self.a_target_published = float(self.output_a_target)
+    self.source_published = self.mpc.source
     if lift_published:
-      published = [c[0] for c in candidates]
-      published[1] = a_cruise
-      self.a_target_published = float(np.clip(min(published), ACCEL_MIN, accel_ceiling))
+      published = list(candidates)
+      published[1] = (a_cruise, LongitudinalPlanSource.cruise, cruise_should_stop)
+      a_published, self.source_published, _ = min(published, key=lambda c: c[0])
+      self.a_target_published = float(np.clip(a_published, ACCEL_MIN, accel_ceiling))
 
     self.v_desired_filter.x = self.v_desired_filter.x + self.dt * (self.output_a_target + a_prev) / 2.0
 
@@ -681,7 +772,8 @@ class LongitudinalPlanner:
     longitudinalPlan.jerks = self.j_desired_trajectory.tolist()
 
     longitudinalPlan.hasLead = sm['radarState'].leadOne.present
-    longitudinalPlan.longitudinalPlanSource = self.mpc.source
+    # Mazda: the winner of the plan sent, which a held gas override lifts (develop)
+    longitudinalPlan.longitudinalPlanSource = self.source_published if self.cruise_handover else self.mpc.source
     longitudinalPlan.fcw = self.fcw
 
     longitudinalPlan.aTarget = float(self.a_target_published if self.cruise_handover else self.output_a_target)

@@ -199,11 +199,33 @@ def test_lkas_off_refuse_only_when_turning_on():
 def test_konik_backup_stands_down_when_konik_is_the_active_provider(monkeypatch):
   from openpilot.system.manager import process_config as pc
   import openpilot.starpilot.connect.provider as provider
+  import openpilot.starpilot.car.mazda.last_car as last_car
+  monkeypatch.delenv('STARPILOT_CLOUD_DISABLED', raising=False)
+  monkeypatch.setattr(last_car, 'car_brand', lambda params, live_only=False: 'mazda')
   params = SimpleNamespace(get_bool=lambda k: k == 'KonikUploadsEnabled', get=lambda k: 'abc123')
   monkeypatch.setattr(provider, 'active_provider', lambda: provider.PROVIDERS['comma'])
   assert pc.konik_uploads_ready(False, params, None) and pc.konik_connect_ready(False, params, None)
   assert not pc.konik_uploads_ready(True, params, None)
   monkeypatch.setattr(provider, 'active_provider', lambda: provider.PROVIDERS['konik'])
+  assert not pc.konik_uploads_ready(False, params, None) and not pc.konik_connect_ready(False, params, None)
+
+
+def test_konik_backup_is_mazda_only_and_honors_cloud_disabled(monkeypatch):
+  """The port's Konik backup never runs on another car or while manager has cloud services off; a known current car
+  wins over the stored one."""
+  from openpilot.system.manager import process_config as pc
+  import openpilot.starpilot.connect.provider as provider
+  import openpilot.starpilot.car.mazda.last_car as last_car
+  monkeypatch.delenv('STARPILOT_CLOUD_DISABLED', raising=False)
+  monkeypatch.setattr(provider, 'active_provider', lambda: provider.PROVIDERS['comma'])
+  params = SimpleNamespace(get_bool=lambda k: k == 'KonikUploadsEnabled', get=lambda k: 'abc123')
+  monkeypatch.setattr(last_car, 'car_brand', lambda params, live_only=False: 'toyota')
+  assert not pc.konik_uploads_ready(False, params, None) and not pc.konik_connect_ready(False, params, None)
+  assert pc.konik_uploads_ready(False, params, SimpleNamespace(brand='mazda'))  # this drive's CarParams say Mazda
+  monkeypatch.setattr(last_car, 'car_brand', lambda params, live_only=False: 'mazda')
+  assert pc.konik_uploads_ready(False, params, None)
+  assert not pc.konik_uploads_ready(False, params, SimpleNamespace(brand='toyota'))  # stale Mazda, current Toyota
+  monkeypatch.setenv('STARPILOT_CLOUD_DISABLED', '1')
   assert not pc.konik_uploads_ready(False, params, None) and not pc.konik_connect_ready(False, params, None)
 
 
@@ -217,3 +239,22 @@ def test_mazda_alerts_are_created_like_onroad_events():
   assert events.create_alerts([ET.WARNING]) == []
   with pytest.raises(AssertionError):
     events.add('notAMazdaEvent')
+
+
+@pytest.mark.parametrize('provider_name, disabled, expected', [('comma', False, True), ('offline', False, False),
+                                                               ('konik', False, False), ('comma', True, False)])
+def test_konik_backup_permitted_follows_starpilots_cloud(monkeypatch, provider_name, disabled, expected):
+  """Backup talks to Konik only where StarPilot's own API would talk to its cloud (common/api.py refuses offline)."""
+  import openpilot.starpilot.connect.provider as provider
+  from openpilot.common.konik_api import backup_permitted
+  from openpilot.system.manager import process_config as pc
+  import openpilot.starpilot.car.mazda.last_car as last_car
+  if disabled:
+    monkeypatch.setenv('STARPILOT_CLOUD_DISABLED', '1')
+  else:
+    monkeypatch.delenv('STARPILOT_CLOUD_DISABLED', raising=False)
+  monkeypatch.setattr(provider, 'active_provider', lambda: provider.PROVIDERS.get(provider_name, provider.OFFLINE))
+  monkeypatch.setattr(last_car, 'car_brand', lambda params, live_only=False: 'mazda')
+  params = SimpleNamespace(get_bool=lambda k: k == 'KonikUploadsEnabled', get=lambda k: 'abc123')
+  assert backup_permitted() is expected
+  assert pc.konik_uploads_ready(False, params, None) is expected

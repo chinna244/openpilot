@@ -272,7 +272,8 @@ static void FDCAN3_IT0_IRQ_Handler(void) { can_rx(2);  }
 static void FDCAN3_IT1_IRQ_Handler(void) { process_can(2); }
 
 bool can_init(uint8_t can_number) {
-  bool ret = false;
+  // true unless a step fails (it started false, so every init reported failure)
+  bool ret = true;
 
   REGISTER_INTERRUPT(FDCAN1_IT0_IRQn, FDCAN1_IT0_IRQ_Handler, CAN_INTERRUPT_RATE, FAULT_INTERRUPT_RATE_CAN_1)
   REGISTER_INTERRUPT(FDCAN1_IT1_IRQn, FDCAN1_IT1_IRQ_Handler, CAN_INTERRUPT_RATE, FAULT_INTERRUPT_RATE_CAN_1)

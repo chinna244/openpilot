@@ -8,6 +8,29 @@
 inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"MazdaTjaButton", {PERSISTENT, BOOL, "0"}},
     {"MazdaCanFilter", {PERSISTENT, BOOL, "0"}},
+    // Mazda lateral (starpilot/car/mazda/lateral): zoompilot develop's keys; defaults = the develop car's values
+    // (drives 33/56 initData: jerk-aware 1, relaxed live torque 1, Blendful 1), as the port has no toggles for them
+    {"EnforceTorqueControl", {PERSISTENT, BOOL}},
+    {"LiveTorqueParamsToggle", {PERSISTENT, BOOL}},
+    {"LiveTorqueParamsRelaxedToggle", {PERSISTENT, BOOL, "1"}},
+    {"CustomTorqueParams", {PERSISTENT, BOOL, "0"}},
+    {"LateralJerkTorqueController", {PERSISTENT, BOOL, "1"}},
+    {"TorqueControlTune", {PERSISTENT, FLOAT, "0.0"}},
+    {"TorqueControlTuneBig", {PERSISTENT, FLOAT, "1.0"}},  // big-model tune
+    {"TorqueParamsOverrideEnabled", {PERSISTENT, BOOL, "0"}},
+    {"TorqueParamsOverrideFriction", {PERSISTENT, FLOAT, "0.1"}},
+    {"TorqueParamsOverrideLatAccelFactor", {PERSISTENT, FLOAT, "2.5"}},
+    {"MazdaTorqueDefaultsApplied", {PERSISTENT, BOOL}},
+    {"MazdaTorqueTuneSeeded", {PERSISTENT, FLOAT}},
+    {"LiveTorqueParametersSP", {PERSISTENT | DONT_LOG, BYTES}},
+    {"Blendful", {PERSISTENT, BOOL, "1"}},
+    {"BigModelSmoothing", {PERSISTENT, BOOL, "1"}},
+    // Mazda: develop's Smart Cruise Control (starpilot/longitudinal/scc), develop's keys. Vision defaults on (develop: off) as
+    // the develop car drove it (route 7c initData: SmartCruiseControlVision 1, SmartCruiseControlMap 0); no StarPilot toggle yet
+    {"SmartCruiseControlVision", {PERSISTENT, BOOL, "1"}},
+    {"SmartCruiseControlMap", {PERSISTENT, BOOL, "0"}},
+    {"CurveSpeedProfile", {PERSISTENT, INT, "1"}},  // curve planners' lateral ceiling: 0 Gentle, 1 Normal, 2 Sporty
+    {"MapTargetVelocities", {CLEAR_ON_ONROAD_TRANSITION, STRING}},  // develop's mapd output; StarPilot's mapd path is used instead
     {"MazdaStockEcuStatus", {CLEAR_ON_MANAGER_START | CLEAR_ON_OFFROAD_TRANSITION, JSON}},
     {"MazdaStockEcuState", {CLEAR_ON_MANAGER_START | CLEAR_ON_OFFROAD_TRANSITION, STRING}},
     {"StockEcuHandBackRequest", {CLEAR_ON_MANAGER_START | CLEAR_ON_ONROAD_TRANSITION, JSON}},

@@ -1,5 +1,5 @@
 from opendbc.car import structs
-from opendbc.car.mazda.values import CAR, MazdaFlags
+from opendbc.car.mazda.values import CAR, MazdaFlags, MazdaSafetyFlags
 
 CARS = frozenset((CAR.MAZDA_CX5_2022, CAR.MAZDA_CX9_2021))
 
@@ -12,6 +12,12 @@ def qualified(cp, *, marked_only=False):
           cp.alternativeExperience in ((32,) if marked_only else (0, 32))):
     return False
   flags, word = int(cp.flags), int(cp.safetyConfigs[0].safetyParam)
+  # the Smart CAN Filter bit (can_filter.prepare): alpha long on the CX-5 2022 only, which `measured` already requires;
+  # MADS lateral is the same with it as without (develop keeps MADS under the filter)
+  filtered = bool(word & int(MazdaSafetyFlags.CAN_FILTER))
+  word &= ~int(MazdaSafetyFlags.CAN_FILTER)
+  if filtered and not cp.openpilotLongitudinalControl:
+    return False
   legacy = flags == int(MazdaFlags.GEN1) and word == 0 and not cp.openpilotLongitudinalControl
   known = int(MazdaFlags.GEN1 | MazdaFlags.EPS_HW | MazdaFlags.G46L_RADAR | MazdaFlags.HAS_BSM)
   measured = (flags & ~known == 0 and flags & int(MazdaFlags.GEN1) and

@@ -190,6 +190,28 @@ int main() {
   }
 
 
+  // Mazda alpha long with the Smart CAN Filter (19/27): pandad admits the word and the host's lateral + long request
+  // is written and acknowledged, as for the unfiltered alpha long words (3/11)
+  for (const uint16_t word : {3U, 11U, 19U, 27U}) {
+    auto mazda = status();
+    mazda.safety_mode = 13U;
+    mazda.safety_param = word;
+    assert(aol_capable(mazda, 13U, VEHICLE_REGISTRY));
+    assert(aol_runtime_enabled(false, mazda, VEHICLE_REGISTRY));
+    AolAxisNegotiator negotiator(VEHICLE_REGISTRY);
+    FakeTransport transport;
+    auto input = axis("mazda-filter", true, true);
+    queue(transport, mazda, mazda);
+    auto neutral = run(negotiator, transport, input, NOW, 13U);
+    assert(neutral.plan.capable && neutral.plan.request_mask == 0U && neutral.outcome.compatible);
+    auto active = mazda;
+    active.request_mask = active.permission_mask = 3U;
+    queue(transport, mazda, active);
+    auto engaged = run(negotiator, transport, input, NOW, 13U);
+    assert(engaged.plan.request_mask == 3U && engaged.outcome.compatible);
+    assert(engaged.outcome.status && engaged.outcome.status->permission_mask == 3U);
+  }
+
   {
     auto sienna = status();
     sienna.safety_mode = 2U;
@@ -240,7 +262,8 @@ int main() {
     assert(!run(negotiator, transport, input, NOW, 2U).outcome.compatible);
   }
   for (uint32_t word = 0U; word <= 65535U; word++) {
-    assert(mazda_aol_param(static_cast<uint16_t>(word)) == (word == 0U));
+    const bool mazda_expected = (word == 0U) || (word == 2U) || (word == 3U) || (word == 10U) || (word == 11U) || (word == 19U) || (word == 27U);
+    assert(mazda_aol_param(static_cast<uint16_t>(word)) == mazda_expected);
     const bool preap_expected = (word == 0U) || (word == 1U) || (word == 2U) || (word == 3U) || (word == 6U) || (word == 7U);
     assert(tesla_preap_aol_param(static_cast<uint16_t>(word)) == preap_expected);
     auto preap = status();

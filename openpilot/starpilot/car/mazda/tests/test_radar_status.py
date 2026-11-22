@@ -43,3 +43,17 @@ def test_requested_takeover_has_no_standing_notice():
 def test_settings_status_is_bound_to_the_current_vehicle():
   assert 'Waiting' in status_text(record(), False, NOW, 'other-car')
   assert 'AEB off' in status_text(record(), False, NOW, str(CAR.MAZDA_CX5_2022))
+
+
+def test_filter_handback_failure_does_not_claim_aeb_off():
+  """The Smart CAN Filter keeps the radar online (radarOff False): a failed hand-back is a cruise problem, not AEB."""
+  filtered = cp()
+  filtered.safetyConfigs[-1].safetyParam |= 16
+  alert = notice(OnroadAlert(), filtered, dict(record(), state='failed', radarOff=False), False, NOW)
+  assert 'hand-back' in alert.text1.lower() and 'aeb' not in (alert.text1 + alert.text2).lower()
+  # radar actually off: the AEB-off notice stands
+  alert = notice(OnroadAlert(), filtered, dict(record(), state='failed', radarOff=True), False, NOW)
+  assert 'aeb off' in alert.text2.lower()
+  # unfiltered alpha long keeps the AEB-off notice
+  alert = notice(OnroadAlert(), cp(), dict(record(), state='failed', radarOff=False), False, NOW)
+  assert 'aeb off' in alert.text2.lower()

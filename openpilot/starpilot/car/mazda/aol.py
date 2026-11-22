@@ -13,7 +13,8 @@ def policy_for(cp):
 
 
 def native_profile_supported(model, param):
-  return model == int(structs.CarParams.SafetyModel.mazda) and param in (0, 2, 3, 10, 11)
+  # 19/27: alpha long words with the Smart CAN Filter bit (16)
+  return model == int(structs.CarParams.SafetyModel.mazda) and param in (0, 2, 3, 10, 11, 19, 27)
 
 
 def native_accepts_cp(cp, model, param):

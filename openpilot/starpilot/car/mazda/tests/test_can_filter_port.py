@@ -112,3 +112,78 @@ def test_set_press_before_the_board_confirms_is_silent():
             'alphaRequested': False, 'monoTime': NOW}
   assert stock_ecu_events(cp(True), record, False, press, NOW) == (False, None)
   assert stock_ecu_events(cp(False), record, False, press, NOW)[1] == StockEcuState.STARTING
+
+
+@pytest.mark.parametrize("tja", [False, True])
+def test_filter_keeps_mads_lateral(tja):
+  """develop keeps MADS under the filter: the filter bit must not cost AOL its admission, the native latch or the
+  panda's alternative experience."""
+  from openpilot.starpilot.car.mazda.aol import native_accepts_cp, policy_for
+  results = {}
+  for enabled in (False, True):
+    p = CarInterface.get_params(CAR.MAZDA_CX5_2022, gen_empty_fingerprint(), [], True, False, False)
+    p.fingerprintSource = structs.CarParams.FingerprintSource.fw
+    p = VehicleStartupPreferences(mazda_can_filter=enabled, mazda_tja=tja).prepare(p)
+    word = p.safetyConfigs[0].safetyParam
+    assert bool(word & MazdaSafetyFlags.CAN_FILTER) == enabled
+    policy = policy_for(p)
+    p.alternativeExperience = policy.alternative_experience_addition
+    results[enabled] = (policy.intent_supported, policy.explicit_latch, policy.alternative_experience_addition,
+                        policy.cruise_main_required, native_accepts_cp(p, int(structs.CarParams.SafetyModel.mazda), word))
+  assert results[True] == results[False] == (True, True, 32, not tja, True)
+
+
+def test_filter_bit_without_long_is_not_admitted():
+  from opendbc.car.mazda.stock_aol import qualified
+  p = CarInterface.get_params(CAR.MAZDA_CX5_2022, gen_empty_fingerprint(), [], False, False, False)
+  p.fingerprintSource = structs.CarParams.FingerprintSource.fw
+  assert qualified(p)
+  p.safetyConfigs[0].safetyParam |= int(MazdaSafetyFlags.CAN_FILTER)
+  assert not qualified(p)
+
+
+def test_stock_cruise_edges_chime_sound_only():
+  sd = selfdrived()
+  step(sd, StockEcuState.READY)
+  assert 'longitudinalEnableChime' in step(sd, StockEcuState.STOCK_CRUISE_ON)
+  assert not {'longitudinalEnableChime', 'longitudinalDisableChime'} & step(sd, StockEcuState.STOCK_CRUISE_ON)
+  assert 'longitudinalDisableChime' in step(sd, StockEcuState.READY)
+  step(sd, StockEcuState.STOCK_CRUISE_ON)
+  assert 'longitudinalDisableChime' not in step(sd, StockEcuState.RESTORED)  # the end-of-drive hand-back
+  for name in ('longitudinalEnableChime', 'longitudinalDisableChime'):
+    assert set(MAZDA_EVENTS[name]) == {ET.PERMANENT}
+
+
+@pytest.mark.parametrize('arming,latched,shown', [(True, True, True), (True, False, False), (False, True, False)])
+def test_lkas_arming_while_lateral_latched(arming, latched, shown):
+  sd = selfdrived()
+  sd.aol_last_intent = SimpleNamespace(allowedLatch=latched)
+  sd.mazda_events.clear()
+  sd.mazda_stock_ecu = {'fingerprint': str(sd.CP.carFingerprint), 'state': str(StockEcuState.READY), 'radarOff': False,
+                        'alphaRequested': False, 'aebSettingOff': False, 'stockEcuLost': False, 'cameraTjaStuck': False,
+                        'lkasArming': arming, 'monoTime': NOW}
+  sd.add_mazda_takeover_events(SimpleNamespace(standstill=False, cruiseState=SimpleNamespace(enabled=False)))
+  assert ('stockLkasArming' in sd.mazda_events) == shown
+
+
+def test_radar_messages_chime_once_after_being_covered():
+  from openpilot.cereal import log
+  from openpilot.selfdrive.selfdrived.alertmanager import AlertManager
+  from openpilot.selfdrive.selfdrived.events import EngagementAlert
+  none = log.SelfdriveState.AudibleAlert.none
+  ready = MazdaEvents()
+  ready.add('stockEcuReady')
+  ready_alert = ready.create_alerts([ET.PERMANENT])[0]
+  ready_alert.duration = 300
+  cover = EngagementAlert(log.SelfdriveState.AudibleAlert.engage)
+  cover.alert_type, cover.event_type, cover.priority = 'cover/permanent', ET.PERMANENT, ready_alert.priority + 1
+  am = AlertManager()
+  am.add_many(0, [ready_alert])
+  am.process_alerts(1, set())
+  assert am.current_alert.audible_alert != none
+  am.add_many(1, [cover])
+  am.process_alerts(2, set())
+  assert am.current_alert is cover
+  am.process_alerts(250, set())  # the cover is gone; the radar message comes back silent
+  assert am.current_alert.alert_type == ready_alert.alert_type and am.current_alert.audible_alert == none
+  assert ready_alert.audible_alert != none  # the shared alert keeps its chime for the next time

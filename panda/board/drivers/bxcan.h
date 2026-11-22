@@ -204,7 +204,8 @@ static void CAN3_RX0_IRQ_Handler(void) { can_rx(2); }
 static void CAN3_SCE_IRQ_Handler(void) { can_sce(2); }
 
 bool can_init(uint8_t can_number) {
-  bool ret = false;
+  // true unless a step fails (it started false, so every init reported failure)
+  bool ret = true;
 
   REGISTER_INTERRUPT(CAN1_TX_IRQn, CAN1_TX_IRQ_Handler, CAN_INTERRUPT_RATE, FAULT_INTERRUPT_RATE_CAN_1)
   REGISTER_INTERRUPT(CAN1_RX0_IRQn, CAN1_RX0_IRQ_Handler, CAN_INTERRUPT_RATE, FAULT_INTERRUPT_RATE_CAN_1)

@@ -387,6 +387,12 @@ class TestHandback:
     assert cruise_frames(sends) == [] and frames(sends, FILTER_CTRL_ADDR) == [MODE_OFF] * 2
     assert not any(s[0] in LEGACY_RADAR_ADDRS for s in sends)
 
+  def test_handback_before_any_takeover_never_requests_the_mode(self, fcc, fcs):
+    """A stop answered notNeeded keeps the hand-back asserted: the filter never asks for ownership after it."""
+    sends = run(fcc, fcs, n=2 * FILTER_CTRL_STEP, state=0, handback=True, long_active=True)
+    assert REQUEST not in frames(sends, FILTER_CTRL_ADDR) and cruise_frames(sends) == []
+    assert not fcc.can_filter.control_active and fcc.stock_ecu_state == StockEcuState.NOT_NEEDED
+
   @pytest.mark.parametrize("state", [CONFIRMED, None])
   def test_board_that_never_acknowledges(self, fcc, fcs, state):
     confirm(fcc, fcs)

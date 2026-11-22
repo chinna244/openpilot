@@ -277,6 +277,15 @@ def get_T_FOLLOW(personality=log.LongitudinalPersonality.standard):
   else:
     raise NotImplementedError("Longitudinal personality not supported")
 
+# Mazda, develop's city following: up to 25 mph the time gap is CITY_T_FOLLOW_FACTOR of the personality's (1.0 s on
+# aggressive), back to the full gap by 35 mph; STOP_DISTANCE is unchanged. Develop routes 00000184-0000019c and
+# 00000008-00000014 at 20-30 mph: the driver followed at 1.66 s (median), alpha long at 2.15 s.
+CITY_T_FOLLOW_BP = [11.2, 15.6]  # m/s, 25 to 35 mph
+CITY_T_FOLLOW_FACTOR = 0.8
+
+def get_city_T_FOLLOW(t_follow, v_ego):
+  return t_follow * float(np.interp(v_ego, CITY_T_FOLLOW_BP, [CITY_T_FOLLOW_FACTOR, 1.]))
+
 def get_stopped_equivalence_factor(v_lead):
   return (v_lead**2) / (2 * COMFORT_BRAKE)
 
@@ -544,10 +553,13 @@ class LongitudinalMpc:
 
   def update(self, radarstate, personality=log.LongitudinalPersonality.standard,
              *, follow_seconds: float | None = None, acceleration_max: float | None = None, stop_line_m: float | None = None, faster_takeoffs: bool = False,
-             modelV2=None, extra_stopped_gap_m: float = 0.0):
+             modelV2=None, extra_stopped_gap_m: float = 0.0, city_follow: bool = False):
     t_follow = get_T_FOLLOW(personality)
     if follow_seconds is not None and math.isfinite(follow_seconds) and 0.5 <= follow_seconds <= 3.0:
       t_follow = follow_seconds
+    elif city_follow:
+      # the personality's gap only: a follow time StarPilot's profiles or gap features chose is kept as chosen
+      t_follow = get_city_T_FOLLOW(t_follow, self.x0[1])
 
     model_leads = getattr(modelV2, "leadsV3", ()) if modelV2 is not None else ()
     velocity = getattr(getattr(modelV2, 'velocity', None), 'x', ()) if modelV2 is not None else ()

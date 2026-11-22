@@ -13,7 +13,10 @@ from openpilot.common.params import Params
 from openpilot.system.ubloxd.ubx import Ubx
 from openpilot.system.ubloxd.gps import Gps
 from openpilot.system.ubloxd.glonass import Glonass
+from openpilot.common.swaglog import cloudlog
 from openpilot.starpilot.gps.car_external import CarGpsExternal
+from openpilot.starpilot.gps.jetson import JetsonGpsReader
+from openpilot.system.ubloxd.gps_arbiter import ExternalFix, GpsArbiter
 
 
 SECS_IN_MIN = 60
@@ -517,11 +520,36 @@ def main():
   last_position_save = float('-inf')
   car_gps = messaging.SubMaster(['starpilotCarState'])
   car_external = CarGpsExternal()
+  # the Jetson's USB GPS fills ublox dropouts (zoompilot develop); car_external takes it as the comma's own fix, ahead
+  # of a car's GPS
+  jetson_reader = JetsonGpsReader()
+  arbiter = GpsArbiter(time.monotonic())
+  switches = 0
+
+  def jetson_fix(now: float):
+    dat = messaging.new_message('gpsLocationExternal', valid=True)
+    arbiter.fill(dat.gpsLocationExternal, now)
+    return dat
 
   while True:
     msg = messaging.recv_one(sock)
     car_gps.update(0)
-    fallback = car_external.select(car_gps, time.monotonic_ns())
+    now = time.monotonic()
+    try:
+      if (rec := jetson_reader.poll(now)) is not None:
+        arbiter.external(ExternalFix.from_record(rec))
+    except (KeyError, TypeError, ValueError, OverflowError):
+      cloudlog.exception("ubloxd.jetson_gps_bad_record")
+    if not jetson_reader.gate_open:
+      arbiter.drop_external()  # no Mazda session: a fix taken before it ended is not used
+    if not arbiter.using_external:
+      car_external.forget_jetson()  # the Jetson stands in no longer (expired or session over): it holds no car fix back
+    # a silent ublox while falling back: the Jetson's fix stands in for its messages
+    publish_jetson = arbiter.tick(now)
+    fallback = car_external.select(car_gps, time.monotonic_ns(), jetson_fix(now) if publish_jetson else None, jetson=publish_jetson)
+    if arbiter.switches != switches:
+      switches = arbiter.switches
+      cloudlog.event("ubloxd.gps_source", source="jetson" if arbiter.using_external else "ublox", switches=switches)
     if fallback is not None:
       payload = fallback.to_bytes()
       pm.send('gpsLocationExternal', payload)
@@ -543,7 +571,13 @@ def main():
         continue
       service, dat = res
       if service == 'gpsLocationExternal':
-        dat = car_external.select(car_gps, time.monotonic_ns(), dat)
+        gps = dat.gpsLocationExternal
+        if not arbiter.internal(gps.hasFix, gps.horizontalAccuracy, now):
+          dat = jetson_fix(now)
+          jetson = True
+        else:
+          jetson = False
+        dat = car_external.select(car_gps, time.monotonic_ns(), dat, jetson=jetson)
         if dat is None:
           continue
       pm.send(service, dat)

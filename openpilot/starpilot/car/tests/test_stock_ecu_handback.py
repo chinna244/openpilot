@@ -140,8 +140,17 @@ class TestStockEcuHandBackServer:
   def test_nothing_to_hand_back_answers_not_needed_at_once(self):
     server, params = _server()
     cc_sp = _step(server, NOT_NEEDED)
-    assert not cc_sp.stockEcuHandBack
     assert params.get(RESULT_KEY) == {"id": 1, "outcome": "notNeeded"}
+    # the answer comes with the assert, so no takeover (the filter's included) starts in the same tick
+    assert cc_sp.stockEcuHandBack
+
+  def test_not_needed_assert_holds_until_the_request_clears(self):
+    server, params = _server()
+    for enabled in (False, True, True):  # engaged or not: nothing is owned, so nothing is revoked
+      assert _step(server, NOT_NEEDED, enabled=enabled).stockEcuHandBack
+    params.remove(REQUEST_KEY)
+    server.update_params()
+    assert not _step(server, NOT_NEEDED).stockEcuHandBack
 
   def test_nothing_requested_nothing_asserted(self):
     server, params = _server(request_id=None)
@@ -241,3 +250,17 @@ def test_reboot_withdrawal_keeps_a_forced_offroad_restore_request():
   params.put('DriveStateRequest', {'mode': 'offroad'})
   gate.reset()
   assert params.get(REQUEST_KEY) == {'id': 1}
+
+
+@pytest.mark.parametrize('word', [3, 11, 19, 27])
+def test_filter_words_delay_shared_stops_like_alpha_long(word):
+  """19/27 are the alpha long words with the Smart CAN Filter: shutdown waits for the board's hand-back too."""
+  from opendbc.car import gen_empty_fingerprint
+  from opendbc.car.mazda.interface import CarInterface
+  from opendbc.car.mazda.values import CAR
+  from openpilot.starpilot.car.stock_ecu_handback import mazda_handback_required
+  cp = CarInterface.get_params(CAR.MAZDA_CX5_2022, gen_empty_fingerprint(), [], True, False, False)
+  cp.safetyConfigs[0].safetyParam = word
+  params = FakeParams()
+  params.put('CarParams', cp.to_bytes())
+  assert mazda_handback_required(params)

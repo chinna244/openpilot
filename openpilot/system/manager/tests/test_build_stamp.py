@@ -145,3 +145,25 @@ def test_no_git_is_never_up_to_date(repo):
   scons_build(repo)
   shutil.rmtree(repo / ".git")
   assert not up_to_date(str(repo))
+
+
+def test_a_deleted_untracked_build_product_needs_a_build(repo):
+  """A generated library outside git (not a tracked output) that cleanup removed must not be skipped at boot."""
+  scons_build(repo)
+  (repo / "gen").mkdir(exist_ok=True)
+  (repo / "gen" / "libgenerated.so").write_bytes(b"generated")
+  record_build(str(repo))
+  assert up_to_date(str(repo))
+  (repo / "gen" / "libgenerated.so").unlink()
+  assert not up_to_date(str(repo))
+
+
+def test_a_deleted_generated_model_needs_a_build(repo):
+  """SCons compiles the driver-monitoring model to an untracked .pkl that dmonitoringmodeld loads."""
+  scons_build(repo)
+  (repo / "models").mkdir(exist_ok=True)
+  (repo / "models" / "dmonitoring_model_tinygrad.pkl").write_bytes(b"compiled")
+  record_build(str(repo))
+  assert up_to_date(str(repo))
+  (repo / "models" / "dmonitoring_model_tinygrad.pkl").unlink()
+  assert not up_to_date(str(repo))

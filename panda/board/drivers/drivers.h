@@ -79,6 +79,7 @@ extern bus_config_t bus_config[PANDA_CAN_CNT];
 #define CAN_NUM_FROM_BUS_NUM(num) (bus_config[num].can_num_lookup)
 
 void can_init_all(void);
+bool can_init_all_checked(void);
 void can_set_orientation(bool flipped);
 bool can_tx_check_min_slots_free(uint32_t min);
 bool can_check_checksum(CANPacket_t *packet);

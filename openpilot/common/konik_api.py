@@ -89,6 +89,16 @@ class KonikApi(BaseApi):
     super().__init__(dongle_id, API_HOST)
 
 
+def backup_permitted() -> bool:
+  """The Mazda port's Konik backup may talk to Konik: cloud services on for this session, and StarPilot's active
+  provider neither offline (where its own API refuses every call, as common/api.py) nor Konik itself (which already
+  uploads there)."""
+  if os.getenv('STARPILOT_CLOUD_DISABLED') == '1':
+    return False
+  from openpilot.starpilot.connect.provider import active_provider
+  return active_provider().name not in ('offline', 'konik')
+
+
 def valid_id(dongle_id) -> bool:
   return isinstance(dongle_id, str) and dongle_id != "UnregisteredDevice" and re.fullmatch(r"[\w-]{1,128}", dongle_id, re.ASCII) is not None
 

@@ -396,3 +396,12 @@ def test_new_request_during_upload_is_not_lost_when_worker_finishes(context):
   items = konik_queue.queue_items(context.params, str(context.segment.parent), 'konik-id')
   assert len(items) == 1
   assert items[0]['path'].endswith('rlog')
+
+
+def test_no_upload_or_registration_when_backup_is_not_permitted(context, mocker):
+  """StarPilot's provider offline (or Konik itself, or cloud disabled for the session): the worker stays idle."""
+  file(context)
+  mocker.patch.object(konik, 'backup_permitted', return_value=False)
+  assert context.worker.step() is not True
+  konik.register.assert_not_called()
+  context.put.assert_not_called()

@@ -9,10 +9,18 @@ from openpilot.starpilot.gps.source import GPS_MAX_AGE_NS, observation
 class CarGpsExternal:
   def __init__(self):
     self.native_ns = 0
+    self.native_jetson = False  # the native fix in native_ns was the Jetson's standing in for the ublox
     self.last_car_ns = 0
     self.last_publish_ns = 0
 
-  def select(self, sm, now_ns, native=None):
+  def forget_jetson(self) -> None:
+    """The Jetson's fix stands in no longer (its fallback ended, or its Mazda session): if the native fix holding car
+    fixes back was the Jetson's, forget it; a genuine ublox fix keeps its priority."""
+    if self.native_jetson:
+      self.native_ns = 0
+      self.native_jetson = False
+
+  def select(self, sm, now_ns, native=None, jetson=False):
     """Keep native fixes first; repeat car fixes at the standard 10Hz cadence.
 
     The source stamp is retained as the standard Event stamp. Repeated polling
@@ -20,6 +28,7 @@ class CarGpsExternal:
     """
     if native is not None:
       self.native_ns = int(native.logMonoTime) if native.valid and native.gpsLocationExternal.hasFix else 0
+      self.native_jetson = bool(jetson) and self.native_ns > 0
     if 0 < self.native_ns <= now_ns <= self.native_ns + GPS_MAX_AGE_NS:
       return native
     fix = observation(sm, 'starpilotCarState', now_ns)

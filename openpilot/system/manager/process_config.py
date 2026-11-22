@@ -119,19 +119,25 @@ def jetlink_enabled(started: bool, params: Params, CP: car.CarParams) -> bool:
 def navigation(started: bool, params: Params, CP: car.CarParams) -> bool:
   return started and params.get_bool("NavigationEnabled")
 
-def konik_backup_allowed(params: Params) -> bool:
-  # Konik as StarPilot's own active cloud provider already uploads there; the backup would duplicate it
-  from openpilot.starpilot.connect.provider import active_provider
-  return params.get_bool("KonikUploadsEnabled") and active_provider().name != 'konik'
+def konik_backup_allowed(params: Params, CP=None) -> bool:
+  # The Mazda port's Konik backup: Mazdas only (any other car keeps StarPilot's cloud alone), never while manager has
+  # cloud services off, and not when Konik is already StarPilot's own active provider (it would duplicate the uploads)
+  if not params.get_bool("KonikUploadsEnabled"):
+    return False
+  from openpilot.starpilot.car.mazda.last_car import is_mazda
+  if not is_mazda(params, CP):  # a known current brand wins over the stored one
+    return False
+  from openpilot.common.konik_api import backup_permitted
+  return backup_permitted()  # cloud on, provider neither offline nor Konik
 
 
 def konik_uploads_ready(started: bool, params: Params, CP: car.CarParams) -> bool:
-  return not started and konik_backup_allowed(params)
+  return not started and konik_backup_allowed(params, CP)
 
 
 def konik_connect_ready(started: bool, params: Params, CP: car.CarParams) -> bool:
   from openpilot.common.konik_api import valid_id
-  return konik_backup_allowed(params) and valid_id(params.get("KonikDongleId"))
+  return konik_backup_allowed(params, CP) and valid_id(params.get("KonikDongleId"))
 
 
 def only_offroad(started: bool, params: Params, CP: car.CarParams) -> bool:

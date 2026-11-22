@@ -68,6 +68,12 @@ class TestStopHoldClock(unittest.TestCase):
         self.assertTrue(self.planner.output_should_stop)
         self.assertEqual(self.planner.output_a_target, 0.)
 
+  def test_the_published_plan_is_held_too(self):
+    # a Mazda planner publishes a_target_published (lifted while a gas override is held): the hold lowers it as well
+    self.planner.a_target_published = .2
+    self.assertTrue(self.call(0, 2000))
+    self.assertEqual(self.planner.a_target_published, 0.)
+
   def test_exact_negative_half_skew_applies(self):
     self.assertTrue(self.call(-1000, 2000))
     self.assertTrue(self.planner.output_should_stop)

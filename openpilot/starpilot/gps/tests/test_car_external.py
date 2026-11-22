@@ -139,3 +139,20 @@ def test_actual_ubloxd_loop_publishes_car_gps_even_without_ubx_bytes():
   assert len(sent) == 1 and sent[0][0] == 'gpsLocationExternal'
   with log.Event.from_bytes(sent[0][1]) as event:
     assert event.gpsLocationExternal.hasFix and str(event.gpsLocationExternal.source) == 'car'
+
+
+def test_jetson_stand_in_no_longer_holds_back_the_car_fix():
+  """The Jetson fix that went out as the comma's own stops standing in (expired, or its Mazda session ended): the car's
+  fix goes out at once, not GPS_MAX_AGE_NS later."""
+  sm, owner, jetson = Messages(), CarGpsExternal(), native(fixed=True)
+  assert owner.select(sm, NOW, jetson, jetson=True) is jetson
+  assert owner.select(sm, NOW + 1) is None  # held back for the native fix
+  owner.forget_jetson()
+  assert str(owner.select(sm, NOW + 2).gpsLocationExternal.source) == 'car'
+
+
+def test_a_genuine_ublox_fix_keeps_its_priority():
+  sm, owner, ublox = Messages(), CarGpsExternal(), native(fixed=True)
+  assert owner.select(sm, NOW, ublox) is ublox
+  owner.forget_jetson()
+  assert owner.select(sm, NOW + 1) is None  # still held back for the ublox's own fix

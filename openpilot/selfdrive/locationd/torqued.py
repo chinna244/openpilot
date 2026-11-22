@@ -15,6 +15,7 @@ from openpilot.common.realtime import config_realtime_process, DT_MDL
 from openpilot.common.filter_simple import FirstOrderFilter
 from openpilot.common.swaglog import cloudlog
 from openpilot.selfdrive.locationd.helpers import PointBuckets, ParameterEstimator, PoseCalibrator, Pose
+from openpilot.starpilot.car.mazda.lateral.torqued_ext import TorqueEstimatorExt
 
 HISTORY = 5  # secs
 POINTS_PER_BUCKET = 1500
@@ -54,8 +55,13 @@ class TorqueBuckets(PointBuckets):
         break
 
 
-class TorqueEstimator(ParameterEstimator):
+class TorqueEstimator(ParameterEstimator, TorqueEstimatorExt):
   def __init__(self, CP, decimated=False, track_all_points=False, *, allow_learning=True):
+    # Mazda: develop's learner (TorqueEstimatorExt), whose toggles decide learning, not StarPilot's preference
+    TorqueEstimatorExt.__init__(self, CP)
+    if self.zp:
+      allow_learning = True
+    self.CP = CP
     self.hist_len = int(HISTORY / DT_MDL)
     self.lag = 0.0
     self.track_all_points = track_all_points  # for offline analysis, without max lateral accel or max steer torque filters
@@ -88,6 +94,8 @@ class TorqueEstimator(ParameterEstimator):
 
     self.calibrator = PoseCalibrator()
 
+    TorqueEstimatorExt.initialize_custom_params(self, decimated)
+
     self.reset()
 
     initial_params = {
@@ -105,7 +113,7 @@ class TorqueEstimator(ParameterEstimator):
     # try to restore cached params
     # The opt-in selector must learn from this session, never an inherited cache.
     # Other vehicles and the ordinary runtime retain upstream cache behavior.
-    fresh_session = not self.learning_allowed or torque_runtime_manual_override(CP, params)
+    fresh_session = not self.zp and (not self.learning_allowed or torque_runtime_manual_override(CP, params))
     params_cache = None if fresh_session else get_cache(params, "CarParamsPrevRoute")
     torque_cache = None if fresh_session else get_cache(params, "LiveTorqueParameters")
     if params_cache is not None and torque_cache is not None:
@@ -210,6 +218,8 @@ class TorqueEstimator(ParameterEstimator):
         vego = np.interp(t, self.raw_points['carState_t'], self.raw_points['vego'])
         steer = np.interp(t, self.raw_points['carOutput_t'], self.raw_points['steer_torque']).item()
         lateral_acc = (vego * yaw_rate) - (np.sin(roll) * ACCELERATION_DUE_TO_GRAVITY).item()
+        if all(lat_active) and not any(steer_override) and (abs(steer) > STEER_MIN_THRESHOLD) and (abs(lateral_acc) <= LAT_ACC_THRESHOLD):
+          self._on_torque_point(steer, lateral_acc, vego)
         if all(lat_active) and not any(steer_override) and (vego > MIN_VEL) and (abs(steer) > STEER_MIN_THRESHOLD):
           if abs(lateral_acc) <= LAT_ACC_THRESHOLD:
             self.filtered_points.add_point(steer, lateral_acc)
@@ -252,6 +262,7 @@ class TorqueEstimator(ParameterEstimator):
     lateralTorqueParameters.calPerc = self.filtered_points.get_valid_percent()
     lateralTorqueParameters.decay = self.decay
     lateralTorqueParameters.maxResets = self.resets
+    self._extend_msg(msg, with_points)
     return msg
 
 
@@ -278,6 +289,8 @@ def main():
         if sm.updated[which]:
           t = sm.logMonoTime[which] * 1e-9
           estimator.handle_log(t, which, sm[which])
+
+    TorqueEstimatorExt.update_use_params(estimator)
 
     # 4Hz driven by deviceMotion
     if sm.frame % 5 == 0:

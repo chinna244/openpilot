@@ -1241,7 +1241,27 @@ MAZDA_EVENTS: dict[str, dict[str, Alert | AlertCallbackType]] = {
     ET.PERMANENT: Alert("Smart/Adaptive Cruise Control: OFF", "Manual Speed Control Required", AlertStatus.normal,
                         AlertSize.mid, Priority.LOW, VisualAlert.none, AudibleAlert.none, 1.),
   },
+
+  # LKA back on with lateral resuming, the EPS not delivering yet: still disabled to the driver (develop, mici).
+  "stockLkasArming": {
+    ET.PERMANENT: NormalPermanentAlert("Lateral Disabled", "Waiting for steering", priority=Priority.LOW),
+  },
+
+  # The car plays nothing when its own cruise engages or ends: sound-only chimes, as develop. PERMANENT carries no
+  # state-machine meaning, so a chime cannot enable or disable anything.
+  "longitudinalEnableChime": {
+    ET.PERMANENT: EngagementAlert(AudibleAlert.engage),
+  },
+  "longitudinalDisableChime": {
+    ET.PERMANENT: EngagementAlert(AudibleAlert.disengage),
+  },
 }
+
+# develop: the radar messages chime once; another alert shown over one (an engage chime, a gear change) must not
+# replay its sound when it comes back (route 00000133, 163.3 s and 271.2 s)
+for _name in ("stockEcuReady", "stockEcuHandedBack", "alphaLongNextStop", "cameraLkasFaultOnset", "cameraLkasResumed",
+              "radarLostCameraOnly", "stockEcuLost", "stockEcuLostIdle", "cameraTjaStuck"):
+  MAZDA_EVENTS[_name][ET.PERMANENT].sound_once = True
 
 
 class MazdaEvents:

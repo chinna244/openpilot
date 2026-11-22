@@ -154,6 +154,17 @@ void can_init_all(void) {
   }
 }
 
+// can_init_all, true only if every core came up
+bool can_init_all_checked(void) {
+  bool ok = true;
+  for (uint8_t i=0U; i < PANDA_CAN_CNT; i++) {
+    bus_config[i].canfd_enabled = false;
+    can_clear(can_queues[i]);
+    ok = can_init(i) && ok;
+  }
+  return ok;
+}
+
 void can_set_orientation(bool flipped) {
   bus_config[0].bus_lookup = flipped ? 2U : 0U;
   bus_config[0].can_num_lookup = flipped ? 2U : 0U;

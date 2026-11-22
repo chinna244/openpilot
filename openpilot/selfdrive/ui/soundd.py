@@ -220,9 +220,30 @@ class Soundd:
       self.current_sound_frame = 0
 
   def safety_switch_hold(self, sm) -> bool:
-    if sm.seen.get('pandaStates', False) and any(ps.safetyModel == SafetyModel.elm327 for ps in sm['pandaStates']):
+    # Mazda only (develop's soundd hold, the alert sound at the startup safety switch stalls the Mazda's panda);
+    # any other car keeps StarPilot's soundd. This drive's CarParams decide for good; before card writes them the last
+    # drive's car decides, re-read each second (a device moved to another car)
+    mazda = getattr(self, 'hold_applies', None)
+    if mazda is None:
+      now = time.monotonic()
+      if now - getattr(self, 'hold_checked_at', -1e9) >= 1.0 or not hasattr(self, 'hold_guess'):
+        from openpilot.starpilot.car.mazda.last_car import car_brand
+        self.hold_checked_at = now
+        live = car_brand(self.volume_params, live_only=True)
+        if live is not None:
+          self.hold_applies = live == "mazda"  # this session's car: decided for good
+        # until card writes this session's CarParams, the last drive's car decides, asked again each second
+        self.hold_guess = (live or car_brand(self.volume_params)) == "mazda"
+      mazda = getattr(self, 'hold_applies', None)
+      if mazda is None:
+        mazda = self.hold_guess
+    if not mazda:
+      # a hold started on the last drive's Mazda ends once the car is known not to be one
+      self.startup_safety_time = None
+    elif sm.seen.get('pandaStates', False) and any(ps.safetyModel == SafetyModel.elm327 for ps in sm['pandaStates']):
       self.startup_safety_time = time.monotonic()
-    return self.startup_safety_time is not None and time.monotonic() - self.startup_safety_time < SAFETY_SWITCH_HOLD
+    held_since = getattr(self, 'startup_safety_time', None)
+    return mazda and held_since is not None and time.monotonic() - held_since < SAFETY_SWITCH_HOLD
 
   def get_audible_alert(self, sm):
     hold = self.safety_switch_hold(sm)

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Restricted Konik presence and parked live view, isolated from comma Athena."""
+import os
 import threading
 import time
 
@@ -7,7 +8,7 @@ import openpilot.cereal.messaging as messaging
 
 from websocket import ABNF, WebSocketTimeoutException, create_connection
 
-from openpilot.common.konik_api import KonikApi, valid_id
+from openpilot.common.konik_api import KonikApi, backup_permitted, valid_id
 from openpilot.common.hardware.hw import Paths
 from openpilot.system.loggerd import konik_queue
 from openpilot.common.hardware import HARDWARE
@@ -30,7 +31,7 @@ class KonikConnection:
   def configured(self, dongle_id: str | None = None) -> bool:
     current_id = self.params.get('KonikDongleId')
     return (self.params.get_bool('KonikUploadsEnabled') and valid_id(current_id)
-            and (dongle_id is None or current_id == dongle_id))
+            and (dongle_id is None or current_id == dongle_id) and backup_permitted())
 
   def status(self, value: str):
     if self.params.get('KonikConnectionStatus') != value:
@@ -160,6 +161,8 @@ class KonikConnection:
 
 def main(exit_event: threading.Event | None = None):
   exit_event = exit_event or threading.Event()
+  if os.getenv('STARPILOT_CLOUD_DISABLED') == '1':
+    return  # manager turned cloud services off for this session
   connection = KonikConnection(Params(), exit_event)
   retries = 0
   while not exit_event.is_set():

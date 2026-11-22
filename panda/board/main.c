@@ -86,15 +86,25 @@ void set_safety_mode(uint16_t mode, uint16_t param) {
       can_silent = false;
       break;
     default:
-      // the relay is closed below, after the CAN cores are back up
-      close_relay = true;
+      if (mode_copy == SAFETY_MAZDA) {
+        // Mazda: factory passthrough while the cores re-init (a previous mode may have closed the relay); it is
+        // closed below, only after they are back up
+        set_intercept_relay(false, false);
+        close_relay = true;
+      } else {
+        set_intercept_relay(true, false);
+      }
       heartbeat_counter = 0U;
       heartbeat_lost = false;
       current_board->set_can_mode(CAN_MODE_NORMAL);
       can_silent = false;
       break;
   }
-  can_init_all();
+  bool cores_up = can_init_all_checked();
+  if (close_relay && !cores_up) {
+    // one retry; a core that still will not come up keeps the relay open, the camera wired to the car
+    cores_up = can_init_all_checked();
+  }
 
   // Close the relay only once the CAN cores are running again. Re-initialising the cores
   // waits on each one (up to CAN_INIT_TIMEOUT_MS per step, inside this call). With the relay
@@ -102,10 +112,31 @@ void set_safety_mode(uint16_t mode, uint16_t param) {
   // lose their stream: on a Mazda a 1.1 s stall here cut the camera's steering frames (0x243)
   // from the EPS, which latched LKAS_FAULT for the rest of the drive. Until the relay closes
   // the camera stays wired straight to the car, so a slow re-init costs nothing.
-  if (close_relay) {
+  if (close_relay && cores_up) {
     set_intercept_relay(true, false);
     // the relay changed state just now: restart the stock-ECU transition window
     safety_mode_cnt = 0U;
+  } else if (close_relay) {
+    // A core still down after the retry: fail safe as SILENT (fault_safe_state, inline: no recursion). The relay
+    // opens even if a previous mode had closed it, the factory path runs straight through, and the host sees SILENT
+    // rather than a ready Mazda mode; its next set_safety_mode request tries the cores again.
+    print("Error: CAN init failed for the Mazda mode. Falling back to SILENT\n");
+    #ifdef STM32H7
+    mpu_safety_open();
+    #endif
+    err = set_safety_hooks(SAFETY_SILENT, 0U);
+    assert_fatal(err == 0, "Error: Failed setting SILENT mode. Hanging\n");
+    #ifdef STM32H7
+    mpu_safety_close();
+    #endif
+    set_intercept_relay(false, false);
+    current_board->set_can_mode(CAN_MODE_NORMAL);
+    can_silent = true;
+    // can_silent reaches the controllers only through their init (can_set_speed): program the ones that work into
+    // silent mode now; one bounded pass, a core that still fails stays down
+    (void)can_init_all_checked();
+  } else {
+    // relay set above
   }
 }
 
@@ -200,7 +231,11 @@ static void tick_handler(void) {
       prev_harness_status = harness.status;
       can_set_orientation(harness.status == HARNESS_STATUS_FLIPPED);
 
-      // re-init everything that uses harness status
+      // re-init everything that uses harness status; Mazda: in factory passthrough, set_safety_mode closes the
+      // relay again once its own init succeeds
+      if (current_safety_mode == SAFETY_MAZDA) {
+        set_intercept_relay(false, false);
+      }
       can_init_all();
       set_safety_mode(current_safety_mode, current_safety_param);
       set_power_save_state(power_save_enabled);
