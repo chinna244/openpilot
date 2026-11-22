@@ -36,8 +36,11 @@ def test_generic_saved_editor_reaches_actual_controls(identity):
     assert production_supported_cp(cp)
     owner = FeatureSettingsOwner(params, lambda _: True, vehicle_fingerprint=lambda: identity,
                                  vehicle_params=lambda: cp, galaxy=lambda: True)
+    developer = next(row for row in owner.snapshot('hub', parked=True, system_long=True,
+                     lateral_context=True, metric=False).rows if row.page == 'torque/developer')
+    assert developer.available and developer.label == 'Developer Parameters'
     def rows():
-      return {row.key: row for row in owner.snapshot('torque', parked=True, system_long=True,
+      return {row.key: row for row in owner.snapshot(developer.page, parked=True, system_long=True,
               lateral_context=True, metric=False).rows}
     for field, value in [('factor', float(cp.lateralTuning.torque.latAccelFactor) * 1.1),
                          ('friction', float(cp.lateralTuning.torque.friction) + 0.01)]:
@@ -92,7 +95,7 @@ def test_generic_partial_manual_tune_honors_scoped_learning_preference(enabled):
   from openpilot.starpilot.lateral.tests.test_torque_family import learner
   from openpilot.starpilot.lateral.torque_runtime import TorqueHost, read_settings
   cp = interfaces['HONDA_FIT_4G'].get_non_essential_params('HONDA_FIT_4G')
-  assert cp.lateralTuning.which() == 'torque' and policy_for(cp) is None
+  assert cp.lateralTuning.which() == 'torque' and policy_for(cp) == 'generic'
   with OpenpilotPrefix():
     params = Params()
     params.put(KEY, replace_preference(None, cp, enabled), block=True)

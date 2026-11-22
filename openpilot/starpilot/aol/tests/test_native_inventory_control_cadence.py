@@ -16,13 +16,16 @@ from openpilot.starpilot.aol.tests.test_runtime import car_state
   'panda_identity', 'panda_experience', 'panda_invalid', 'panda_lost', 'panda_unseen', 'axis_lat',
   'axis_request_lat', 'axis_request_long', 'axis_ack', 'brake', 'gas', 'acc', 'can', 'timeout', 'steer', 'cruise'])
 @pytest.mark.parametrize('long_active', [False, True])
-def test_newer_native_retains_only_complete_current_combined_intent(case, long_active):
+@pytest.mark.parametrize('cruise_enabled', [False, True])
+def test_newer_native_retains_only_complete_current_combined_intent(case, long_active, cruise_enabled):
+  from openpilot.starpilot.car.hyundai.aol import early_native_long_withdrawal_supported
   cp = configured_cp()
+  assert cp.brand == 'hyundai' and early_native_long_withdrawal_supported(cp)
   native = bound_state(cp)
   source = native.sourcePandaStatesMonoTime
   timestamp = source - 50_000_000 if case not in ('equal', 'newer') else source + int(case == 'newer')
   cs = car_state()
-  cs.cruiseState.enabled = True
+  cs.cruiseState.enabled = cruise_enabled
   axis = SimpleNamespace(sessionId=native.axisSessionId, nativeAcknowledged=True,
     desiredLateral=True, lateralActive=True, desiredLongitudinal=True, longitudinalActive=long_active)
   native_changes = {'native_long': {'longitudinalAllowed': False}, 'native_lat': {'lateralAllowed': False},
@@ -68,7 +71,8 @@ def test_newer_native_retains_only_complete_current_combined_intent(case, long_a
   assert healthy_transport(sm, cp, cs, axis.sessionId, now) == (case == 'request_long')
   before = (native, tuple(sm.logMonoTime.items()), tuple(sm.recv_time.items()))
   result = _newer_combined_intent_native(sm, cp, cs, axis, now)
-  assert (result is not None) == (case == 'older')
+  # Cruise-only withdrawal is not explicit AOL-off: retain only the newer proven intent.
+  assert (result is not None) == (case in ('older', 'cruise'))
   assert (native, tuple(sm.logMonoTime.items()), tuple(sm.recv_time.items())) == before
   if result is not None:
     assert result == current_native(sm, cp, now_ns=now, axis_session_id=axis.sessionId)
@@ -101,6 +105,7 @@ def test_actual_gm_sd_controls_and_card_keep_current_denials(case):
       card.aol_process_fault_context = AolProcessFaultContext()
       card.aol_transport_feedback = TransportPauseFeedback(card.CP)
       settings = AolSettings(True, 0., 9, 0, (0, 0, 0), (0, 0, 0))
+      card.aol_settings = settings
       card.aol_card_intent = create_intent(card.CP, settings, policy_for(card.CP))
       assert card.aol_card_intent is not None
       cs = car_state()

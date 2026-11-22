@@ -123,7 +123,8 @@ def car_controller(alpha_long=True, candidate=CAR.MAZDA_CX5_2022, cruise_request
 # capnp messages
 
 def car_state(standstill=False, gas=False, brake_pressed=False, v_ego=0., a_ego=0., driver_torque=0.,
-              steering_pressed=False, available=True, cruise_engaged=False, can_valid=True, buttons=()) -> structs.CarState:
+              steering_pressed=False, available=True, cruise_engaged=False, can_valid=True, buttons=(),
+              steer_angle=0.) -> structs.CarState:
   """structs.CarState with the fields the controller reads off CS.out."""
   ret = structs.CarState()
   ret.canValid = can_valid
@@ -135,6 +136,7 @@ def car_state(standstill=False, gas=False, brake_pressed=False, v_ego=0., a_ego=
   ret.aEgo = a_ego
   ret.steeringTorque = driver_torque
   ret.steeringPressed = steering_pressed
+  ret.steeringAngleDeg = steer_angle
   ret.cruiseState.available = available
   ret.cruiseState.enabled = cruise_engaged
   ret.buttonEvents = [structs.CarState.ButtonEvent(pressed=True, type=b) for b in buttons]
@@ -143,7 +145,7 @@ def car_state(standstill=False, gas=False, brake_pressed=False, v_ego=0., a_ego=
 
 def car_control(enabled=None, long_active=True, lat_active=False, accel=0.5, torque=0.,
                 long_state=LongCtrlState.pid, cancel=False, resume=False, lead_visible=True, gap=2,
-                visual_alert=VisualAlert.none):
+                visual_alert=VisualAlert.none, set_speed=0.):
   """structs.CarControl reader, as card hands it to the controller. openpilot is enabled
   whenever it is longitudinally active; a gas override is the case where it stays enabled
   with longActive low."""
@@ -159,6 +161,7 @@ def car_control(enabled=None, long_active=True, lat_active=False, accel=0.5, tor
   cc.hudControl.leadVisible = lead_visible
   cc.hudControl.leadDistanceBars = gap
   cc.hudControl.visualAlert = visual_alert
+  cc.hudControl.setSpeed = set_speed
   return cc.as_reader()
 
 
@@ -354,3 +357,16 @@ def cs(cc) -> CarState:
 @pytest.fixture
 def stock_cs(stock_cc) -> CarState:
   return mazda_car_state(stock_cc.CP, stock_cc.CP_SP)
+
+
+def _initialize_mazda(CP, CP_SP, params_dict) -> None:
+  """develop's opendbc.sunnypilot.car.interfaces._initialize_mazda for the filter: the port applies the choice
+  through can_filter.prepare (StarPilot's vehicle preferences) and derives CP_SP from the safety bit."""
+  from opendbc.car.mazda.can_filter import prepare
+  from opendbc.car.mazda.values import MazdaSafetyFlags
+  from opendbc.car.mazda.values_ext import MazdaFlagsSP, MazdaSafetyFlagsSP
+  prepare(CP, int(params_dict.get("MazdaCanFilter", 0)) == 1)
+  if CP.safetyConfigs[0].safetyParam & MazdaSafetyFlags.CAN_FILTER:
+    CP_SP.flags |= MazdaFlagsSP.CAN_FILTER.value
+    CP_SP.safetyParam |= MazdaSafetyFlagsSP.CAN_FILTER
+

@@ -40,7 +40,8 @@ def test_forward_copy_only_strips_declared_tja(safety, param):
   original = b'\x00\x08\x00\x00\x00\x00\x00\x00'
   packet = libsafety_py.make_CANPacket(0x9d, 0, original)
   safety.safety_fwd_modify_hook(0, packet)
-  assert bytes(packet.data)[:8] == (b'\x00'*8 if param in (10, 11) else original)
+  # develop 0f6ce31f: the driver's TJA press reaches the camera again, forwarded unmodified
+  assert bytes(packet.data)[:8] == original
   camera = libsafety_py.make_CANPacket(0x9d, 2, original)
   safety.safety_fwd_modify_hook(2, camera)
   assert bytes(camera.data)[:8] == original

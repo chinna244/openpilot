@@ -77,7 +77,7 @@ class TestMazdaEps:
     candidate, fw, steer_to_zero, alpha_offered = EPS_PROJECTIONS[name]
     CP = car_params(candidate, car_fw=eps_fw(fw) if fw else None, alpha_long=alpha_long)
     assert CP.dashcamOnly is (CP.carFingerprint not in ADMITTED)
-    assert CP.steerActuatorDelay == pytest.approx(0.05, abs=5e-8)
+    assert CP.steerActuatorDelay == pytest.approx(0.14, abs=5e-8)
     assert CP.safetyConfigs[0].safetyParam & MazdaSafetyFlags.EPS_HW.value
     assert bool(CP.flags & MazdaFlags.STEER_TO_ZERO_EPS) == steer_to_zero
     assert bool(CP.flags & MazdaFlags.LEGACY_FW_EPS) == (not steer_to_zero)
@@ -195,6 +195,11 @@ class TestForeignRadar:
     assert not CP.radarUnavailable
     assert CP.alphaLongitudinalAvailable
     assert not CP.flags & MazdaFlags.G46L_RADAR
+
+  def test_radar_delay_aligns_tracks_with_ego_speed(self):
+    # track range rates lag carState vEgo by 0.10-0.14 s; radard pairs vRel with vEgo that old
+    for alpha_long in (False, True):
+      assert car_params(CAR.MAZDA_CX5_2022, alpha_long=alpha_long).radarDelay == pytest.approx(0.1)
 
 
 class TestCamLaneinfoLatch:

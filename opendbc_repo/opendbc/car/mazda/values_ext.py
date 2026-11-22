@@ -12,6 +12,8 @@ class MazdaSafetyFlagsSP:
   DEFAULT = 0
   # The physical TJA button is the MADS lateral switch; MRCC no longer drives the main edge.
   TJA_BUTTON = 1
+  # develop's second-word filter bit; the port's panda reads MazdaSafetyFlags.CAN_FILTER (16) instead
+  CAN_FILTER = 2
 
 
 class MazdaFlagsSP(IntFlag):
@@ -22,3 +24,6 @@ class MazdaFlagsSP(IntFlag):
   # samples, zero residual, zoompilot/opendbc#7); NA and non-Oceania export clusters show the
   # CAN value exactly. Keyed on the Oceania WMI, so cruiseState.speedCluster is the dash number.
   OCEANIA_CLUSTER = 2
+  # A Smart CAN Filter sits between the radar and the car, declared by the driver: under alpha long it keeps
+  # the radar online in place of the UDS takeover (can_filter.py). Follows MazdaSafetyFlags.CAN_FILTER.
+  CAN_FILTER = 4

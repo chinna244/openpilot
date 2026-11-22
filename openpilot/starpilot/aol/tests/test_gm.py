@@ -57,7 +57,7 @@ def _configurations():
     disabled = cp.as_reader().as_builder()
     VehicleStartupPreferences(disable_bolt_long=True).prepare(disabled)
     yield disabled
-  for identity in GM_BASE_GATEWAY_IDS:
+  for identity in sorted(GM_BASE_GATEWAY_IDS):
     cp = ordinary_params(identity, radar=True)
     yield cp
     if identity == CAR.BUICK_LACROSSE:
@@ -102,12 +102,12 @@ def _configurations():
   from opendbc.car.gm.tests.test_conventional_pedal import params as conventional_pedal
   from opendbc.car.gm.tests.test_silverado_cc_pedal import params as silverado_pedal
   from opendbc.car.gm.tests.test_camera_acc_pedal import params as camera_pedal
-  for identity in ORDINARY_ASCM_CAR | ORDINARY_SDGM_CAR:
+  for identity in sorted(ORDINARY_ASCM_CAR | ORDINARY_SDGM_CAR):
     for alpha in (False, True):
       for c9 in (False, True):
         for radar in (False, True):
           yield intercept_params(identity, sascm=True, accelerator=not c9, radar=radar, alpha=alpha)
-  for identity in ORDINARY_CAMERA_CAR:
+  for identity in sorted(ORDINARY_CAMERA_CAR):
     for alpha in (False, True):
       for analog in (False, True):
         yield ordinary_camera(identity, alpha=alpha, be=analog)
@@ -123,7 +123,7 @@ def _configurations():
     disabled = cp.as_reader().as_builder()
     VehicleStartupPreferences(disable_bolt_long=True).prepare(disabled)
     yield disabled
-  for identity in ORDINARY_CC_CAR:
+  for identity in sorted(ORDINARY_CC_CAR):
     yield intercept_params(identity)
     for removed in (False, True):
       for disabled in (False, True):
@@ -280,22 +280,22 @@ class TestGmAol(unittest.TestCase):
         self.assertIsNone(candidate)
         self.assertEqual(fp[0], gen2)
     fp = {0: gen2}
-    self.assertEqual(automatic_bolt_candidate(CAR.CHEVROLET_BOLT_CC_2022_2023, fp, {4}),
+    self.assertEqual(automatic_bolt_candidate(CAR.CHEVROLET_BOLT_CC_2022_2023, fp, {b'\0\4' + bytes(4)}),
                      CAR.CHEVROLET_BOLT_CC_2022_2023)
     malformed = {0: dict(gen2)}
     malformed[0][0x201] = 5
-    self.assertIsNone(automatic_bolt_candidate(CAR.CHEVROLET_BOLT_CC_2018_2021, malformed, {2}))
+    self.assertIsNone(automatic_bolt_candidate(CAR.CHEVROLET_BOLT_CC_2018_2021, malformed, {stock_acc[1]}))
     malformed[0][0x201] = 6
     malformed[0][0x236] = 7
-    self.assertIsNone(automatic_bolt_candidate(CAR.CHEVROLET_BOLT_CC_2018_2021, malformed, {2}))
+    self.assertIsNone(automatic_bolt_candidate(CAR.CHEVROLET_BOLT_CC_2018_2021, malformed, {stock_acc[1]}))
     no_pedal = {0: {address: length for address, length in gen2.items() if address != 0x201}}
     for alias in (CAR.CHEVROLET_BOLT_CC_2017, CAR.CHEVROLET_BOLT_CC_2018_2021, CAR.CHEVROLET_BOLT_EUV):
       self.assertIsNone(automatic_bolt_candidate(alias, no_pedal, set()))
-      self.assertIsNone(automatic_bolt_candidate(alias, no_pedal, {4, 5}))
+      self.assertIsNone(automatic_bolt_candidate(alias, no_pedal, {b'\0\4' + bytes(4), b'\0\5' + bytes(4)}))
     self.assertEqual(automatic_bolt_candidate(CAR.CHEVROLET_BOLT_ACC_2022_2023, no_pedal, set()),
                      CAR.CHEVROLET_BOLT_ACC_2022_2023)
-    self.assertIsNone(automatic_bolt_candidate(None, fp, {2}))
-    self.assertEqual(automatic_bolt_candidate(MOCK.MOCK, fp, {2}), MOCK.MOCK)
+    self.assertIsNone(automatic_bolt_candidate(None, fp, {stock_acc[1]}))
+    self.assertEqual(automatic_bolt_candidate(MOCK.MOCK, fp, {stock_acc[1]}), MOCK.MOCK)
 
     def startup(pt, forced, camera):
       with OpenpilotPrefix(), patch.dict(os.environ, {'SKIP_FW_QUERY': '1', 'FINGERPRINT': ''}):

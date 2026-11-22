@@ -524,3 +524,14 @@ def test_on_device_browser_api_is_gone(api):
   cookie = headers['Set-Cookie'].split(';', 1)[0]
   start = {'operation': 'start', 'email': 'user@example.com', 'remember': False}
   assert request('POST', '/api/starport/google-browser', json.dumps(start), cookie=cookie, content_type='application/json')[0] != 200
+
+
+def test_legacy_setup_switch_is_no_longer_supported(api):
+  request, _, _, _ = api
+  body = json.dumps({'action': 'new_setup', 'enabled': False})
+  assert request('POST', '/api/starport/control', body, content_type='application/json')[0] == 401
+  code, _, headers = request('POST', '/api/auth/login', json.dumps({'password': 'password123'}), content_type='application/json')
+  assert code == 200
+  cookie = headers['Set-Cookie'].split(';', 1)[0]
+  assert request('POST', '/api/starport/control', body, cookie=cookie, content_type='application/json')[0] != 200
+  assert 'newSetup' not in request('GET', '/api/starport/setup', cookie=cookie)[1]

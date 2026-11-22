@@ -35,6 +35,19 @@ TJA_MRCC_ARM_WAIT_FRAMES = int(1.0 / DT_CTRL)
 # The white wheel waits this long on a fully-off, quiet cruise before it displays.
 MADS_WHITE_HUD_OFF_CONFIRM_FRAMES = int(0.5 / DT_CTRL)
 
+# The camera's own TJA (CAM_LANEINFO.TJA, native) must read nonzero this long, fresh, while
+# openpilot steers before it is pressed off: a passed press shows TJA=2 for under 0.5 s on its own.
+CAMERA_TJA_CONFIRM_FRAMES = int(1.0 / DT_CTRL)
+# Press-off pacing and budget per episode.
+CAMERA_TJA_PRESS_FRAMES = int(1.0 / DT_CTRL)
+CAMERA_TJA_PRESS_MAX = 3
+# The panda's shared budget for every camera-only press (mazda.h MAZDA_CAM_PRESS_*): >= 0.9 s apart,
+# 4 per burst, the burst over after 5 s without one. Mirrored with margin across back-to-back
+# episodes, so no press is sent that the panda would refuse.
+CAMERA_PRESS_MIN_FRAMES = int(1.0 / DT_CTRL)
+CAMERA_PRESS_BURST_MAX = 4
+CAMERA_PRESS_QUIET_FRAMES = int(5.1 / DT_CTRL)
+
 
 # The MADS white wheel: the dash draws it when the camera's own HUD frame carries TJA=2,
 # and the body reads the same frame. The white bit is only ever XORed into an exact
@@ -54,6 +67,8 @@ MADS_HUD_SAFE_BASE_PAYLOADS = frozenset(bytes.fromhex(h) for h in (
   "4123000000004040", "4124000000004040", "4102000000001060", "4102000000004060",
   "4122000000001060", "4122000000004060", "0122000000000040", "0122000000004040",
   "4202000000001040", "4102000000000040",
+  # one-line LANE_LINES=3/4 with the high-beam bit (night): routes 00000072/75, steering above 40 mph
+  "4103000000004040", "4104000000004040",
 ))
 # OFF to WHITE is TJA 0 to 2 only: one bit, byte 4 0x20, XORed in, never a frame swap.
 MADS_HUD_WHITE_TJA_XOR = bytes.fromhex("0000000020000000")
@@ -90,6 +105,18 @@ def apply_mads_white_hud(fsc_raw: bytes | None, packed_dat: bytes, enabled: bool
   return bytes(a ^ b for a, b in zip(packed_dat, MADS_HUD_WHITE_TJA_XOR, strict=True))
 
 
+def with_camera_lane_keep(dat: bytes, fsc_raw: bytes | None) -> bytes:
+  """The camera's lane-keep state (byte 3 low nibble: TJA_TRANSITION 0x0C, unnamed 0x03) on our frame.
+
+  Routes 0000006e/6f: camera armed, our byte 3 zeroed, no dash lines; with the C4 unplugged the
+  dash gets the camera's frame and draws them. A stale or missing camera frame sends 0.
+  EXPERIMENT, not a confirmed cause: Sept drives also sent byte 3 zeroed, unexplained.
+  """
+  if fsc_raw is None or len(fsc_raw) != 8 or len(dat) != 8:
+    return dat
+  return dat[:3] + bytes([(dat[3] & 0xF0) | (fsc_raw[3] & 0x0F)]) + dat[4:]
+
+
 def create_mrcc_off_cmd(packer, counter):
   # The wheel's MRCC master press, active-low: every button bit 0 with its inversion 1,
   # the master signature in BIT1/BIT1_INV plus BIT2/BIT3, counter plus one. Only the
@@ -101,6 +128,19 @@ def create_mrcc_off_cmd(packer, counter):
     "CTR": (counter + 1) % 16,
   }
   return packer.make_can_msg("CRZ_BTNS", 0, values)
+
+
+def create_camera_tja_press(packer, counter):
+  # The wheel's TJA press over its idle pattern, on the camera bus only (route 00000097:
+  # 0009ffcc00000000). The panda pins the exact bytes in mazda_cam_tja_press_msg_valid.
+  values = {
+    "TJA_BUTTON": 1,
+    "CAN_OFF_INV": 1, "SET_P_INV": 1, "RES_INV": 1, "SET_M_INV": 1,
+    "DISTANCE_LESS_INV": 1, "DISTANCE_MORE_INV": 1, "MODE_X_INV": 1, "MODE_Y_INV": 1,
+    "BIT1": 1, "BIT2": 1, "BIT3": 1,
+    "CTR": (counter + 1) % 16,
+  }
+  return packer.make_can_msg("CRZ_BTNS", 2, values)
 
 
 class MadsCarController:
@@ -119,6 +159,75 @@ class MadsCarController:
     # The white wheel rides the alert frame; on_bus tracks that the white bit is on the wire.
     self.mads_white_hud_off_frames = 0
     self.mads_white_hud_on_bus = False
+    # The camera's own TJA pressed off while openpilot steers (one episode per nonzero stretch).
+    self.camera_tja_frames = 0
+    self.camera_tja_presses = 0
+    self.camera_tja_press_frame: int | None = None
+    # Every camera-only press: the panda's burst as this side counts it.
+    self.camera_press_burst = 0
+    self.camera_press_frame: int | None = None
+
+  def camera_press_ready(self) -> bool:
+    """Whether the panda's shared camera-press budget has room for one now."""
+    if self.camera_press_frame is None:
+      return True
+    since = self.frame - self.camera_press_frame
+    if since >= CAMERA_PRESS_QUIET_FRAMES:
+      self.camera_press_burst = 0
+    return since >= CAMERA_PRESS_MIN_FRAMES and self.camera_press_burst < CAMERA_PRESS_BURST_MAX
+
+  def camera_press(self, CS):
+    self.camera_press_burst += 1
+    self.camera_press_frame = self.frame
+    return create_camera_tja_press(self.packer, CS.crz_btns_counter)
+
+  def update_camera_tja(self, CC, CS):
+    """Press the camera's own TJA off, on the camera bus only, while openpilot steers.
+
+    Every TJA press reaches the camera again (cruise on or off) so its lane-keep state arms the
+    dash lane lines; with MRCC main on a press can also latch the camera's own TJA. Leave native
+    TJA=2 (standby) alone to preserve the camera's HUD state. Active camera TJA must not run
+    alongside openpilot's steering (route 0000013b: FSC malfunction). Confirm a fresh native state
+    other than 0 or 2 for CAMERA_TJA_CONFIRM_FRAMES, then send up to CAMERA_TJA_PRESS_MAX presses
+    CAMERA_TJA_PRESS_FRAMES apart, each only when the panda's shared burst has room
+    (camera_press_ready). Native TJA=0 or 2 ends the episode. A persistent active state after the
+    budget raises camera_tja_stuck. Stale camera data or openpilot not steering sends nothing.
+    """
+    can_sends = []
+    if not self.CP_SP.flags & MazdaFlagsSP.TJA_BUTTON:
+      return can_sends
+
+    native_tja = int(CS.cam_laneinfo["TJA"]) if CS.cam_laneinfo_live else None
+    if native_tja in (0, 2):
+      self.camera_tja_frames = 0
+      self.camera_tja_presses = 0
+      self.camera_tja_press_frame = None
+      CS.camera_tja_stuck = False
+      return can_sends
+
+    if native_tja is None or not CC.latActive:
+      # Unknown, or the camera steering alone (allowed): keep the episode's budget, restart the
+      # confirmation, and let the camera be.
+      self.camera_tja_frames = 0
+      if not CC.latActive:
+        CS.camera_tja_stuck = False
+      return can_sends
+
+    self.camera_tja_frames = min(self.camera_tja_frames + 1, CAMERA_TJA_CONFIRM_FRAMES)
+    # Never inside the driver's own held press.
+    if self.camera_tja_frames < CAMERA_TJA_CONFIRM_FRAMES or CS.tja_button:
+      return can_sends
+
+    due = self.camera_tja_press_frame is None or self.frame - self.camera_tja_press_frame >= CAMERA_TJA_PRESS_FRAMES
+    if due and self.camera_tja_presses < CAMERA_TJA_PRESS_MAX:
+      # An attempt counts only when it is sent; a full panda burst means wait, not a spent attempt.
+      if self.camera_press_ready():
+        can_sends.append(self.camera_press(CS))
+        self.camera_tja_presses += 1
+        self.camera_tja_press_frame = self.frame
+    elif due:
+      CS.camera_tja_stuck = True
+    return can_sends
 
   def update_mrcc_cleanup(self, CC, CC_SP, CS, handback_active: bool):
     # Undo the MRCC arm a physical TJA press causes: the wheel's press reaches every bus-0
@@ -205,7 +314,8 @@ class MadsCarController:
   def update_white_hud(self, CC, CC_SP, CS, handback_active: bool) -> bool:
     """Whether the alert frame carries the white wheel.
 
-    On a TJA-declared car with MADS active and cruise fully off, the white-wheel TJA=2 state
+    On a TJA-declared car with MADS active and cruise fully off, or with openpilot steering and
+    cruising under alpha long that owns cruise (radar held silent, or the Smart CAN Filter), the white-wheel TJA=2 state
     is XORed into the camera's current payload, but only onto an exact allowlisted idle base:
     TJA=2 is not display-only, the body reads the same frame. Every cruise interaction fails
     closed, and a white wheel HUD state that became unsafe is withdrawn immediately, outside
@@ -214,6 +324,14 @@ class MadsCarController:
     session_ambiguous = handback_active or CC_SP.stockEcuHandBack
     mrcc_off = (not session_ambiguous and not CS.mrcc_armed_raw and
                 not CS.cruise_available and not CS.cruise_enabled)
+    # Alpha long engaged with openpilot owning cruise: openpilot steering and cruising carries the
+    # white state too, and with it the dash's lane lines (routes 00000097 to 0000013e drew them only
+    # from TJA=2 frames). Owned = the radar held silent (UDS), or the Smart CAN Filter's confirmed
+    # mode: that radar stays online and reads this frame with its main on in standby, its cruise
+    # frames kept off the car by the board (the user's 2026-11-15 choice).
+    owned = self.can_filter.control_active if self.can_filter is not None else self.radar_session.control_active
+    cruising = (not session_ambiguous and CC.enabled and CC.latActive and owned and
+                CS.radar_bus_healthy and CS.out.canValid)
 
     # Every button a TJA wheel carries: TJA, MRCC, SET+/-, RES, DISTANCE, plus the
     # synthesized ICBM set presses and openpilot's own cancel/resume.
@@ -224,12 +342,11 @@ class MadsCarController:
 
     white_allowed = (
       bool(self.CP_SP.flags & MazdaFlagsSP.TJA_BUTTON) and
-      CC_SP.mads.active and
       CS.cam_laneinfo_live and
       white_hud_allowlist_base(CS.cam_laneinfo_raw) is not None and
       CC.hudControl.visualAlert == VisualAlert.none and
       not button_activity and
-      mrcc_off
+      ((CC_SP.mads.active and mrcc_off) or cruising)
     )
     if white_allowed:
       self.mads_white_hud_off_frames = min(self.mads_white_hud_off_frames + 1, MADS_WHITE_HUD_OFF_CONFIRM_FRAMES)
@@ -242,7 +359,8 @@ class MadsCarController:
     fsc_raw = CS.cam_laneinfo_raw
     payload = white_hud_allowlist_base(fsc_raw) if white else alert[1]
     self.mads_white_hud_on_bus = white
-    return alert[0], apply_mads_white_hud(fsc_raw, payload, white), alert[2]
+    dat = apply_mads_white_hud(fsc_raw, payload, white)
+    return alert[0], with_camera_lane_keep(dat, fsc_raw if CS.cam_laneinfo_live else None), alert[2]
 
 
 class MadsCarState(MadsCarStateBase):

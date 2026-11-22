@@ -8,6 +8,7 @@ from opendbc.car import Bus, DT_CTRL, structs
 from opendbc.car.lateral import apply_driver_steer_torque_limits
 from opendbc.car.interfaces import CarControllerBase
 from opendbc.car.mazda import mazdacan
+from opendbc.car.mazda.can_filter import CanFilterSession
 from opendbc.car.mazda.longitudinal import AccelShaper, LeadIcon, StandstillHold
 from opendbc.car.mazda.radar_session import RadarSessionManager, RadarSessionState
 from opendbc.car.mazda.values import CarControllerParams, Buttons, MazdaFlags
@@ -16,6 +17,7 @@ from opendbc.car.mazda.icbm import IntelligentCruiseButtonManagementInterface
 from opendbc.car.mazda.mads import MadsCarController
 from opendbc.car.mazda.stock_ecu import StockEcuState
 from opendbc.car.mazda.stock_aol import qualified as qualified_aol
+from opendbc.car.mazda.values_ext import MazdaFlagsSP
 
 VisualAlert = structs.CarControl.HUDControl.VisualAlert
 LongCtrlState = structs.CarControl.Actuators.LongControlState
@@ -46,8 +48,9 @@ RADAR_WARMUP_MAX_FRAMES = int(20.0 / DT_CTRL)
 # the radar's own frames follows its mode), so AEB counts as off for that long. Off when it may be
 # on is the safe error; the reverse is not.
 RADAR_RESTART_FRAMES = int(12.0 / DT_CTRL)
-# A takeover starts only at a real stop: one shorter than this (creeping traffic) would be cut short
-# by the next roll, turning AEB off and back on for nothing. Standing still since start counts.
+# The first takeover runs moving. Once the radar refused one, a takeover starts only at a real stop:
+# one shorter than this (creeping traffic) would be cut short by the next roll, turning AEB off and
+# back on for nothing. Standing still since start counts.
 TAKEOVER_STOP_FRAMES = int(2.0 / DT_CTRL)
 
 
@@ -122,6 +125,8 @@ class CarController(CarControllerBase, IntelligentCruiseButtonManagementInterfac
     self.long_counter = 0
     self.radar_counter = 0
     self.radar_session = RadarSessionManager()
+    # The Smart CAN Filter keeps the radar online in place of the UDS takeover (MazdaFlagsSP.CAN_FILTER).
+    self.can_filter = CanFilterSession() if CP_SP.flags & MazdaFlagsSP.CAN_FILTER else None
     self.cruise_requested = False  # latched for the drive on the first SET/RES press
     # nothing asked for yet: no "remain parked" banner before the first controls frame either
     self.radar_session.status = StockEcuState.PARK_TO_TAKE_OVER
@@ -188,6 +193,11 @@ class CarController(CarControllerBase, IntelligentCruiseButtonManagementInterfac
                                           self.params.EPS_CEILING_LOOKUP[1])))
       new_torque = int(np.clip(new_torque, -eps_ceiling, eps_ceiling))
 
+      # Yield a share of the command to a driver pushing against it.
+      driver_opposing = -np.sign(new_torque) * CS.out.steeringTorque
+      new_torque = int(round(new_torque * float(np.interp(driver_opposing, self.params.STEER_OVERRIDE_BP,
+                                                          self.params.STEER_OVERRIDE_V))))
+
       # Use the worst sample plus margin to stay inside panda's fresher driver-torque envelope.
       if new_torque >= 0:
         driver_torque = min(self.driver_torque_samples) - self.params.STEER_DRIVER_MARGIN
@@ -221,6 +231,7 @@ class CarController(CarControllerBase, IntelligentCruiseButtonManagementInterfac
         can_sends.append(mazdacan.create_button_cmd(self.packer, self.CP, CS.crz_btns_counter, Buttons.RESUME))
 
     can_sends.extend(self.update_mrcc_cleanup(CC, CC_SP, CS, self.radar_session.handback_active))
+    can_sends.extend(self.update_camera_tja(CC, CS))
 
     self.apply_torque_last = apply_torque
 
@@ -260,16 +271,21 @@ class CarController(CarControllerBase, IntelligentCruiseButtonManagementInterfac
     that silences nothing."""
     if not self.CP.openpilotLongitudinalControl:
       return StockEcuState.NOT_NEEDED
+    if self.can_filter is not None:
+      # the board's mode and its release, not the radar's session
+      return self.can_filter.stock_ecu_state
     return stock_ecu_driver_view(self.radar_session.status, self.radar_session.state,
                                  stock_cruise_engaged=self.stock_cruise_engaged, main_on=self.main_on,
                                  radar_warming=self.radar_warmup_frames > 0, stock_radar_live=self.stock_radar_live)
 
   @property
   def alpha_long_requested(self) -> bool:
-    """The driver asked for alpha long (RES), main is on, and the radar is not held yet: card
-    publishes it for the "alpha long at the next stop" line. It stays up through a takeover that
-    a roll cuts short, so one request is announced once."""
-    return self.CP.openpilotLongitudinalControl and self.cruise_requested and self.main_on and \
+    """The driver asked for alpha long (RES), main is on, and the radar is not held yet, with the
+    takeover waiting for a stop (the radar refused a moving one): card publishes it for the
+    "alpha long at the next stop" line. It stays up through a takeover that a roll cuts short,
+    so one request is announced once."""
+    return self.CP.openpilotLongitudinalControl and self.can_filter is None and self.cruise_requested and self.main_on and \
+           not self.radar_session.moving_open and \
            self.radar_session.state != RadarSessionState.SILENCED and not self.radar_session.silencing_failed
 
   @property
@@ -277,9 +293,15 @@ class CarController(CarControllerBase, IntelligentCruiseButtonManagementInterfac
     """The radar's own functions, AEB with them, off or not yet counted as back: programming
     requested, silenced, mid hand-back, or within RADAR_RESTART_FRAMES of one. card publishes it
     for the UI's AEB-off marker and the "AEB on" line."""
-    if not self.CP.openpilotLongitudinalControl:
+    if not self.CP.openpilotLongitudinalControl or self.can_filter is not None:
       return False
     return self.radar_off_prev or self.radar_restart_frames > 0
+
+  @property
+  def stock_ecu_lost(self) -> bool:
+    """The Smart CAN Filter lost (or never confirmed) ownership for the drive. card publishes it for the
+    loss alert: under the filter a loss is a quiet cruise drop, not a fault (carstate keeps MADS lateral)."""
+    return self.can_filter is not None and self.can_filter.lost
 
   def _track_radar_session(self, session_state: RadarSessionState, CS, CC_SP) -> None:
     """Per-frame bookkeeping after the session manager ran: what carstate is told, and the timers
@@ -350,66 +372,74 @@ class CarController(CarControllerBase, IntelligentCruiseButtonManagementInterfac
   def update_longitudinal(self, CC, CC_SP, CS):
     can_sends = []
 
-    # Start takeover only after the FSC boot check and any stock engagement have ended.
-    stock_radar_alive = CS.stock_radar_alive
-    stock_engaged = stock_radar_alive and CS.cruise_enabled
     bus_healthy = CS.radar_bus_healthy
-    # Main on withdraws the hand-back; the next takeover waits for a new SET/RES press and a stop.
-    self.main_on = CS.cruise_available
-    self.stock_radar_live = stock_radar_alive
-    self.stock_cruise_engaged = stock_engaged
-    # The car's own cruise running is the driver choosing it: a pending request goes, and until
-    # main goes off RES belongs to it (the car remembers its speed), not to alpha long.
-    self.car_cruise_used = CS.cruise_available and (self.car_cruise_used or stock_engaged)
-    if (self.car_cruise_used or stock_engaged) and self.radar_session.state != RadarSessionState.SILENCED:
-      self.cruise_requested = False  # also mid-takeover: the car's cruise at a stop aborts it
-      self.cruise_request_frames = 0
-    if CS.cruise_available:
-      self.cruise_off_handback = False
-      self.main_seen_on = True
-    elif self.main_seen_on and self.radar_session.state != RadarSessionState.SILENCED:
-      # main off with the radar not yet held: the request goes with it. A takeover in progress is
-      # abandoned (the manager's own abort, a hand-back if programming was sent) and none follows
-      # at the next stop. A held radar is the 5 s hold's, below.
-      self.cruise_requested = False
-      self.cruise_request_frames = 0
-    elif self.radar_silenced_frames > RADAR_HANDBACK_HOLD_FRAMES and not self.cruise_off_handback:
-      self.cruise_off_handback = True
-      self.cruise_requested = False
-      self.cruise_request_frames = 0
-    # A press while the radar is being handed back or restarting is the driver reaching for stock
-    # cruise (route 0000012c, three times), not a request for the radar again.
-    radar_returning = self.radar_session.state == RadarSessionState.HANDBACK or \
-                      (self.radar_warmup_frames > 0 and not CS.stock_set_allowed)
-    self.cruise_requested |= CS.cruise_available and not radar_returning and not self.car_cruise_used and \
-                             not self.radar_session.silencing_failed and \
-                             any(be.pressed and be.type in ALPHA_LONG_REQUEST_BUTTONS for be in CS.out.buttonEvents)
-    self.cruise_request_frames = self.cruise_request_frames + 1 if self.cruise_requested else 0
-    gate_passed = CS.fsc_settled and self.cruise_request_frames > CRUISE_REQUEST_SETTLE_FRAMES
-    self.standstill_frames = self.standstill_frames + 1 if CS.out.standstill else 0
-    # carstate's guard from the previous frame is the ownership the engagement path sees
-    session_state = self.radar_session.update(gate_passed, stock_radar_alive, CC_SP.stockEcuHandBack or self.cruise_off_handback,
-                                              standstill=self.standstill_frames >= TAKEOVER_STOP_FRAMES,
-                                              session_refused=CS.radar_session_refused,
-                                              stock_radar_gone=CS.stock_radar_gone,
-                                              bus_healthy=bus_healthy and CS.out.canValid,
-                                              frame=self.frame,
-                                              stock_engaged=stock_engaged, owned=CS.radar_owned,
-                                              cruise_requested=self.cruise_requested)
-    if self.radar_session.silencing_failed:
-      # the radar refused or never answered: no takeover is retried this drive, so nothing pends
-      self.cruise_requested = False
-      self.cruise_request_frames = 0
-    # Continue synthetic radar frames through hand-back to avoid a camera-visible gap.
-    radar_master = self.radar_session.replacement_active
-    self._track_radar_session(session_state, CS, CC_SP)
+    if self.can_filter is not None:
+      # The radar stays online behind the filter: no UDS takeover and no synthetic radar frames. Our cruise
+      # frames run only while the board confirms its mode; the lifecycle's hand-back releases it.
+      can_sends.extend(self.can_filter.update(CS.can_filter_age, CS.cruise_enabled, CC_SP.stockEcuHandBack))
+      session_state = RadarSessionState.STOCK
+      radar_master = self.can_filter.control_active
+    else:
+      # Start takeover only after the FSC boot check and any stock engagement have ended.
+      stock_radar_alive = CS.stock_radar_alive
+      stock_engaged = stock_radar_alive and CS.cruise_enabled
+      # Main on withdraws the hand-back; the next takeover waits for a new SET/RES press and a stop.
+      self.main_on = CS.cruise_available
+      self.stock_radar_live = stock_radar_alive
+      self.stock_cruise_engaged = stock_engaged
+      # The car's own cruise running is the driver choosing it: a pending request goes, and until
+      # main goes off RES belongs to it (the car remembers its speed), not to alpha long.
+      self.car_cruise_used = CS.cruise_available and (self.car_cruise_used or stock_engaged)
+      if (self.car_cruise_used or stock_engaged) and self.radar_session.state != RadarSessionState.SILENCED:
+        self.cruise_requested = False  # also mid-takeover: the car's cruise at a stop aborts it
+        self.cruise_request_frames = 0
+      if CS.cruise_available:
+        self.cruise_off_handback = False
+        self.main_seen_on = True
+      elif self.main_seen_on and self.radar_session.state != RadarSessionState.SILENCED:
+        # main off with the radar not yet held: the request goes with it. A takeover in progress is
+        # abandoned (the manager's own abort, a hand-back if programming was sent) and none follows
+        # at the next stop. A held radar is the 5 s hold's, below.
+        self.cruise_requested = False
+        self.cruise_request_frames = 0
+      elif self.radar_silenced_frames > RADAR_HANDBACK_HOLD_FRAMES and not self.cruise_off_handback:
+        self.cruise_off_handback = True
+        self.cruise_requested = False
+        self.cruise_request_frames = 0
+      # A press while the radar is being handed back or restarting is the driver reaching for stock
+      # cruise (route 0000012c, three times), not a request for the radar again.
+      radar_returning = self.radar_session.state == RadarSessionState.HANDBACK or \
+                        (self.radar_warmup_frames > 0 and not CS.stock_set_allowed)
+      self.cruise_requested |= CS.cruise_available and not radar_returning and not self.car_cruise_used and \
+                               not self.radar_session.silencing_failed and \
+                               any(be.pressed and be.type in ALPHA_LONG_REQUEST_BUTTONS for be in CS.out.buttonEvents)
+      self.cruise_request_frames = self.cruise_request_frames + 1 if self.cruise_requested else 0
+      gate_passed = CS.fsc_settled and self.cruise_request_frames > CRUISE_REQUEST_SETTLE_FRAMES
+      self.standstill_frames = self.standstill_frames + 1 if CS.out.standstill else 0
+      # carstate's guard from the previous frame is the ownership the engagement path sees
+      session_state = self.radar_session.update(gate_passed, stock_radar_alive, CC_SP.stockEcuHandBack or self.cruise_off_handback,
+                                                standstill=self.standstill_frames >= TAKEOVER_STOP_FRAMES,
+                                                session_refused=CS.radar_session_refused,
+                                                stock_radar_gone=CS.stock_radar_gone,
+                                                bus_healthy=bus_healthy and CS.out.canValid,
+                                                frame=self.frame,
+                                                stock_engaged=stock_engaged, owned=CS.radar_owned,
+                                                cruise_requested=self.cruise_requested)
+      if self.radar_session.silencing_failed:
+        # the radar refused or never answered: no takeover is retried this drive, so nothing pends
+        self.cruise_requested = False
+        self.cruise_request_frames = 0
+      # Continue synthetic radar frames through hand-back to avoid a camera-visible gap.
+      radar_master = self.radar_session.replacement_active
+      self._track_radar_session(session_state, CS, CC_SP)
 
-    if self.radar_session.diagnostic_message is not None:
-      can_sends.append(self.radar_session.diagnostic_message)
+      if self.radar_session.diagnostic_message is not None:
+        can_sends.append(self.radar_session.diagnostic_message)
 
     stopping = CC.actuators.longControlState == LongCtrlState.stopping
     # Engaged bits follow CC.enabled. Gas is an override, not a disengagement.
-    control_ready = self.radar_session.control_active and bus_healthy and CS.out.canValid
+    owned = self.can_filter.control_active if self.can_filter is not None else self.radar_session.control_active
+    control_ready = owned and bus_healthy and CS.out.canValid
     long_engaged = CC.enabled and control_ready
     long_active = CC.longActive and control_ready
     sm = self.stop_and_go
@@ -418,11 +448,12 @@ class CarController(CarControllerBase, IntelligentCruiseButtonManagementInterfac
 
     accel = self.accel_shaper.update(long_active, CC.actuators.accel, self.accel_last, sm, CS.out.standstill,
                                      CS.body_hold, CS.out.vEgoRaw, CS.gear_box, CS.out.aEgo,
-                                     CC.hudControl.leadVisible, CS.out.gasPressed, long_engaged)
+                                     CC.hudControl.leadVisible, CS.out.gasPressed, long_engaged,
+                                     CS.out.steeringAngleDeg, CC.hudControl.setSpeed)
     self.accel_last = accel
     lead_shown = self.lead_icon.update(CC.hudControl.leadVisible)
 
-    if radar_master and self.frame % CarControllerParams.RADAR_STEP == 0:
+    if radar_master and self.can_filter is None and self.frame % CarControllerParams.RADAR_STEP == 0:
       for bus in LONG_BUSES:
         can_sends.extend(mazdacan.create_radar_frames(bus, self.radar_counter, g46l=self.g46l))
       self.radar_counter += 1
@@ -446,7 +477,8 @@ class CarController(CarControllerBase, IntelligentCruiseButtonManagementInterfac
         can_sends.append(mazdacan.create_acc_command(self.packer, bus, self.long_counter, accel,
                                                      long_active=long_engaged, acc_available=acc_available,
                                                      brake_pressed=CS.out.brakePressed,
-                                                     stopping=sm.stop_bits, resume_unlatching=sm.resume_unlatching))
+                                                     stopping=sm.stop_bits, resume_unlatching=sm.resume_unlatching,
+                                                     hud_tja2=self.mads_white_hud_on_bus))
         # The cruise frame is ours under alpha long, so it also carries the white wheel while openpilot steers
         # (MADS) with cruise on, engaged or not, when the camera frame's white state stays off (it fails closed on
         # any cruise). The camera frame itself is untouched, and the car's own cruise never sees this frame.

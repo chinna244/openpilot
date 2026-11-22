@@ -142,17 +142,11 @@ static bool mazda_forward(int bus, int addr) {
   return current_safety_param != 0U ? mazda_port_fwd_hook(bus, addr) : mazda_aol_fwd(bus, addr);
 }
 
-static void mazda_forward_modify(int bus, CANPacket_t *msg) {
-  if (current_safety_param != 0U) {
-    mazda_port_fwd_modify(bus, msg);
-  }
-}
-
 const safety_hooks mazda_hooks = {
   .init = mazda_init,
   .rx = mazda_rx_hook,
   .tx = mazda_tx_hook,
   .optional_rx = mazda_aol_optional_rx,
   .fwd = mazda_forward,
-  .fwd_modify = mazda_forward_modify,
+  // no forward modify: the driver's TJA press reaches the camera again (develop 0f6ce31f)
 };

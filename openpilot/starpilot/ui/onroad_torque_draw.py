@@ -1,11 +1,13 @@
 """Antialiased torque arc, painted in one bounded pass without a polygon cache."""
+import numpy as np
 
 import math
 
-import pyray as rl
+from openpilot.starpilot.ui.raylib import rl
+from openpilot.starpilot.ui.raylib import rl as native_rl
 
 from openpilot.system.ui.lib.application import GL_VERSION
-from openpilot.starpilot.ui.onroad_torque_geometry import MAX_HEIGHT, MAX_OFFSET, MIN_HEIGHT, MIN_OFFSET, RADIUS, TORQUE_ANGLE_SPAN
+from openpilot.starpilot.ui.onroad_torque_geometry import MAX_HEIGHT, MAX_OFFSET, MIN_HEIGHT, MIN_OFFSET, RADIUS, TORQUE_ANGLE_SPAN, arc_scale
 
 
 VERTEX_SHADER = GL_VERSION + """
@@ -75,7 +77,7 @@ class TorqueBarPainter:
       if shader.id and shader.id != rl.rl_get_shader_id_default():
         rl.unload_shader(shader)
       raise RuntimeError('Torque bar shader unavailable')
-    self._uniforms = {name: (location, rl.ffi.new('float[4]')) for name, location in locations.items()}
+    self._uniforms = {name: (location, np.zeros(4, dtype=np.float32)) for name, location in locations.items()}
     self._previous.clear()
     self._shader = shader
 
@@ -84,7 +86,7 @@ class TorqueBarPainter:
     if alpha <= 0:
       return
     self.prepare()
-    scale = rect.height / 240.0 * (rect.width / screen_width)
+    scale = arc_scale(rect.width, rect.height, screen_width)
     strength = max(0.0, min(1.0, (abs(torque) - 0.5) * 2))
     torque_offset = MIN_OFFSET * scale + (MAX_OFFSET * scale - MIN_OFFSET * scale) * strength
     thickness = MIN_HEIGHT * scale + (MAX_HEIGHT * scale - MIN_HEIGHT * scale) * strength
@@ -96,7 +98,9 @@ class TorqueBarPainter:
     half_span = math.radians(alpha * TORQUE_ANGLE_SPAN / 2)
     sine, cosine = math.sin(half_span), math.cos(half_span)
     end_sine, end_cosine = math.sin(half_span * torque), math.cos(half_span * torque)
-    start, end = ((end_sine, -end_cosine), (0, -1)) if torque < 0 else ((0, -1), (end_sine, -end_cosine))
+    root_sine = math.copysign(min(cap / middle_radius, abs(end_sine)), torque)
+    root = (root_sine, -math.sqrt(1 - root_sine * root_sine))
+    start, end = ((end_sine, -end_cosine), root) if torque < 0 else (root, (end_sine, -end_cosine))
     dot_y = rect.y + rect.height - torque_offset - thickness / 2 + offset[1]
     indicator_alpha = int(255 * 0.9 * alpha) / 255
     warmth = max(0.0, min(1.0, (abs(torque) - 0.75) * 4))
@@ -116,24 +120,25 @@ class TorqueBarPainter:
     extent += 4
     top = rect.y + rect.height - torque_offset - thickness + offset[1] - 4
     bottom = cy - (radius + cap) * cosine + cap + 4
-    rl.begin_shader_mode(self._shader)
+    # Use the native bindings without per-vertex Python wrappers.
+    native_rl.begin_shader_mode(self._shader)
     try:
       for name, value in values.items():
         if self._previous.get(name) != value:
           location, pointer = self._uniforms[name]
           pointer[0:4] = value
-          rl.set_shader_value(self._shader, location, pointer, rl.ShaderUniformDataType.SHADER_UNIFORM_VEC4)
+          native_rl.set_shader_value(self._shader, location, pointer, rl.ShaderUniformDataType.SHADER_UNIFORM_VEC4)
           self._previous[name] = value
       # rlgl may transform positions on the CPU; UVs keep distance calculations in logical pixels.
       left, right = cx - extent, cx + extent
-      rl.rl_set_texture(0)
-      rl.rl_begin(rl.RL_QUADS)
+      native_rl.rl_set_texture(0)
+      native_rl.rl_begin(rl.RL_QUADS)
       for x, y in ((left, top), (left, bottom), (right, bottom), (right, top)):
-        rl.rl_tex_coord2f(x, y)
-        rl.rl_vertex2f(x, y)
-      rl.rl_end()
+        native_rl.rl_tex_coord2f(x, y)
+        native_rl.rl_vertex2f(x, y)
+      native_rl.rl_end()
     finally:
-      rl.end_shader_mode()
+      native_rl.end_shader_mode()
 
   def close(self) -> None:
     if self._shader is not None and rl.is_window_ready():

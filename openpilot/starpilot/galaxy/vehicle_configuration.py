@@ -4,9 +4,10 @@ from openpilot.starpilot.saved_source import read_saved
 from openpilot.starpilot.vehicle_selection import read_selection
 
 
-STARTUP_KEYS = ('MazdaTjaButton', 'SubaruAvhStartup', 'SubaruStopStartOff', 'AlphaLongitudinalEnabled', 'IsReleaseBranch', 'OpenpilotEnabledToggle', 'SafeMode',
+STARTUP_KEYS = ('MazdaTjaButton', 'MazdaCanFilter',
+                'SubaruAvhStartup', 'SubaruStopStartOff', 'AlphaLongitudinalEnabled', 'IsReleaseBranch', 'OpenpilotEnabledToggle', 'SafeMode',
                 'DisableOpenpilotLongitudinal', 'ToyotaAutoHold', 'JeepBrakeHold',
-                'ToyotaRadarMode', 'VoltSNG', 'GMAutoHold', 'VoltOnePedalMode', 'TurnAssist', 'LongPitch',
+                'VoltSNG', 'GMAutoHold', 'VoltOnePedalMode', 'TurnAssist', 'LongPitch',
                 'HondaBoschARadar', 'NAPPedalEnabled', 'NAPRadarEnabled', 'NAPRadarBehindNosecone')
 
 

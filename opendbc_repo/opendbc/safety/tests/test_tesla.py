@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
 import random
+import signal
+import subprocess
+import sys
 import unittest
 import numpy as np
 
@@ -10,7 +13,8 @@ from opendbc.car.structs import CarParams
 from opendbc.car.vehicle_model import VehicleModel
 from opendbc.can import CANDefine
 import opendbc.safety.tests.common as common
-from opendbc.safety.tests.common import MAX_SPEED_DELTA, MAX_WRONG_COUNTERS, away_round, round_speed
+from opendbc.safety.tests.common import MAX_WRONG_COUNTERS, away_round, round_speed, speeds_within_delta
+from opendbc.safety.tests.libsafety import libsafety_py
 
 MSG_DAS_steeringControl = 0x488
 MSG_APS_eacMonitor = 0x27d
@@ -22,6 +26,63 @@ def round_angle(apply_angle, can_offset=0):
   # 0.49999_ == 0.5
   rnd_offset = 1e-5 if apply_angle >= 0 else -1e-5
   return away_round(apply_angle_can + rnd_offset) * 0.1 - 1638.35
+
+
+class TestTeslaNativeCallbacks(unittest.TestCase):
+  def _assert_checksum_callback_finishes(self, param):
+    packet = common.CANPackerSafety('tesla_model3_party').make_can_msg_safety('DI_speed', 0, {'DI_vehicleSpeed': 0})
+    self.assertEqual((packet.addr, packet.bus, packet.data_len_code), (0x257, 0, 8))
+    try:
+      mutant = libsafety_py.libsafety.mutation_get_active_mutant()
+    except AttributeError:
+      mutant = None
+    script = """import sys
+from opendbc.car.structs import CarParams
+from opendbc.safety.tests.libsafety import libsafety_py
+libsafety_py.load(sys.argv[1])
+safety = libsafety_py.libsafety
+if sys.argv[2] != 'None':
+  safety.mutation_set_active_mutant(int(sys.argv[2]))
+print('NATIVE_SETUP_BEGIN', flush=True)
+status = safety.set_safety_hooks(CarParams.SafetyModel.tesla, int(sys.argv[3]))
+print('NATIVE_SETUP_RETURN', flush=True)
+if status != 0:
+  print('NATIVE_SETUP_ASSERTION', flush=True)
+  raise SystemExit(1)
+safety.init_tests()
+packet = libsafety_py.make_CANPacket(0x257, 0, bytes.fromhex(sys.argv[4]))
+print('NATIVE_CALLBACK_BEGIN', flush=True)
+accepted = safety.safety_rx_hook(packet)
+print('NATIVE_CALLBACK_RETURN', flush=True)
+raise SystemExit(0 if accepted else 1)
+"""
+    try:
+      result = subprocess.run([sys.executable, '-c', script, libsafety_py.libpath, str(mutant),
+                               str(param), bytes(packet.data[0:8]).hex()], capture_output=True, text=True, timeout=10)
+    except subprocess.TimeoutExpired as exc:
+      output = exc.stdout or b''
+      if isinstance(output, bytes):
+        output = output.decode(errors='replace')
+      setup_entered = 'NATIVE_SETUP_BEGIN' in output and 'NATIVE_SETUP_RETURN' not in output
+      if 'NATIVE_CALLBACK_BEGIN' not in output and not setup_entered:
+        raise RuntimeError('Native checksum probe did not reach its callback') from exc
+      self.fail('Native checksum callback did not finish within ten seconds')
+    setup_entered = 'NATIVE_SETUP_BEGIN' in result.stdout and 'NATIVE_SETUP_RETURN' not in result.stdout
+    if result.returncode == -signal.SIGSEGV and setup_entered:
+      self.fail('Native initialization faulted on a supported profile: ' + result.stderr)
+    entered = 'NATIVE_CALLBACK_BEGIN' in result.stdout
+    if result.returncode == -signal.SIGSEGV and entered and 'NATIVE_CALLBACK_RETURN' not in result.stdout:
+      self.fail('Native checksum callback faulted on a fully allocated valid packet: ' + result.stderr)
+    asserted = 'NATIVE_SETUP_ASSERTION' in result.stdout or 'NATIVE_CALLBACK_RETURN' in result.stdout
+    if result.returncode not in (0, 1) or not asserted:
+      raise RuntimeError(f'Native checksum probe infrastructure failure ({result.returncode}): {result.stdout}{result.stderr}')
+    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+  def test_stock_checksum_callback_finishes(self):
+    self._assert_checksum_callback_finishes(0)
+
+  def test_longitudinal_checksum_callback_finishes(self):
+    self._assert_checksum_callback_finishes(TeslaSafetyFlags.LONG_CONTROL)
 
 
 class TestTeslaSafetyBase(common.CarSafetyTest, common.AngleSteeringSafetyTest, common.LongitudinalAccelSafetyTest):
@@ -40,17 +101,11 @@ class TestTeslaSafetyBase(common.CarSafetyTest, common.AngleSteeringSafetyTest, 
   STEER_ANGLE_MAX = 360  # deg
   DEG_TO_CAN = 10
 
-  # Tesla uses get_max_angle_delta_vm and get_max_angle_vm for real lateral accel and jerk limits
-  # TODO: integrate this into AngleSteeringSafetyTest
-  ANGLE_RATE_BP = None
-  ANGLE_RATE_UP = None
-  ANGLE_RATE_DOWN = None
-
   # Real time limits
   LATERAL_FREQUENCY = 50  # Hz
 
   # Long control limits
-  MAX_ACCEL = 2.0
+  MAX_ACCEL = 3.52
   MIN_ACCEL = -3.48
   INACTIVE_ACCEL = 0.0
 
@@ -183,7 +238,7 @@ class TestTeslaSafetyBase(common.CarSafetyTest, common.AngleSteeringSafetyTest, 
         self.safety.set_controls_allowed(True)
         self.assertTrue(self._rx(self._speed_msg_2(speed_2)))
 
-        within_delta = abs(speed - speed_2) <= MAX_SPEED_DELTA
+        within_delta = speeds_within_delta(speed, speed_2)
         self.assertEqual(self.safety.get_controls_allowed(), within_delta)
 
     # Test ESP_B quality flag
@@ -280,6 +335,8 @@ class TestTeslaSafetyBase(common.CarSafetyTest, common.AngleSteeringSafetyTest, 
     self.assertEqual(0, self.safety.safety_fwd_hook(2, lkas_msg_cam.addr))
     self.assertFalse(self._tx(no_lkas_msg))
 
+  # Tesla uses get_max_angle_delta_vm and get_max_angle_vm for real lateral accel and jerk limits
+  # TODO: integrate this into AngleSteeringSafetyTest
   def test_angle_cmd_when_enabled(self):
     # We properly test lateral acceleration and jerk below
     pass

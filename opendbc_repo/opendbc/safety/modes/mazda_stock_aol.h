@@ -140,14 +140,9 @@ static void mazda_aol_optional_rx(const CANPacket_t *msg) {
     } else if (msg_matches(msg, 0x243U, 2U, 8U)) {
       mazda_aol_seen |= 8U;
       mazda_aol_cam_ts = now;
-      // The camera's fault (ERR_BIT_1) withholds lateral through mazda_aol_permission (sources != 1). With the TJA
-      // button it keeps the driver's token, as develop's MADS pauses and resumes on it: glare or a blocked windshield
-      // clears mid-drive. Otherwise it consumes the token.
-      mazda_aol_sources = (mazda_aol_sources & 3U) | (GET_BIT(msg, 16U) ? 4U : 0U);
-      if (((mazda_aol_sources & 4U) != 0U) && !(mazda_port_tja_button && mazda_aol_enabled)) {
-        mazda_aol_clear();
-        mazda_aol_startup_pending = false;
-      }
+      // The camera's ERR_BIT_1 alone is sun glare or a blocked windshield: the EPS keeps assisting when the
+      // forwarded LKAS frame does not carry it (mazdacan never copies it), so lateral continues as on develop.
+      // The EPS's own LKAS_FAULT is the permanent fault (host steerFaultPermanent).
     } else {
     }
   }
@@ -159,7 +154,7 @@ static void mazda_aol_rx(const CANPacket_t *msg) {
       mazda_aol_seen |= 1U;
       mazda_aol_main_ts = microsecond_timer_get();
       acc_main_on = GET_BIT(msg, 17U);
-      if ((mazda_aol_session && !heartbeat_engaged) || !aol_rx_healthy() || !mazda_aol_current() || safety_rx_checks_invalid || (((mazda_aol_sources & 4U) != 0U) && !(mazda_port_tja_button && mazda_aol_enabled))) {
+      if ((mazda_aol_session && !heartbeat_engaged) || !aol_rx_healthy() || !mazda_aol_current() || safety_rx_checks_invalid) {
         mazda_aol_clear();
       } else if (!acc_main_on) {
         mazda_aol_clear();
@@ -185,7 +180,7 @@ static void mazda_aol_rx(const CANPacket_t *msg) {
       // Mapped Cancel can request LAT only after the same fresh physical edge
       // and current host acknowledgment used by the other cruise buttons.
       const bool press = (msg->data[0] & 0x35U) != 0U;
-      if ((mazda_aol_session && !heartbeat_engaged) || !aol_rx_healthy() || !mazda_aol_current() || safety_rx_checks_invalid || (((mazda_aol_sources & 4U) != 0U) && !(mazda_port_tja_button && mazda_aol_enabled))) {
+      if ((mazda_aol_session && !heartbeat_engaged) || !aol_rx_healthy() || !mazda_aol_current() || safety_rx_checks_invalid) {
         mazda_aol_clear();
       } else if (!press) {
         mazda_aol_buttons_neutral = true;

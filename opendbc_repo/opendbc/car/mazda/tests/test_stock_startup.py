@@ -167,7 +167,7 @@ def complete_frames(packer, cp, tick, *, main, engaged=False, reverse=False, spe
     "GEAR": {"GEAR": 2 if reverse else 4},
     "STEER": {"STEER_ANGLE": 0},
     "STEER_TORQUE": {"STEER_TORQUE_SENSOR": 0, "STEER_TORQUE_MOTOR": 0},
-    "STEER_RATE": {"STEER_ANGLE_RATE": 0, "LKAS_BLOCK": int(temporary), "CTR": tick % 16},
+    "STEER_RATE": {"STEER_ANGLE_RATE": 0, "LKAS_BLOCK": int(temporary), "LKAS_FAULT": int(permanent), "CTR": tick % 16},
     "CRZ_CTRL": {"CRZ_AVAILABLE": int(main), "CRZ_ACTIVE": int(engaged)},
     "CRZ_BTNS": {"CTR": tick % 16, "CAN_OFF": int(cancel)},
     "CRZ_EVENTS": {"CRZ_SPEED": speed_kph},

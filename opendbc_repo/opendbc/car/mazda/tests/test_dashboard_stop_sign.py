@@ -18,7 +18,7 @@ def test_all_factory_variants_match_the_requested_measured_profile(identity, alp
   assert cp.dashcamOnly is (identity not in SUPPORTED)
   assert cp.pcmCruise and cp.mass > 1000
   assert cp.openpilotLongitudinalControl is (alpha and cp.alphaLongitudinalAvailable)
-  assert cp.steerActuatorDelay == pytest.approx(0.05) and cp.steerLimitTimer == pytest.approx(0.8)
+  assert cp.steerActuatorDelay == pytest.approx(0.14) and cp.steerLimitTimer == pytest.approx(0.8)
   assert cp.safetyConfigs[0].safetyParam == (3 if cp.openpilotLongitudinalControl else 2) and len(cp.safetyConfigs) == 1
   assert type(CarInterface(cp).CC).__module__ == 'opendbc.car.mazda.carcontroller'
 

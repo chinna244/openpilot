@@ -24,6 +24,10 @@ class CarControllerParams:
   STEER_DRIVER_ALLOWANCE = 15     # allowed driver torque before start limiting
   STEER_DRIVER_MULTIPLIER = 15    # weight driver torque, tuned for the 2022 EPS
   STEER_DRIVER_FACTOR = 1         # from dbc
+  # The share of the command given up to a driver pushing against it, the same at every speed.
+  # The headroom above is on the 1200 rail, so it never reached the 620 highway ceiling.
+  STEER_OVERRIDE_BP = [STEER_DRIVER_ALLOWANCE, 50]  # opposing driver torque, counts
+  STEER_OVERRIDE_V = [1., 0.]                       # fraction of the command kept
   STEER_STEP = 1  # 100 Hz
   # Upstream's STEER_MAX, the scale params.toml's tunes, NNLC models and the manual torque override
   # use: latAccelFactor x TUNE_SCALE, friction / TUNE_SCALE.
@@ -39,9 +43,10 @@ class CarControllerParams:
   LONG_STEP = 2        # CRZ_INFO/CRZ_CTRL at 50 Hz, matching stock
   RADAR_STEP = 10      # radar static + track frames at 10 Hz
 
-  FSC_SETTLE_T = 7.0           # the camera's cold-boot radar check settled before the teardown may start
+  FSC_SETTLE_T = 1.0           # two CAM_LANEINFO frames past the camera's boot marker before the teardown may start
   STOCK_RADAR_ALIVE_T = 0.05   # a normal CRZ_INFO gap; it does not establish ownership
   STOCK_RADAR_GUARD_T = 1.27   # silence before ownership is trusted, ~12x the longest stock gap
+  STOCK_RADAR_ACK_GUARD_T = 0.25  # the same once the radar acknowledged our programming request
   CAM_LANEINFO_FRESH_T = 1.5   # longer than one ~2 Hz CAM_LANEINFO period
 
   # The car's lane keep back on, the EPS holds LKAS_BLOCK for ~3 s whatever it is sent.
@@ -70,17 +75,38 @@ class CarControllerParams:
   ACCEL_BREAKAWAY_OVERSHOOT = 0.75  # m/s2 above the plan the still-stopped ramp may climb
 
   # Shape positive commands like stock MRCC: its accelerating command's ceiling by speed, and its
-  # build rate (taken a third quicker once rolling: the plan sees a lead pull away before the radar
+  # build rate (taken quicker once rolling: the plan sees a lead pull away before the radar
   # would). Positive commands only, so braking is never held longer than the plan asks.
   # The ceiling is held under stock's p99 ([1.5, 1.75, 1.45, 1.05, 0.85, 0.65] at [0, 4, 9, 14, 18, 25]
-  # m/s). Up to 1.2 m/s2 from a stop, easing from there: the engaged pull-aways of routes 00000160 and
+  # m/s). It was up to 1.2 m/s2 from a stop, easing from there: the engaged pull-aways of routes 00000160 and
   # 00000163 took 6 to 7.5 s from 6 to 25 mph at 1.1 to 1.4 m/s2 mean, this driver's own took 8 to 23 s
-  # (median 11); this table takes about 9 to 10 s.
-  # From 40 mph up it is held at 0.55: in routes 00000160 and 00000163 every engaged downshift of two gears
-  # (5th to 4th, 4th to 3rd) came at a command of 0.61 or more and every one-gear downshift at 0.54 or less,
-  # and holding 0.55 gives up about 6 mph over 19 engaged minutes.
-  ACCEL_CEILING_BP = [0., 4., 5.5, 7., 9., 11., 13.5, 18., 25.]  # m/s
-  ACCEL_CEILING_V = [1.2, 1.2, 1.1, 1.0, 0.9, 0.8, 0.75, 0.55, 0.55]  # m/s2
+  # (median 11); that table took about 9 to 10 s.
+  # From 20 to 56 mph it follows this driver's own pickups (p90, no car within 40 m, all logs to route 00000022):
+  # 0.93 / 0.86 / 0.82 / 0.76 / 0.71 / 0.56 at 20-25 / 25-30 / 30-35 / 35-40 / 40-49 / 49-56 mph, where the old
+  # 0.85 / 0.78 / 0.70 / 0.60 / 0.55 / 0.55 held the plan back (routes 00000020-00000022: 3rd at 25-45 mph sent 0.62
+  # for a plan of 0.76). Under 20 mph and over 56 mph it was already at or over the driver's. It was held at 0.55
+  # from 40 mph for the transmission (two-gear downshifts at 0.61 or more); the gears' own caps below hold that now,
+  # and 3rd never kicks down (0 of about 200 engaged pushes up to 1.0).
+  # Under 25 mph raised 0.15 (0.1 at 11 m/s) with the 1.2 m/s3 build below: replaying 1082 engaged segments (routes
+  # 00000008-0000019c), the wire sat more than 0.1 under the plan 20% of the pickup time under 27 mph, 12-17% with
+  # this under 20 mph; a hard ask from a stop reaches 35 mph about 0.9 s sooner (simulated). At 20-25 mph that is
+  # 1.1-1.0, over this driver's 0.93: 3rd has no cap there, and over 15 mph none of its engaged pushes of 1.0-1.3 (40)
+  # nor this driver's own of 1.0 or more (193) dropped to 2nd.
+  ACCEL_CEILING_BP = [0., 4., 5.5, 7., 9., 11., 13.5, 15.6, 18., 22., 25.]  # m/s
+  ACCEL_CEILING_V = [1.35, 1.35, 1.25, 1.15, 1.1, 1.0, 0.85, 0.8, 0.75, 0.6, 0.55]  # m/s2
+  # Straight pull-aways from a stop: this driver's own, straight with no car within 40 m, gave 1.38 / 1.37 / 1.21
+  # m/s2 at 0-5 / 5-10 / 10-15 mph (0-10 mph in 3.0 s), op's 0.97 / 1.08 / 1.09 (3.9 s) with the plan asking
+  # 1.6 under the 1.2 ceiling; under 15 mph the car gives about 0.87 of the command (31 routes, 00000184 to
+  # 00000012). From a standstill until LAUNCH_SPEED, a brake request or the wheel past LAUNCH_STEER_MAX, the ceiling
+  # is LAUNCH_CEILING_V, meeting ACCEL_CEILING_V by 9 m/s. Turning pull-aways were already harder than the driver's.
+  # A straight pickup rolling under LAUNCH_ROLL_SPEED starts one too: under 10 mph the plan asked a median 1.40 above
+  # the 1.2 ceiling for 12% of the engaged pickup time, nearly all straight with no car ahead (34 routes, 00000184 to
+  # 00000014); the wire met the plan 68% of the time there, about 78% with this.
+  # Raised 0.15 with ACCEL_CEILING_V, except at a standstill, where stock's own command tops out at 1.5.
+  LAUNCH_CEILING_V = [1.5, 1.65, 1.5, 1.3, 1.1, 1.0, 0.85, 0.8, 0.75, 0.6, 0.55]  # m/s2
+  LAUNCH_SPEED = 9.  # m/s, 20 mph
+  LAUNCH_ROLL_SPEED = 4.47  # m/s, 10 mph
+  LAUNCH_STEER_MAX = 30.  # deg
   # Under the plan the transmission takes 4th at 19-20 mph and about 1600 rpm (this driver's own 3rd to
   # 4th: 23-26 mph, about 2000 rpm). In routes 00000164-00000166 both 4th-to-3rd kickdowns within 3 s of
   # such an upshift came at a command of 0.80, and every upshift held at 0.53-0.61 stayed in 4th. For
@@ -106,31 +132,20 @@ class CarControllerParams:
   # 3rd and back (route 0000018f: 0.69 at 30.2 mph, just over the old 30 mph edge), none of 41 under 0.65.
   FOURTH_GEAR_ACCEL = 0.65  # m/s2
   FOURTH_GEAR_SPEED = 15.6  # m/s, 35 mph
+  # Over FOURTH_GEAR_SPEED in 4th it was stock's ceiling (0.70 falling to 0.55 by 40 mph); it kicks down there at 0.6
+  # (all logs, engaged 4th at 35-50 mph: 1 of 10 pushes at 0.55-0.6 kicked down, 2 of 5 at 0.6-0.7). With the ceiling
+  # now over that, the ceiling there is FOURTH_GEAR_HIGH_ACCEL.
+  FOURTH_GEAR_HIGH_ACCEL = 0.55  # m/s2
+  # With the gear unknown over FOURTH_GEAR_SPEED (never seen, or a read that is not a forward gear) the ceiling is
+  # FIFTH_GEAR_ACCEL, the 0.55 the old ceiling held there for the transmission.
   # In 6th the transmission drops to 5th under a small push and comes back once it eases: in routes 00000160 and
   # 00000163 every engaged 6->5 came from a push of 0.23 or more (60-100% of pushes from 0.20 up) and none of 81
   # under 0.20 did; 20 of the 24 engaged highway hunts were the set-speed or gap boost. This driver's own push in
   # 6th is 0.17 at p90. In 6th the ceiling is SIXTH_GEAR_ACCEL.
   SIXTH_GEAR_ACCEL = 0.2  # m/s2
-  # A plan that asks SIXTH_KICK_ACCEL or more for SIXTH_KICK_FRAMES gets one deliberate downshift, as a driver
-  # flooring it to pass would; it lasts until the plan asks less than SIXTH_KICK_RELEASE or the gear changes.
-  # Back in 6th the cap holds for SIXTH_KICK_COOLDOWN_FRAMES, so a kick can never turn into a hunt. Routes
-  # 00000160 and 00000163: none in 16 min engaged in 6th. It sits above the set-speed floor's highway ceiling (0.5
-  # from 56 mph; the floor alone can reach it below about 52 mph): this driver catches up in 6th under 0.17 at p90 and
-  # almost never kicks down. With the floor at 0.8, a replay of the same 16 min still had no kick.
-  # Raised to 0.7: routes 00000164-00000187 (16 min in 6th) asked it for a full second 5 times (4 armed, one inside
-  # the cooldown), every one the far-lead gap boost (0.39-0.50) and the floor catching up to a lead 50-80 m ahead
-  # while the model asked 0.12-0.42; 4 went 6-5-6 or 6-5-4. No plan held 0.65 for the full second, so a replay at
-  # 0.7 arms none.
-  # Raised to 1.2: routes 00000160-0000018f (2.1 h engaged in 6th) held 0.7 for a full second 7 times, 6 went 6-5-6
-  # or 6-5-4 and back in 1-2 s, every one the gap boost (0.5) and the floor (0.26-0.61) over a model at 0.26-0.49.
-  # The model never asked 0.5 in 6th; boosted plans peaked at 0.96. A kick is now only a real floor-it ask.
-  SIXTH_KICK_ACCEL = 1.2  # m/s2
-  SIXTH_KICK_RELEASE = 0.25  # m/s2
-  SIXTH_KICK_FRAMES = int(1.0 / DT_CTRL)
-  SIXTH_KICK_COOLDOWN_FRAMES = int(15.0 / DT_CTRL)
   # In 5th the transmission drops to 4th and back under a firm push: routes 00000160 and 00000163, all four
   # engaged 5-4-5 hunts (38-60 mph) came from pushes of 0.59-0.75, and pushes up to 0.58 held. In 5th the
-  # ceiling is FIFTH_GEAR_ACCEL, the highway ceiling at any speed.
+  # ceiling is FIFTH_GEAR_ACCEL.
   FIFTH_GEAR_ACCEL = 0.55  # m/s2
   # Under FIFTH_GEAR_LOW_SPEED (under about 1600 rpm in 5th) it kicks down to 4th at much less: routes
   # 00000160-00000180, 14 of 69 engaged pushes there kicked down (under 0.4: 1 of 40, at 0.36; 0.4-0.5: 4 of 15;
@@ -139,8 +154,61 @@ class CarControllerParams:
   # ceiling is FIFTH_GEAR_LOW_ACCEL; the model alone asked more for 4 s of 1612 s engaged in 5th under that speed.
   FIFTH_GEAR_LOW_ACCEL = 0.35  # m/s2
   FIFTH_GEAR_LOW_SPEED = 17.9  # m/s, 40 mph
-  ACCEL_BUILD_BP = [3., 6.]   # m/s
-  ACCEL_BUILD_V = [ACCEL_RELEASE_RAMP, 0.8]  # m/s3
+  # A kickdown, as this driver takes one: when a gear's cap holds the plan back by KICK_MARGIN or more for
+  # KICK_FRAMES while the car is KICK_DEFICIT or more under the set speed, the cap is lifted for one deliberate
+  # downshift. Routes 00000020-00000022: the plan asked 0.45-0.8 against the caps in 28 pickups of 4 s or more (6th 14,
+  # 5th under 40 mph 4), 62->76 mph took 26 s at 6th's 0.2. All logs: this driver's downshifts from 6th gained 4.7 mph
+  # and held 3.9 s, against op's (boost-driven) 1.8 mph and 51% back up in under 3 s.
+  # It arms only where the kick's push is KICK_MARGIN or more over this gear's cap: not from 5th over 40 mph (0.65
+  # against 5th's 0.55; 4th holds no more there), nor from 4th over about 43 mph, where stock's ceiling is under
+  # 4th's cap and the margin. The kick's push, by the gear kicked from, is one the gear below holds, so it drops one gear and pulls there: in
+  # 5th over 40 mph, 9 of 9 pushes at 0.40-0.45 stayed and 7 of 13 at 0.55 dropped to 4th (routes 0000018b t=3180
+  # and 0000018f t=2065: 6-5-4 at 0.55); from 5th, 4th's own cap; from 4th, stock's ceiling. In 6th any push of 0.25
+  # or more drops it to 5th (10 of 14). The push never goes past the plan and the lower gears keep their own caps.
+  # The kick lasts until the car is back up in the gear it kicked from (in a lower gear it only ever lowers the push,
+  # so a 6-5 kick keeps 5th under the push that drops it to 4th); before the downshift starts an ask under
+  # KICK_RELEASE ends it, and any brake request, loss of control or a gear read that is not a forward gear does.
+  # After any upshift into 4th or above no kick for KICK_COOLDOWN_FRAMES, so a kick and the upshift after it cannot
+  # become a hunt. Replay of routes 00000147-00000022 (6.3 h engaged): 71 kicks (6th 61, 5th 9, 4th 1), 24% with the ask
+  # easing within 3 s (this driver's own downshifts from 6th: 32% back up within 3 s); more time or deficit before
+  # the kick cut kicks without changing that share.
+  KICK_MARGIN = 0.15  # m/s2 over the gear's cap
+  # From 6th only an ask of KICK_SIXTH_ASK or more, held for KICK_FRAMES, kicks. Route 00000086 (42-53 mph behind a
+  # lead, set 59): 6 kicks in 5 min (5 from 6th, 1 from 5th) on asks of 0.42-0.68 that eased within a few seconds,
+  # most back up in 4-8 s. Replay of routes 00000043-00000086 (354 engaged min): 63 kicks, about half back up within
+  # 6 s whatever the lead or the ask. This rule removes 38, all from 6th: 33 asked under 0.55 when they fired, 5 did
+  # not hold 0.55 for the full second. They gained a median 4.0 mph in 10 s, about what 6th's own 0.2 gives (4.5).
+  KICK_SIXTH_ASK = 0.55  # m/s2
+  # With no lead shown the ask is KICK_SIXTH_ASK_NO_LEAD. Route 00000089 (55-62 mph, set 66, no lead): the plan asked
+  # 0.43-0.50 for 20 s and 6th's cap gave about 0.15. Replay of routes 00000043-00000089 (6.3 h engaged): 2 more
+  # kicks, both route 00000089, neither easing within 3 s; none added on route 00000086. At 0.40 it was 5 more, 3
+  # easing within 3 s.
+  KICK_SIXTH_ASK_NO_LEAD = 0.45  # m/s2
+  KICK_DEFICIT = 2.2  # m/s, 5 mph under the set speed
+  KICK_SET_SPEED_MAX = 69.  # m/s; over this the set speed is unset (255 km/h)
+  KICK_ACCEL = {6: 0.4, 5: FOURTH_GEAR_ACCEL}  # m/s2 by the gear kicked from; from 4th, the ceiling
+  # A kick from 6th with no lead shown pushes KICK_SIXTH_ACCEL_NO_LEAD: route 00000089's on-ramp kicked 6-5-4 at 45-50
+  # mph and pulled at the 0.4 to 65 mph while the plan asked 0.50-0.58 (45->65 mph in 26 s). All logs, engaged in 4th
+  # over 35 mph: 0 of 17 pushes under 0.55 kicked down to 3rd, 1 of 22 at 0.55-0.60. The gear's own cap still applies
+  # under it (5th under 40 mph 0.35). Behind a lead the kick keeps KICK_ACCEL.
+  KICK_SIXTH_ACCEL_NO_LEAD = 0.5  # m/s2
+  KICK_RELEASE = 0.25  # m/s2
+  KICK_FRAMES = int(1.0 / DT_CTRL)
+  KICK_COOLDOWN_FRAMES = int(15.0 / DT_CTRL)
+  # An ask this far over the gear's cap kicks through the cooldown: route 00000048 t=564 an on-ramp asked ~1.0 in 5th
+  # at 28-33 mph right after the 4-5 upshift and got 0.35 for 9 s until the driver pressed (and took it 5-4-3). Replay
+  # of 128 routes (9.2 h): 8 more kicks, all asking 0.8-1.2, 1 easing within 3 s (30% of all kicks do).
+  KICK_COOLDOWN_BYPASS = 0.4  # m/s2 over the gear's cap
+  # In 6th with no lead shown the cooldown after any upshift into 6th, a kick's return or an ordinary one, is
+  # KICK_SIXTH_COOLDOWN_NO_LEAD_FRAMES. Route 00000089 t=505: a kick 6-4 ended at 55 mph on a short dip in the ask, 11
+  # mph under the set speed, and the 15 s cooldown held 6th's 0.2 to 61 mph; its on-ramp kick (an ordinary 5-6
+  # upshift) came at 46.8 mph instead of 48.9. Replay of routes 00000043-00000089 (6.3 h engaged), 6th only: 3 more kicks (route 00000048 t=623,
+  # 00000089 t=276 and t=509), none easing within 3 s, no three kicks within 60 s; none on route 00000086. For all
+  # gears it added 23, most in 4th in town.
+  KICK_SIXTH_COOLDOWN_NO_LEAD_FRAMES = int(3.0 / DT_CTRL)
+  # 1.2 m/s3 in town with the raised ceiling, our 0.8 from 36 mph.
+  ACCEL_BUILD_BP = [3., 6., 12., 16.]   # m/s
+  ACCEL_BUILD_V = [ACCEL_RELEASE_RAMP, 1.2, 1.2, 0.8]  # m/s3
   # A rolling gas override zeroes the command, and the plan comes back at the car's own acceleration: the build rate
   # alone took 0.6-1.0 s to catch up, the car sagging from +0.63 to +0.11 m/s2 (median of 29 rolling returns, routes
   # 0000016d-00000175). With no lead shown and the car still pulling, the command climbs at HANDOVER_BUILD up to that
@@ -151,8 +219,20 @@ class CarControllerParams:
   HANDOVER_BUILD = 4.0  # m/s3
   HANDOVER_BRAKE = -0.3  # m/s2
   HANDOVER_MAX = 0.6  # m/s2
-  HANDOVER_MIN_SPEED = 3.0  # m/s
+  # Down to HANDOVER_MIN_SPEED: a push off a stop-sign crawl let go at 3-6 mph rebuilt from zero too (route 0000002b,
+  # 238.6 s: the car sagged to 0.0-0.5 m/s2 for ~1 s against a 1.65 plan). The lift-off brake keeps LIFTOFF_MIN_SPEED.
+  HANDOVER_MIN_SPEED = 1.0  # m/s
   HANDOVER_FRAMES = int(1.0 / DT_CTRL)
+  # Back from a rolling gas override, the plan's brake came back at the winddown limit: 5.9 m/s3 median, up to 11.7,
+  # the IMU overshooting the request (8 lift-offs behind a lead, 18-56 mph, gap >= 1.0 s, TTC >= 14.7 s, routes
+  # 00000160-00000199). For LIFTOFF_FRAMES the brake deepens at most at LIFTOFF_BRAKE_RATE: replayed on 15.7 h (335
+  # returns changed, 181 behind a lead, TTC down to 5.2 s) it costs at most 0.21 m and 0.29 mph, and the deepest command
+  # is unchanged. A plan at LIFTOFF_FAST_BRAKE or below (close, closing fast or a braking lead) skips it.
+  LIFTOFF_BRAKE_RATE = -3.0  # m/s3
+  LIFTOFF_FAST_BRAKE = -1.0  # m/s2
+  LIFTOFF_FRAMES = int(1.0 / DT_CTRL)
+  LIFTOFF_MIN_SPEED = 3.0  # m/s
+  LIFTOFF_GAS_FRAMES = int(0.5 / DT_CTRL)  # a return this soon after the gas is released is a lift-off
   # Stock's throttle lift rate, while the plan is still >= 0; a brake request skips it.
   ACCEL_LIFT_LIMIT = -2.0  # m/s3
   # Limit upward plan-command slew in the brake region without delaying braking response.
@@ -237,6 +317,10 @@ class MazdaSafetyFlags(IntFlag):
   # may still send it.
   EPS_HW = 2
   TJA_BUTTON = 8
+  # A Smart CAN Filter keeps the radar online under alpha long (can_filter.py): panda allows its FILTER_CTRL
+  # (0x2A0) and no UDS takeover or synthetic radar frames. Develop carries this in sunnypilot's second
+  # safety word (MAZDA_PARAM_SP_CAN_FILTER 2); StarPilot's panda has one word.
+  CAN_FILTER = 16
 
 
 class WMI(StrEnum):

@@ -3,6 +3,7 @@ import hashlib
 import json
 import lzma
 import os
+from pathlib import Path
 import struct
 import subprocess
 import time
@@ -13,6 +14,42 @@ import requests
 SPARSE_CHUNK_FMT = struct.Struct('H2xI4x')
 
 AGNOS_MANIFEST_FILE = "openpilot/common/hardware/comma/agnos.json"
+
+
+INCOMPATIBLE_C3_ABL = "29fd7ed1c012e599420764840f9f11286d34dbff4adaf102a447f06d8c5e0b35"
+AGNOS_MARKER = Path("/AGNOS")
+DEVICE_MODEL_PATH = Path("/sys/firmware/devicetree/base/model")
+
+
+def check_manifest_compatibility(update: list[dict]) -> None:
+  if not any(p.get('name') == 'abl' and p.get('hash_raw', '').lower() == INCOMPATIBLE_C3_ABL for p in update):
+    return
+  try:
+    model = DEVICE_MODEL_PATH.read_text().rstrip('\0\n')
+  except FileNotFoundError:
+    # Non-device hosts have no device tree.
+    if not AGNOS_MARKER.exists():
+      return
+    raise RuntimeError("Cannot identify hardware for AGNOS firmware update") from None
+  if model == 'comma tici':
+    raise RuntimeError("This AGNOS bootloader is incompatible with comma 3. No firmware write or slot activation was attempted.")
+  if model not in ('comma tizi', 'comma mici'):
+    raise RuntimeError("Cannot identify supported hardware for this AGNOS bootloader")
+
+
+def load_manifest(manifest_path: str) -> list[dict]:
+  path = Path(manifest_path)
+  try:
+    model = DEVICE_MODEL_PATH.read_text().rstrip('\0\n')
+  except FileNotFoundError:
+    model = None
+  c3_path = path.with_name('agnos-c3.json')
+  if model == 'comma tici' and path.name == 'agnos.json' and c3_path.is_file():
+    path = c3_path
+  with path.open() as manifest:
+    update = json.load(manifest)
+  check_manifest_compatibility(update)
+  return update
 
 
 def phone_uplink_active() -> bool:
@@ -174,7 +211,7 @@ def clear_partition_hash(target_slot_number: int, partition: dict) -> None:
     os.sync()
 
 
-def extract_compressed_image(target_slot_number: int, partition: dict, cloudlog):
+def extract_compressed_image(target_slot_number: int, partition: dict, cloudlog, progress=None):
   path = get_partition_path(target_slot_number, partition)
   downloader = StreamingDecompressor(partition['url'])
 
@@ -190,6 +227,8 @@ def extract_compressed_image(target_slot_number: int, partition: dict, cloudlog)
       if p != last_p:
         last_p = p
         print(f"Installing {partition['name']}: {p}", flush=True)
+        if progress is not None:
+          progress(f"Downloading and writing AGNOS {partition['name']}", p)
 
     if raw_hash.hexdigest().lower() != partition['hash_raw'].lower():
       raise Exception(f"Raw hash mismatch '{raw_hash.hexdigest().lower()}'")
@@ -203,7 +242,7 @@ def extract_compressed_image(target_slot_number: int, partition: dict, cloudlog)
     os.sync()
 
 
-def flash_partition(target_slot_number: int, partition: dict, cloudlog, standalone=False):
+def flash_partition(target_slot_number: int, partition: dict, cloudlog, standalone=False, progress=None):
   cloudlog.info(f"Downloading and writing {partition['name']}")
 
   if verify_partition(target_slot_number, partition):
@@ -217,7 +256,7 @@ def flash_partition(target_slot_number: int, partition: dict, cloudlog, standalo
 
   path = get_partition_path(target_slot_number, partition)
 
-  extract_compressed_image(target_slot_number, partition, cloudlog)
+  extract_compressed_image(target_slot_number, partition, cloudlog, progress=progress)
 
   # Write hash after successful flash
   if not full_check:
@@ -227,7 +266,7 @@ def flash_partition(target_slot_number: int, partition: dict, cloudlog, standalo
 
 
 def swap(manifest_path: str, target_slot_number: int, cloudlog) -> None:
-  update = json.load(open(manifest_path))
+  update = load_manifest(manifest_path)
   for partition in update:
     if not partition.get('full_check', False):
       clear_partition_hash(target_slot_number, partition)
@@ -241,8 +280,8 @@ def swap(manifest_path: str, target_slot_number: int, cloudlog) -> None:
       cloudlog.error(f"Swap failed {out}")
 
 
-def flash_agnos_update(manifest_path: str, target_slot_number: int, cloudlog, standalone=False) -> None:
-  update = json.load(open(manifest_path))
+def flash_agnos_update(manifest_path: str, target_slot_number: int, cloudlog, standalone=False, progress=None) -> None:
+  update = load_manifest(manifest_path)
 
   cloudlog.info(f"Target slot {target_slot_number}")
 
@@ -254,7 +293,9 @@ def flash_agnos_update(manifest_path: str, target_slot_number: int, cloudlog, st
 
     for retries in range(10):
       try:
-        flash_partition(target_slot_number, partition, cloudlog, standalone)
+        if progress is not None:
+          progress(f"Downloading and verifying AGNOS {partition['name']}", None)
+        flash_partition(target_slot_number, partition, cloudlog, standalone, progress=progress)
         success = True
         break
 
@@ -271,7 +312,7 @@ def flash_agnos_update(manifest_path: str, target_slot_number: int, cloudlog, st
 
 
 def verify_agnos_update(manifest_path: str, target_slot_number: int) -> bool:
-  update = json.load(open(manifest_path))
+  update = load_manifest(manifest_path)
   return all(verify_partition(target_slot_number, partition) for partition in update)
 
 
@@ -304,3 +345,4 @@ if __name__ == "__main__":
     swap(args.manifest, target_slot_number, logging)
   else:
     flash_agnos_update(args.manifest, target_slot_number, logging, standalone=True)
+

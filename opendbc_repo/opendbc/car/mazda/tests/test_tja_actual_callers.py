@@ -313,7 +313,8 @@ def _exercise_actual_family_callers(identity, monkeypatch, *, scenario='brake', 
           log_lines.append(('race', card.aol_card_intent.allowed_latch, host_state.enabled, sd.aol_authority_lost, axis.lateralActive))
         for i in range(60):
           state, axis, host_state, command = (step(engaged=True, lkas_off=True) if scenario == 'camera_lkas' else step(engaged=True, permanent=True))
-          assert not command.latActive and (scenario == 'camera_lkas' or not safety.aol_get_permission_mask() & 1), (i, log_lines, state.invalidLkasSetting)
+          # the EPS's LKAS_FAULT pauses lateral on the host; the panda leaves permission alone, as on develop
+          assert not command.latActive, (i, log_lines, state.invalidLkasSetting)
           if i in (0, 1, 2, 10, 59):
             log_lines.append(('why', card.aol_card_intent.latch_clear_reason, card.aol_card_intent.latch_clear_count, card.aol_card_intent._fault_inhibit,
                               getattr(card.aol_transport_feedback, 'failed', None), [ (e.name, e.immediateDisable, e.noEntry) for e in card.sm['onroadEvents']]))
@@ -530,8 +531,8 @@ def test_tja_pause_and_resume_actual_callers(scenario, monkeypatch, armed_intent
   _exercise_actual_family_callers(CAR.MAZDA_CX5_2022, monkeypatch, scenario=scenario, armed_intent=armed_intent_decoder)
 
 
-@pytest.mark.xfail(strict=True, reason='known limit: the panda sees the camera fault one sample before card, and the '
-                                        'transport fails the latch (fail-safe: steering off until the next TJA press)')
+# Once a known limit (the panda acted on the camera's ERR_BIT_1 a sample before card and failed the latch);
+# the panda now leaves the camera's error bits alone, as develop does.
 def test_tja_camera_fault_panda_first_actual_callers(monkeypatch, armed_intent_decoder):
   _exercise_actual_family_callers(CAR.MAZDA_CX5_2022, monkeypatch, scenario='camera_race', armed_intent=armed_intent_decoder)
 

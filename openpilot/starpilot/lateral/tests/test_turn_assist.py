@@ -10,6 +10,7 @@ from opendbc.car import structs
 from opendbc.car.car_helpers import interfaces
 from opendbc.car.hyundai.values import CAR
 from opendbc.car.vehicle_model import VehicleModel
+from openpilot.common.params import Params
 from openpilot.common.realtime import DT_CTRL
 from openpilot.selfdrive.controls.lib.latcontrol_torque import LatControlTorque
 from openpilot.starpilot.lateral.torque_extension import selected_policy
@@ -23,6 +24,7 @@ def controller(enabled=False, mode=None, minimum=0.):
   cp.minSteerSpeed = minimum
   lac = LatControlTorque(cp.as_reader(), interfaces[CAR.HYUNDAI_IONIQ_6](cp), DT_CTRL,
                          controller_mode=mode, turn_assist=enabled)
+  lac.turn_assist_maneuver = True
   cs = structs.CarState.new_message()
   cs.gearShifter = structs.CarState.GearShifter.drive
   cs.vEgo = 1.
@@ -85,7 +87,8 @@ def test_startup_saved_exact_on_defaults_and_safe_mode():
   snapshot = VehicleStartupPreferences(toyota_auto_hold=True)
   assert snapshot.toyota_auto_hold and not snapshot.turn_assist
   with tempfile.TemporaryDirectory() as root:
-    source = SimpleNamespace(get_param_path=lambda key: str(Path(root) / key))
+    source = SimpleNamespace(get_param_path=lambda key: str(Path(root) / key),
+                             get_default_value=Params().get_default_value)
     for raw in (None, b'0', b'1', b'', b'true', b'1\n', b'1'*20):
       path = Path(root) / 'TurnAssist'
       path.unlink(missing_ok=True)
@@ -130,7 +133,8 @@ def test_stock_assist_is_independent_of_tune_and_explicit_off():
 
 def test_explicit_off_survives_repeated_startup_reads():
   with tempfile.TemporaryDirectory() as root:
-    source = SimpleNamespace(get_param_path=lambda key: str(Path(root) / key))
+    source = SimpleNamespace(get_param_path=lambda key: str(Path(root) / key),
+                             get_default_value=Params().get_default_value)
     path = Path(root) / 'TurnAssist'
     assert VehicleStartupPreferences.read(source, enabled=True).turn_assist
     assert not path.exists()
@@ -161,6 +165,7 @@ def test_shared_assist_actual_torque_factories(brand, candidate):
   lp = SimpleNamespace(angleOffsetDeg=0., roll=0.)
   on = LatControlTorque(cp.as_reader(), interfaces[car](cp), DT_CTRL, controller_mode=ControllerMode.STANDARD, turn_assist=True)
   off = LatControlTorque(cp.as_reader(), interfaces[car](cp), DT_CTRL, controller_mode=ControllerMode.STANDARD, turn_assist=False)
+  on.turn_assist_maneuver = True
   with patch.object(on.turn_assist, 'apply', wraps=on.turn_assist.apply) as assist:
     output, _, log = on.update(True, cs, vm, lp, False, -.01, False, .1)
   assist.assert_called_once()
@@ -183,6 +188,7 @@ def test_g70_assist_preserves_vehicle_output_cap():
   cs = structs.CarState.new_message()
   cs.vEgo = 1.
   cs.gearShifter = structs.CarState.GearShifter.drive
+  lac.turn_assist_maneuver = True
   with patch.object(lac.turn_assist, 'apply', wraps=lac.turn_assist.apply) as assist:
     output, _, state = lac.update(True, cs, VehicleModel(cp), SimpleNamespace(angleOffsetDeg=0., roll=0.),
                                   False, -.01, False, .1)
@@ -219,6 +225,7 @@ def test_bolt_assist_preserves_custom_output_cap_and_single_saturation():
   lac = LatControlTorque(cp.as_reader(), interfaces[cp.carFingerprint](cp), DT_CTRL, turn_assist=True)
   cs = structs.CarState.new_message()
   cs.gearShifter, cs.vEgo = 'low', 1.
+  lac.turn_assist_maneuver = True
   with patch.object(lac.turn_assist, 'apply', return_value=lac.steer_max) as assist:
     output, _, state = lac.update(True, cs, VehicleModel(cp), SimpleNamespace(angleOffsetDeg=0., roll=0.),
                                   False, -.01, False, .1)
@@ -226,3 +233,17 @@ def test_bolt_assist_preserves_custom_output_cap_and_single_saturation():
   limit = get_bolt_2022_2023_low_speed_center_output_limit(state.desiredLateralAccel, cs.vEgo)
   assert limit < lac.steer_max and abs(output) <= limit
   assert lac.sat_time == 0.
+
+
+def test_enabled_controller_locked_matches_no_assist():
+  cp, locked, cs = controller(True)
+  _, disabled, _ = controller(False)
+  locked.turn_assist_maneuver = False
+  vm = VehicleModel(cp)
+  lp = SimpleNamespace(angleOffsetDeg=0., roll=0.)
+  saturated = False
+  with patch.object(policy, 'get_ioniq_6_low_speed_angle_assist_torque', wraps=policy.get_ioniq_6_low_speed_angle_assist_torque) as helper:
+    locked_output, _, _ = locked.update(True, cs, vm, lp, saturated, -.025, False, .1)
+    normal_output, _, _ = disabled.update(True, cs, vm, lp, saturated, -.025, False, .1)
+    helper.assert_not_called()
+  assert locked_output == normal_output

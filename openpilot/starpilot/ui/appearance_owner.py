@@ -2,8 +2,12 @@
 
 from collections.abc import Callable
 from dataclasses import replace
+import json
+import math
 
 from openpilot.starpilot.saved_document import commit_exact
+from openpilot.starpilot.saved_source import read_saved
+from openpilot.starpilot.ui.onroad_customization import MAX_BYTES, PARAM_KEY, decode_document, default_document
 from openpilot.starpilot.ui.appearance_preferences import (CAMERA_LABELS, DEFAULTS, LEAD_INFO_LABELS, MAX_RAW_BYTES,
                                                           RETIRED_DISPLAY_KEYS, read_camera_view, read_lead_info, read_visibility)
 from openpilot.starpilot.ui.feature_settings_state import FeatureRow, FeatureSettingsRequest, FeatureSettingsState
@@ -84,11 +88,74 @@ class AppearanceOwner:
                 for key, value in DEFAULTS.items()}
     defaults.update(CameraView='Standard', LeadInfo='Off')
     rows = tuple(replace(row, default_value=defaults[row.key]) if row.key in defaults else row for row in rows)
+    raw, document = self._motion_source()
+    # Galaxy edits this same switch in its per-screen widget editor.
+    if not include_large:
+      rows += (FeatureRow(f"TurnByTurn:{profile}", "Turn-by-turn",
+                          ("On" if document["layouts"][str(profile)]["nav_card"]["enabled"] else "Off") if document is not None else "Unavailable",
+                          source=raw, choices=("Off", "On"), available=parked and document is not None, default_value="On",
+                          reason="On the comma screen only; StarPort has its own layout" if document is not None else
+                                 "Repair the saved layout in Colors & Layout"),)
+    if profile == Profile.LARGE:
+      rows += (FeatureRow('ReduceMotion', 'Reduce Quick Select motion',
+                          ('On' if document.get('reduceMotion') else 'Off') if document is not None else 'Unavailable', source=raw,
+                          choices=('Off', 'On'), available=parked and document is not None, default_value='Off',
+                          reason='Show Quick Select without transitions' if document is not None else 'Repair the saved layout in Colors & Layout'),)
     return FeatureSettingsState(page="appearance", title="Onroad HUD" if profile == Profile.LARGE else "Visuals",
                                 subtitle="Display preferences; border highlights apply to C4 only.",
                                 rows=tuple(rows), parked=parked)
 
+  def developer_snapshot(self) -> FeatureSettingsState:
+    raw, document = self._motion_source()
+    valid = document is not None
+    value = f"{document.get('speedDisplayOffset', 0):g}" if document is not None else "Unavailable"
+    row = FeatureRow("SpeedDisplayOffset", "Speed display adjustment", value, source=raw,
+                     step=0.1, minimum=-5., maximum=5., unit="%", default_value="0",
+                     available=self.parked() and valid,
+                     reason=("0% leaves the display unchanged. Lower if the comma reads too high; raise if it reads too low. " +
+                             "Only changes displayed vehicle speed, not cruise speed or vehicle control.") if valid else
+                            "Repair the saved driving-screen layout first.")
+    return FeatureSettingsState("developer", "Developer", "Advanced display calibration for every vehicle.",
+                                (row,), self.parked())
+
   def apply(self, request: FeatureSettingsRequest) -> bool:
+    if request.key == "SpeedDisplayOffset":
+      raw, document = self._motion_source()
+      if document is None or request.expected != raw or type(request.value) is not str:
+        return False
+      try:
+        value = float(request.value)
+      except ValueError:
+        return False
+      if not math.isfinite(value) or not -5 <= value <= 5:
+        return False
+      value = round(value, 1)
+      if value:
+        document['speedDisplayOffset'] = value
+      else:
+        document.pop('speedDisplayOffset', None)
+      result = commit_exact(self.params, key=PARAM_KEY, max_bytes=MAX_BYTES,
+                            raw=json.dumps(document, separators=(',', ':')).encode(), expected=raw,
+                            authorized=self.parked, temp_prefix='.appearance-')
+      return result.committed and result.verified
+    if request.key in ('TurnByTurn:large', 'TurnByTurn:compact'):
+      raw, document = self._motion_source()
+      if document is None or request.expected != raw or request.value not in ('Off', 'On'):
+        return False
+      document['layouts'][request.key.split(':')[1]]['nav_card']['enabled'] = request.value == 'On'
+      result = commit_exact(self.params, key=PARAM_KEY, max_bytes=MAX_BYTES,
+                            raw=json.dumps(document, separators=(',', ':')).encode(), expected=raw,
+                            authorized=self.parked, temp_prefix='.appearance-')
+      return result.committed and result.verified
+    if request.key == 'ReduceMotion':
+      raw, document = self._motion_source()
+      if document is None or request.expected != raw or request.value not in ('Off', 'On'):
+        return False
+      document['reduceMotion'] = request.value == 'On'
+      result = commit_exact(self.params, key=PARAM_KEY, max_bytes=MAX_BYTES,
+                            raw=json.dumps(document, separators=(',', ':')).encode(), expected=raw,
+                            authorized=self.parked, temp_prefix='.appearance-')
+      return result.committed and result.verified
     if request.key == "ShowBrakeStatus":
       return self._save_wheel_feedback(request)
     if request.key == "LeadInfo":
@@ -105,6 +172,15 @@ class AppearanceOwner:
     result = commit_exact(self.params, key=request.key, max_bytes=max_bytes, raw=raw, expected=request.expected,
                           authorized=self.parked, temp_prefix=".appearance-")
     return result.committed and result.verified
+
+  def _motion_source(self):
+    raw, readable = read_saved(self.params, PARAM_KEY, MAX_BYTES)
+    if not readable:
+      return raw, None
+    try:
+      return raw, default_document() if raw is None else decode_document(raw)
+    except (ValueError, TypeError, UnicodeError, RecursionError):
+      return raw, None
 
   def _save_wheel_feedback(self, request: FeatureSettingsRequest) -> bool:
     saved = {key: read_visibility(self.params, key) for key in ("ShowBrakeStatus", "PedalsOnUI")}

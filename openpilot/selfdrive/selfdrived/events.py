@@ -434,6 +434,7 @@ EVENTS: dict[int, dict[str, Alert | AlertCallbackType]] = {
 
   EventName.selfdriveInitializing: {
     ET.NO_ENTRY: NoEntryAlert("System Initializing"),
+    ET.PERMANENT: NormalPermanentAlert("System Initializing"),
   },
 
   EventName.startup: {
@@ -766,89 +767,6 @@ EVENTS: dict[int, dict[str, Alert | AlertCallbackType]] = {
 
   EventName.carNotReady: {
     ET.NO_ENTRY: NoEntryAlert("Car Not Ready"),
-  },
-
-  # Mazda alpha long: a SET/RES press the car will not engage on while openpilot does not own the
-  # radar or it is being returned. PERMANENT so it reaches a driver with nothing engaged; it grants
-  # and blocks nothing (the press itself does nothing on the car).
-  EventName.stockEcuNotReady: {
-    ET.PERMANENT: stock_ecu_not_ready_alert,
-  },
-
-  # The factory radar was not returned, this drive or at the stop that ended the last one: AEB is off
-  # and stock cruise is blocked until the car is restarted. Display evidence only.
-  EventName.stockEcuFailed: {
-    ET.PERMANENT: Alert("Stock Cruise Failed", "Restart the car", AlertStatus.normal, AlertSize.mid,
-                        Priority.LOW, VisualAlert.none, AudibleAlert.prompt, .2),
-  },
-
-  # Mazda, as develop (events_zp.py). PERMANENT only: a NO_ENTRY here would also withdraw AOL's longitudinal axis
-  # (aol_no_entry). Stopped with the takeover still starting.
-  EventName.stockEcuInitializing: {
-    ET.PERMANENT: NormalPermanentAlert("Stay still", "AEB turning off", priority=Priority.MID),
-  },
-
-  # The takeover's end: a chime, replacing whatever the stop left up.
-  EventName.stockEcuReady: {
-    ET.PERMANENT: Alert("AEB off", "SET+ for alpha long", AlertStatus.normal, AlertSize.mid,
-                        Priority.MID, VisualAlert.none, AudibleAlert.prompt, 2.),
-  },
-
-  # The stock ECU's own functions (Mazda AEB) counted as back.
-  EventName.stockEcuHandedBack: {
-    ET.PERMANENT: Alert("AEB on", "radar back to car", AlertStatus.normal, AlertSize.mid,
-                        Priority.LOW, VisualAlert.none, AudibleAlert.prompt, 3.),
-  },
-
-  # RES registered as a request for alpha long; the radar is taken at the next 2 s stop.
-  EventName.alphaLongNextStop: {
-    ET.PERMANENT: Alert("Alpha long", "next stop, 2 s", AlertStatus.normal, AlertSize.mid,
-                        Priority.LOW, VisualAlert.none, AudibleAlert.prompt, 3.),
-  },
-
-  # The camera's fault (CAM_LKAS ERR_BIT_1) under the TJA button: lateral paused, cruise kept, resumed 1 s after it clears.
-  EventName.cameraLkasFault: {
-    ET.PERMANENT: NormalPermanentAlert("Steering Paused", "Camera blocked", priority=Priority.LOW),
-  },
-
-  # The fault's first frame while TJA steering is on: as loud as a soft disable, but cruise has not let go.
-  EventName.cameraLkasFaultOnset: {
-    ET.PERMANENT: Alert("Steering Paused: Steer Now", "Camera blocked", AlertStatus.userPrompt, AlertSize.mid,
-                        Priority.MID, VisualAlert.steerRequired, AudibleAlert.warningSoft, 3.),
-  },
-
-  EventName.cameraLkasResumed: {
-    ET.PERMANENT: Alert("Steering Resumed", "", AlertStatus.normal, AlertSize.small,
-                        Priority.LOW, VisualAlert.none, AudibleAlert.engage, 2.),
-  },
-
-  # The car's own lane keep switched off: steering paused, cruise unaffected.
-  EventName.stockLkasOff: {
-    ET.PERMANENT: NormalPermanentAlert("Lateral Disabled", "LKAS is off", priority=Priority.LOW),
-  },
-
-  # A TJA press while the camera's fault holds lateral off (develop's cameraLkasFault NO_ENTRY).
-  EventName.cameraLkasFaultPress: {
-    ET.PERMANENT: Alert("Lateral Disabled", "Camera blocked", AlertStatus.normal, AlertSize.mid,
-                        Priority.LOW, VisualAlert.none, AudibleAlert.refuse, 3.),
-  },
-
-  # A TJA press while the car's lane keep is off.
-  EventName.stockLkasOffPress: {
-    ET.PERMANENT: Alert("Lateral Disabled", "LKAS is off", AlertStatus.normal, AlertSize.mid,
-                        Priority.LOW, VisualAlert.none, AudibleAlert.refuse, 3.),
-  },
-
-  # TJA off under engaged cruise. AOL's own transition plays the disengage chime.
-  EventName.manualSteeringRequired: {
-    ET.PERMANENT: Alert("Automatic Lane Centering is OFF", "Manual Steering Required", AlertStatus.normal, AlertSize.mid,
-                        Priority.LOW, VisualAlert.none, AudibleAlert.none, 1.),
-  },
-
-  # Cancel ended cruise while TJA steering stays on.
-  EventName.manualLongitudinalRequired: {
-    ET.PERMANENT: Alert("Smart/Adaptive Cruise Control: OFF", "Manual Speed Control Required", AlertStatus.normal,
-                        AlertSize.mid, Priority.LOW, VisualAlert.none, AudibleAlert.none, 1.),
   },
 
   EventName.wrongCruiseMode: {
@@ -1207,3 +1125,149 @@ if __name__ == '__main__':
     for p, alert_list in evs:
       print(f"  {repr(p)}:")
       print("   ", ', '.join(alert_list), "\n")
+
+
+# Mazda port alerts. StarPilot pins log.capnp (tools/ci/schema_policy.py: no new EventName values), so these
+# display-only ET.PERMANENT alerts live outside the enum and are raised inside selfdrived only, presented
+# like the Tesla stock alerts. Same text, sounds and durations as develop.
+MAZDA_EVENTS: dict[str, dict[str, Alert | AlertCallbackType]] = {
+  # Mazda alpha long: a SET/RES press the car will not engage on while openpilot does not own the
+  # radar or it is being returned. PERMANENT so it reaches a driver with nothing engaged; it grants
+  # and blocks nothing (the press itself does nothing on the car).
+  "stockEcuNotReady": {
+    ET.PERMANENT: stock_ecu_not_ready_alert,
+  },
+
+  # The factory radar was not returned, this drive or at the stop that ended the last one: AEB is off
+  # and stock cruise is blocked until the car is restarted. Display evidence only.
+  "stockEcuFailed": {
+    ET.PERMANENT: Alert("Stock Cruise Failed", "Restart the car", AlertStatus.normal, AlertSize.mid,
+                        Priority.LOW, VisualAlert.none, AudibleAlert.prompt, .2),
+  },
+
+  # Mazda, as develop (events_zp.py). PERMANENT only: a NO_ENTRY here would also withdraw AOL's longitudinal axis
+  # (aol_no_entry). Stopped with the takeover still starting.
+  "stockEcuInitializing": {
+    ET.PERMANENT: NormalPermanentAlert("Stay still", "AEB turning off", priority=Priority.MID),
+  },
+
+  # The takeover's end: a chime, replacing whatever the stop left up.
+  "stockEcuReady": {
+    ET.PERMANENT: Alert("AEB off", "SET+ for alpha long", AlertStatus.normal, AlertSize.mid,
+                        Priority.MID, VisualAlert.none, AudibleAlert.prompt, 2.),
+  },
+
+  # The stock ECU's own functions (Mazda AEB) counted as back.
+  "stockEcuHandedBack": {
+    ET.PERMANENT: Alert("AEB on", "radar back to car", AlertStatus.normal, AlertSize.mid,
+                        Priority.LOW, VisualAlert.none, AudibleAlert.prompt, 3.),
+  },
+
+  # RES registered as a request for alpha long; the radar is taken at the next 2 s stop.
+  "alphaLongNextStop": {
+    ET.PERMANENT: Alert("Alpha long", "next stop, 2 s", AlertStatus.normal, AlertSize.mid,
+                        Priority.LOW, VisualAlert.none, AudibleAlert.prompt, 3.),
+  },
+
+  # The camera's fault (CAM_LKAS ERR_BIT_1) under the TJA button: lateral paused, cruise kept, resumed 1 s after it clears.
+  "cameraLkasFault": {
+    ET.PERMANENT: NormalPermanentAlert("Steering Paused", "Camera blocked", priority=Priority.LOW),
+  },
+
+  # The fault's first frame while TJA steering is on: as loud as a soft disable, but cruise has not let go.
+  "cameraLkasFaultOnset": {
+    ET.PERMANENT: Alert("Steering Paused: Steer Now", "Camera blocked", AlertStatus.userPrompt, AlertSize.mid,
+                        Priority.MID, VisualAlert.steerRequired, AudibleAlert.warningSoft, 3.),
+  },
+
+  "cameraLkasResumed": {
+    ET.PERMANENT: Alert("Steering Resumed", "", AlertStatus.normal, AlertSize.small,
+                        Priority.LOW, VisualAlert.none, AudibleAlert.engage, 2.),
+  },
+
+  # The car's own lane keep switched off: steering paused, cruise unaffected.
+  "stockLkasOff": {
+    ET.PERMANENT: NormalPermanentAlert("Lateral Disabled", "LKAS is off", priority=Priority.LOW),
+  },
+
+  # A TJA press while the camera's fault holds lateral off (develop's cameraLkasFault NO_ENTRY).
+  "cameraLkasFaultPress": {
+    ET.PERMANENT: Alert("Lateral Disabled", "Camera blocked", AlertStatus.normal, AlertSize.mid,
+                        Priority.LOW, VisualAlert.none, AudibleAlert.refuse, 3.),
+  },
+
+  # A TJA press while the car's lane keep is off.
+  "stockLkasOffPress": {
+    ET.PERMANENT: Alert("Lateral Disabled", "LKAS is off", AlertStatus.normal, AlertSize.mid,
+                        Priority.LOW, VisualAlert.none, AudibleAlert.refuse, 3.),
+  },
+
+  # TJA off under engaged cruise. AOL's own transition plays the disengage chime.
+  "manualSteeringRequired": {
+    ET.PERMANENT: Alert("Automatic Lane Centering is OFF", "Manual Steering Required", AlertStatus.normal, AlertSize.mid,
+                        Priority.LOW, VisualAlert.none, AudibleAlert.none, 1.),
+  },
+
+  # Cancel ended cruise while TJA steering stays on.
+  # Mazda's Smart CAN Filter (develop events_zp.py): the camera's own TJA stayed on through openpilot's camera-only
+  # press-offs while openpilot steers (opendbc mads.update_camera_tja). openpilot keeps steering and the panda keeps
+  # the camera's steering blocked; it clears when the camera's TJA goes off or openpilot stops steering.
+  "cameraTjaStuck": {
+    ET.PERMANENT: Alert("Camera Lane Keep Still On", "openpilot is steering", AlertStatus.userPrompt, AlertSize.mid,
+                        Priority.MID, VisualAlert.none, AudibleAlert.prompt, .2),
+  },
+
+  # Behind the filter the board stopped confirming openpilot's cruise while engaged: the car's cruise let go of gas
+  # and brake with no fault (AOL keeps steering). As loud as an immediate disable, for 3 s.
+  "stockEcuLost": {
+    ET.PERMANENT: Alert("Cruise Lost", "CAN filter dropped", AlertStatus.critical, AlertSize.mid,
+                        Priority.HIGH, VisualAlert.none, AudibleAlert.warningImmediate, 3.),
+  },
+
+  # The same loss while not engaged, or a board that never confirmed (10 s): alpha long is off for the drive.
+  "stockEcuLostIdle": {
+    ET.PERMANENT: Alert("Stock Cruise", "CAN filter lost", AlertStatus.normal, AlertSize.mid,
+                        Priority.LOW, VisualAlert.none, AudibleAlert.prompt, 5.),
+  },
+
+  # Behind the filter the radar's tracks stopped: openpilot keeps driving on the camera's leads, and says so once.
+  # PERMANENT so it reaches a driver who is not engaged yet; in place of radarTempUnavailable.
+  "radarLostCameraOnly": {
+    ET.PERMANENT: Alert("Radar lost", "camera only", AlertStatus.userPrompt, AlertSize.mid,
+                        Priority.LOW, VisualAlert.none, AudibleAlert.prompt, .2),
+  },
+
+  "manualLongitudinalRequired": {
+    ET.PERMANENT: Alert("Smart/Adaptive Cruise Control: OFF", "Manual Speed Control Required", AlertStatus.normal,
+                        AlertSize.mid, Priority.LOW, VisualAlert.none, AudibleAlert.none, 1.),
+  },
+}
+
+
+class MazdaEvents:
+  def __init__(self):
+    self.names: list[str] = []
+
+  def __contains__(self, name: str) -> bool:
+    return name in self.names
+
+  def add(self, name: str) -> None:
+    assert name in MAZDA_EVENTS, name
+    if name not in self.names:
+      self.names.append(name)
+
+  def clear(self) -> None:
+    self.names = []
+
+  def create_alerts(self, event_types: list[str], callback_args=None) -> list[Alert]:
+    ret = []
+    for name in self.names:
+      for et, alert in MAZDA_EVENTS[name].items():
+        if et in event_types:
+          if not isinstance(alert, Alert):
+            alert = alert(*(callback_args or []))
+          alert.alert_type = f"{name}/{et}"
+          alert.event_type = et
+          ret.append(alert)
+    return ret
+

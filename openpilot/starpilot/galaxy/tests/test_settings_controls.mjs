@@ -39,6 +39,33 @@ function control(row = numeric) {
   return { vm, commits, event }
 }
 
+for (const [label, choices, fresh, initial] of [
+  ['Selected Acceleration Profile', ['StarPilot Default', 'Normal', 'Comfort', 'Sport', 'Sport+'], 'StarPilot Default', 'StarPilot Default'],
+  ['Selected Deceleration Profile', ['StarPilot Default', 'Normal', 'Comfort', 'Sport'], 'Comfort', 'Comfort'],
+]) {
+  for (const saved of new Set([fresh, ...choices])) {
+    const row = { label, choices, value: saved, defaultValue: initial, displayScale: 'selected-profile', available: true, action: true }
+    const { vm, commits } = control(row)
+    const expected = saved === 'StarPilot Default' ? 'Normal' : saved
+    assert.equal(vm.control, 'select')
+    assert.equal(vm.currentValue, expected)
+    assert.deepEqual(vm.presentedRow.choices, choices.slice(1))
+    assert.equal(new Set(vm.presentedRow.choices).size, vm.presentedRow.choices.length)
+    assert.equal(vm.showDefault, saved !== initial, 'reset retains the actual saved/default distinction')
+    await vm.commit(expected)
+    assert.deepEqual(commits, [], 'viewing/reselecting a legacy default never writes a profile')
+    assert.equal(row.value, saved)
+    await vm.commit('Sport')
+    assert.deepEqual(commits, expected === 'Sport' ? [] : [[7, 'Sport']])
+    vm.row = { ...row, value: 'Sport' }
+    assert.equal(vm.currentValue, 'Sport', 'saved readback stays selected')
+    assert.equal(control(vm.row).vm.currentValue, 'Sport', 'reopening retains the saved choice')
+  }
+}
+assert.ok(GalaxySettingRow.template.includes('choice in presentedRow.choices'))
+assert.deepEqual(control({ choices: ['StarPilot Default', 'Custom'], value: 'StarPilot Default' }).vm.presentedRow.choices,
+  ['StarPilot Default', 'Custom'], 'personality presets and unrelated selectors are unchanged')
+
 // Drag previews remain local. Fine mode uses the held value and one fifth of normal travel.
 const fine = control()
 fine.vm.onSliderPointerDown(fine.event())
@@ -194,17 +221,85 @@ for (const id of ["wheel", "sounds"]) {
 }
 
 const deviceData = SETTINGS_SECTIONS.find((item) => item.id === "device")
-assert.deepEqual(deviceData.pages, ["display", "data"])
+assert.deepEqual(deviceData.pages, ["power", "data", "starport_options", "browser_preferences", "localization"])
 assert.equal(SettingsPage.computed.atSectionRoot.call({ activeSection: deviceData,
   state: { data: { page: "hub" } } }), true)
 assert.equal(SettingsPage.computed.atSectionRoot.call({ activeSection: deviceData,
-  state: { data: { page: "display" } } }), false)
+  state: { data: { page: "power" } } }), false)
 
 const dataLinks = SettingsPage.computed.visibleRows.call({ initialPage: "hub", activeSection: deviceData,
   state: { query: "", data: { page: "hub", rows: [] } } })
-assert.deepEqual(dataLinks.map(({ row }) => row.page), ["display", "data"])
+assert.deepEqual(dataLinks.map(({ row }) => row.page), ["power", "data", "starport_options", "browser_preferences", "localization"])
+assert.equal(dataLinks[1].row.label, "Data & Connections")
+const coolingLinks = SettingsPage.computed.visibleRows.call({ initialPage: "hub", activeSection: deviceData,
+  state: { query: "", data: { page: "hub", rows: [], coolingAvailable: true } } })
+assert.deepEqual(coolingLinks.map(({ row }) => row.page), ["power", "data", "starport_options", "browser_preferences", "localization"])
+assert.equal(coolingLinks[1].row.label, "Data & Connections")
+assert.equal(dataLinks[0].row.label, "Power & Cooling")
+assert.equal(coolingLinks[0].row.label, "Power & Cooling")
 
 assert.equal(SettingsPage.computed.atSectionRoot.call({initialPage:'hub',state:{data:null,parents:[]}}),true,
   'section tabs stay mounted while loading a new section')
 assert.equal(SettingsPage.computed.atSectionRoot.call({initialPage:'hub',activeSection:lateral,state:{data:null,parents:['hub']}}),false,
   'nested page loading does not become a section root')
+
+const longitudinal = SETTINGS_SECTIONS.find(section => section.id === "longitudinal")
+const personalityRows = ["aggressive", "standard", "relaxed", "traffic"].map(page => ({page, label: page}))
+const longRoot = SettingsPage.computed.visibleRows.call({initialPage: "hub", activeSection: longitudinal,
+  state: {query: "", data: {page: "hub", rows: [
+    {page: "profiles", label: "Long Planner"}, {page: "personalities", label: "Driving Personalities"},
+  ]}}})
+assert.deepEqual(longRoot.map(({row}) => row.page), ["profiles", "personalities"])
+assert.deepEqual(SettingsPage.computed.visibleRows.call({initialPage: "hub", activeSection: longitudinal,
+  state: {query: "", data: {page: "personalities", rows: personalityRows}}}).map(({row}) => row.page),
+  ["aggressive", "standard", "relaxed", "traffic"])
+assert.equal(SettingsPage.computed.activeSection.call({sections: SETTINGS_SECTIONS,
+  state: {data: {page: "personalities"}}}).id, "longitudinal")
+
+assert.ok(SETTINGS_SECTIONS.find(section => section.id === "device").pages.includes("power"))
+for (const row of [{ value: "30", minimum: 1, maximum: 30, step: 1, unit: "h" },
+                   { value: "11.8", minimum: 11.8, maximum: 12.5, step: .1, unit: "V" }]) {
+  assert.equal(settingControl(row), "slider")
+}
+
+// A section heading (for example "StarPort" on the Developer page) is a label only: no control, no readout, no default button.
+{
+  const heading = { label: "StarPort", value: "", heading: true, available: false, choices: [], key: "heading:starport" }
+  assert.equal(settingControl(heading), "readout")
+  const template = GalaxySettingRow.template
+  assert.match(template, /'gx-row--heading': row\.heading/)
+  assert.match(template, /v-else-if="!row\.heading" class="gx-row__value gx-row__readout"/)
+  assert.match(template, /showDefault && !row\.heading/)
+  assert.match(template, /presentedRow\.reason && !row\.heading/)
+}
+console.log("Settings controls: section headings render as labels only")
+
+
+const previewVolume = control({ ...numeric, previewSound: "EngageVolume" })
+let finishPreview
+const playedKeys = []
+previewVolume.vm.testAlert = key => { playedKeys.push(key); return new Promise(resolve => { finishPreview = resolve }) }
+const playing = previewVolume.vm.previewSound()
+assert.equal(previewVolume.vm.testingSound, true)
+assert.deepEqual(playedKeys, ["EngageVolume"])
+await previewVolume.vm.previewSound()
+assert.equal(playedKeys.length, 1)
+finishPreview()
+await playing
+assert.equal(previewVolume.vm.testingSound, false)
+assert.deepEqual(previewVolume.commits, [])
+previewVolume.vm.testAlert = async () => { throw new Error("Keep the comma offroad") }
+await previewVolume.vm.previewSound()
+assert.equal(previewVolume.vm.soundError, "Keep the comma offroad")
+assert.equal(previewVolume.vm.testingSound, false)
+previewVolume.vm.disabled = true
+previewVolume.vm.testAlert = () => { throw new Error("disabled preview must not run") }
+await previewVolume.vm.previewSound()
+assert.equal(previewVolume.vm.soundError, "Keep the comma offroad")
+
+const visualSection = SETTINGS_SECTIONS.find(section => section.id === "visual")
+assert(visualSection.pages.includes("display"))
+assert(!deviceData.pages.includes("display"))
+const visualLinks = SettingsPage.computed.visibleRows.call({ initialPage: "hub", activeSection: visualSection,
+  state: { query: "", data: { page: "hub", rows: [] } } })
+assert.equal(visualLinks.find(({row}) => row.page === "display").row.label, "Display")

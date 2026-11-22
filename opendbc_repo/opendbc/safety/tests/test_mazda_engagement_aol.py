@@ -89,8 +89,10 @@ class TestMazdaEngagementAol(unittest.TestCase):
           self.assertEqual(self.safety.aol_get_permission_mask(), 0)
           self.safety.set_aol_test_heartbeat(True)
         elif fault == 'permanent':
+          # the camera's ERR_BIT_1 alone is sun glare, not a fault: the grant stands, as on develop
           self.frame(active=True, permanent=True)
-          self.assertEqual(self.safety.aol_get_permission_mask(), 0)
+          self.assertEqual(self.safety.aol_get_permission_mask(), 1)
+          continue
         else:
           for _ in range(40):
             self.frame(active=True, omit='CAM_LKAS')

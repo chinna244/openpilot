@@ -8,7 +8,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 import numpy as np
-import pyray as rl
+from openpilot.starpilot.ui.raylib import rl
 
 from openpilot.common.params import Params
 from openpilot.selfdrive.ui.mici.onroad import model_renderer as native
@@ -71,7 +71,7 @@ class LeadInfoTests(unittest.TestCase):
     def initialize_defaults():
       with patch.object(manager, "Params", return_value=self.params), \
            patch.object(manager, "prepare_manager_start"), patch.object(manager, "starpilot_storage_root", return_value=self.storage), \
-           patch.object(manager, "save_bootlog"), \
+           patch.object(manager, "save_bootlog"), patch.object(manager, "clear_bookmark_checkpoint"), \
            patch.object(manager, "get_build_metadata", return_value=NS(release_channel=False)), \
            patch.object(manager.Paths, "shm_path", side_effect=AfterDefaults):
         with self.assertRaises(AfterDefaults):

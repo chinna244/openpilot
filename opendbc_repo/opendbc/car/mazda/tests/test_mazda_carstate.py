@@ -43,6 +43,8 @@ CAM_LANEINFO_PERIOD_FRAMES = int(0.563 / DT_CTRL)
 
 SETTLE_T = CarControllerParams.FSC_SETTLE_T
 GUARD_T = CarControllerParams.STOCK_RADAR_GUARD_T
+ACK_GUARD_T = CarControllerParams.STOCK_RADAR_ACK_GUARD_T
+PROGRAMMING_ACK = bytes.fromhex("065002001901f400")  # route 00000025 t+10.538
 
 
 def t_ns(i):
@@ -73,7 +75,7 @@ def test_carstate_runs_with_real_parsers(alpha_long):
 
 
 class TestFscSettleGate:
-  """The gate that defers the radar teardown past the FSC's cold-boot radar-presence check.
+  """The gate that holds the radar teardown until the camera (FSC) has booted.
 
   It must hold while the camera is booting or faulted, and must not be vetoed indefinitely
   by a bit that carries no boot information.
@@ -266,6 +268,40 @@ class TestTwoMasterGuard:
     ret, n = feed_guard(CI, 0.2, radar_alive=False, start_frame=n)
     assert CI.CS.radar_owned
     assert CI.CS.stock_radar_gone
+
+  def ack(self, CI, n, requested=True):
+    # the radar's positive reply to our programming request, on a healthy bus
+    CI.CC.radar_session.programming_sent = requested
+    pk = packer()
+    feed(CI, n, pk.make_can_msg("PEDALS", 0, {"ACC_OFF": 1}), pk.make_can_msg("ENGINE_DATA", 0, {"SPEED": 0}),
+         (RADAR_UDS_RESP, PROGRAMMING_ACK, 0))
+    return n + 1
+
+  def test_an_acknowledged_request_shortens_the_guard(self):
+    CI = car_interface()
+    ret, n = feed_guard(CI, 5.0, radar_alive=True)
+    n = self.ack(CI, n)
+    ret, n = feed_guard(CI, ACK_GUARD_T - 0.05, radar_alive=False, start_frame=n)
+    assert not CI.CS.radar_owned
+    ret, n = feed_guard(CI, 0.1, radar_alive=False, start_frame=n)
+    assert CI.CS.radar_owned
+
+  def test_stock_traffic_after_the_ack_needs_the_whole_guard(self):
+    CI = car_interface()
+    ret, n = feed_guard(CI, 5.0, radar_alive=True)
+    n = self.ack(CI, n)
+    ret, n = feed_guard(CI, 0.1, radar_alive=True, start_frame=n)
+    ret, n = feed_guard(CI, ACK_GUARD_T + 0.1, radar_alive=False, start_frame=n)
+    assert not CI.CS.radar_owned
+    ret, n = feed_guard(CI, GUARD_T, radar_alive=False, start_frame=n)
+    assert CI.CS.radar_owned
+
+  def test_an_ack_without_our_request_counts_for_nothing(self):
+    CI = car_interface()
+    ret, n = feed_guard(CI, 5.0, radar_alive=True)
+    n = self.ack(CI, n, requested=False)
+    ret, n = feed_guard(CI, ACK_GUARD_T + 0.1, radar_alive=False, start_frame=n)
+    assert not CI.CS.radar_owned
 
   def test_radar_return_after_teardown_is_a_fault(self):
     CI = car_interface()
@@ -525,11 +561,11 @@ class UndeliveredRig:
     self.packer = packer()
     self.frame = 0
 
-  def step(self, request, effective, blocked, speed_kph=40., driver_torque=0, track_state=0):
+  def step(self, request, effective, blocked, speed_kph=40., driver_torque=0, track_state=0, lkas_fault=0, extra=()):
     self.frame += 1
-    ret, _ = feed(self.CI, self.frame,
+    ret, _ = feed(self.CI, self.frame, *extra,
                   self.packer.make_can_msg("STEER_RATE", 0, {"LKAS_REQUEST": request, "LKAS_EFFECTIVE": effective, "LKAS_BLOCK": blocked,
-                                                             "LKAS_TRACK_STATE": track_state}),
+                                                             "LKAS_TRACK_STATE": track_state, "LKAS_FAULT": lkas_fault}),
                   self.packer.make_can_msg("WHEEL_SPEEDS", 0, {"FL": speed_kph, "FR": speed_kph, "RL": speed_kph, "RR": speed_kph}),
                   self.packer.make_can_msg("STEER_TORQUE", 0, {"STEER_TORQUE_SENSOR": driver_torque}))
     return ret
@@ -844,13 +880,34 @@ def test_faulted_camera_is_not_the_las_switch():
   assert feed(CI, 0, (CAM_LANEINFO, las_off, 2))[0].invalidLkasSetting
   assert not feed(CI, 1, (CAM_LANEINFO, faulted, 2))[0].invalidLkasSetting
 
-  # CAM_LKAS ERR_BIT_1 alone (steerFaultPermanent) also marks the camera as faulted; same route's frames
+  # CAM_LKAS ERR_BIT_1 alone also marks the camera as faulted; same route's frames
   CI = car_interface(alpha_long=False)
   feed(CI, 0, (CAM_LKAS, bytes.fromhex("f8000960020000a7"), 2))
   feed(CI, 1, (CAM_LKAS, bytes.fromhex("08000960020000b6"), 2))
   ret = feed(CI, 2, (CAM_LANEINFO, las_off, 2))[0]
-  assert ret.steerFaultPermanent
   assert not ret.invalidLkasSetting
+
+
+class TestPermanentFault:
+  """steerFaultPermanent is the EPS's LKAS_FAULT; the camera's ERR_BIT_1 alone is sun glare."""
+
+  @staticmethod
+  def camera(rig, fault):
+    return [rig.packer.make_can_msg("CAM_LKAS", 2, {"ERR_BIT_1": fault, "ERR_BIT_2": fault})]
+
+  @pytest.mark.parametrize("blocked", [0, 1])
+  def test_camera_glare_is_not_a_permanent_fault(self, blocked):
+    rig = UndeliveredRig()
+    rig.step(0, 0, 0)
+    ret = rig.step(0, 0, blocked, extra=self.camera(rig, 1))
+    assert rig.CS.cam_lkas["ERR_BIT_1"] == 1
+    assert not ret.steerFaultPermanent
+
+  def test_eps_fault_is_permanent_before_the_camera_follows(self):
+    rig = UndeliveredRig()
+    rig.step(0, 0, 0)
+    assert rig.step(0, 0, 1, lkas_fault=1).steerFaultPermanent
+    assert rig.step(0, 0, 1, lkas_fault=1, extra=self.camera(rig, 1)).steerFaultPermanent
 
 
 class TestLkasRearm:

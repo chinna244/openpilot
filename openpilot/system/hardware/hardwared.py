@@ -31,6 +31,8 @@ from openpilot.common.linux import LinuxSystemStats
 from openpilot.system.loggerd.config import get_available_percent
 from openpilot.common.swaglog import cloudlog
 from openpilot.system.hardware.power_monitoring import PowerMonitoring
+from openpilot.system.hardware.power_telemetry import PowerTelemetry
+from openpilot.system.hardware.hardware_timing import HardwareLoopTiming
 from openpilot.system.hardware.fan_controller import FanController
 from openpilot.system.hardware.chestnut.monitoring import chestnut_state_thread
 from openpilot.system.hardware.chestnut.status import ChestnutStatus
@@ -41,7 +43,6 @@ from openpilot.starpilot.models import jetlink_adapter
 ThermalStatus = log.DeviceState.ThermalStatus
 NetworkType = log.DeviceState.NetworkType
 NetworkStrength = log.DeviceState.NetworkStrength
-CURRENT_TAU = 15.   # 15s time constant
 TEMP_TAU = 5.   # 5s time constant
 DISCONNECT_TIMEOUT = 5.  # wait 5 seconds before going offroad after disconnect so you get an alert
 PANDA_STATES_TIMEOUT = round(1000 / SERVICE_LIST['pandaStates'].frequency * 1.5)  # 1.5x the expected pandaState frequency
@@ -144,6 +145,12 @@ def update_jetlink_alert() -> None:
     jetlink_alert_usable = False
     cloudlog.warning("Offroad_JetlinkUnavailable is not in this params library: Jetlink's offroad alert is off")
 
+def read_aggressive_cooling(params) -> bool:
+  try:
+    return params.get_bool("AggressiveCoolingEnabled")
+  except (UnknownKeyName, OSError, ValueError):
+    return False
+
 def touch_thread(end_event):
   count = 0
 
@@ -224,8 +231,9 @@ def hw_state_thread(end_event, hw_queue):
     time.sleep(DT_HW)
 
 
-def hardware_thread(end_event, hw_queue) -> None:
+def hardware_thread(end_event, hw_queue, power_telemetry: PowerTelemetry) -> None:
   system_stats = LinuxSystemStats() if sys.platform == "linux" else None
+  timing = HardwareLoopTiming()
   pm = messaging.PubMaster(['deviceState'])
   sm = messaging.SubMaster(["peripheralState", "gpsLocationExternal", "selfdriveState", "pandaStates", "chestnutState"], poll="pandaStates")
 
@@ -281,13 +289,17 @@ def hardware_thread(end_event, hw_queue) -> None:
   thermal_config = HARDWARE.get_thermal_config()
 
   fan_controller = FanController(int(1./DT_HW))
+  aggressive_cooling = read_aggressive_cooling(params)
+  cooling_ignition_prev = False
   chestnut = Chestnut()
   chestnut_status = ChestnutStatus()
   branch = get_short_branch()
 
   while not end_event.is_set():
+    timing.mark("panda_poll")
     sm.update(PANDA_STATES_TIMEOUT)
 
+    timing.mark("drive_mode")
     pandaStates = sm['pandaStates']
     peripheralState = sm['peripheralState']
 
@@ -329,6 +341,7 @@ def hardware_thread(end_event, hw_queue) -> None:
     if (sm.frame % round(SERVICE_LIST['pandaStates'].frequency * DT_HW) != 0) and not ign_edge:
       continue
 
+    timing.mark("thermal_read")
     msg = messaging.new_message('deviceState', valid=True)
     msg.deviceState = thermal_config.get_msg()
     msg.deviceState.deviceType = HARDWARE.get_device_type()
@@ -338,6 +351,7 @@ def hardware_thread(end_event, hw_queue) -> None:
     except queue.Empty:
       pass
 
+    timing.mark("system_stats")
     memory_usage = system_stats.memory_usage_percent() if system_stats is not None else 0.
     cpu_usage = system_stats.cpu_usage_percent() if system_stats is not None else []
 
@@ -357,8 +371,10 @@ def hardware_thread(end_event, hw_queue) -> None:
 
     msg.deviceState.modemTempC = last_hw_state.modem_temps
 
+    timing.mark("brightness")
     msg.deviceState.screenBrightnessPercent = HARDWARE.get_screen_brightness()
 
+    timing.mark("usb_chestnut")
     set_usb_state(msg.deviceState, last_hw_state.usb_state)
     chestnut.update(started_ts is None, last_hw_state.usb_state)
     chestnut_state = sm["chestnutState"]
@@ -379,7 +395,11 @@ def hardware_thread(end_event, hw_queue) -> None:
     all_comp_temp = all_temp_filter.update(max(temp_sources))
     msg.deviceState.maxTempC = all_comp_temp
 
-    msg.deviceState.fanSpeedPercentDesired = fan_controller.update(all_comp_temp, onroad_conditions["ignition"])
+    timing.mark("fan_control")
+    if onroad_conditions["ignition"] and not cooling_ignition_prev:
+      aggressive_cooling = read_aggressive_cooling(params)
+    cooling_ignition_prev = onroad_conditions["ignition"]
+    msg.deviceState.fanSpeedPercentDesired = fan_controller.update(all_comp_temp, onroad_conditions["ignition"], aggressive_cooling)
 
     is_offroad_for_5_min = (started_ts is None) and ((not started_seen) or (off_ts is None) or (time.monotonic() - off_ts > 60 * 5))
     if is_offroad_for_5_min and offroad_comp_temp > OFFROAD_DANGER_TEMP:
@@ -396,6 +416,7 @@ def hardware_thread(end_event, hw_queue) -> None:
 
     # **** starting logic ****
 
+    timing.mark("startup_conditions")
     startup_conditions["up_to_date"] = params.get("Offroad_ConnectivityNeeded") is None or params.get_bool("DisableUpdates") or params.get_bool("SnoozeUpdate")
     startup_conditions["no_excessive_actuation"] = params.get("Offroad_ExcessiveActuation") is None
     startup_conditions["not_uninstalling"] = not params.get_bool("DoUninstall")
@@ -418,6 +439,7 @@ def hardware_thread(end_event, hw_queue) -> None:
     onroad_conditions["device_temp_good"] = thermal_status < ThermalStatus.critical
     extra_text = f"{offroad_comp_temp:.1f}C"
     show_alert = (not onroad_conditions["device_temp_good"] or not startup_conditions["device_temp_engageable"]) and onroad_conditions["ignition"]
+    timing.mark("alerts")
     set_offroad_alert_if_changed("Offroad_TemperatureTooHigh", show_alert, extra_text=extra_text)
     update_jetlink_alert()
 
@@ -428,9 +450,10 @@ def hardware_thread(end_event, hw_queue) -> None:
     if not PC:
       # we enforce this for our software, but you are welcome
       # to make a different decision in your software
-      startup_conditions["registered_device"] = PC or (params.get("DongleId") != UNREGISTERED_DONGLE_ID)
+      startup_conditions["registered_device"] = params.get("DongleId") != UNREGISTERED_DONGLE_ID
 
     # Handle offroad/onroad transition
+    timing.mark("engagement")
     should_start = resolve_start(drive_mode, onroad_conditions, startup_conditions, already_started=started_ts is not None)
     if (not should_start and started_ts is not None and onroad_conditions["ignition"] and
         onroad_conditions["not_onroad_cycle"] and mazda_handback_required(params)):
@@ -456,6 +479,7 @@ def hardware_thread(end_event, hw_queue) -> None:
       except Exception:
         pass
 
+    timing.mark("power_save")
     should_pwrsave = not (onroad_conditions["ignition"] or should_start) and msg.deviceState.screenBrightnessPercent < 1e-3
     if should_pwrsave != pwrsave or (count == 0):
       HARDWARE.set_power_save(should_pwrsave)
@@ -491,13 +515,16 @@ def hardware_thread(end_event, hw_queue) -> None:
 
     # Offroad power monitoring
     voltage = None if peripheralState.pandaType == log.PandaState.PandaType.unknown else peripheralState.voltage
+    timing.mark("power_read")
     power_monitor.calculate(voltage, onroad_conditions["ignition"])
     msg.deviceState.offroadPowerUsageUwh = power_monitor.get_power_used()
     msg.deviceState.carBatteryCapacityUwh = max(0, power_monitor.get_car_battery_capacity())
+    timing.mark("power_draw")
     current_power_draw = HARDWARE.get_current_power_draw()
     msg.deviceState.powerDrawW = current_power_draw
 
-    som_power_draw = HARDWARE.get_som_power_draw()
+    timing.mark("som_power")
+    som_power_draw = power_telemetry.value()
     msg.deviceState.somPowerDrawW = som_power_draw
 
     # Check if we need to shut down
@@ -506,6 +533,7 @@ def hardware_thread(end_event, hw_queue) -> None:
       cloudlog.warning(f"shutting device down, offroad since {shutdown_off_ts}")
       params.put_bool("DoShutdown", True, block=True)
 
+    timing.mark("publish")
     msg.deviceState.started = started_ts is not None
     msg.deviceState.startedMonoTime = int(1e9*(started_ts or 0))
 
@@ -536,6 +564,7 @@ def hardware_thread(end_event, hw_queue) -> None:
         except Exception:
           cloudlog.exception("failed to save offroad status")
 
+    timing.mark("bookkeeping")
     params.put_bool("NetworkMetered", msg.deviceState.networkMetered)
 
     now_ts = time.monotonic()
@@ -546,8 +575,8 @@ def hardware_thread(end_event, hw_queue) -> None:
     last_uptime_ts = now_ts
 
     if (count % int(60. / DT_HW)) == 0:
-      params.put("UptimeOffroad", uptime_offroad, block=True)
-      params.put("UptimeOnroad", uptime_onroad, block=True)
+      params.put("UptimeOffroad", uptime_offroad)
+      params.put("UptimeOnroad", uptime_onroad)
 
     count += 1
     should_start_prev = should_start
@@ -557,9 +586,15 @@ def main():
   hw_queue = queue.Queue(maxsize=1)
   end_event = threading.Event()
 
+  power_telemetry = PowerTelemetry(HARDWARE.get_som_power_draw, DT_HW)
+  # A kernel sysfs read may not be cancellable. The sole telemetry worker is
+  # daemonized so it cannot delay process shutdown; no health work runs in it.
+  power_thread = threading.Thread(target=power_telemetry.run, args=(end_event,), daemon=True, name="som_power")
+  power_thread.start()
+
   threads = [
     threading.Thread(target=hw_state_thread, args=(end_event, hw_queue)),
-    threading.Thread(target=hardware_thread, args=(end_event, hw_queue)),
+    threading.Thread(target=hardware_thread, args=(end_event, hw_queue, power_telemetry)),
   ]
 
   if COMMA_HARDWARE:

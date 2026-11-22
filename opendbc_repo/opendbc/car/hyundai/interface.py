@@ -1,3 +1,4 @@
+from opendbc.car import ACCEL_MAX_TAKEOFF
 from opendbc.car.hyundai.ioniq5pe_long_profile import required as pe_long_required, candidate as pe_long_candidate
 from opendbc.car.pedal import supported_pedal_detected
 from opendbc.car.hyundai.classic_scc_aol import CLASSIC_SCC_IDS
@@ -7,7 +8,8 @@ from opendbc.car.hyundai.non_scc_aol import NON_SCC_IDS
 from opendbc.car.hyundai.values import (is_blended, is_blended_alpha, HyundaiFlags, CAR, DBC, HyundaiSafetyFlags, CANFD_ANGLE_MODEL_BITS,
                                         CANFD_ANGLE_OBSERVED_ADAS_BIT, HYUNDAI_MRR35_RADAR_DBC, HYUNDAI_MRR30_RADAR_DBC,
                                         HYUNDAI_GV70_RADAR_DBC, HYUNDAI_G90_RADAR_DBC, HYUNDAI_MRREVO14F_RADAR_DBC)
-from opendbc.car.hyundai.radar_interface import RADAR_START_ADDR, MRR35_RADAR_START_ADDR, MRR30_RADAR_START_ADDR, radar_bus
+from opendbc.car.hyundai.radar_interface import RADAR_START_ADDR, MRR35_RADAR_START_ADDR, MRR30_RADAR_START_ADDR, radar_bus, \
+                                               stinger_2022_radar_available
 from opendbc.car.interfaces import CarInterfaceBase
 from opendbc.car.disable_ecu import disable_ecu
 from opendbc.car.hyundai.carcontroller import CarController
@@ -111,13 +113,13 @@ class CarInterface(CarInterfaceBase):
   DRIVABLE_GEARS = (structs.CarState.GearShifter.sport, structs.CarState.GearShifter.manumatic)
 
   @staticmethod
-  def get_pid_accel_limits(CP, current_speed, cruise_speed):
+  def get_pid_accel_limits(CP, current_speed, cruise_speed, *, faster_takeoffs=False):
     from opendbc.car.hyundai.ev9_longitudinal import qualified as ev9_long_qualified
     if ev9_long_qualified(CP):
-      return -3.5, 2.2
+      return -3.5, ACCEL_MAX_TAKEOFF if faster_takeoffs else 2.2
     if is_blended_alpha(CP):
       return -3.5, 3.5
-    return CarInterfaceBase.get_pid_accel_limits(CP, current_speed, cruise_speed)
+    return CarInterfaceBase.get_pid_accel_limits(CP, current_speed, cruise_speed, faster_takeoffs=faster_takeoffs)
 
   @staticmethod
   def _get_params(ret: structs.CarParams, candidate, fingerprint, car_fw, alpha_long, is_release, docs) -> structs.CarParams:
@@ -141,6 +143,9 @@ class CarInterface(CarInterfaceBase):
       CAN = CanBus(None, fingerprint, lka_steering)
 
       ret.alphaLongitudinalAvailable = not (ret.flags & HyundaiFlags.CANFD_NO_RADAR_DISABLE)
+      if (candidate == CAR.HYUNDAI_IONIQ_6 and not lka_steering and
+          fingerprint[CAN.CAM].get(0x1A0) == 32 and fingerprint[CAN.ECAN].get(0x1CF) == 8):
+        ret.alphaLongitudinalAvailable = True
       if ret.flags & HyundaiFlags.CANFD_ANGLE_STEERING:
         # These manual angle profiles retain stock SCC in both builds.
         ret.alphaLongitudinalAvailable = False
@@ -295,6 +300,8 @@ class CarInterface(CarInterfaceBase):
       ret.radarUnavailable = fingerprint[radar_bus(ret)].get(MRR30_RADAR_START_ADDR) != 32
     elif DBC[ret.carFingerprint].get(Bus.radar) == HYUNDAI_MRR35_RADAR_DBC:
       ret.radarUnavailable = fingerprint[radar_bus(ret)].get(MRR35_RADAR_START_ADDR) != 24
+    elif candidate == CAR.KIA_STINGER_2022:
+      ret.radarUnavailable = not stinger_2022_radar_available(fingerprint)
     else:
       ret.radarUnavailable = radar_start not in fingerprint[1] or Bus.radar not in DBC[ret.carFingerprint]
     from opendbc.car.hyundai.torque_ev_startup import topology_owned as torque_ev_topology
@@ -393,12 +400,18 @@ class CarInterface(CarInterfaceBase):
     return ret
 
   def update(self, can_packets):
+    if self.CS.daw.enabled:
+      can_packets = list(can_packets)
+      self.CS.daw.update(can_packets)
     recovery = getattr(getattr(self, 'CC', None), 'angle_tx_recovery', None)
     if recovery is not None:
       can_packets = list(can_packets)
       recovery.observe(can_packets, self.CC.frame)
+    stock_lkas_damping = getattr(self.CS, "stock_lkas_damping", None)
     if (self.CS.pe_ready is not None or self.CS.gv70_camera_lead is not None or self.CS.ev9_camera_lead is not None or
-        self.CS.ioniq6_camera_lead is not None or self.CS.torque_ev_camera_lead is not None or self.CS.forte_lkas_sources is not None):
+        self.CS.ioniq6_camera_lead is not None or self.CS.torque_ev_camera_lead is not None or
+        self.CS.forte_lkas_sources is not None or self.CS.stock_lfa_status is not None or
+        stock_lkas_damping is not None):
       # This isolated optional parser must never join required controls health.
       can_packets = list(can_packets)
       if self.CS.gv70_camera_lead is not None:
@@ -413,6 +426,11 @@ class CarInterface(CarInterfaceBase):
         self.CS.torque_ev_camera_lead.update(can_packets)
       if self.CS.forte_lkas_sources is not None:
         self.CS.forte_lkas_sources.update(can_packets)
+      if stock_lkas_damping is not None:
+        stock_lkas_damping.update(can_packets)
+      if self.CS.stock_lfa_status is not None:
+        self.CS.stock_lfa_status.update(can_packets)
+        self.CS.stock_cluster_status.update(can_packets)
     ret = super().update(can_packets)
     self.CS.finalize_blended_cancel(ret)
     return ret

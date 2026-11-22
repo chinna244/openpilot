@@ -1,3 +1,4 @@
+import { WikiHelp } from './wiki-help.js'
 import { GxState } from "./state.js"
 import { GxNotice } from "./notice.js"
 import { BluetoothNotice, bluetoothConnection } from "./bluetooth-notice.js"
@@ -22,7 +23,7 @@ export class LocalHistoryFeed extends SnapshotFeed {
 
 export const LocalRecordingsPage = {
   name: "LocalRecordingsPage",
-  components: { GxState, GxNotice, BluetoothNotice, RecordingActions, GalaxySelect, RouteWorkspace },
+  components: { WikiHelp, GxState, GxNotice, BluetoothNotice, RecordingActions, GalaxySelect, RouteWorkspace },
   props: { mode: { type: String, required: true }, unauthorized: { type: Function, required: true },
     routePath: { type: String, default: "/recordings" }, go: { type: Function, default: () => {} } },
   data: () => ({ bluetooth: bluetoothConnection(), sortOrder: "newest", query: "", preservedOnly: false, status: "idle", data: null, error: "", entryMode: "footage", exports: null }),
@@ -77,7 +78,7 @@ export const LocalRecordingsPage = {
       <BluetoothNotice v-if="bluetooth" feature="Local recordings and replay" />
       <RouteWorkspace v-else-if="selectedRouteId && mode === 'local'" :key="selectedRouteId" :route-id="selectedRouteId" :summary="selectedSummary" :initial-mode="entryMode" :unauthorized="unauthorized" :exports="exports" @back="go('/recordings')" @changed="refresh" />
       <div v-else ref="routeList" class="gx-recordings__browse">
-      <header class="gx-recordings__heading"><h2>Routes</h2><span v-if="mode === 'local' && data" class="gx-note">{{ stats.count }} drives · ~{{ formatDuration(stats.minutes) }}</span></header>
+      <header class="gx-settings__header gx-page-header"><div class="gx-recordings__heading"><h2>Routes</h2><span v-if="mode === 'local' && data" class="gx-note">{{ stats.count }} drives · ~{{ formatDuration(stats.minutes) }}</span></div><WikiHelp /></header>
       <GxState v-if="mode !== 'local'">Local recordings are unavailable in the offline preview.</GxState>
       <template v-else>
         <GxNotice v-if="exports?.job?.owned" tone="info">
@@ -104,7 +105,7 @@ export const LocalRecordingsPage = {
             <p v-if="!routeCards.length" class="gx-recordings__empty">{{ data.routes.length ? 'No drives match your filters.' : 'No saved drives found on this device.' }}</p>
             <article v-for="route in routeCards" :key="route.routeId" class="gx-recordings__row" :class="{'gx-recordings__row--preserved': route.preserved}">
               <button class="gx-recordings__drive" :data-route-id="route.routeId" :aria-label="'Open route ' + (route.displayName || route.date.label)" @click="openRoute(route)">
-                <span class="gx-recordings__name"><span class="gx-row__label">{{ route.displayName !== route.routeId ? route.displayName : route.date.label }}</span><span v-if="route.preserved" class="gx-chip">Preserved</span></span>
+                <span class="gx-recordings__name"><span class="gx-row__label"><span translate="no">{{ route.displayName !== route.routeId ? route.displayName : route.date.label }}</span></span><span v-if="route.preserved" class="gx-chip">Preserved</span></span>
                 <span class="gx-row__desc"><template v-if="route.displayName !== route.routeId">{{ route.date.label }} · </template>~{{ formatDuration(route.segmentCount) }}</span>
               </button>
               <span class="gx-note">{{ route.segmentCount }} {{ route.segmentCount === 1 ? "segment" : "segments" }}</span>

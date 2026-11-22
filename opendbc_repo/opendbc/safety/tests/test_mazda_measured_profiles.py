@@ -44,7 +44,8 @@ LONG_TX = LAT_TX + [[0x21b, 0], [0x21c, 0], [0x499, 0], [0x361, 0], [0x362, 0], 
                     [0x366, 0], [0x764, 0], [0x21b, 2], [0x21c, 2], [0x499, 2], [0x361, 2], [0x362, 2], [0x363, 2],
                     [0x364, 2], [0x365, 2], [0x366, 2]]
 RADAR_CAPTURES = {
-  0x499: bytes.fromhex("0008c00000000000"),
+  # 2022 family static frame as the real radar sends it (develop 34ca73f8, for the dash's lane lines)
+  0x499: bytes.fromhex("0008e00000000000"),
   0x361: bytes.fromhex("fff7fefe1fc00080"),
   0x362: bytes.fromhex("fff7fefe1fc78c80"),
   0x363: bytes.fromhex("fff7fefe1fc00000"),
@@ -215,12 +216,16 @@ class MazdaMeasuredBase(common.CarSafetyTest, common.DriverTorqueSteeringSafetyT
         self.assertEqual(controls_allowed, self._tx(msg), f"{controls_allowed=} {addr=:#x}")
 
   def test_no_button_reaches_the_camera(self):
+    # Without the declared TJA button openpilot never writes CRZ_BTNS on the camera bus. With it, only the exact
+    # camera-only TJA press-off while openpilot steers (develop 0f6ce31f; pacing in test_mazda_camera_tja.py).
+    tja = _is_tja(self.SAFETY_PARAM)
     for experience in (0, AOL):
-      self._init(experience=experience)
       for controls_allowed in (False, True):
-        self.safety.set_controls_allowed(controls_allowed)
         for ctr in range(16):
-          self.assertFalse(self._tx(self._cam_tja_press(ctr=ctr)), f"{experience=} {controls_allowed=} {ctr=}")
+          self._init(experience=experience)
+          self.safety.set_controls_allowed(controls_allowed)
+          steering = bool(self.safety.get_controls_allowed()) and experience == 0
+          self.assertEqual(tja and steering, self._tx(self._cam_tja_press(ctr=ctr)), f"{experience=} {controls_allowed=} {ctr=}")
         self.assertFalse(self._tx(make_msg(2, 0x09d, 8)))
 
   def test_tja_button_never_pressed_on_the_car_side(self):
@@ -483,7 +488,7 @@ class MazdaMeasuredLongBase(MazdaMeasuredBase, common.LongitudinalAccelSafetyTes
 
   def test_unexpected_radar_tracks_blocked(self):
     bad_messages = {
-      0x499: bytes.fromhex("0008c00100000000"),
+      0x499: bytes.fromhex("0008e00100000000"),
       0x361: bytes.fromhex("fff7fefe1fc00180"),
       0x362: bytes.fromhex("fff7fefe1fc00080"),
       0x363: bytes.fromhex("fff7fefe1fc00080"),
@@ -955,8 +960,9 @@ class TestMazdaMeasuredAol(unittest.TestCase):
         self.assertEqual(1, h.safety.aol_get_permission_mask())
 
   def test_faults_withhold_lateral(self):
-    # gear-not-D is temporary; a camera fault consumes the token. LKAS_BLOCK (the EPS's re-arm/standby state,
-    # delivering partly above ~4 m/s) never withholds lateral: gating on it kept AOL from ever starting.
+    # gear-not-D is temporary. LKAS_BLOCK (the EPS's re-arm/standby state, delivering partly above ~4 m/s) never
+    # withholds lateral: gating on it kept AOL from ever starting. Nor does the camera's ERR_BIT_1 alone (sun glare):
+    # the EPS keeps assisting through it, as on develop.
     for word in WORDS:
       with self.subTest(word=word):
         h = MazdaAolHarness(self, word)
@@ -971,11 +977,10 @@ class TestMazdaMeasuredAol(unittest.TestCase):
         self.assertTrue(h.safety.safety_tx_hook(h.torque(5)))
         h.feed()
         h.feed(cam_err=1)
-        self.assertEqual(0, h.lat())
-        self.assertFalse(h.safety.safety_tx_hook(h.torque(5)))
+        self.assertEqual(1, h.lat())
+        self.assertTrue(h.safety.safety_tx_hook(h.torque(5)))
         h.feed()
-        # with the TJA button the camera's fault pauses (develop's MADS); otherwise it consumes the token
-        self.assertEqual(1 if _is_tja(word) else 0, h.lat())
+        self.assertEqual(1, h.lat())
 
   def test_stale_sources_withhold_lateral(self):
     required = ["CRZ_BTNS", "STEER_TORQUE", "ENGINE_DATA", "PEDALS", "GEAR", "STEER_RATE", "CAM_LKAS"]
@@ -1124,14 +1129,13 @@ class TestMazdaMeasuredTjaForwardCopy(unittest.TestCase):
     return self.packer.make_can_msg_safety("CRZ_BTNS", 0, values)
 
   def test_declared_button_is_cleared_and_nothing_else(self):
+    # develop 0f6ce31f: the driver's TJA press reaches the camera again, forwarded unmodified
     for word in (TJA, TJA_LONG):
       self._init(word)
       for over in ({}, {"SET_P": 1}, {"RES": 1}, {"CAN_OFF": 1}, {"CTR": 9}):
         orig, fwd = self._fwd_copy(0, self._btns(TJA_BUTTON=1, **over))
         self.assertTrue(orig[1] & 0x08)
-        expected = bytearray(orig)
-        expected[1] &= 0xf7
-        self.assertEqual(bytes(expected), fwd, f"{word=} {over=}")
+        self.assertEqual(orig, fwd, f"{word=} {over=}")
 
   def test_a_frame_without_the_press_is_untouched(self):
     for word in (TJA, TJA_LONG):
@@ -1367,6 +1371,81 @@ class TestMazdaMeasuredDiagnostics(unittest.TestCase):
             self.safety.set_controls_allowed(controls_allowed)
             self.assertTrue(self._tx("0210020000000000"), (speed, controls_allowed))
             self.assertTrue(self._tx("0210010000000000"), (speed, controls_allowed))
+
+
+LONG_FILTER = LONG | int(MazdaSafetyFlags.CAN_FILTER)
+FILTER_MAGIC = bytes([0xce, 0xfa, 0xad, 0xde])
+
+
+class TestMazdaMeasuredLongFilter(TestMazdaMeasuredLong):
+  """develop d61310c0, Alpha long through the Smart CAN Filter: every longitudinal check above still holds, the
+  UDS takeover and the synthetic radar frames are gone, and FILTER_CTRL is the one extra message. The port
+  carries the filter in its one safety word (MazdaSafetyFlags.CAN_FILTER); develop in its second word."""
+
+  SAFETY_PARAM = LONG_FILTER
+  TX_MSGS = LAT_TX + [[0x21b, 0], [0x21c, 0], [0x2a0, 0], [0x21b, 2], [0x21c, 2]]
+
+  def test_filter_ctrl_mode_and_filter_bits_only(self):
+    for ctrl in range(4):
+      self.assertTrue(self._tx(make_msg(0, 0x2a0, 8, FILTER_MAGIC + bytes([0x2e, ctrl, 0, 0]))))
+    for ctrl in (0x04, 0x80, 0xff):
+      self.assertFalse(self._tx(make_msg(0, 0x2a0, 8, FILTER_MAGIC + bytes([0x2e, ctrl, 0, 0]))))
+    # reserved bytes must be zero, the magic exact, and only the main bus
+    self.assertFalse(self._tx(make_msg(0, 0x2a0, 8, FILTER_MAGIC + bytes([0x2e, 1, 1, 0]))))
+    self.assertFalse(self._tx(make_msg(0, 0x2a0, 8, FILTER_MAGIC + bytes([0x2e, 1, 0, 1]))))
+    self.assertFalse(self._tx(make_msg(0, 0x2a0, 8, bytes([0xce, 0xfa, 0xad, 0xdf, 0x2e, 1, 0, 0]))))
+    self.assertFalse(self._tx(make_msg(2, 0x2a0, 8, FILTER_MAGIC + bytes([0x2e, 1, 0, 0]))))
+
+  def test_board_reset_flash_and_feature_commands_blocked(self):
+    for cmd in ("1e0bb002", "1e0bb00a", "1e0bb001", "1f010001", "1f000000"):
+      self.assertFalse(self._tx(make_msg(0, 0x2a0, 8, FILTER_MAGIC + bytes.fromhex(cmd))), cmd)
+    for addr in (0x2a1, 0x2a8, 0x2a9):
+      self.assertFalse(self._tx(make_msg(0, addr, 8, FILTER_MAGIC + bytes([0x2e, 1, 0, 0]))), hex(addr))
+
+  def test_filter_ctrl_independent_of_controls(self):
+    msg = FILTER_MAGIC + bytes([0x2e, 3, 0, 0])
+    for allowed in (False, True):
+      self.safety.set_controls_allowed(allowed)
+      self.assertTrue(self._tx(make_msg(0, 0x2a0, 8, msg)))
+
+  def test_aol_uses_the_filter_table_too(self):
+    self._init(experience=AOL)
+    self.assertTrue(self._tx(make_msg(0, 0x2a0, 8, FILTER_MAGIC + bytes([0x2e, 3, 0, 0]))))
+    self.assertFalse(self._tx(make_msg(0, 0x764, 8, bytes.fromhex("0210020000000000"))))
+    self.assertFalse(self._tx(make_msg(0, 0x499, 8, RADAR_CAPTURES[0x499])))
+
+  # the UDS takeover and its synthetic radar frames are blocked outright
+  def test_empty_radar_tracks_allowed(self):
+    for allowed in (False, True):
+      self.safety.set_controls_allowed(allowed)
+      for bus in (0, 2):
+        for addr, dat in RADAR_CAPTURES.items():
+          self.assertFalse(self._tx(make_msg(bus, addr, 8, dat)), f"{addr=:#x} {bus=}")
+
+  def test_g46l_radar_static_allowed(self):
+    for bus in (0, 2):
+      self.assertFalse(self._tx(make_msg(bus, 0x499, 8, bytes.fromhex("0098400000000000"))))
+
+  def test_radar_uds_allowlist(self):
+    self.safety.set_controls_allowed(True)
+    for dat in ("023e800000000000", "0210020000000000", "0210010000000000"):
+      self.assertFalse(self._tx(make_msg(0, 0x764, 8, bytes.fromhex(dat))))
+
+
+class TestMazdaMeasuredFilterNeedsLongitudinal(TestMazdaMeasuredEps):
+  """The filter bit alone, without alpha long, changes nothing: FILTER_CTRL stays blocked."""
+
+  SAFETY_PARAM = EPS | int(MazdaSafetyFlags.CAN_FILTER)
+
+  def test_filter_ctrl_blocked(self):
+    for allowed in (False, True):
+      self.safety.set_controls_allowed(allowed)
+      self.assertFalse(self._tx(make_msg(0, 0x2a0, 8, FILTER_MAGIC + bytes([0x2e, 3, 0, 0]))))
+
+
+class TestMazdaMeasuredLongBlocksFilterCtrl(TestMazdaMeasuredLong):
+  def test_filter_ctrl_blocked_without_the_filter(self):
+    self.assertFalse(self._tx(make_msg(0, 0x2a0, 8, FILTER_MAGIC + bytes([0x2e, 3, 0, 0]))))
 
 
 if __name__ == "__main__":

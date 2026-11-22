@@ -3,7 +3,8 @@ from opendbc.car.mazda.values import Buttons, CarControllerParams, MazdaFlags
 
 # Captured empty radar tracks required by the body ECU for stop-and-go. Only the counter
 # nibble changes.
-RADAR_STATIC_MSG = (0x499, bytes.fromhex("0008c00000000000"))
+# The real radar sends byte 2 0xe0 in every log, cruising or not (Sept-Nov captures); 0xc0 was never stock.
+RADAR_STATIC_MSG = (0x499, bytes.fromhex("0008e00000000000"))
 RADAR_TRACK_MSGS = {
   0x361: bytes.fromhex("fff7fefe1fc00080"),
   0x362: bytes.fromhex("fff7fefe1fc78c80"),
@@ -24,8 +25,11 @@ def crz_info_checksum(dat: bytes) -> int:
 
 
 def create_acc_command(packer, bus, counter, accel, *, long_active, acc_available,
-                       brake_pressed=False, stopping=False, resume_unlatching=False):
+                       brake_pressed=False, stopping=False, resume_unlatching=False, hud_tja2=False):
   # CRZ_INFO replaces the disabled radar's acceleration command and armed-idle state.
+  # hud_tja2: the real radar echoes the dash frame's white TJA=2 (0x440) in byte 5 bit 0, outside
+  # its checksum (Sept-Oct captures, cruise not engaged: TJA=2 -> 1 in 19341/19355 frames, TJA=0 ->
+  # 0 in 23033/23043; lines were drawn only then). Our frame never carried it.
   values = {
     "ERROR_STATUS": 1,
     "STATIC_1": 0x7ff,
@@ -46,7 +50,10 @@ def create_acc_command(packer, bus, counter, accel, *, long_active, acc_availabl
 
   dat = packer.make_can_msg("CRZ_INFO", bus, values)[1]
   values["CHKSUM"] = crz_info_checksum(dat)
-  return packer.make_can_msg("CRZ_INFO", bus, values)
+  addr, dat, bus = packer.make_can_msg("CRZ_INFO", bus, values)
+  if hud_tja2:
+    dat = dat[:5] + bytes([dat[5] | 0x01]) + dat[6:]
+  return addr, dat, bus
 
 
 def create_crz_ctrl(packer, bus, long_active, acc_available, gap_setting, acc_active_2, *, lead_distance=0,
@@ -91,10 +98,12 @@ def create_steering_control(packer, CP, frame, apply_torque, lkas):
 
   # copy values from camera
   b1 = int(lkas["BIT_1"])
-  er1 = int(lkas["ERR_BIT_1"])
+  # Never the camera's error bits: alone they are sun glare, and the EPS stops assisting on them
+  # (docs/zoompilot/mazda-lateral.md, "LKAS_FAULT and the camera's ERR_BIT_1").
+  er1 = 0
   lnv = 0
   ldw = 0
-  er2 = int(lkas["ERR_BIT_2"])
+  er2 = 0
 
   # Some older models do have these, newer models don't.
   # Either way, they all work just fine if set to zero.

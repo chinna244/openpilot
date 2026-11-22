@@ -2,21 +2,21 @@
 
 import math
 import os
-from pathlib import Path
 
 from openpilot.cereal.services import SERVICE_LIST
 from openpilot.common.realtime import DT_CTRL
 from openpilot.common.params import UnknownKeyName
+from openpilot.starpilot.saved_source import read_saved
 from openpilot.starpilot.lateral.lane_centering import ControlMode, LaneCenteringRequest, LaneCenteringSettings, STRENGTH_BASELINE, STRENGTH_MAX
 from openpilot.starpilot.feature_capabilities import lateral_supported
 
 
 def read_settings(params) -> LaneCenteringSettings:
   def raw(key, default):
-    try:
-      return Path(params.get_param_path(key)).read_bytes()
-    except FileNotFoundError:
-      return default
+    value, readable = read_saved(params, key, 64)
+    if not readable:
+      raise ValueError('Invalid lane preference')
+    return default if value is None else value
 
   def boolean(key, default):
     value = raw(key, default)
@@ -28,7 +28,7 @@ def read_settings(params) -> LaneCenteringSettings:
     enabled = boolean('LaneCentering', b'0')
     pause = boolean('LaneCenteringPauseOnSignal', b'1')
     offset = float(raw('LaneCenterOffset', b'0.0'))
-    authority = float(raw('LaneCenteringE2EAuthority', b'1.0'))
+    authority = float(raw('LaneCenteringE2EAuthority', b'0.5'))
     try:
       strength = float(raw('LaneCenteringStrength', str(STRENGTH_BASELINE).encode()))
     except UnknownKeyName:
@@ -53,12 +53,19 @@ class LaneCenteringHost:
   REQUIRED = ('carState', 'selfdriveState', 'modelV2', 'vehicleParameters')
   FREQUENCY_CHECKED = ('carState', 'modelV2', 'vehicleParameters')
 
-  def __init__(self, params):
+  def __init__(self, params, *, settings_reader=None):
     self.params = params
+    self.settings_reader = settings_reader
     self.settings = LaneCenteringSettings()
     self.last_refresh_ns: int | None = None
     self.last_tick_ns: int | None = None
     self.last_refusal = 'inactive'
+
+  def inputs_need_refresh(self, sm, *, now_ns: int) -> bool:
+    """Leave time to receive queued state before checking its original age."""
+    return self.settings.enabled and any(
+      0 < int(sm.logMonoTime[name]) < now_ns - 15_000_000 for name in ('carState', 'selfdriveState')
+    )
 
   def sample(self, sm, *, now_ns: int, lateral_active: bool, longitudinal_active: bool) -> LaneCenteringRequest | None:
     self.last_refusal = 'inactive'
@@ -70,7 +77,12 @@ class LaneCenteringHost:
       self.last_refresh_ns = None
       self.last_refusal = 'host_clock'
       return None
-    if self.last_refresh_ns is None or now_ns < self.last_refresh_ns or now_ns - self.last_refresh_ns >= self.REFRESH_NS:
+    if self.settings_reader is not None:
+      settings = self.settings_reader()
+      if settings is not self.settings:
+        self.settings = settings
+        self.last_refresh_ns = now_ns
+    elif self.last_refresh_ns is None or now_ns < self.last_refresh_ns or now_ns - self.last_refresh_ns >= self.REFRESH_NS:
       self.settings = read_settings(self.params)
       self.last_refresh_ns = now_ns
     if not self.settings.enabled:

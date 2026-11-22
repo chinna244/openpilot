@@ -1,8 +1,9 @@
 """Confirmation text for parked vehicle preferences."""
 
-VEHICLE_BOOL_KEYS = frozenset(("MazdaTjaButton", "AlphaLongitudinalEnabled", "SubaruAvhStartup", "SubaruStopStartOff", "SubaruSNG", "SubaruRedneckCruise",
-                              "GMPedalLongitudinal", "DisableOpenpilotLongitudinal", "LongPitch", "VoltSNG", "GMAutoHold", "VoltOnePedalMode",
-                              "TeslaAOLScreenTap", "TeslaAOLDisengageOnBrake",
+VEHICLE_BOOL_KEYS = frozenset(("MazdaTjaButton", "MazdaCanFilter",
+                              "AlphaLongitudinalEnabled", "SubaruAvhStartup", "SubaruStopStartOff", "SubaruSNG", "SubaruRedneckCruise",
+                              "GMPedalLongitudinal", "DisableOpenpilotLongitudinal", "LongPitch", "VoltSNG", "SNGHack", "GMAutoHold", "VoltOnePedalMode",
+                              "TeslaCoopSteering", "TeslaAOLScreenTap", "TeslaAOLDisengageOnBrake",
                               "RemoteStartBootsComma", "HKGRemoteStartBootsComma", "IgnoreIgnitionLine", "TeslaWakeOnCAN"))
 
 
@@ -13,6 +14,9 @@ def confirmation_question(request):
   from openpilot.starpilot.ui.panda_wake_feature import LABELS
   if request.key in LABELS:
     return f"{verb} {LABELS[request.key][0].lower()}? This changes Panda firmware after the next device restart."
+  if request.key == "MazdaCanFilter":
+    return (f"{verb} the Smart CAN Filter after the next startup? Alpha long keeps the factory radar and AEB online " +
+            "through the filter board; without a board alpha long stays off for the drive.")
   if request.key == "MazdaTjaButton":
     return f"{verb} the physical Mazda TJA button for steering assistance independently of cruise after the next startup? Requires Always On Lateral."
   if request.key == "AlphaLongitudinalEnabled":
@@ -32,6 +36,8 @@ def confirmation_question(request):
     return f"{verb} Subaru stop-and-go assistance after the next startup? Factory ACC retains speed control."
   if request.key == "SubaruRedneckCruise":
     return f"{verb} software cruise after the next startup? Stock ACC keeps pedal control."
+  if request.key == "SNGHack":
+    return f"{verb} Toyota stop-and-go assistance after the next startup?"
   if request.key == "VoltSNG":
     return f"{verb} Volt stop-and-go assistance after the next startup?"
   if request.key == "GMAutoHold":
@@ -42,8 +48,10 @@ def confirmation_question(request):
     return f"{verb} Volt one-pedal driving after the next startup? Lifting off the accelerator can apply the brakes with cruise disengaged and cruise main on."
   if request.key == "LongPitch":
     return f"{verb} compensation for road grade? This refreshes during the drive."
+  if request.key == "TeslaCoopSteering":
+    return f"{verb} Tesla cooperative steering after the next startup? Light steering input adjusts the assisted steering angle within its limits."
   if request.key == "TeslaAOLScreenTap":
     return f"{verb} three-finger screen taps for Always On Lateral after the next startup? Cruise control stays independent."
   if request.key == "TeslaAOLDisengageOnBrake":
-    return f"{verb} disarming Always On Lateral with the brake after the next startup? This applies to screen-tap steering."
+    return f"{verb} disarming Always On Lateral with the brake after the next startup? This applies with either Tesla harness."
   raise ValueError("Unsupported vehicle preference")

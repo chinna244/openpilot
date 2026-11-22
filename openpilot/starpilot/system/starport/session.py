@@ -62,6 +62,10 @@ AV_SETUP_RESPONSE = 0x8003
 AV_MEDIA_ACK = 0x8004
 VIDEO_FOCUS_REQUEST = 0x8007
 VIDEO_FOCUS_INDICATION = 0x8008
+VIDEO_UI_CONFIG_REQUEST = 0x8009
+VIDEO_UI_CONFIG_REPLY = 0x800A
+TEST_ACKS_LOGGED = 100
+TEST_FRAMES_LOGGED = 20
 
 # Input channel message ids.
 INPUT_EVENT = 0x8001
@@ -80,6 +84,7 @@ BLUETOOTH_AUTH_DATA = 0x8003
 SENSOR_NIGHT, SENSOR_DRIVING_STATUS = 10, 13
 
 CODEC_H264_BP = 3
+CODEC_H265 = 7          # MediaCodecType VIDEO_H265, offered by some head units instead of H.264
 SETUP_STATUS_READY = 2
 FOCUS_PROJECTED = 1
 FOCUS_NATIVE = 2
@@ -88,7 +93,7 @@ FOCUS_REASON_LAUNCH_NATIVE = 2
 FOCUS_REASON_USER_SELECTION = 4
 SHUTDOWN_REASON_USER_SELECTION = 1
 
-RESOLUTIONS = {1: (800, 480), 2: (1280, 720), 3: (1920, 1080)}
+RESOLUTIONS = {1: (800, 480), 2: (1280, 720), 3: (1920, 1080), 6: (720, 1280)}
 # Named in errors and reports only: 1440p, 4K and portrait screens also offer 800x480, which is mandatory.
 RESOLUTION_NAMES = {**{index: f"{w}x{h}" for index, (w, h) in RESOLUTIONS.items()}, 4: "2560x1440", 5: "3840x2160",
                     6: "720x1280", 7: "1080x1920", 8: "1440x2560", 9: "2160x3840"}
@@ -97,14 +102,19 @@ CODEC_NAMES = {3: "H.264", 5: "VP9", 6: "AV1", 7: "H.265"}
 # kind and then every hundredth, so a head unit repeating one cannot flood the session log.
 IGNORED_LOG_FIRST = 5
 IGNORED_LOG_EVERY = 100
+INPUT_LOG_FIRST = 20
+INPUT_LOG_EVERY = 100
 FRAME_RATES = {1: 60, 2: 30}
 # Software H.264 on the comma is the constraint: prefer 720p, then 480p. 1080p
 # is accepted only when nothing smaller is offered.
-RESOLUTION_PREFERENCE = (2, 1, 3)
+RESOLUTION_PREFERENCE = (2, 1, 3, 6)
+TALL_HEVC_RESOLUTION, TALL_HEVC_SIZE = 7, (1080, 1920)  # only with the owner's H.265 at 1080x1920 setting
 
 # A real phone pings periodically; answering pings is mandatory, sending them
 # is harmless and keeps impatient receivers from declaring the link idle.
 PING_INTERVAL = 2.0
+PHONE_STATUS_SERVICE, VENDOR_SERVICE = 10, 12  # ServiceDiscoveryResponse channel descriptor field numbers
+SHUTDOWN_REASONS = {1: "user_selection", 2: "device_switch", 3: "not_supported", 4: "not_currently_supported", 5: "probe_supported"}
 
 
 class AuthenticationRejected(ValueError):
@@ -115,6 +125,8 @@ class PeerRequestedStop(EOFError):
   pass
 
 
+class SharedRadioStall(TimeoutError):
+  """The car stopped acknowledging video while the comma's other Wi-Fi network was joining or roaming."""
 START_CODE = re.compile(b"\x00\x00(?:\x00)?\x01")
 
 
@@ -141,6 +153,55 @@ def wire_frame(access_unit: bytes, *, drop_config: bool) -> bytes:
   return b"".join(units) or access_unit
 
 
+# H.265 handling is kept apart from the H.264 functions above so the H.264 path stays byte-for-byte what it was.
+# A NAL header is two bytes; the type is bits 1-6 of the first (ITU-T H.265 7.3.1.2).
+HEVC_PARAMETER_SETS = (32, 33, 34)   # VPS, SPS, PPS
+HEVC_AUD = 35
+
+
+def hevc_nal_type(first_byte: int) -> int:
+  return (first_byte >> 1) & 0x3F
+
+
+def codec_config_hevc(access_unit: bytes) -> bytes:
+  """The VPS, SPS and PPS NAL units of an H.265 keyframe, as the codec-config buffer carries them."""
+  starts = list(START_CODE.finditer(access_unit))
+  units = []
+  for index, match in enumerate(starts):
+    end = starts[index + 1].start() if index + 1 < len(starts) else len(access_unit)
+    if match.end() < end and hevc_nal_type(access_unit[match.end()]) in HEVC_PARAMETER_SETS:
+      units.append(b"\x00\x00\x00\x01" + access_unit[match.end():end])
+  return b"".join(units)
+
+
+def wire_frame_hevc(access_unit: bytes, *, drop_config: bool) -> bytes:
+  """The H.265 picture NAL units without the access unit delimiter, and without parameter sets once they went separately."""
+  starts = list(START_CODE.finditer(access_unit))
+  drop = {HEVC_AUD, *HEVC_PARAMETER_SETS} if drop_config else {HEVC_AUD}
+  units = []
+  for index, match in enumerate(starts):
+    end = starts[index + 1].start() if index + 1 < len(starts) else len(access_unit)
+    if match.end() < end and hevc_nal_type(access_unit[match.end()]) not in drop:
+      units.append(b"\x00\x00\x00\x01" + access_unit[match.end():end])
+  return b"".join(units) or access_unit
+
+
+def hevc_keyframe_summary(access_unit: bytes) -> dict:
+  starts = list(START_CODE.finditer(access_unit))
+  types, summary = [], {}
+  for index, match in enumerate(starts):
+    end = starts[index + 1].start() if index + 1 < len(starts) else len(access_unit)
+    if match.end() >= end:
+      continue
+    nal_type = hevc_nal_type(access_unit[match.end()])
+    types.append(nal_type)
+    if nal_type == 33 and "tier" not in summary:
+      rbsp = access_unit[match.end():end].replace(b"\x00\x00\x03", b"\x00\x00")
+      if len(rbsp) > 14:
+        summary.update(tier="high" if rbsp[3] & 0x20 else "main", profile=rbsp[3] & 0x1F, level=rbsp[14] / 30)
+  return {"nal_types": types, **summary}
+
+
 @dataclass(frozen=True)
 class VideoMode:
   channel: int
@@ -150,6 +211,10 @@ class VideoMode:
   fps: int
   margin_width: int
   margin_height: int
+  content_left: int | None = None
+  content_top: int | None = None
+  density: int = 0  # dpi the head unit reports; 0 when it does not say
+  codec: int = CODEC_H264_BP
 
   @property
   def content_width(self) -> int:
@@ -161,7 +226,10 @@ class VideoMode:
 
   def as_dict(self) -> dict:
     return {"channel": self.channel, "config_index": self.config_index, "width": self.width, "height": self.height,
-            "fps": self.fps, "margin_width": self.margin_width, "margin_height": self.margin_height}
+            "fps": self.fps, "margin_width": self.margin_width, "margin_height": self.margin_height,
+            "density": self.density,
+            **({"codec": CODEC_NAMES[self.codec]} if self.codec != CODEC_H264_BP else {}),
+            **({"content_left": self.content_left, "content_top": self.content_top} if self.content_left is not None else {})}
 
 
 def describe_video_config(config: dict, display_type: int | None = None) -> str:
@@ -183,24 +251,50 @@ def describe_video_configs(channels: list[dict]) -> str:
   return ", ".join(offered) or "no video"
 
 
-def choose_video_mode(channels: list[dict]) -> VideoMode:
-  """Pick a negotiated H.264 mode the software encoder can sustain."""
+def choose_video_mode(channels: list[dict], allow_hevc: bool = False, tall_hevc: bool = False) -> VideoMode:
+  """Pick a negotiated H.264 mode the software encoder can sustain.
+
+  H.265 is considered only when the owner allows it and the car offered no usable H.264 mode, so a car that works on
+  H.264 is never changed."""
   candidates = []
+  hevc_candidates = []
   for channel in channels:
+    if channel.get("display_type") not in (None, 0):
+      continue  # a cluster or auxiliary screen: the car waits on the main display
     for index, config in enumerate(channel.get("video_configs", [])):
       resolution = one(config, 1)
       codec = one(config, 10, CODEC_H264_BP)
-      if resolution not in RESOLUTIONS or codec != CODEC_H264_BP:
+      tall = tall_hevc and resolution == TALL_HEVC_RESOLUTION and codec == CODEC_H265
+      if (resolution not in RESOLUTIONS and not tall) or codec not in (CODEC_H264_BP, CODEC_H265):
         continue
-      width, height = RESOLUTIONS[resolution]
+      width, height = TALL_HEVC_SIZE if tall else RESOLUTIONS[resolution]
       margin_width, margin_height = int(one(config, 3, 0) or 0), int(one(config, 4, 0) or 0)
       if not (0 <= margin_width < width and 0 <= margin_height < height):
         continue
       fps = FRAME_RATES.get(one(config, 2, 2), 30)
-      mode = VideoMode(int(channel["id"]), index, width, height, fps, margin_width, margin_height)
-      candidates.append((RESOLUTION_PREFERENCE.index(resolution), fps != 30, index, mode))
+      left = top = None
+      additional = one(config, 11)
+      if isinstance(additional, bytes):
+        insets = one(parse_fields(additional), 1)
+        if isinstance(insets, bytes):
+          edges = parse_fields(insets)
+          top_edge, bottom, left_edge, right = (one(edges, field, 0) for field in (1, 2, 3, 4))
+          # Use explicit placement only when it describes the same visible area
+          # as the legacy totals. Otherwise retain the negotiated centered mode.
+          if (all(type(value) is int and value >= 0 for value in (top_edge, bottom, left_edge, right)) and
+              top_edge + bottom == margin_height and left_edge + right == margin_width):
+            left, top = left_edge, top_edge
+      mode = VideoMode(int(channel["id"]), index, width, height, fps, margin_width, margin_height, left, top,
+                       int(one(config, 5, 0) or 0), codec)
+      rank = -1 if tall else RESOLUTION_PREFERENCE.index(resolution)
+      (candidates if codec == CODEC_H264_BP else hevc_candidates).append((rank, fps != 30, index, mode))
+  if not candidates and allow_hevc:
+    candidates = hevc_candidates
   if not candidates:
-    raise ValueError(f"Head unit did not advertise a supported H.264 video mode (offered {describe_video_configs(channels)})")
+    hint = "; this car offers H.265, which can be turned on in Developer > StarPort" if hevc_candidates else ""
+    if not hint and any(channel.get("display_type") not in (None, 0) and channel.get("video_configs") for channel in channels):
+      hint = "; only a secondary display offered a supported mode, which cannot carry the main projection"
+    raise ValueError(f"Head unit did not advertise a supported H.264 video mode (offered {describe_video_configs(channels)}){hint}")
   return min(candidates, key=lambda item: item[:3])[3]
 
 
@@ -211,12 +305,15 @@ class Session:
   DISCOVERY_TIMEOUT = 60.0
 
   def __init__(self, peer, cert: str, key: str, log: Callable[..., None] | None = None, ca: str | None = None, *,
-               receive_timeout: float = 3.0, send_timeout: float = 3.0, handshake_timeout: float = 15.0):
+               receive_timeout: float = 3.0, send_timeout: float = 3.0, handshake_timeout: float = 15.0,
+               version_wait: float | None = None):
     self.peer = peer
     self._log = log
     self.receive_timeout = self._timeout(receive_timeout)
     self.send_timeout = self._timeout(send_timeout)
     self.handshake_timeout = self._timeout(handshake_timeout)
+    # Relaying adapters ping until the car starts its own session
+    self.version_wait = max(self.handshake_timeout, self._timeout(version_wait)) if version_wait is not None else self.handshake_timeout
     self.authenticated = False
     self.head_unit_subject: str = ""
     self.incoming = ssl.MemoryBIO()
@@ -379,14 +476,15 @@ class Session:
   def authenticate(self) -> None:
     # Some wireless adapters send a control keepalive before their version request.
     # A pong keeps the transport alive; version, TLS and certificate checks remain mandatory.
-    deadline = time.monotonic() + self.handshake_timeout
+    started = time.monotonic()
+    deadline = started + self.version_wait
     pings = 0
     while True:
       channel, kind, data = self.receive(deadline=deadline)
       if channel != 0 or kind != MSG_PING_REQUEST:
         break
       pings += 1
-      if pings > 8 or len(data) > 64:
+      if pings > 8 + 3 * (time.monotonic() - started) or len(data) > 64:
         raise ValueError('Excessive pre-version Android Auto keepalive')
       fields = parse_fields(data)
       timestamps = fields.get(1, [])
@@ -461,6 +559,7 @@ class Session:
     self.event("authenticated", version=self.tls.version(), cipher=cipher[0])
 
   def discover(self, device_name: str, device_brand: str) -> list[dict]:
+    self.event("discovery_requested")
     self.send(0, MSG_SERVICE_DISCOVERY_REQUEST, field(4, device_name) + field(5, device_brand))
     raw = self.wait_for(0, MSG_SERVICE_DISCOVERY_RESPONSE, timeout=self.DISCOVERY_TIMEOUT, patient=True)
     response = parse_fields(raw)
@@ -508,6 +607,7 @@ class Session:
       channels.append(item)
     # Everything but the channel list: make, model, year, software and, on newer units, headunit_info.
     head_unit = redact_head_unit(describe_fields({number: values for number, values in response.items() if number != 1}))
+    self.head_unit_info = head_unit
     self.event("discovered", channels=[{k: (json_fields_list(v) if k in ("video_configs", "audio_configs") else str(v) if k == "input_config" else v)
                                         for k, v in ch.items()} for ch in channels],
                head_unit=head_unit)
@@ -583,11 +683,28 @@ class ProjectionSession(Session):
   # held it ~1 s on 2026-10-01 while the car kept acking in 27-219 ms. Stays under the 3 s after which a Honda takes
   # its screen back without video.
   ACK_TIMEOUT = 2.5
+  # The radio is shared with the comma's own Wi-Fi (aa0 + wlan0): joining or roaming there stalled the car's acks past
+  # 2.5 s on 2026-11-02 (hotspot join, home join, mesh roam). While that happens, wait this long before reconnecting.
+  ACK_GRACE_TIMEOUT = 8.0
   ACK_DRAIN_SECONDS = 0.1  # before calling an ACK late, read what already arrived, for at most this long
   MAX_WINDOW = 2
   nav = None
+  grace_frame: float | None = None  # send time of the frame whose late ack is being waited out
+  grace_focus_lost = False
+
+  # Replaced by the supervisor: whether the comma's other Wi-Fi joined or roamed in the last few seconds.
+  radio_change: Callable[..., bool] = staticmethod(lambda: False)
+  # Replaced by the supervisor: stops a join still under way on the comma's other Wi-Fi.
+  radio_stalled: Callable[..., None] = staticmethod(lambda: None)
+
   # HeadunitPad acknowledges every fragment (codec config included) rather than every frame.
   fragment_acks = False
+
+  # Owner toggle or head-unit fix, any codec: for cars that show video but never acknowledge it.
+  unacked_video = False
+  UNACKED_SILENCE_TIMEOUT = 5.0
+  unacked_started_at: float | None = None  # when the first frame of an unacknowledged stream was sent
+  unacked_ack_seen = False
 
   def __init__(self, *args, **kwargs):
     super().__init__(*args, **kwargs)
@@ -611,18 +728,34 @@ class ProjectionSession(Session):
     self.config_ack_slack = 0  # codec-config messages a head unit may acknowledge like frames
     self.epoch_acked = 0
     self.video_confirmed = False
+    self.video_confirmed_at = 0.0
     self.input_channel: int | None = None
     self.max_window = self.MAX_WINDOW  # raised by the supervisor for adapters that need the car's full window
+    self.allow_hevc = False  # the owner's Allow H.265 video setting; used only when the car offers no H.264 mode
+    self.hevc_keyframe_logged = False
+    self.tall_hevc = False  # the owner's H.265 at 1080x1920 setting: prefer that mode when the car offers it
+    self.keyframe_test = False  # the owner's keyframe-only video test: keyframe-only video and extra logging, H.265 sessions only
+    self.test_acks_logged = 0
+    self.test_frames_logged = 0
     self.phone_services = False  # open the car-data and Bluetooth channels like a phone (adapter profile)
     self.phone_frames = False  # send picture NAL units only (adapter profile)
     self.phone_address = ""  # this comma's Bluetooth address, for the pairing request
     self.sensor_channel: int | None = None
     self.sensor_events: dict[int, int] = {}
     self.bluetooth_channel: int | None = None
+    self.phone_status_channel: int | None = None
+    self.vendor_channel: int | None = None
+    self.head_unit_info: dict = {}
+    self.on_discovered: Callable[[dict], tuple[str, ...]] | None = None  # set by the supervisor: the car-specific actions to run
+    self.fix_actions: tuple[str, ...] = ()
+    self.focus_requested_at: float | None = None
+    self.focus_granted_at: float | None = None
     self.nav = None  # NavStatus, attached by the supervisor when the head unit offers turn-by-turn
     self.audio = None  # MediaAudio, attached by the supervisor when Spotify plays through Android Auto
     self.input_events = 0
     self.touch: TouchMapper | None = None
+    self.touch_units: dict[str, str] = {}  # touch geometry -> saved "pixels" or "touchscreen"
+    self.on_touch_units: Callable[[str, str], None] | None = None
     self.touch_events: deque[TouchEvent] = deque(maxlen=128)
     self.keys = KeyTracker()
     self.media_control: Callable[[str], None] | None = None  # non-blocking; set by the supervisor
@@ -634,11 +767,19 @@ class ProjectionSession(Session):
 
   def start(self, device_name: str, device_brand: str) -> VideoMode:
     self.channels = self.discover(device_name, device_brand)
-    self.mode = choose_video_mode(self.channels)
+    self.mode = choose_video_mode(self.channels, self.allow_hevc, self.tall_hevc)
+    if self.on_discovered is not None:
+      try:
+        self.fix_actions = tuple(self.on_discovered(self.head_unit_info) or ())
+      except Exception as error:  # a fix is never allowed to stop a session that would otherwise run
+        self.fix_actions = ()
+        self.event("fix_selection_failed", error=str(error)[:120])
     self.open_video()
     self.open_input()
     if self.phone_services:
       self.open_phone_services()
+    if self.fix_actions:
+      self.run_fix_actions()
     self.request_projection()
     return self.mode
 
@@ -649,7 +790,7 @@ class ProjectionSession(Session):
     opened = parse_fields(self.wait_for(mode.channel, MSG_CHANNEL_OPEN_RESPONSE))
     if signed(one(opened, 1)) != 0:
       raise ValueError(f"Head unit rejected opening the video channel: {json_fields(opened)}")
-    self.send(mode.channel, AV_SETUP_REQUEST, field(1, CODEC_H264_BP))
+    self.send(mode.channel, AV_SETUP_REQUEST, field(1, mode.codec))
     setup = parse_fields(self.wait_for(mode.channel, AV_SETUP_RESPONSE))
     window = int(one(setup, 2, 0) or 0)
     if one(setup, 1) != SETUP_STATUS_READY or window < 1:  # the window is capped to MAX_WINDOW below; MIB3 offers 100
@@ -662,7 +803,11 @@ class ProjectionSession(Session):
 
   def open_input(self) -> None:
     """Open the touch/key channel so input is acknowledged; failures are not fatal."""
-    channel = next((ch for ch in self.channels if ch.get("input")), None)
+    inputs = [ch for ch in self.channels if ch.get("input")]
+    channel = next((ch for ch in inputs if ch.get("display_id") in (None, 0)), inputs[0] if inputs else None)
+    self.event("input_channels", channels=[{"channel": ch["id"], "display_id": ch.get("display_id"),
+                                           "config": str(ch.get("input_config") or InputConfig())} for ch in inputs],
+               selected=channel["id"] if channel is not None else None)
     if channel is None:
       return
     try:
@@ -675,11 +820,23 @@ class ProjectionSession(Session):
       # Echo the advertised keycodes, as a phone does; touch needs no binding.
       self.send(channel["id"], INPUT_BINDING_REQUEST, b"".join(field(1, code) for code in config.keycodes))
       if self.mode is not None:
-        self.touch = TouchMapper(config, self.mode.width, self.mode.height, self.mode.margin_width, self.mode.margin_height)
+        self.touch = TouchMapper(config, self.mode.width, self.mode.height, self.mode.margin_width, self.mode.margin_height,
+                                 content_left=self.mode.content_left, content_top=self.mode.content_top)
+        if self.touch.content_space:
+          saved = self.touch_units.get(self.touch.key)
+          self.touch.content_pixels = saved != "touchscreen"
+          self.touch.calibrating = saved is None
       self.event("input_opened", channel=channel["id"], keycodes=list(config.keycodes),
-                 touch=f"{config.touch_width}x{config.touch_height}")
+                 touch=f"{config.touch_width}x{config.touch_height}", display_id=channel.get("display_id"),
+                 mapping={"touch_width": self.touch.touch_width, "touch_height": self.touch.touch_height,
+                          "video_width": self.touch.video_width, "video_height": self.touch.video_height,
+                          "content_left": self.touch.left, "content_top": self.touch.top,
+                          "content_width": self.touch.content_width, "content_height": self.touch.content_height,
+                          "content_space": self.touch.content_space,
+                          "content_pixels": self.touch.content_pixels, "key": self.touch.key,
+                          "touch_setup": self.touch.calibrating} if self.touch is not None else None)
     except (TimeoutError, ValueError) as error:
-      self.event("input_unavailable", error=str(error))
+      self.event("input_unavailable", channel=channel["id"], error=str(error))
 
   def _open_optional(self, channel: dict, name: str) -> bool:
     try:
@@ -694,27 +851,74 @@ class ProjectionSession(Session):
 
   def open_phone_services(self) -> None:
     """Open the car-data and Bluetooth channels before asking for the screen, as a phone does. Failures are not fatal."""
+    self._open_sensors()
+    self._open_bluetooth(pair=True)
+
+  def _open_sensors(self) -> bool:
     sensors = next((ch for ch in self.channels if "sensors" in ch), None)
-    if sensors is not None and self._open_optional(sensors, "sensors"):
-      self.sensor_channel = sensors["id"]
-      # Only what decides whether the screen may project; location would put the car's position in the session log.
-      wanted = [kind for kind in (SENSOR_DRIVING_STATUS, SENSOR_NIGHT) if kind in sensors["sensors"]]
-      for kind in wanted:
-        self.send(sensors["id"], SENSOR_START_REQUEST, field(1, kind) + field(2, 0))
-      self.event("sensors_opened", channel=sensors["id"], requested=wanted)
+    if sensors is None or self.sensor_channel is not None or not self._open_optional(sensors, "sensors"):
+      return False
+    self.sensor_channel = sensors["id"]
+    # Only what decides whether the screen may project; location would put the car's position in the session log.
+    wanted = [kind for kind in (SENSOR_DRIVING_STATUS, SENSOR_NIGHT) if kind in sensors["sensors"]]
+    for kind in wanted:
+      self.send(sensors["id"], SENSOR_START_REQUEST, field(1, kind) + field(2, 0))
+    self.event("sensors_opened", channel=sensors["id"], requested=wanted)
+    return True
+
+  def _open_bluetooth(self, pair: bool) -> bool:
     bluetooth = next((ch for ch in self.channels if "bluetooth" in ch), None)
-    if bluetooth is not None and self._open_optional(bluetooth, "bluetooth"):
-      self.bluetooth_channel = bluetooth["id"]
-      methods = bluetooth["bluetooth"].get("pairing_methods") or []
-      if self.phone_address:
-        self.send(bluetooth["id"], BLUETOOTH_PAIRING_REQUEST, field(1, self.phone_address) + field(2, methods[0] if methods else 2))
-      self.event("bluetooth_opened", channel=bluetooth["id"], phone_address=self.phone_address,
-                 car_address=bluetooth["bluetooth"].get("car_address", ""), pairing_methods=methods)
+    if bluetooth is None or self.bluetooth_channel is not None or not self._open_optional(bluetooth, "bluetooth"):
+      return False
+    self.bluetooth_channel = bluetooth["id"]
+    methods = bluetooth["bluetooth"].get("pairing_methods") or []
+    if pair:
+      self._send_pairing_request(methods)
+    self.event("bluetooth_opened", channel=bluetooth["id"], phone_address_sent=bool(pair and self.phone_address),
+               has_car_address=bool(bluetooth["bluetooth"].get("car_address")), pairing_methods=methods)
+    return True
+
+  def _send_pairing_request(self, methods: list[int]) -> None:
+    if self.phone_address and self.bluetooth_channel is not None:
+      self.send(self.bluetooth_channel, BLUETOOTH_PAIRING_REQUEST, field(1, self.phone_address) + field(2, methods[0] if methods else 2))
+
+  def _open_service(self, service: int, name: str) -> int | None:
+    channel = next((ch for ch in self.channels if service in ch.get("services", ())), None)
+    if channel is None or not self._open_optional(channel, name):
+      return None
+    return channel["id"]
+
+  def run_fix_actions(self) -> None:
+    """Run the car-specific actions chosen for this head unit, each on its own so one the car dislikes stops nothing else."""
+    for action in self.fix_actions:
+      done = False
+      if action == "open_bluetooth":
+        done = self.bluetooth_channel is not None or self._open_bluetooth(pair=False)
+      elif action == "open_phone_status":
+        if self.phone_status_channel is None:
+          self.phone_status_channel = self._open_service(PHONE_STATUS_SERVICE, "phone_status")
+        done = self.phone_status_channel is not None
+      elif action == "open_sensors":
+        done = self.sensor_channel is not None or self._open_sensors()
+      elif action == "open_vendor":
+        if self.vendor_channel is None:
+          self.vendor_channel = self._open_service(VENDOR_SERVICE, "vendor")
+        done = self.vendor_channel is not None
+      elif action == "unacked_video":
+        self.unacked_video = done = True
+      elif action == "request_bt_pairing":
+        if self.bluetooth_channel is not None and self.phone_address:
+          bluetooth = next((ch for ch in self.channels if ch.get("id") == self.bluetooth_channel), {})
+          self._send_pairing_request((bluetooth.get("bluetooth") or {}).get("pairing_methods") or [])
+          done = True
+      self.event("fix_action", action=action, done=done)
 
   def request_projection(self) -> None:
     """Ask for display focus; the Mazda donor needed this, DHU grants it unsolicited."""
     assert self.mode is not None
     self.allow_projection = True
+    self.focus_requested_at = time.monotonic()
+    self.event("focus_requested")
     self.send(self.mode.channel, VIDEO_FOCUS_REQUEST, field(2, FOCUS_PROJECTED) + field(3, FOCUS_REASON_USER_SELECTION))
 
   def request_native(self) -> bool:
@@ -764,7 +968,9 @@ class ProjectionSession(Session):
         self.ping_responses += 1
       elif kind == MSG_SHUTDOWN_REQUEST:
         self.send(0, MSG_SHUTDOWN_RESPONSE)
-        self.event("peer_requested_shutdown", reason=one(fields, 1))
+        reason = one(fields, 1)
+        after = {"after_focus_s": round(time.monotonic() - self.focus_granted_at, 1)} if self.focus_granted_at is not None else {}
+        self.event("peer_requested_shutdown", reason=reason, reason_label=SHUTDOWN_REASONS.get(reason, "unknown"), **after)
         raise PeerRequestedStop(f"Head unit ended projection (reason {one(fields, 1)})")
       else:
         self.ignored("control_ignored", channel, kind, data)
@@ -773,26 +979,54 @@ class ProjectionSession(Session):
         self._handle_focus(one(fields, 1), one(fields, 2, 0))
       elif kind == AV_MEDIA_ACK:
         self._handle_ack(one(fields, 1), int(one(fields, 2, 0) or 0))
+        if self.keyframe_test_active() and self.test_acks_logged < TEST_ACKS_LOGGED:
+          self.test_acks_logged += 1
+          self.event("video_ack", session=one(fields, 1), count=int(one(fields, 2, 0) or 0), pending=len(self.pending))
+      elif kind == VIDEO_UI_CONFIG_REQUEST and mode.codec == CODEC_H265:
+        self.send(channel, VIDEO_UI_CONFIG_REPLY, data)
+        self.event("ui_config_replied", channel=channel, bytes=len(data))
       else:
         self.ignored("video_ignored", channel, kind, data)
     elif channel == self.input_channel:
       if kind == INPUT_EVENT:
         self.input_events += 1
+        mapped = []
+        disposition = "no_mapper" if self.touch is None else "unfocused" if not self.focused else "no_touch_event"
         if self.touch is not None and self.focused:
           try:
-            self.touch_events.extend(self.touch.decode(data))
+            switched, calibrating = self.touch.units_switched, self.touch.calibrating
+            mapped = self.touch.decode(data)
+            units = "touchscreen" if self.touch.units_switched and not switched else \
+              self.touch.calibrated if calibrating and not self.touch.calibrating else None
+            if units is not None:
+              self.event("touch_units_switched" if switched != self.touch.units_switched else "touch_setup_done",
+                         channel=channel, units=units, key=self.touch.key)
+              if self.on_touch_units is not None:
+                self.on_touch_units(self.touch.key, units)
+              if calibrating:
+                mapped = [TouchEvent("setup", 0.0, 1.0)]  # setup done: show the confirmation
+            self.touch_events.extend(mapped)
+            if mapped:
+              disposition = "queued"
+            elif calibrating:
+              disposition = "touch_setup"
           except ValueError as error:
-            self.event("input_invalid", error=str(error))
+            disposition = "invalid"
+            self.event("input_invalid", channel=channel, kind=kind, error=str(error))
+        if self.input_events <= INPUT_LOG_FIRST or self.input_events % INPUT_LOG_EVERY == 0:
+          self.event("input_event", channel=channel, kind=kind, count=self.input_events, bytes=len(data),
+                     focused=self.focused, disposition=disposition, message=describe(data),
+                     mapped=[{"kind": event.kind, "x": round(event.x, 5), "y": round(event.y, 5)} for event in mapped])
         # The driver may be on the car's own screen while Android Auto plays the music.
         try:
           for action in self.keys.decode(data):
-            self.event("media_key", action=action)
+            self.event("media_key", channel=channel, action=action)
             if self.media_control is not None:
               self.media_control(action)
         except ValueError as error:
-          self.event("input_invalid", error=str(error))
+          self.event("input_invalid", channel=channel, kind=kind, error=str(error))
       elif kind == INPUT_BINDING_RESPONSE:
-        self.event("input_bound", status=signed(one(fields, 1, 0)))
+        self.event("input_bound", channel=channel, status=signed(one(fields, 1, 0)))
       else:
         self.ignored("input_ignored", channel, kind, data)
     elif channel is not None and channel == self.sensor_channel:
@@ -820,7 +1054,14 @@ class ProjectionSession(Session):
     was_focused = self.focused
     granted = focus in (FOCUS_PROJECTED, FOCUS_PROJECTED_NO_INPUT)
     self.focused = granted and self.allow_projection
-    self.event("video_focus", focus=focus, unsolicited=unsolicited, focused=self.focused)
+    wait = {}
+    if self.focused and self.focus_granted_at is None:
+      self.focus_granted_at = time.monotonic()
+      if self.focus_requested_at is not None:
+        wait = {"wait_s": round(self.focus_granted_at - self.focus_requested_at, 2)}
+    self.event("video_focus", focus=focus, unsolicited=unsolicited, focused=self.focused, **wait)
+    if was_focused and not self.focused and self.grace_frame is not None:
+      self.grace_focus_lost = True  # the car gave up on the stalled video: reconnect rather than wait unfocused
     if was_focused and not self.focused and self.touch is not None:
       self.touch_events.extend(self.touch.reset())
     if self.focused and not was_focused:
@@ -844,6 +1085,12 @@ class ProjectionSession(Session):
 
   def _handle_ack(self, sid, count: int) -> None:
     if sid in self.retired_sessions:
+      return
+    if self.unacked_video:
+      self.acked += count
+      if not self.unacked_ack_seen:
+        self.unacked_ack_seen = True
+        self.event("unexpected_video_ack", session=sid, count=count, frames_sent=self.frames_sent)
       return
     if self.fragment_acks:
       if sid != self.session_id:
@@ -879,6 +1126,9 @@ class ProjectionSession(Session):
     self.unacked -= count
     self.acked += count
     self.epoch_acked += count
+    if self.grace_frame is not None and (not self.pending or self.pending[0] != self.grace_frame):
+      self.event("ack_grace_recovered", gap_ms=round((now - self.grace_frame) * 1000))
+      self.grace_frame = None
     self._confirm_video()
 
   def _confirm_video(self) -> None:
@@ -887,12 +1137,15 @@ class ProjectionSession(Session):
     # bound on acknowledged frames without changing flow-control credit.
     if not self.video_confirmed and self.epoch_acked > self.config_ack_slack:
       self.video_confirmed = True
+      self.video_confirmed_at = time.monotonic()
       self.event("video_acknowledged", session=self.session_id, ack_ms=round(self.max_ack_seconds * 1000))
 
   # ANDROID AUTO VIDEO PERFORMANCE GUARDRAIL: Receiver ACK flow control bounds in-flight video; extra buffering increases latency.
   # Altering this can degrade video smoothness or introduce lag on Android Auto.
   # Do not change it autonomously; require an explicit user request specifically for this video optimization.
   def can_send(self) -> bool:
+    if self.unacked_video:
+      return self.focused
     return self.focused and self.unacked < self.window
 
   def _ack_overdue(self, now: float) -> bool:
@@ -901,6 +1154,8 @@ class ProjectionSession(Session):
   def check_progress(self, now: float | None = None) -> None:
     measured = now is None
     now = time.monotonic() if measured else now
+    if self.grace_focus_lost:
+      raise SharedRadioStall("The car took its screen back while the comma's Wi-Fi was switching networks")
     if self._ack_overdue(now):
       # ACKs that arrived while this loop was busy (a slow encode, a CPU burst) still sit in the socket; the
       # streaming loop drains only a bounded batch per pass, so read what is there before calling the car silent.
@@ -910,11 +1165,50 @@ class ProjectionSession(Session):
       if measured:
         now = time.monotonic()
       if self._ack_overdue(now):
-        raise TimeoutError(f"Video acknowledgement older than {self.ACK_TIMEOUT:.1f} s")
+        self._wait_out_radio_change(now)
+    if self.unacked_video:
+      now = self._check_unacked_video(now, measured)
     # Only a receiver known to answer pings can be declared dead by silence; for
     # others a lost link surfaces as a socket error or a dropped Wi-Fi lease.
     if self.ping_responses and now - self.last_rx > 15.0:
       raise TimeoutError("Head unit stopped answering for 15 s")
+
+  def _unacked_silent(self, now: float) -> bool:
+    started = self.unacked_started_at
+    return bool(self.focused and started is not None and now - max(self.last_rx, started) > self.UNACKED_SILENCE_TIMEOUT)
+
+  def _check_unacked_video(self, now: float, measured: bool) -> float:
+    """Without ACKs a car that still talks is still there: give up on silence, and count video as shown once it has stayed."""
+    if self._unacked_silent(now):
+      deadline = time.monotonic() + self.ACK_DRAIN_SECONDS
+      while time.monotonic() < deadline and self.pump(0.0):
+        pass
+      if measured:
+        now = time.monotonic()
+      if self._unacked_silent(now):
+        raise TimeoutError(f"Head unit stopped answering for {self.UNACKED_SILENCE_TIMEOUT:.1f} s while projecting without video acknowledgments")
+    started = self.unacked_started_at
+    if (not self.video_confirmed and self.focused and started is not None and now - started > self.ACK_TIMEOUT and
+        self.last_rx > started):
+      self.video_confirmed = True
+      self.video_confirmed_at = started
+      self.event("video_acknowledged", session=self.session_id, ack_ms=None, unacked=True, frames_sent=self.frames_sent)
+    return now
+
+  def _wait_out_radio_change(self, now: float) -> None:
+    """The oldest frame is past ACK_TIMEOUT: give up, unless the comma's other Wi-Fi just changed networks."""
+    oldest = self.pending[0]
+    if self.grace_frame != oldest:
+      if not self.radio_change():
+        if not self.acked and not self.video_confirmed:
+          self.event("video_never_acknowledged", frames_sent=self.frames_sent,
+                     last_rx_ms=round((time.monotonic() - self.last_rx) * 1000))
+        raise TimeoutError(f"Video acknowledgement older than {self.ACK_TIMEOUT:.1f} s")
+      self.grace_frame = oldest
+      self.event("ack_grace", after_ms=round((now - oldest) * 1000))
+      self.radio_stalled()
+    if now - oldest > self.ACK_GRACE_TIMEOUT:
+      raise SharedRadioStall(f"Video acknowledgement older than {self.ACK_GRACE_TIMEOUT:.1f} s while the comma's Wi-Fi was switching networks")
 
   def send_frame(self, data: bytes, timestamp_us: int, *, keyframe: bool) -> None:
     if not self.can_send():
@@ -925,20 +1219,34 @@ class ProjectionSession(Session):
     fragments = 0
     config = b""
     if self.needs_keyframe:
-      config = codec_config(data)
+      config = codec_config_hevc(data) if self.mode.codec == CODEC_H265 else codec_config(data)
+      if self.mode.codec == CODEC_H265 and not self.hevc_keyframe_logged:
+        self.hevc_keyframe_logged = True
+        self.event("hevc_keyframe", config_bytes=len(config), frame_bytes=len(data), **hevc_keyframe_summary(data))
       if config:
         fragments += self.send(self.mode.channel, AV_MEDIA_CODEC_CONFIG, config)
         if not self.fragment_acks:
           self.config_ack_slack += 1
     if self.phone_frames:
-      data = wire_frame(data, drop_config=bool(config))
+      data = (wire_frame_hevc if self.mode.codec == CODEC_H265 else wire_frame)(data, drop_config=bool(config))
     fragments += self.send(self.mode.channel, AV_MEDIA_WITH_TIMESTAMP, struct.pack(">Q", timestamp_us) + data)
-    if self.fragment_acks:
-      self.frame_fragments.append(fragments)
     self.needs_keyframe = False
-    self.pending.append(time.monotonic())
-    self.unacked += 1
+    if self.unacked_video:
+      if self.unacked_started_at is None:
+        self.unacked_started_at = time.monotonic()
+    else:
+      if self.fragment_acks:
+        self.frame_fragments.append(fragments)
+      self.pending.append(time.monotonic())
+      self.unacked += 1
     self.frames_sent += 1
+    if self.keyframe_test_active() and self.test_frames_logged < TEST_FRAMES_LOGGED:
+      self.test_frames_logged += 1
+      self.event("video_frame_sent", frame=self.frames_sent, keyframe=keyframe, config_bytes=len(config), bytes=len(data),
+                 timestamp_us=timestamp_us, nal_types=hevc_keyframe_summary(data)["nal_types"], pending=len(self.pending))
+
+  def keyframe_test_active(self) -> bool:
+    return self.keyframe_test and self.mode is not None and self.mode.codec == CODEC_H265
 
   def shutdown(self, timeout: float = 2.0) -> None:
     self.send(0, MSG_SHUTDOWN_REQUEST, field(1, SHUTDOWN_REASON_USER_SELECTION))
@@ -963,4 +1271,4 @@ class ProjectionSession(Session):
     return {"frames_sent": self.frames_sent, "frames_acked": self.acked, "pending": self.unacked,
             "focus_epoch": self.focus_epoch, "focused": self.focused, "max_ack_ms": round(self.max_ack_seconds * 1000),
             "input_events": self.input_events, "touch": self.touch is not None,
-            "sensor_events": sum(self.sensor_events.values())}
+            "sensor_events": sum(self.sensor_events.values()), **({"unacked_video": True} if self.unacked_video else {})}

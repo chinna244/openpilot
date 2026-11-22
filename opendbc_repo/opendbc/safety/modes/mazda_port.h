@@ -33,6 +33,16 @@
 #define MAZDA_PARAM_LONGITUDINAL 1U
 // The measured gen1 EPS envelope; the interface sets it on every Mazda it admits.
 #define MAZDA_PARAM_EPS_HW 2U
+// A Smart CAN Filter keeps the radar online under alpha long (develop's MAZDA_PARAM_SP_CAN_FILTER, in the
+// second safety word there): FILTER_CTRL may go out, the UDS takeover and synthetic radar frames may not.
+#define MAZDA_PARAM_CAN_FILTER 16U
+// Smart CAN Filter control: magic, subcommand 0x2e (FILTER_CTRL)
+#define MAZDA_CAN_FILTER_CTRL 0x2A0U
+// The camera-only TJA press-off (develop 0f6ce31f): at least this far apart, at most MAZDA_CAM_PRESS_MAX in a
+// burst, and the burst ends after MAZDA_CAM_PRESS_QUIET_US without one.
+#define MAZDA_CAM_PRESS_MIN_US 900000U
+#define MAZDA_CAM_PRESS_MAX 4U
+#define MAZDA_CAM_PRESS_QUIET_US 5000000U
 
 // Keep SET/RES intent fresh until PEDALS reports engagement.
 #define MAZDA_ENGAGE_BTN_WINDOW 10U
@@ -47,6 +57,17 @@ static bool mazda_port_eps_hw = false;
 static bool mazda_port_acc_armed = false;
 static uint32_t mazda_port_engage_btn_frames = 0U;
 static uint32_t mazda_port_main_off_samples = 0U;
+static uint32_t mazda_port_cam_press_ts = 0U;     // camera-only TJA press-off: last press sent
+static uint32_t mazda_port_cam_press_count = 0U;  // presses in the current burst
+
+static bool mazda_port_cam_tja_press_msg_valid(const CANPacket_t *msg) {
+  // Exact wheel TJA press over the idle pattern (route 00000097: 0009ffcc00000000): every other
+  // button bit 0, its inversions 1, CTR the only free bits in byte 3.
+  return (GET_LEN(msg) == 8U) && (msg->data[0] == 0x00U) &&
+         (msg->data[1] == 0x09U) && (msg->data[2] == 0xffU) &&
+         ((msg->data[3] & 0xc3U) == 0xc0U) && (msg->data[4] == 0x00U) &&
+         (msg->data[5] == 0x00U) && (msg->data[6] == 0x00U) && (msg->data[7] == 0x00U);
+}
 
 static bool mazda_port_mrcc_off_msg_valid(const CANPacket_t *msg) {
   // Exact active-low MRCC master tap. CTR occupies the variable bits in byte 3;
@@ -68,7 +89,7 @@ typedef struct {
 
 static bool mazda_port_radar_capture_msg_valid(const CANPacket_t *msg) {
   static const MazdaPortRadarCapture MAZDA_RADAR_CAPTURES[] = {
-    {MAZDA_RADAR_STATIC,  {0x00U, 0x08U, 0xc0U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U}, 0xffU},  // 2022 family
+    {MAZDA_RADAR_STATIC,  {0x00U, 0x08U, 0xe0U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U}, 0xffU},  // 2022 family
     {MAZDA_RADAR_STATIC,  {0x00U, 0x98U, 0x40U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U}, 0xffU},  // G46L
     {MAZDA_RADAR_TRACK_1, {0xffU, 0xf7U, 0xfeU, 0xfeU, 0x1fU, 0xc0U, 0x00U, 0x80U}, 0xf0U},
     {MAZDA_RADAR_TRACK_2, {0xffU, 0xf7U, 0xfeU, 0xfeU, 0x1fU, 0xc7U, 0x8cU, 0x80U}, 0xf0U},
@@ -283,14 +304,15 @@ static bool mazda_port_tx_hook(const CANPacket_t *msg) {
   }
 
   if (mazda_port_longitudinal && long_replacement_bus && (msg->addr == MAZDA_CRZ_INFO)) {
-    // Allow byte-exact stock standby patterns with the raw 8190 command sentinel.
+    // Allow byte-exact stock standby patterns with the raw 8190 command sentinel. Byte 5 bit 0 is the
+    // radar's echo of the dash frame's white TJA=2, outside the factory checksum (Sept-Oct captures).
     bool stock_standby = (msg->data[0] == 0x01U) && (msg->data[1] == 0xffU) &&
                          (msg->data[2] == 0xe3U) && (msg->data[3] == 0xffU) &&
                          ((msg->data[4] & 0xfbU) == 0xc0U) &&
-                         ((msg->data[5] & 0x7fU) == 0x00U) &&
+                         ((msg->data[5] & 0x7eU) == 0x00U) &&
                          ((msg->data[6] & 0xf0U) == 0x00U) &&
                          (msg->data[7] == ((0xffU - ((msg->data[0] + msg->data[1] + msg->data[2] + msg->data[3] +
-                                                     msg->data[4] + msg->data[5] + msg->data[6]) & 0xffU)) & 0xffU));
+                                                     msg->data[4] + (msg->data[5] & 0xfeU) + msg->data[6]) & 0xffU)) & 0xffU));
 
     // Assemble the 13-bit ACCEL_CMD unsigned for MISRA 10.1, then remove its 4096 offset.
     uint32_t accel_raw = (((uint32_t)msg->data[2] & 0x3U) << 11) | ((uint32_t)msg->data[3] << 3) | ((uint32_t)msg->data[4] >> 5);
@@ -300,14 +322,17 @@ static bool mazda_port_tx_hook(const CANPacket_t *msg) {
     }
 
     // ACC_ACTIVE requires prior controls permission established from the physical SET edge.
+    // So do the standstill bits sent only with it: STOPPING, STOPPING_2 and RESUME_UNLATCHING (a hold release).
     bool acc_active = GET_BIT(msg, 33U);
-    if (!controls_allowed && acc_active) {
+    bool standstill_bits = GET_BIT(msg, 42U) || GET_BIT(msg, 52U) || GET_BIT(msg, 54U);
+    if (!controls_allowed && (acc_active || standstill_bits)) {
       tx = false;
     }
   }
 
   if (mazda_port_longitudinal && long_replacement_bus && (msg->addr == MAZDA_CRZ_CTRL)) {
-    bool cruise_active = GET_BIT(msg, 3U);
+    // CRZ_ACTIVE and ACC_ACTIVE_2, which is sent only with it
+    bool cruise_active = GET_BIT(msg, 3U) || GET_BIT(msg, 52U);
     if (!controls_allowed && cruise_active) {
       tx = false;
     }
@@ -350,6 +375,36 @@ static bool mazda_port_tx_hook(const CANPacket_t *msg) {
     }
   }
 
+  if (main_bus && (msg->addr == MAZDA_CAN_FILTER_CTRL)) {
+    // FILTER_CTRL only: MODE/FILTER bits, reserved bytes zero. The board's bootloader, softloader,
+    // reset (0x1e) and feature-save (0x1f) subcommands never pass. Listed only in the filter TX tables.
+    bool filter_ctrl = (msg->data[0] == 0xceU) && (msg->data[1] == 0xfaU) && (msg->data[2] == 0xadU) &&
+                       (msg->data[3] == 0xdeU) && (msg->data[4] == 0x2eU) && ((msg->data[5] & 0xfcU) == 0U) &&
+                       (msg->data[6] == 0U) && (msg->data[7] == 0U);
+    if (!filter_ctrl) {
+      tx = false;
+    }
+  }
+
+  if ((msg->bus == (unsigned char)MAZDA_CAM) && (msg->addr == MAZDA_CRZ_BTNS)) {
+    // Camera-only TJA press (mads update_camera_tja: press the camera's own TJA off): the exact
+    // press, only while openpilot steers, paced and capped per burst. It reaches the camera alone,
+    // never the body or the panda's own TJA latch (rx reads bus 0).
+    uint32_t ts = microsecond_timer_get();
+    uint32_t since = safety_get_ts_elapsed(ts, mazda_port_cam_press_ts);
+    if ((mazda_port_cam_press_count > 0U) && (since >= MAZDA_CAM_PRESS_QUIET_US)) {
+      mazda_port_cam_press_count = 0U;
+    }
+    bool paced = (mazda_port_cam_press_count == 0U) || (since >= MAZDA_CAM_PRESS_MIN_US);
+    if (mazda_port_tja_button && mazda_port_cam_tja_press_msg_valid(msg) && mazda_port_openpilot_controlling() &&
+        paced && (mazda_port_cam_press_count < MAZDA_CAM_PRESS_MAX)) {
+      mazda_port_cam_press_count += 1U;
+      mazda_port_cam_press_ts = ts;
+    } else {
+      tx = false;
+    }
+  }
+
   mazda_aol_tx_commit(msg, tx && !relay_malfunction);
   return tx;
 }
@@ -366,21 +421,10 @@ static bool mazda_port_fwd_hook(int bus_num, int addr) {
   return block_msg;
 }
 
-// Mutate only the bus0->bus2 forward copy of CRZ_BTNS. Panda RX and the OEM body/MRCC
-// keep the original bus0 frame, including physical TJA. Requires the declared TJA button and
-// the MADS feature (system_enabled), not heartbeat_engaged_mads, so the first button edge
-// cannot leak to the FSC during a USB-heartbeat transition.
-static void mazda_port_fwd_modify(int bus_num, CANPacket_t *msg) {
-  if (mazda_port_tja_button && mazda_aol_enabled && (bus_num == MAZDA_MAIN) &&
-      (msg->addr == MAZDA_CRZ_BTNS) && (GET_LEN(msg) >= 2U)) {
-    msg->data[MAZDA_TJA_BUTTON_BIT / 8U] &= (uint8_t)~(1U << (MAZDA_TJA_BUTTON_BIT % 8U));
-  }
-}
-
 static safety_config mazda_port_init(uint16_t param) {
   mazda_aol_reset();
   mazda_aol_alpha_long = false;
-  if (((param & ~11U) != 0U) || ((param & MAZDA_PARAM_EPS_HW) == 0U)) {
+  if (((param & ~27U) != 0U) || ((param & MAZDA_PARAM_EPS_HW) == 0U)) {
     return (safety_config){0};
   }
   mazda_aol_enabled = (unsigned int)alternative_experience == 32U;
@@ -399,17 +443,23 @@ static safety_config mazda_port_init(uint16_t param) {
   mazda_port_engage_btn_frames = 0U;
   mazda_port_main_off_samples = 0U;
   mazda_port_acc_armed = false;
+  mazda_port_cam_press_ts = 0U;
+  mazda_port_cam_press_count = 0U;
 
+  // CRZ_BTNS on the camera bus is the camera-only TJA press; no relay check, so the real wheel
+  // stream, the driver's TJA press included, keeps forwarding to the camera.
   static const CanMsg MAZDA_TX_MSGS[] = {
     {MAZDA_LKAS, 0, 8, .check_relay = true, .disable_static_blocking = true},
     {MAZDA_CRZ_BTNS, 0, 8, .check_relay = false},
     {MAZDA_LKAS_HUD, 0, 8, .check_relay = true, .disable_static_blocking = true},
+    {MAZDA_CRZ_BTNS, MAZDA_CAM, 8, .check_relay = false},
   };
 
   static const CanMsg MAZDA_NATIVE_TX_MSGS[] = {
     {MAZDA_LKAS, 0, 8, .check_relay = false, .disable_static_blocking = true},
     {MAZDA_CRZ_BTNS, 0, 8, .check_relay = false},
     {MAZDA_LKAS_HUD, 0, 8, .check_relay = false, .disable_static_blocking = true},
+    {MAZDA_CRZ_BTNS, MAZDA_CAM, 8, .check_relay = false},
   };
 
 // Replaced-radar addresses omit relay checks because the radar remains live during boot and
@@ -437,6 +487,7 @@ static safety_config mazda_port_init(uint16_t param) {
     {MAZDA_RADAR_TRACK_4, MAZDA_CAM, 8, .check_relay = false},
     {MAZDA_RADAR_TRACK_5, MAZDA_CAM, 8, .check_relay = false},
     {MAZDA_RADAR_TRACK_6, MAZDA_CAM, 8, .check_relay = false},
+    {MAZDA_CRZ_BTNS, MAZDA_CAM, 8, .check_relay = false},
   };
 
   static const CanMsg MAZDA_NATIVE_LONG_TX_MSGS[] = {
@@ -462,8 +513,35 @@ static safety_config mazda_port_init(uint16_t param) {
     {MAZDA_RADAR_TRACK_4, MAZDA_CAM, 8, .check_relay = false},
     {MAZDA_RADAR_TRACK_5, MAZDA_CAM, 8, .check_relay = false},
     {MAZDA_RADAR_TRACK_6, MAZDA_CAM, 8, .check_relay = false},
+    {MAZDA_CRZ_BTNS, MAZDA_CAM, 8, .check_relay = false},
   };
 
+
+  // The Smart CAN Filter keeps the radar online: no UDS takeover and no synthetic radar frames, and
+  // its FILTER_CTRL is the one extra message.
+  static const CanMsg MAZDA_LONG_FILTER_TX_MSGS[] = {
+    {MAZDA_LKAS, 0, 8, .check_relay = true, .disable_static_blocking = true},
+    {MAZDA_CRZ_BTNS, 0, 8, .check_relay = false},
+    {MAZDA_LKAS_HUD, 0, 8, .check_relay = true, .disable_static_blocking = true},
+    {MAZDA_CRZ_INFO, 0, 8, .check_relay = false},
+    {MAZDA_CRZ_CTRL, 0, 8, .check_relay = false},
+    {MAZDA_CAN_FILTER_CTRL, 0, 8, .check_relay = false},
+    {MAZDA_CRZ_BTNS, MAZDA_CAM, 8, .check_relay = false},
+    {MAZDA_CRZ_INFO, MAZDA_CAM, 8, .check_relay = false},
+    {MAZDA_CRZ_CTRL, MAZDA_CAM, 8, .check_relay = false},
+  };
+
+  static const CanMsg MAZDA_NATIVE_LONG_FILTER_TX_MSGS[] = {
+    {MAZDA_LKAS, 0, 8, .check_relay = false, .disable_static_blocking = true},
+    {MAZDA_CRZ_BTNS, 0, 8, .check_relay = false},
+    {MAZDA_LKAS_HUD, 0, 8, .check_relay = false, .disable_static_blocking = true},
+    {MAZDA_CRZ_INFO, 0, 8, .check_relay = false},
+    {MAZDA_CRZ_CTRL, 0, 8, .check_relay = false},
+    {MAZDA_CAN_FILTER_CTRL, 0, 8, .check_relay = false},
+    {MAZDA_CRZ_BTNS, MAZDA_CAM, 8, .check_relay = false},
+    {MAZDA_CRZ_INFO, MAZDA_CAM, 8, .check_relay = false},
+    {MAZDA_CRZ_CTRL, MAZDA_CAM, 8, .check_relay = false},
+  };
 
   mazda_port_longitudinal = GET_FLAG(param, MAZDA_PARAM_LONGITUDINAL);
   mazda_port_eps_hw = GET_FLAG(param, MAZDA_PARAM_EPS_HW);
@@ -474,8 +552,14 @@ static safety_config mazda_port_init(uint16_t param) {
   if (mazda_port_longitudinal) {
     ret.rx_checks = &mazda_rx_checks[1];
     ret.rx_checks_len -= 1;
-    ret.tx_msgs = mazda_aol_enabled ? MAZDA_NATIVE_LONG_TX_MSGS : MAZDA_LONG_TX_MSGS;
-    ret.tx_msgs_len = sizeof(MAZDA_LONG_TX_MSGS) / sizeof(CanMsg);
+    if (GET_FLAG(param, MAZDA_PARAM_CAN_FILTER)) {
+      // Alpha long through the Smart CAN Filter instead of the radar's UDS takeover.
+      ret.tx_msgs = mazda_aol_enabled ? MAZDA_NATIVE_LONG_FILTER_TX_MSGS : MAZDA_LONG_FILTER_TX_MSGS;
+      ret.tx_msgs_len = sizeof(MAZDA_LONG_FILTER_TX_MSGS) / sizeof(CanMsg);
+    } else {
+      ret.tx_msgs = mazda_aol_enabled ? MAZDA_NATIVE_LONG_TX_MSGS : MAZDA_LONG_TX_MSGS;
+      ret.tx_msgs_len = sizeof(MAZDA_LONG_TX_MSGS) / sizeof(CanMsg);
+    }
   } else if (mazda_aol_enabled) {
     ret.tx_msgs = MAZDA_NATIVE_TX_MSGS;
   }

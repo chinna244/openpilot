@@ -19,8 +19,8 @@ def identity(tmp_path_factory):
   return make_identity(tmp_path_factory.mktemp("identity"))
 
 
-def decide(policy, now, onroad=False, car_link=False, ready=True, running=False, enabled=True):
-  return policy.decide(now, enabled=enabled, onroad=onroad, car_link=car_link, ready=ready, running=running)
+def decide(policy, now, onroad=False, car_link=False, ready=True, running=False, enabled=True, linked=False):
+  return policy.decide(now, enabled=enabled, onroad=onroad, car_link=car_link, ready=ready, running=running, linked=linked)
 
 
 # -------------------------------------------------------------------- policy
@@ -45,10 +45,27 @@ def test_policy_stops_after_car_gone():
   assert decide(policy, 100) is None                             # stopped, car still gone: no restart
 
 
+def test_policy_keeps_a_projecting_session_when_the_car_link_drops():
+  policy = AutoConnectPolicy()
+  assert decide(policy, 0, car_link=True) == "start"
+  assert decide(policy, 1, car_link=True, running=True) is None
+  for now in range(2, 400, 10):
+    assert decide(policy, now, running=True, linked=True) is None
+  assert decide(policy, 400, running=True) is None                # stream ended: grace period starts
+  assert decide(policy, 400 + auto_connect.STOP_AFTER, running=True) == "stop"
+
+
 def test_policy_leaves_sessions_that_never_saw_the_car():
   policy = AutoConnectPolicy()
   for now in range(0, 300, 10):
     assert decide(policy, now, running=True) is None
+
+
+def test_policy_hold_blocks_start_while_idle_until_next_drive():
+  policy = AutoConnectPolicy()
+  policy.hold()
+  assert decide(policy, 0, car_link=True) is None
+  assert decide(policy, 1, onroad=True, car_link=True) == "start"
 
 
 def test_policy_manual_stop_holds_until_next_drive():
@@ -305,7 +322,7 @@ def test_projection_verifies_head_unit_only_when_chosen(identity, tmp_path, monk
     pass
 
   class RecordingSession:
-    def __init__(self, sock, cert, key, log, ca):
+    def __init__(self, sock, cert, key, log, ca, **kwargs):
       seen.append(ca)
 
     def authenticate(self):
@@ -315,6 +332,29 @@ def test_projection_verifies_head_unit_only_when_chosen(identity, tmp_path, monk
   with pytest.raises(Stop):
     sup._project(None, None, ident, connect=lambda: socket.socketpair()[0])
   assert seen == [ident.root if verified else None]
+
+
+@pytest.mark.parametrize("car_type, wait", [("adapter", 90.0), ("built_in", None)])
+def test_only_adapters_wait_long_for_the_version_request(identity, tmp_path, monkeypatch, car_type, wait):
+  from openpilot.starpilot.system.starport import identity as identity_store, supervisor
+  sup, _ = make_supervisor(identity, tmp_path, monkeypatch, lambda *a, **k: socket.socketpair()[0])
+  monkeypatch.setattr(sup, "car_type", lambda: car_type)
+  seen = []
+
+  class Stop(Exception):
+    pass
+
+  class RecordingSession:
+    def __init__(self, sock, cert, key, log, ca, **kwargs):
+      seen.append(kwargs.get("version_wait"))
+
+    def authenticate(self):
+      raise Stop
+
+  monkeypatch.setattr(supervisor, "ProjectionSession", RecordingSession)
+  with pytest.raises(Stop):
+    sup._project(None, None, identity_store.load_identity(), connect=lambda: socket.socketpair()[0])
+  assert seen == [wait]
 
 
 def _wireless_backoff_harness(sup, monkeypatch, failure):

@@ -70,6 +70,10 @@ def stock_ecu_events(cp, record, restore_failed, button_events, now_ns):
   pressed = any(be.pressed and str(be.type) in SET_SPEED_BUTTONS for be in button_events)
   if not pressed or state in ENGAGES_NORMALLY or state == StockEcuState.STOCK_CRUISE_ON:
     return failed, None
+  # Mazda's Smart CAN Filter: a SET press before the board confirms ownership is silently ignored (develop)
+  from opendbc.car.mazda.values import MazdaSafetyFlags
+  if state == StockEcuState.STARTING and cp.safetyConfigs[0].safetyParam & MazdaSafetyFlags.CAN_FILTER:
+    return failed, None
   return failed, state if state is not None else 'unknown'
 
 

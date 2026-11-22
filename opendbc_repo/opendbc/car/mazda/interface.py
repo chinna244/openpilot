@@ -4,6 +4,7 @@ from opendbc.car import Bus, get_safety_config, structs
 from opendbc.car.carlog import carlog
 from opendbc.car.common.conversions import Conversions as CV
 from opendbc.car.interfaces import CarInterfaceBase
+from opendbc.car.mazda.can_filter import FACTORY_CRUISE, FACTORY_CRUISE_ADDRS, FILTER_BUS, FILTER_STATE_ADDR
 from opendbc.car.mazda.carcontroller import CarController
 from opendbc.car.mazda.carstate import CarState
 from opendbc.car.mazda.radar_interface import RadarInterface
@@ -28,6 +29,7 @@ class CarInterface(CarInterfaceBase):
     self.CC = self.CarController({bus: parser.dbc_name for bus, parser in self.can_parsers.items()}, CP, self.CP_SP)
     # The controller runs the radar session; carstate reads its outcome on the next update.
     self.CS.radar_session = self.CC.radar_session
+    self.CS.can_filter = self.CC.can_filter
 
   @staticmethod
   def configure_torque_tune(candidate, tune, steering_angle_deadzone_deg=0.0):
@@ -55,6 +57,8 @@ class CarInterface(CarInterfaceBase):
     if g46l_radar:
       ret.flags |= MazdaFlags.G46L_RADAR.value
     ret.radarUnavailable = Bus.radar not in DBC[candidate] or g46l_radar
+    # Track range rates lag carState vEgo by 0.10-0.14 s (stationary objects vs -vEgo while accelerating).
+    ret.radarDelay = 0.1
 
     # Every gen1 Mazda EPS is the same hardware; only the firmware differs. Steer-to-zero follows
     # the EPS firmware, so a donor-EPS swap carries it and older firmware in a 2022 body loses it.
@@ -86,7 +90,8 @@ class CarInterface(CarInterfaceBase):
       ret.pcmCruise = True
       ret.radarUnavailable = True
       ret.stopAccel = -1.0  # stock MRCC standstill command, raw -1024
-      ret.longitudinalActuatorDelay = 0.36  # measured ~0.3 s dead time + ~0.3 s first-order lag
+      # Gas responds in 0-0.2 s, the friction brake in 0.75-0.85 s.
+      ret.longitudinalActuatorDelay = 0.5
 
     carlog.debug({"event": "mazdaRadarVerdict", "radarUnavailable": ret.radarUnavailable,
                   "platformClaim": Bus.radar in DBC[candidate], "g46lRadar": g46l_radar, "steerToZeroEps": steer_to_zero})
@@ -94,8 +99,8 @@ class CarInterface(CarInterfaceBase):
     if 0x477 in fingerprint[0]:
       ret.flags |= MazdaFlags.HAS_BSM.value
 
-    # lagd starts from this plus 0.2 s; CX-5 drives learn 0.23-0.26 s request-to-yaw.
-    ret.steerActuatorDelay = 0.05
+    # lagd starts from this plus 0.2 s; CX-5 drives learn 0.30-0.34 s.
+    ret.steerActuatorDelay = 0.14
     ret.steerLimitTimer = 0.8
 
     CarInterface.configure_torque_tune(candidate, ret.lateralTuning)
@@ -109,6 +114,8 @@ class CarInterface(CarInterfaceBase):
     params = cls._get_params_sp(CP, context.CarParamsSP(), candidate, fingerprint, car_fw, alpha_long, is_release_sp, docs)
     if CP.safetyConfigs[0].safetyParam & 8:
       params.flags |= MazdaFlagsSP.TJA_BUTTON
+    if CP.safetyConfigs[0].safetyParam & MazdaSafetyFlags.CAN_FILTER:
+      params.flags |= MazdaFlagsSP.CAN_FILTER
     return params
 
   @staticmethod
@@ -132,15 +139,27 @@ class CarInterface(CarInterfaceBase):
     return ret
 
   def update(self, can_packets):
-    """Latch the camera's last CAM_LANEINFO payload and staleness: carstate's freshness and the white-wheel HUD gate."""
+    """Latch the camera's last CAM_LANEINFO payload and staleness: carstate's freshness and the white-wheel HUD gate.
+    Likewise the Smart CAN Filter's status byte and its age; the read's filter events go to its session in order,
+    every status byte and every radar cruise frame the board let through to the car side."""
     # card sends [(t, frames), ...]; the model tests send one bare (t, frames) tuple. CANParser.update takes both.
     if can_packets and not isinstance(can_packets[0], (list, tuple)):
       can_packets = [can_packets]
     raw, received = self.CS.cam_laneinfo_raw, False
+    filter_state, filter_received, filter_events = self.CS.can_filter_state, False, []
     for _t, frames in can_packets:
       for addr, dat, src in frames:
         if addr == 0x440 and src == 2 and len(dat) == 8:
           raw, received = bytes(dat), True
+        elif addr == FILTER_STATE_ADDR and src == FILTER_BUS and len(dat) == 8:
+          filter_state, filter_received = dat[7], True
+          filter_events.append(filter_state)
+        elif addr in FACTORY_CRUISE_ADDRS and src == FILTER_BUS:
+          filter_events.append(FACTORY_CRUISE)
     self.CS.cam_laneinfo_raw = raw
     self.CS.cam_laneinfo_stale_frames = 0 if received else self.CS.cam_laneinfo_stale_frames + 1
+    self.CS.can_filter_state = filter_state
+    self.CS.can_filter_age = 0 if filter_received else self.CS.can_filter_age + 1
+    if self.CC.can_filter is not None:
+      self.CC.can_filter.receive(filter_events, self.CS.can_filter_age)
     return super().update(can_packets)

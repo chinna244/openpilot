@@ -87,11 +87,25 @@ class TestMazdaStockAol(unittest.TestCase):
     self.safety.set_aol_test_heartbeat(True)
     self.feed()
     self.assertEqual(self.safety.aol_get_permission_mask(), 0)
-    self.arm()
-    self.feed(permanent=True)
-    self.assertEqual(self.safety.aol_get_permission_mask(), 0)
-    self.feed()
-    self.assertEqual(self.safety.aol_get_permission_mask(), 0)
+
+  def glare_masks(self, steps, glare):
+    """Permission masks along steps, with the camera's ERR_BIT_1 (sun glare) on every frame when glare."""
+    self.configure()
+    masks = []
+    for step in steps:
+      if step == 'arm':
+        self.arm()
+      else:
+        self.feed(permanent=glare, **step)
+      masks.append(self.safety.aol_get_permission_mask())
+    return masks
+
+  def test_camera_glare_never_changes_permission(self):
+    # The EPS keeps assisting through the camera's ERR_BIT_1 alone (never copied to the EPS), as on develop.
+    steps = ['arm', {}, {}, {'buttons': 3}, {'buttons': 3}, {'buttons': 0, 'main': False}, {'buttons': 3, 'main': False},
+             'arm', {'temporary': True}, {}, {'reverse': True}, {}]
+    self.assertEqual(self.glare_masks(steps, True), self.glare_masks(steps, False))
+    self.assertIn(1, self.glare_masks(steps, True))
 
   def test_each_required_source_missing_wrong_bus_or_length_expires(self):
     for name in ('CRZ_CTRL', 'CRZ_BTNS', 'STEER_TORQUE', 'ENGINE_DATA', 'PEDALS', 'GEAR', 'STEER_RATE', 'CAM_LKAS'):
@@ -199,15 +213,18 @@ class TestMazdaStockAol(unittest.TestCase):
     self.safety.aol_set_host_request(3)
     self.assertEqual(self.safety.aol_get_permission_mask(), 1)
 
-  def test_cancel_held_after_fault_and_main_off_never_rearms(self):
+  def test_cancel_held_and_main_off_never_rearms(self):
     self.configure()
     self.arm()
     self.feed(buttons=3)
     self.feed(buttons=3, permanent=True)
+    # a held cancel keeps AOL lateral, camera glare (ERR_BIT_1) included
     for _ in range(4):
       self.feed(buttons=3)
-      self.assertEqual(self.safety.aol_get_permission_mask(), 0)
+      self.assertEqual(self.safety.aol_get_permission_mask(), 1)
+    # main off revokes it, and a held cancel with main off never re-arms
     self.feed(buttons=0, main=False)
+    self.assertEqual(self.safety.aol_get_permission_mask(), 0)
     self.feed(buttons=3, main=False)
     self.assertEqual(self.safety.aol_get_permission_mask(), 0)
 
@@ -236,15 +253,18 @@ class TestMazdaStockAol(unittest.TestCase):
       self.feed()
       self.assertEqual(self.safety.aol_get_permission_mask(), 0)
 
-  def test_boot_permanent_camera_fault_consumes_main_on_eligibility(self):
-    self.configure()
-    self.feed(permanent=True)
-    for _ in range(12):
-      self.feed()
-    self.time += 1
-    self.safety.set_timer(self.time)
-    self.safety.aol_set_host_request(1)
-    self.assertEqual(self.safety.aol_get_permission_mask(), 0)
+  def test_boot_camera_glare_keeps_main_on_eligibility(self):
+    masks = []
+    for glare in (True, False):
+      self.configure()
+      self.feed(permanent=glare)
+      for _ in range(12):
+        self.feed()
+      self.time += 1
+      self.safety.set_timer(self.time)
+      self.safety.aol_set_host_request(1)
+      masks.append(self.safety.aol_get_permission_mask())
+    self.assertEqual(masks[0], masks[1])
 
   def test_boot_main_on_pending_ack_keeps_original_deadline(self):
     self.configure()

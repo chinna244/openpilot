@@ -37,7 +37,7 @@ class CEMOptions:
   curves_with_lead: bool = False
   lead: bool = True
   slower_lead: bool = True
-  stopped_lead: bool = False
+  stopped_lead: bool = True
   stop_lights: bool = True
   model_stop_s: float = 7.7
   signal_lane_detection: bool = True
@@ -178,7 +178,8 @@ def encode_preferences(preferences: SavedPreferences) -> bytes:
 def saved_selection_for_drive(preferences: SavedPreferences, drive_id: object) -> ModeSelection | None:
   """Bind validated preferences to a drive; live authority is checked by Host."""
   _validate(preferences)
-  return selection_for_drive(preferences.mode, preferences.mode_settings(), drive_id)
+  choice = ModeChoice.CEM if preferences.mode is ModeChoice.CCM else preferences.mode
+  return selection_for_drive(choice, preferences.mode_settings(), drive_id)
 
 
 @dataclass(frozen=True)

@@ -68,7 +68,9 @@ def test_eps73_prius_advert_six_independent_rx_and_limits(stock, experience):
     for _ in range(50):
       case.tick(ad=False)
     active(case, stock, experience)
-    for accel in (-3.501, 2.001):
+    for accel in (-3.5, 3.5):
+      assert bool(case.tx('ACC_CONTROL', {'ACCEL_CMD': accel})) == (not stock)
+    for accel in (-3.501, 3.501):
       assert not case.tx('ACC_CONTROL', {'ACCEL_CMD': accel})
     assert not case.tx('STEERING_LTA', {'STEER_REQUEST': 1})
     assert not case.native.safety_tx_hook(libsafety_py.make_CANPacket(0x750, 0, bytes.fromhex('0f02280100000000')))
@@ -85,16 +87,15 @@ def test_eps73_prius_advert_main_eps_refusal_and_recovery(stock, experience, sou
   case = AdvertPhysical(owner.STOCK_WORD if stock else owner.LONG_WORD, experience)
   try:
     case.earn()
-    cfg = case.native.current_safety_config
     index = 5 if source == 0x1D3 else 4
-    prior = int(cfg.rx_checks[index].status.last_timestamp)
+    prior = int(case.native.rx_status[index].last_timestamp)
     for _ in range(41):
       case.tick(source=source, failure=failure)
     if failure == 'checksum':
-      assert int(cfg.rx_checks[index].status.last_timestamp) == case.now
-      assert not cfg.rx_checks[index].status.valid_checksum
+      assert int(case.native.rx_status[index].last_timestamp) == case.now
+      assert not case.native.rx_status[index].valid_checksum
     else:
-      assert int(cfg.rx_checks[index].status.last_timestamp) == prior
+      assert int(case.native.rx_status[index].last_timestamp) == prior
     refused(case)
     case.earn()
     active(case, stock, experience)
@@ -119,7 +120,7 @@ def test_eps73_prius_advert_sticky_conflict_until_reconfiguration(stock, experie
     case.native.set_aol_test_heartbeat(True)
     cfg = case.native.current_safety_config
     assert cfg.rx_checks_len == 6
-    assert all(cfg.rx_checks[i].status.last_timestamp == 0 for i in range(6))
+    assert all(case.native.rx_status[i].last_timestamp == 0 for i in range(6))
     case.earn()
     active(case, stock, experience)
   finally:

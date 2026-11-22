@@ -73,16 +73,18 @@ def test_original_prius_required_status_lease_aeb_and_malformed_source(stock, ex
     assert not case.tx('ACC_CONTROL', {'ACCEL_CMD': .1})
     for failure in ('missing', 'short', 'mirror'):
       case.earn()
-      prior = int(cfg.rx_checks[4].status.last_timestamp)
+      prior = int(case.native.rx_status[4].last_timestamp)
       for _ in range(21):
         case.tick(status=None if failure == 'missing' else 0, malformed=failure == 'short', mirror=failure == 'mirror')
-      assert int(cfg.rx_checks[4].status.last_timestamp) == prior
+      assert int(case.native.rx_status[4].last_timestamp) == prior
       assert case.native.aol_get_permission_mask() == 0
       assert not case.tx('STEERING_LKA', {'STEER_REQUEST': 1, 'STEER_TORQUE_CMD': 3})
       assert not case.tx('ACC_CONTROL', {'ACCEL_CMD': .1})
       assert case.tx('ACC_CONTROL', {'ACCEL_CMD': 0, 'CANCEL_REQ': 1})
     case.earn()
-    for value in (-3.501, 2.001):
+    for value in (-3.5, 3.5):
+      assert bool(case.tx('ACC_CONTROL', {'ACCEL_CMD': value})) == (not stock)
+    for value in (-3.501, 3.501):
       assert not case.tx('ACC_CONTROL', {'ACCEL_CMD': value})
     assert not case.tx('STEERING_LTA', {'STEER_REQUEST': 1})
     assert not case.native.safety_tx_hook(libsafety_py.make_CANPacket(0x750, 0, bytes.fromhex('0f02280100000000')))
@@ -125,9 +127,8 @@ def test_original_prius_main_eps_independent_source_refusals(stock, experience, 
   case = Physical(prius_sdsu.STOCK_WORD if stock else prius_sdsu.LONG_WORD, experience)
   try:
     case.earn()
-    cfg = case.native.current_safety_config
     index = 6 if source == 0x1D3 else 5
-    prior = int(cfg.rx_checks[index].status.last_timestamp)
+    prior = int(case.native.rx_status[index].last_timestamp)
     for _ in range(41):
       case.now += 10_000
       case.native.set_timer(case.now)
@@ -148,10 +149,10 @@ def test_original_prius_main_eps_independent_source_refusals(stock, experience, 
       case.native.aol_set_host_request(3)
     if failure == 'checksum':
       # Native records reception independently of checksum validity.
-      assert int(cfg.rx_checks[index].status.last_timestamp) == case.now
-      assert not cfg.rx_checks[index].status.valid_checksum
+      assert int(case.native.rx_status[index].last_timestamp) == case.now
+      assert not case.native.rx_status[index].valid_checksum
     else:
-      assert int(cfg.rx_checks[index].status.last_timestamp) == prior
+      assert int(case.native.rx_status[index].last_timestamp) == prior
     assert case.native.aol_get_permission_mask() == 0
     assert not case.tx('STEERING_LKA', {'STEER_REQUEST': 1, 'STEER_TORQUE_CMD': 3})
     assert not case.tx('ACC_CONTROL', {'ACCEL_CMD': .1})
@@ -181,7 +182,7 @@ def test_original_prius_contradictory_identity_requires_reconfiguration(stock, e
     assert case.native.set_safety_hooks(structs.CarParams.SafetyModel.toyota, word) == 0
     case.native.set_aol_test_heartbeat(True)
     assert case.native.current_safety_config.rx_checks_len == 7
-    assert all(case.native.current_safety_config.rx_checks[i].status.last_timestamp == 0 for i in range(7))
+    assert all(case.native.rx_status[i].last_timestamp == 0 for i in range(7))
     assert not case.tx('STEERING_LKA', {'STEER_REQUEST': 1, 'STEER_TORQUE_CMD': 3})
     case.earn()
     assert case.tx('STEERING_LKA', {'STEER_REQUEST': 1, 'STEER_TORQUE_CMD': 3})
@@ -205,7 +206,7 @@ def test_original_prius_seventh_rx_slot_cannot_retain_warm_health(stock, experie
     case.native.set_aol_test_heartbeat(True)
     cfg = case.native.current_safety_config
     assert cfg.rx_checks_len == 7
-    assert all(cfg.rx_checks[i].status.last_timestamp == 0 for i in range(7))
+    assert all(case.native.rx_status[i].last_timestamp == 0 for i in range(7))
     assert not case.tx('STEERING_LKA', {'STEER_REQUEST': 1, 'STEER_TORQUE_CMD': 3})
     case.earn()
     assert case.tx('STEERING_LKA', {'STEER_REQUEST': 1, 'STEER_TORQUE_CMD': 3})

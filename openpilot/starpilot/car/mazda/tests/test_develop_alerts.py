@@ -7,7 +7,7 @@ from opendbc.car import structs
 from opendbc.car.mazda.stock_ecu import StockEcuState
 from openpilot.cereal import log
 from openpilot.selfdrive.car.car_events import CarEvents
-from openpilot.selfdrive.selfdrived.events import EVENTS, ET, Events
+from openpilot.selfdrive.selfdrived.events import ET, MAZDA_EVENTS, Events, MazdaEvents
 from openpilot.selfdrive.selfdrived.selfdrived import SelfdriveD
 from openpilot.starpilot.aol.runtime import AxisDecision
 from openpilot.starpilot.car.mazda.aol import create_intent
@@ -16,16 +16,17 @@ from openpilot.starpilot.car.mazda.tests.test_tja_only_lateral import SETTINGS, 
 
 EventName = log.OnroadEvent.EventName
 ButtonType = structs.CarState.ButtonEvent.Type
-NEW = (EventName.cameraLkasFault, EventName.cameraLkasFaultOnset, EventName.cameraLkasResumed, EventName.stockLkasOff,
-       EventName.stockLkasOffPress, EventName.stockEcuInitializing, EventName.stockEcuReady, EventName.stockEcuHandedBack,
-       EventName.alphaLongNextStop, EventName.manualSteeringRequired, EventName.manualLongitudinalRequired,
-       EventName.cameraLkasFaultPress)
+NEW = ('cameraLkasFault', 'cameraLkasFaultOnset', 'cameraLkasResumed', 'stockLkasOff', 'stockLkasOffPress',
+       'stockEcuInitializing', 'stockEcuReady', 'stockEcuHandedBack', 'alphaLongNextStop', 'manualSteeringRequired',
+       'manualLongitudinalRequired', 'cameraLkasFaultPress')
 
 
 @pytest.mark.parametrize('event', NEW)
 def test_new_alerts_are_display_only(event):
   # a NO_ENTRY would also withdraw AOL's longitudinal axis (aol_no_entry); none may disable anything
-  assert set(EVENTS[event]) == {ET.PERMANENT}
+  assert set(MAZDA_EVENTS[event]) == {ET.PERMANENT}
+  # outside log.capnp's pinned EventName enum (StarPilot's schema policy)
+  assert not hasattr(EventName, event)
 
 
 def car_events(cs, cp=None):
@@ -36,8 +37,8 @@ def car_events(cs, cp=None):
 def test_lkas_off_pauses_lateral_without_blocking_cruise():
   cs = driving()
   cs.invalidLkasSetting = True
-  _, events = car_events(cs)
-  assert EventName.stockLkasOff in events.names and EventName.invalidLkasSetting not in events.names
+  ce, events = car_events(cs)
+  assert 'stockLkasOff' in ce.mazda_events and EventName.invalidLkasSetting not in events.names
   assert not events.contains(ET.NO_ENTRY)
 
 
@@ -45,20 +46,20 @@ def test_camera_fault_pauses_and_holds_one_second_past_its_clear():
   cs = driving()
   cs.steerFaultPermanent = True
   ce, events = car_events(cs)
-  assert EventName.cameraLkasFault in events.names and EventName.steerUnavailable not in events.names
+  assert 'cameraLkasFault' in ce.mazda_events and EventName.steerUnavailable not in events.names
   assert not events.contains(ET.IMMEDIATE_DISABLE)
   cs.steerFaultPermanent = False
   for frame in range(1, CAMERA_FAULT_CLEAR_FRAMES + 1):
     events = ce.update(cs, cs, SimpleNamespace())
-    assert (EventName.cameraLkasFault in events.names) == (frame < CAMERA_FAULT_CLEAR_FRAMES)
+    assert ('cameraLkasFault' in ce.mazda_events) == (frame < CAMERA_FAULT_CLEAR_FRAMES)
 
 
 def test_without_the_tja_button_upstream_faults_stand():
   cs = driving()
   cs.steerFaultPermanent = cs.invalidLkasSetting = True
-  _, events = car_events(cs, tja_cp(alpha=False, tja=False))
+  ce, events = car_events(cs, tja_cp(alpha=False, tja=False))
   assert EventName.steerUnavailable in events.names and EventName.invalidLkasSetting in events.names
-  assert EventName.cameraLkasFault not in events.names
+  assert 'cameraLkasFault' not in ce.mazda_events
 
 
 def test_sustained_non_delivery_is_silent_on_the_steer_to_zero_eps():
@@ -99,6 +100,7 @@ def selfdrived(latched=True, enabled=True):
   sd = SelfdriveD.__new__(SelfdriveD)
   sd.CP = tja_cp()
   sd.events = Events()
+  sd.mazda_events = MazdaEvents()
   sd.enabled = enabled
   sd.aol_last_intent = SimpleNamespace(allowedLatch=latched)
   sd.aol_axis_decision = AxisDecision()
@@ -114,37 +116,40 @@ def buttons(*types):
 def test_tja_and_cancel_banners():
   sd = selfdrived()
   sd.add_mazda_tja_events(SimpleNamespace(buttonEvents=buttons(ButtonType.lkas), invalidLkasSetting=False))
-  assert EventName.manualSteeringRequired in sd.events.names
+  assert 'manualSteeringRequired' in sd.mazda_events
   sd = selfdrived(enabled=False)  # TJA off without cruise: the AOL chime alone
   sd.add_mazda_tja_events(SimpleNamespace(buttonEvents=buttons(ButtonType.lkas), invalidLkasSetting=False))
-  assert EventName.manualSteeringRequired not in sd.events.names
+  assert 'manualSteeringRequired' not in sd.mazda_events
   sd = selfdrived(latched=False)
   sd.add_mazda_tja_events(SimpleNamespace(buttonEvents=buttons(ButtonType.lkas), invalidLkasSetting=True))
-  assert EventName.stockLkasOffPress in sd.events.names
+  assert 'stockLkasOffPress' in sd.mazda_events
   sd = selfdrived()
   sd.add_mazda_tja_events(SimpleNamespace(buttonEvents=buttons(ButtonType.cancel), invalidLkasSetting=False))
-  assert EventName.manualLongitudinalRequired in sd.events.names
+  assert 'manualLongitudinalRequired' in sd.mazda_events
 
 
 def test_camera_fault_onset_and_resumed():
   sd = selfdrived()
   cs = SimpleNamespace(buttonEvents=[], invalidLkasSetting=False)
-  sd.events.add(EventName.cameraLkasFault)
+  sd.mazda_events.add('cameraLkasFault')
   sd.add_mazda_tja_events(cs)
-  assert EventName.cameraLkasFaultOnset in sd.events.names
+  assert 'cameraLkasFaultOnset' in sd.mazda_events
   sd.events.clear()
-  sd.events.add(EventName.cameraLkasFault)
+  sd.mazda_events.clear()
+  sd.mazda_events.add('cameraLkasFault')
   sd.add_mazda_tja_events(cs)
-  assert EventName.cameraLkasFaultOnset not in sd.events.names  # once
+  assert 'cameraLkasFaultOnset' not in sd.mazda_events  # once
   sd.events.clear()
+  sd.mazda_events.clear()
   sd.add_mazda_tja_events(cs)  # cleared, lateral not back yet
-  assert EventName.cameraLkasResumed not in sd.events.names
+  assert 'cameraLkasResumed' not in sd.mazda_events
   sd.aol_axis_decision = AxisDecision(desired_lateral=True, lateral_active=True)
   sd.add_mazda_tja_events(cs)
-  assert EventName.cameraLkasResumed in sd.events.names
+  assert 'cameraLkasResumed' in sd.mazda_events
   sd.events.clear()
+  sd.mazda_events.clear()
   sd.add_mazda_tja_events(cs)
-  assert EventName.cameraLkasResumed not in sd.events.names
+  assert 'cameraLkasResumed' not in sd.mazda_events
 
 
 def test_takeover_lines_are_said_once_per_edge(monkeypatch):
@@ -153,18 +158,19 @@ def test_takeover_lines_are_said_once_per_edge(monkeypatch):
   sd = selfdrived()
   def step(state, standstill, radar_off=False, requested=False, aeb_setting_off=False):
     sd.events.clear()
+    sd.mazda_events.clear()
     sd.mazda_stock_ecu = dict(fingerprint=str(sd.CP.carFingerprint), state=str(state), radarOff=radar_off,
                               alphaRequested=requested, aebSettingOff=aeb_setting_off, monoTime=10_000_000_000)
-    sd.add_mazda_takeover_events(SimpleNamespace(standstill=standstill))
-    return set(sd.events.names)
-  assert EventName.alphaLongNextStop in step(StockEcuState.PARK_TO_TAKE_OVER, False, requested=True)
-  assert EventName.alphaLongNextStop not in step(StockEcuState.PARK_TO_TAKE_OVER, False, requested=True)
-  assert EventName.stockEcuInitializing in step(StockEcuState.STARTING, True, requested=True)
-  assert EventName.stockEcuReady in step(StockEcuState.READY, True, radar_off=True)
-  assert EventName.stockEcuReady not in step(StockEcuState.READY, False, radar_off=True)
-  assert EventName.stockEcuHandedBack in step(StockEcuState.RESTORED, False)
+    sd.add_mazda_takeover_events(SimpleNamespace(standstill=standstill, cruiseState=SimpleNamespace(enabled=False)))
+    return set(sd.mazda_events.names)
+  assert 'alphaLongNextStop' in step(StockEcuState.PARK_TO_TAKE_OVER, False, requested=True)
+  assert 'alphaLongNextStop' not in step(StockEcuState.PARK_TO_TAKE_OVER, False, requested=True)
+  assert 'stockEcuInitializing' in step(StockEcuState.STARTING, True, requested=True)
+  assert 'stockEcuReady' in step(StockEcuState.READY, True, radar_off=True)
+  assert 'stockEcuReady' not in step(StockEcuState.READY, False, radar_off=True)
+  assert 'stockEcuHandedBack' in step(StockEcuState.RESTORED, False)
   step(StockEcuState.READY, False, radar_off=True)
-  assert EventName.stockEcuHandedBack not in step(StockEcuState.RESTORED, False, aeb_setting_off=True)
+  assert 'stockEcuHandedBack' not in step(StockEcuState.RESTORED, False, aeb_setting_off=True)
 
 
 def test_tja_cannot_turn_steering_on_through_the_camera_fault():
@@ -179,15 +185,15 @@ def test_tja_cannot_turn_steering_on_through_the_camera_fault():
     owner.update(owner.observe_lateral_holds(cs), now_ns=t + 10_000_000, fault_active=False)
     assert not owner.allowed_latch
   sd = selfdrived(latched=False)
-  sd.events.add(EventName.cameraLkasFault)
+  sd.mazda_events.add('cameraLkasFault')
   sd.add_mazda_tja_events(SimpleNamespace(buttonEvents=buttons(ButtonType.lkas), invalidLkasSetting=False))
-  assert EventName.cameraLkasFaultPress in sd.events.names
+  assert 'cameraLkasFaultPress' in sd.mazda_events
 
 
 def test_lkas_off_refuse_only_when_turning_on():
   sd = selfdrived(latched=True, enabled=False)  # turning it off is allowed and silent here (AOL chime)
   sd.add_mazda_tja_events(SimpleNamespace(buttonEvents=buttons(ButtonType.lkas), invalidLkasSetting=True))
-  assert EventName.stockLkasOffPress not in sd.events.names
+  assert 'stockLkasOffPress' not in sd.mazda_events
 
 
 def test_konik_backup_stands_down_when_konik_is_the_active_provider(monkeypatch):
@@ -199,3 +205,15 @@ def test_konik_backup_stands_down_when_konik_is_the_active_provider(monkeypatch)
   assert not pc.konik_uploads_ready(True, params, None)
   monkeypatch.setattr(provider, 'active_provider', lambda: provider.PROVIDERS['konik'])
   assert not pc.konik_uploads_ready(False, params, None) and not pc.konik_connect_ready(False, params, None)
+
+
+def test_mazda_alerts_are_created_like_onroad_events():
+  # selfdrived extends its alert list with these, as with the Tesla stock alerts
+  events = MazdaEvents()
+  events.add('stockEcuReady')
+  events.add('stockEcuReady')
+  alerts = events.create_alerts([ET.PERMANENT, ET.WARNING])
+  assert [(a.alert_type, a.event_type, a.alert_text_1) for a in alerts] == [('stockEcuReady/permanent', ET.PERMANENT, 'AEB off')]
+  assert events.create_alerts([ET.WARNING]) == []
+  with pytest.raises(AssertionError):
+    events.add('notAMazdaEvent')

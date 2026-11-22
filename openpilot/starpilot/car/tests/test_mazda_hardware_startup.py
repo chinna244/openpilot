@@ -9,4 +9,4 @@ def test_hardware_daemon_initializes_with_its_real_params_owner(tmp_path, monkey
   stopped = threading.Event()
   stopped.set()
   with OpenpilotPrefix():
-    hardwared.hardware_thread(stopped, queue.Queue())
+    hardwared.hardware_thread(stopped, queue.Queue(), hardwared.PowerTelemetry(lambda: 0., hardwared.DT_HW))

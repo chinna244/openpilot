@@ -9,7 +9,7 @@ from opendbc.car.mazda.interface import CarInterface
 from opendbc.car.mazda.stock_ecu import StockEcuState
 from opendbc.car.mazda.values import CAR
 from openpilot.cereal import log
-from openpilot.selfdrive.selfdrived.events import EVENTS, ET, Events, STOCK_ECU_PRESS_STATE
+from openpilot.selfdrive.selfdrived.events import ET, MAZDA_EVENTS, MazdaEvents, STOCK_ECU_PRESS_STATE
 from openpilot.selfdrive.selfdrived.selfdrived import SelfdriveD
 from openpilot.starpilot.car.mazda.radar_status import notice, stock_ecu_events
 from openpilot.starpilot.car.stock_ecu_handback import (FAILED_KEY, HANDBACK_WAIT_T, StockEcuHandBackGate,
@@ -64,21 +64,21 @@ def test_only_mazda_alpha_long_gets_stock_ecu_events():
 
 
 def test_selfdrived_adds_the_display_events_from_its_params_view():
-  sd = SimpleNamespace(CP=cp(), events=Events(), mazda_stock_ecu=None, mazda_handback_failed=True,
+  sd = SimpleNamespace(CP=cp(), mazda_events=MazdaEvents(), mazda_stock_ecu=None, mazda_handback_failed=True,
                        add_mazda_takeover_events=lambda CS: None)
   sd.mazda_stock_ecu = record(StockEcuState.STARTING)
   sd.mazda_stock_ecu['monoTime'] = 1  # stale on purpose: still unknown, failure flag still shown
   SelfdriveD.add_mazda_stock_ecu_events(sd, SimpleNamespace(buttonEvents=press()))
-  assert EventName.stockEcuFailed in sd.events.names and EventName.stockEcuNotReady in sd.events.names
+  assert 'stockEcuFailed' in sd.mazda_events and 'stockEcuNotReady' in sd.mazda_events
   assert STOCK_ECU_PRESS_STATE[0] == 'unknown'
 
 
-@pytest.mark.parametrize("event", [EventName.stockEcuFailed, EventName.stockEcuNotReady])
+@pytest.mark.parametrize("event", ["stockEcuFailed", "stockEcuNotReady"])
 def test_alerts_are_display_only(event):
   # PERMANENT: shown to a driver with nothing engaged, and no enable/disable/no-entry authority
-  assert set(EVENTS[event]) == {ET.PERMANENT}
+  assert set(MAZDA_EVENTS[event]) == {ET.PERMANENT}
   STOCK_ECU_PRESS_STATE[0] = StockEcuState.PARK_TO_TAKE_OVER
-  alert = EVENTS[event][ET.PERMANENT]
+  alert = MAZDA_EVENTS[event][ET.PERMANENT]
   alert = alert(cp(), None, None, False, 0, None) if callable(alert) else alert
   assert alert.alert_text_1
 

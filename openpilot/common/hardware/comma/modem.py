@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import fcntl
+import glob
 import json
 import logging
 import os
@@ -18,6 +19,8 @@ from ipaddress import IPv4Address, AddressValueError
 from enum import Enum
 
 from openpilot.common.esim.base import WEBBING_ICCID_PREFIX
+from openpilot.common.hardware.comma.hardware import get_device_type
+from openpilot.common.swaglog import cloudlog
 
 logging.basicConfig(
   level=logging.INFO,
@@ -69,8 +72,8 @@ INITIAL_STATE: dict[str, object] = {
 
 
 @contextmanager
-def _serial_port(port: str, baudrate: int):
-  fd = os.open(port, os.O_RDWR | os.O_NOCTTY)
+def _serial_port(port: str, baudrate: int, flags: int = 0):
+  fd = os.open(port, os.O_RDWR | os.O_NOCTTY | flags)
   try:
     attrs = termios.tcgetattr(fd)
     attrs[0] = 0
@@ -99,6 +102,20 @@ def _read_line(fd: int, timeout: float) -> bytes:
     data.extend(byte)
     if byte == b"\n":
       return bytes(data)
+
+
+def _answers_at(port: str, timeout: float = 0.3) -> bool:
+  deadline = time.monotonic() + timeout
+  try:
+    with _serial_port(port, 9600, os.O_NONBLOCK) as fd:
+      termios.tcflush(fd, termios.TCIFLUSH)
+      os.write(fd, b"AT\r")
+      while (remaining := deadline - time.monotonic()) > 0:
+        if _read_line(fd, remaining).strip() == b"OK":
+          return True
+  except OSError:
+    pass
+  return False
 
 
 class State(Enum):
@@ -213,6 +230,7 @@ class Modem:
   def __init__(self):
     self._ppp = PPPSession()
     self._sim_change = False
+    self._modem_restarting = False
     self._apn = ""  # blank = network-provided via PCO
     self._roaming_allowed = True
     self.running = True
@@ -234,8 +252,11 @@ class Modem:
       return "unknown"
 
   @staticmethod
-  def _has_modem_manager() -> bool:
-    return os.path.isfile("/lib/systemd/system/ModemManager.service")
+  def _system_modem_service() -> str | None:
+    for service in ("modem", "ModemManager"):
+      if os.path.isfile(f"/lib/systemd/system/{service}.service"):
+        return service
+    return None
 
   def _is_roaming_allowed(self) -> bool:
     if self.S["iccid"].startswith(WEBBING_ICCID_PREFIX):
@@ -284,6 +305,8 @@ class Modem:
         return lines
     except (RuntimeError, TimeoutError, OSError) as e:
       logging.info(f"AT {cmd} failed: {e}")
+      if cmd in (*AT_INIT, "AT+CGMI", "AT+CGSN", "AT+QCCID", "AT+CIMI", "AT+GMR"):
+        cloudlog.error(f"modem: {cmd} failed: {e}")
       return []
     finally:
       fcntl.flock(fd, fcntl.LOCK_UN)
@@ -309,8 +332,7 @@ class Modem:
       # clear initial EPS bearer APN (some carriers reject the default)
       'AT+CGDCONT=0,"IP",""',
 
-      # SIM hot swap
-      'AT+QSIMDET=1,0',
+      # SIM hot swap (detection itself is set per device in _do_initializing)
       'AT+QSIMSTAT=1',
 
       # configure modem as data-centric
@@ -321,20 +343,68 @@ class Modem:
     for c in cmds:
       self._at(c)
 
+  def _sync_ports(self) -> bool:
+    """The modem's nodes come up root only every time it enumerates, and their numbers
+    move if something is holding the old ones. Ask them which are AT ports and link those."""
+    ttys = sorted(glob.glob("/dev/ttyUSB*"), key=lambda p: int(p.removeprefix("/dev/ttyUSB")), reverse=True)
+    subprocess.run(["sudo", "chgrp", "dialout", *ttys], capture_output=True)
+    subprocess.run(["sudo", "chmod", "660", *ttys], capture_output=True)
+
+    fd = os.open(AT_LOCK, os.O_CREAT | os.O_RDWR, 0o666)
+    try:
+      fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+      os.close(fd)
+      return False
+    try:
+      # the AT ports are the highest two, stop there to stay off the GPS and debug ports
+      ports = []
+      for tty in ttys:
+        if _answers_at(tty):
+          ports.append(tty)
+        if len(ports) == 2:
+          break
+    finally:
+      fcntl.flock(fd, fcntl.LOCK_UN)
+      os.close(fd)
+    if len(ports) != 2:
+      cloudlog.warning(f"modem: found AT ports {ports} in {ttys}, retrying")
+      return False
+
+    for link, tty in zip((AT_PORT, PPP_PORT), reversed(ports), strict=True):
+      subprocess.run(["sudo", "ln", "-sfn", os.path.basename(tty), link], capture_output=True)
+    logging.info(f"AT port {ports[1]}, PPP port {ports[0]}")
+    return True
+
   def _do_initializing(self):
-    if not os.path.exists(AT_PORT):
+    if not glob.glob("/dev/ttyUSB*"):
+      self._modem_restarting = False  # off USB, so a requested restart has happened
       return State.INITIALIZING
     logging.info("port found, initializing")
     self._ppp.kill()
     self._ppp.cleanup_routes()
 
+    if not self._sync_ports():
+      return State.INITIALIZING
+
     if not self._init_at_channel():
-      logging.warning("AT echo still on, retrying")
+      cloudlog.error("modem: AT channel initialization failed, retrying")
+      return State.INITIALIZING
+
+    # tici's SIM detect pin reads "removed"; the modem stores this setting and applies it only after a restart
+    want = {"tizi": "1,0", "tici": "0,0"}.get(get_device_type())
+    if want and (have := self._atv("AT+QSIMDET?", "+QSIMDET:")) and have != want:
+      cloudlog.warning(f"modem: SIM detection {have} -> {want}, restarting modem")
+      self._at(f"AT+QSIMDET={want}")
+      self._modem_restarting = True
+    if self._modem_restarting:
+      self._at("AT+CFUN=1,1")  # resent each pass until the modem drops off USB: _at skips silently while LPA holds the port
       return State.INITIALIZING
 
     identity = self._read_identity()
     if not identity["iccid"] or not identity["imei"]:
-      logging.warning(f"identity read incomplete: {identity}, retrying")
+      cloudlog.error("modem: identity read incomplete: imei_present=%s iccid_present=%s, retrying",
+                     bool(identity["imei"]), bool(identity["iccid"]))
       return State.INITIALIZING
 
     self._configure_modem(identity["modem_version"])
@@ -543,9 +613,7 @@ class Modem:
     return {}
 
   def _read_cellular_dns(self) -> list[str]:
-    v = self._atv(f"AT+CGCONTRDP={DIAL_CID}", "+CGCONTRDP:")
-    if not v:
-      return []
+    v = self._atv(f"AT+CGCONTRDP={DIAL_CID}", "+CGCONTRDP:") or ""
     # +CGCONTRDP: <cid>,<bearer_id>,<apn>,<local_addr>,<gw_addr>,<dns_prim>,<dns_sec>,...
     fields = [f.strip().strip('"') for f in v.split(",")]
     dns_servers = []
@@ -583,10 +651,9 @@ class Modem:
 
   def run(self):
     logging.info("starting")
+    if service := self._system_modem_service():
+      subprocess.run(["sudo", "systemctl", "mask", "--runtime", "--now", service], capture_output=True, check=True)
     self._publish_state(state=State.INITIALIZING.value)
-    if self._has_modem_manager():
-      subprocess.run(["sudo", "systemctl", "mask", "--runtime", "ModemManager"], capture_output=True)
-      subprocess.run(["sudo", "systemctl", "stop", "ModemManager"], capture_output=True)
     self._ppp.kill()
 
     state = State.INITIALIZING
@@ -608,7 +675,7 @@ class Modem:
           self._publish_state(state=state.value)
           logging.info(f"{prev.value} -> {state.value}")
       except Exception:
-        logging.exception(f"error in {state.value}")
+        cloudlog.exception(f"modem: error in {state.value}")
         state = State.DISCONNECTING
       time.sleep(STATE_WAIT)
 
@@ -620,9 +687,9 @@ class Modem:
       os.remove(STATE_PATH)
     except FileNotFoundError:
       pass
-    if self._has_modem_manager():
-      subprocess.run(["sudo", "systemctl", "unmask", "--runtime", "ModemManager"], capture_output=True)
-      subprocess.run(["sudo", "systemctl", "start", "ModemManager"], capture_output=True)
+    if service := self._system_modem_service():
+      subprocess.run(["sudo", "systemctl", "unmask", "--runtime", service], capture_output=True)
+      subprocess.run(["sudo", "systemctl", "start", service], capture_output=True)
 
 
 def main():

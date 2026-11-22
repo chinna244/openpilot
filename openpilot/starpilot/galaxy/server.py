@@ -17,10 +17,11 @@ from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 from openpilot.common.swaglog import cloudlog
 from openpilot.starpilot.galaxy.batch_routes import change_drive_state, delete_records, non_default_settings, preview_layout, preview_settings_recovery
+from openpilot.starpilot.audio.preview import AlertPreview, AlertPreviewError
 from openpilot.starpilot.galaxy.access import AccessStatus, default_owner
 from openpilot.starpilot.galaxy.auth import LocalSessions
 from openpilot.starpilot.galaxy.http_server import (_LocalHTTPHandler, _LocalHTTPServer, allowed_authority,
-                                                  direct_local_connection, install_origin_allowed, static_asset)
+                                                  direct_local_connection, dns_authority_name, install_origin_allowed)
 from openpilot.starpilot.galaxy.camera_snapshot import CameraSnapshot, SnapshotDenied, SnapshotUnavailable
 from openpilot.starpilot.galaxy.remote import default_remote_pairing, gateway_cookie_valid
 from openpilot.starpilot.galaxy.crash_reports import CrashChanged, CrashMissing, CrashReports, CrashUnavailable
@@ -42,6 +43,7 @@ from openpilot.starpilot.galaxy.map_operations import MapOperationError, MapOper
 from openpilot.starpilot.galaxy.plots import Plots
 from openpilot.starpilot.galaxy.software_status import SoftwareStatus, SoftwareUnavailable
 from openpilot.starpilot.galaxy.web_manifest import web_manifest
+from openpilot.starpilot.galaxy.web_assets import WebAssets
 from openpilot.starpilot.galaxy.software_operations import SoftwareOperations, SoftwareOperationError
 from openpilot.starpilot.galaxy.settings import PAGES, SettingsGateway, SettingsChanged, SettingsUnavailable
 from openpilot.starpilot.galaxy.onroad_layout import LayoutChanged, OnroadLayoutOwner
@@ -97,12 +99,18 @@ def make_server(*, port=8082, host='127.0.0.1', monitor=None, owner=None, crashe
                 sounds=None, software_operations=None, drive_stats=None, layout_preview_socket=None, controllers_socket=None,
                 remote_pairing=None, parked=None, camera_snapshot=None, clock=time.monotonic, starport_setup=None,
                 starport_client=None, navigation=None, offline_maps=None, drive_state=None, cloud_provider=None, cloud_offroad=None, projection_layout=None,
-                local_access=None, tmux_live=None, starport_logs=None, hotspot=None, toyota_tools=None, replay_client=None, replay_root=None,
-                spotify_setup=None, companion=None, phone_location=None):
+                local_access=None, tmux_live=None, starport_logs=None, starport_log_sender=None, hotspot=None, toyota_tools=None,
+                replay_client=None, replay_root=None,
+                spotify_setup=None, companion=None, phone_location=None, reverse_proxy=None, local_hostnames=None, sound_preview=None):
+  from openpilot.starpilot.galaxy.local_hostnames import LocalHostnames
+  hostname_source = local_hostnames if local_hostnames is not None else LocalHostnames(clock=clock)
   from openpilot.starpilot.galaxy.companion import CompanionRegistry, APK_PATH
   from openpilot.starpilot.gps.phone import PhoneGpsPublisher
   companion_source = companion if companion is not None else CompanionRegistry()
-  training_results_source = training_results if training_results is not None else FlmTrainingResults()
+  if training_results is None:
+    from openpilot.common.params import Params
+    training_results = FlmTrainingResults(params=Params())
+  training_results_source = training_results
   phone_location_source = phone_location if phone_location is not None else PhoneGpsPublisher()
   cloud = cloud_provider
   hotspot_source = hotspot
@@ -116,6 +124,16 @@ def make_server(*, port=8082, host='127.0.0.1', monitor=None, owner=None, crashe
         hotspot_source = HotspotSettings()
     return hotspot_source
 
+  network_source = None
+
+  def network_owner():
+    nonlocal network_source
+    with hotspot_source_lock:
+      if network_source is None:
+        from openpilot.starpilot.galaxy.network_prefs import NetworkSettings
+        network_source = NetworkSettings()
+    return network_source
+
   def cloud_status():
     from openpilot.starpilot.connect.provider import status
     return cloud.status() if cloud is not None else status()
@@ -126,7 +144,6 @@ def make_server(*, port=8082, host='127.0.0.1', monitor=None, owner=None, crashe
 
   address_source = local_access if local_access is not None else LocalAccess(port)
   console_source = tmux_live if tmux_live is not None else TmuxLive()
-  monitor_source = monitor if monitor is not None else SystemMonitor()
   reports = crashes if crashes is not None else CrashReports()
   crash_reports_lock = threading.Lock()
   starport_logs_source = starport_logs
@@ -137,6 +154,17 @@ def make_server(*, port=8082, host='127.0.0.1', monitor=None, owner=None, crashe
       from openpilot.starpilot.galaxy.starport_logs import StarPortLogs
       starport_logs_source = StarPortLogs()
     return starport_logs_source
+  starport_log_sender_source = starport_log_sender
+  starport_log_sender_lock = threading.Lock()
+
+  def starport_log_sender():
+    nonlocal starport_log_sender_source
+    with starport_log_sender_lock:
+      if starport_log_sender_source is None:
+        from openpilot.starpilot.galaxy.starport_send import StarPortLogSender, device_summary
+        source = starport_logs()
+        starport_log_sender_source = StarPortLogSender(source.bundle, summary=lambda: device_summary(source.directory))
+    return starport_log_sender_source
   software_source = software
   software_operations_source = software_operations
   software_lock = threading.Lock()
@@ -162,6 +190,8 @@ def make_server(*, port=8082, host='127.0.0.1', monitor=None, owner=None, crashe
   notification_owner = notifications
   snapshots = camera_snapshot if camera_snapshot is not None else CameraSnapshot()
   access = owner if owner is not None else default_owner()
+  from openpilot.starpilot.galaxy.reverse_proxy import ReverseProxySettings
+  proxy_settings = ReverseProxySettings(access.root)
   pairing = remote_pairing if remote_pairing is not None else default_remote_pairing()
   pairing_authority = None
   device_name = DeviceName(pairing.root)
@@ -173,11 +203,23 @@ def make_server(*, port=8082, host='127.0.0.1', monitor=None, owner=None, crashe
     from openpilot.starpilot.galaxy.evidence import EvidenceSource
     evidence_source = EvidenceSource()
 
+  monitor_source = monitor if monitor is not None else SystemMonitor(messages=evidence_source)
+  weather_source = None
+  weather_lock = threading.Lock()
+
+  def weather_status():
+    nonlocal weather_source
+    with weather_lock:
+      if weather_source is None:
+        from openpilot.starpilot.galaxy.weather import WeatherSource
+        weather_source = WeatherSource()
+        server.weather_source = weather_source
+      return weather_source.sample()
   vehicle_display = DeviceStateSource(evidence_source)
 
   def context_source(params):
     from openpilot.starpilot.galaxy.settings import LiveContextSource
-    return LiveContextSource(params, messages=evidence_source, evidence_wait_ms=0) if evidence_source is not None else LiveContextSource(params)
+    return LiveContextSource(params, messages=evidence_source) if evidence_source is not None else LiveContextSource(params)
 
   if parked is None:
     from openpilot.common.params import Params
@@ -203,6 +245,7 @@ def make_server(*, port=8082, host='127.0.0.1', monitor=None, owner=None, crashe
   models_lock = threading.Lock()
   settings_gateway = settings
   recovery_gateway = None
+  flm_backup_gateway = None
   vehicle_gateway = vehicle_selection
   toyota_source = toyota_tools
   model_source = models
@@ -222,6 +265,7 @@ def make_server(*, port=8082, host='127.0.0.1', monitor=None, owner=None, crashe
   favorites_source = favorites
   favorites_lock = threading.Lock()
   sound_source = sounds
+  alert_preview = sound_preview or AlertPreview(parked=parked)
   sounds_lock = threading.Lock()
 
   def drive_owner():
@@ -319,7 +363,7 @@ def make_server(*, port=8082, host='127.0.0.1', monitor=None, owner=None, crashe
         params = Params()
         authority = context_source(params)
         server.layout_authority = authority
-        layout_source = OnroadLayoutOwner(params, authority.parked)
+        layout_source = OnroadLayoutOwner(params, authority.parked, lambda: authority.sample().cp)
       return layout_source
 
   def projection_layout_owner():
@@ -374,7 +418,7 @@ def make_server(*, port=8082, host='127.0.0.1', monitor=None, owner=None, crashe
                   Path('/dev/dri/renderD128').exists())
         def service_ready():
           try:
-            return bool(starport_client().call('status')['status'])
+            return bool(starport_client_owner().call('status')['status'])
           except (OSError, RuntimeError, KeyError, TypeError):
             return False
         def enable_bluetooth(identity):
@@ -408,7 +452,7 @@ def make_server(*, port=8082, host='127.0.0.1', monitor=None, owner=None, crashe
         server.starport_source_registry = starport_registry_source
     return starport_registry_source
 
-  def starport_client():
+  def starport_client_owner():
     nonlocal starport_client_source
     with starport_source_lock:
       if starport_client_source is None:
@@ -445,7 +489,7 @@ def make_server(*, port=8082, host='127.0.0.1', monitor=None, owner=None, crashe
       if settings_gateway is None:
         from openpilot.common.params import Params
         params = Params()
-        settings_gateway = SettingsGateway(params, context_source(params), starport=starport_client)
+        settings_gateway = SettingsGateway(params, context_source(params), starport=starport_client_owner)
         server.settings_source = settings_gateway
       return settings_gateway
 
@@ -457,6 +501,15 @@ def make_server(*, port=8082, host='127.0.0.1', monitor=None, owner=None, crashe
         from openpilot.starpilot.galaxy.defaults_recovery import DefaultsRecovery
         recovery_gateway = DefaultsRecovery(gateway)
       return recovery_gateway
+
+  def flm_backups():
+    nonlocal flm_backup_gateway
+    gateway = feature_settings()
+    with settings_lock:
+      if flm_backup_gateway is None:
+        from openpilot.starpilot.galaxy.flm_backup import FlmBackup
+        flm_backup_gateway = FlmBackup(gateway)
+      return flm_backup_gateway
 
   def toyota_owner():
     nonlocal toyota_source
@@ -502,7 +555,10 @@ def make_server(*, port=8082, host='127.0.0.1', monitor=None, owner=None, crashe
 
   def model_laboratory():
     from openpilot.starpilot.models.laboratory import ModelLaboratory
-    return ModelLaboratory(model_owner())
+    def runtime_status(config):
+      model_status()
+      return model_source.laboratory_json(config)
+    return ModelLaboratory(model_owner(), runtime_status=runtime_status)
 
   def login(password):
     # Keep throttling, verifier work and session creation in one transaction.
@@ -520,6 +576,8 @@ def make_server(*, port=8082, host='127.0.0.1', monitor=None, owner=None, crashe
         return 401, {'error': 'Sign in failed'}, None
       return 200, {'authenticated': True}, sessions.create(generation)
 
+  browser_assets = WebAssets(WEB)
+
   class Handler(_LocalHTTPHandler):
     def camera_video(self, encoded_name: str, *, combined=False):
       camera_video(self, encoded_name, media=local_media, combined=combined)
@@ -528,8 +586,12 @@ def make_server(*, port=8082, host='127.0.0.1', monitor=None, owner=None, crashe
       send_recording(self, lease, content_type)
 
     def local_request(self, *, mutation=False):
+      proxy = reverse_proxy if reverse_proxy is not None else proxy_settings.current
       host = self.headers.get('Host', '')
       origin = self.headers.get('Origin')
+      if len(self.headers.get_all('Host', [])) != 1 or len(self.headers.get_all('Origin', [])) > 1:
+        self.json(403, {'error': 'Ambiguous request origin'})
+        return False
       local_address = self.connection.getsockname()[0]
       if getattr(self.server, 'remote_transport', False):
         record = pairing.read()
@@ -549,7 +611,25 @@ def make_server(*, port=8082, host='127.0.0.1', monitor=None, owner=None, crashe
         if self.path.startswith(prefix + '/') or self.path == prefix:
           self.path = self.path[len(prefix):] or '/'
         return True
-      if not allowed_authority(host, local_address, self.server.server_port) or \
+      if proxy is not None and proxy.allows(self.client_address[0], host, origin, mutation=mutation):
+        return True
+      # curl can override Host without the nonstandard port. Permit that form
+      # only for the inert landing document, never API/session reads or writes.
+      portless_landing = self.command in ('GET', 'HEAD') and self.path == '/' and origin is None
+      authority_allowed = allowed_authority(host, local_address, self.server.server_port, local_hostnames=hostname_source,
+                                            allow_portless=portless_landing)
+      if not authority_allowed and portless_landing and self.direct_local() and \
+         dns_authority_name(host, self.server.server_port, allow_portless=True) is not None:
+        # An arbitrary A-only alias has no independent identity to trust. Let
+        # its landing navigation enter through the real socket address instead.
+        # Never serve API data or create a session under that named origin.
+        self.send_response(302)
+        self.send_header('Location', f'http://{local_address}:{self.server.server_port}/')
+        self.send_header('Content-Length', '0')
+        self.send_header('Cache-Control', 'no-store')
+        self.end_headers()
+        return False
+      if not authority_allowed or \
          (mutation and origin != f'http://{host}') or \
          (origin is not None and origin != f'http://{host}'):
         self.json(403, {'error': 'Local access only'})
@@ -568,10 +648,15 @@ def make_server(*, port=8082, host='127.0.0.1', monitor=None, owner=None, crashe
       return access.status().status
 
     def direct_local(self):
+      proxy = reverse_proxy if reverse_proxy is not None else proxy_settings.current
       return not getattr(self.server, 'remote_transport', False) and \
+             not (proxy is not None and proxy.matches_peer(self.client_address[0])) and \
              direct_local_connection(self.client_address[0], self.connection.getsockname()[0], self.headers)
 
     def spotify_install_allowed(self):
+      proxy = reverse_proxy if reverse_proxy is not None else proxy_settings.current
+      if proxy is not None and proxy.matches_peer(self.client_address[0]):
+        return False
       return install_origin_allowed(self.client_address[0], self.connection.getsockname()[0], self.headers,
                                     getattr(self.server, 'remote_transport', False))
 
@@ -620,7 +705,7 @@ def make_server(*, port=8082, host='127.0.0.1', monitor=None, owner=None, crashe
       try:
         if self.settings_session() != identity:
           raise ValueError('Galaxy session changed')
-        return starport_client().call(command, source=source, **arguments)
+        return starport_client_owner().call(command, source=source, **arguments)
       finally:
         starport_source_registry().revoke_source(source)
 
@@ -648,7 +733,7 @@ def make_server(*, port=8082, host='127.0.0.1', monitor=None, owner=None, crashe
       try:
         if self.settings_session() != identity:
           raise ValueError('Galaxy session changed')
-        delegated = starport_client().call('phone_window', source=source, operation=operation, **arguments)
+        delegated = starport_client_owner().call('phone_window', source=source, operation=operation, **arguments)
       except (OSError, RuntimeError) as error:
         # Falling back to this process cannot work while Android Auto holds the adapter, so say why it was skipped.
         cloudlog.warning(f'android auto phone window {operation} not delegated: {error!r}')
@@ -691,6 +776,15 @@ def make_server(*, port=8082, host='127.0.0.1', monitor=None, owner=None, crashe
         else:
           self.camera_video(path.removeprefix('/api/recordings/media/'))
         return
+      if path == '/api/connect/proxy':
+        if not self.require_session():
+          return
+        try:
+          self.json(200, {**proxy_settings.snapshot(), 'canEdit': cloud_allowed(),
+                          'passwordConfigured': access.status().status == AccessStatus.CONFIGURED_LOCAL})
+        except (OSError, ValueError):
+          self.json(503, {'error': 'Reverse proxy configuration is unavailable'})
+        return
       if path == '/api/connect/provider':
         if not self.require_session():
           return
@@ -721,6 +815,13 @@ def make_server(*, port=8082, host='127.0.0.1', monitor=None, owner=None, crashe
                         **({'gatewayAccess': True} if getattr(self.server, 'remote_transport', False) else {}),
                         'state': 'configured' if status == AccessStatus.CONFIGURED_LOCAL else
                                  'unavailable' if status == AccessStatus.UNAVAILABLE else 'setup_required'})
+      elif path == '/api/localization':
+        if not self.require_session():
+          return
+        from openpilot.common.params import Params
+        from openpilot.starpilot.galaxy.localization import language_snapshot
+        previous = parse_qs(urlsplit(self.path).query).get('language', [''])[0]
+        self.json(200, language_snapshot(Params(), previous))
       elif path == '/api/galaxy/device-name':
         if not self.require_session():
           return
@@ -765,6 +866,16 @@ def make_server(*, port=8082, host='127.0.0.1', monitor=None, owner=None, crashe
           result = hotspot_owner().snapshot(parked())
         except (OSError, ValueError):
           self.json(503, {'error': 'Hotspot settings are unavailable.'})
+        else:
+          if self.require_session():
+            self.json(200, result)
+      elif path == '/api/galaxy/networks':
+        if not self.require_session():
+          return
+        try:
+          result = network_owner().snapshot(parked())
+        except (OSError, ValueError):
+          self.json(503, {'error': 'Network settings are unavailable.'})
         else:
           if self.require_session():
             self.json(200, result)
@@ -854,6 +965,12 @@ def make_server(*, port=8082, host='127.0.0.1', monitor=None, owner=None, crashe
             self.json(200, result)
           else:
             self.json(401, {'error': 'Sign in to Galaxy'})
+      elif path == '/api/weather':
+        if not self.require_session():
+          return
+        result = weather_status()
+        if self.require_session():
+          self.json(200, result)
       elif path == '/api/system/monitor':
         if not self.require_session():
           return
@@ -882,6 +999,9 @@ def make_server(*, port=8082, host='127.0.0.1', monitor=None, owner=None, crashe
           # immediately before sending potentially sensitive content.
           if self.require_session():
             self.json(200, result)
+      elif path == '/api/starport/logs/send':
+        if self.require_session():
+          self.json(200, starport_log_sender().status())
       elif path == '/api/starport/logs' or path.startswith('/api/starport/logs/'):
         if not self.require_session():
           return
@@ -921,15 +1041,19 @@ def make_server(*, port=8082, host='127.0.0.1', monitor=None, owner=None, crashe
           self.json(400, {'error': 'Invalid map tile'})
           return
         try:
-          query = parse_qs(urlsplit(self.path).query, keep_blank_values=True, max_num_fields=1)
-          theme = query.get('theme', ['light'])[0]
-          if set(query) - {'theme'} or theme not in ('light', 'dark'):
+          query = parse_qs(urlsplit(self.path).query, keep_blank_values=True, max_num_fields=2)
+          theme = query.get('theme', ['light'])
+          provider = query.get('provider', ['mapbox'])
+          if (set(query) - {'theme', 'provider'} or len(theme) != 1 or theme[0] not in ('light', 'dark') or
+              len(provider) != 1 or provider[0] not in ('mapbox', 'google')):
             raise ValueError('Invalid map theme')
         except ValueError:
           self.json(400, {'error': 'Invalid map theme'})
           return
         try:
-          tile = navigation_owner().map_tile(*(int(value) for value in match.groups()), theme)
+          coords = (int(value) for value in match.groups())
+          tile = (navigation_owner().map_tile(*coords, theme[0], provider='google')
+                  if provider[0] == 'google' else navigation_owner().map_tile(*coords, theme[0]))
         except (OSError, ValueError, RuntimeError):
           self.json(503, {'error': 'Map tiles are unavailable'})
         else:
@@ -961,13 +1085,19 @@ def make_server(*, port=8082, host='127.0.0.1', monitor=None, owner=None, crashe
         else:
           if self.require_session():
             self.json(200, result)
-      elif path == '/api/software/status':
+      elif path in ('/api/software/status', '/api/update/fast/status'):
         identity = self.settings_session()
         if identity is None:
           if not self.require_session():
             return
         try:
-          result = software_snapshot(include_history=parse_qs(urlsplit(self.path).query).get('history') != ['0'])
+          if path == '/api/update/fast/status':
+            installed = (software_source if software_source is not None else SoftwareStatus()).snapshot()['installed']
+            result = {'branch': installed['branch'], 'localCommit': installed['commit'],
+                      'running': False, 'stage': 'updated', 'updateAvailable': False,
+                      'message': 'Galaxy has been upgraded. Reload this page, or close and reopen the Galaxy app, to load the new interface.'}
+          else:
+            result = software_snapshot(include_history=parse_qs(urlsplit(self.path).query).get('history') != ['0'])
         except (SoftwareUnavailable, SoftwareOperationError, OSError):
           self.json(503, {'error': 'Software status is unavailable'})
         else:
@@ -1038,13 +1168,13 @@ def make_server(*, port=8082, host='127.0.0.1', monitor=None, owner=None, crashe
           return
         source = starport_source_registry().current(identity)
         try:
-          result: dict = starport_client().call('pairing_status', source=source) if source and configuration_allowed() else \
+          result: dict = starport_client_owner().call('pairing_status', source=source) if source and configuration_allowed() else \
                    {'pairing': {'active': False, 'receiver': None, 'prompt': None, 'approved': False}}
         except (OSError, RuntimeError):
           self.json(503, {'error': 'StarPort pairing service is unavailable'})
         else:
           try:
-            runtime = starport_client().call('status')['status']
+            runtime = starport_client_owner().call('status')['status']
           except (OSError, RuntimeError, ValueError, KeyError, TypeError):
             runtime = None
           result['selectedReceiver'] = None
@@ -1065,7 +1195,7 @@ def make_server(*, port=8082, host='127.0.0.1', monitor=None, owner=None, crashe
           self.json(401, {'error': 'Sign in to Galaxy'})
           return
         try:
-          runtime = starport_client().call('status')['status']
+          runtime = starport_client_owner().call('status')['status']
           if runtime.get('pairing_ready'):
             raise ValueError('Finish or cancel pairing before choosing a car')
           if not starport_setup_owner().enabled():
@@ -1255,6 +1385,36 @@ def make_server(*, port=8082, host='127.0.0.1', monitor=None, owner=None, crashe
         else:
           if self.require_session():
             self.json(200, result)
+      elif path == '/api/flm/backup':
+        if not self.require_session():
+          return
+        identity = self.settings_session()
+        if urlsplit(self.path).query:
+          self.json(400, {'error': 'Unexpected tune backup query'})
+          return
+        from openpilot.starpilot.galaxy.flm_backup import BackupRefused
+        try:
+          result = flm_backups().export()
+        except (SettingsChanged, BackupRefused) as error:
+          self.json(409, {'error': str(error)})
+        except (SettingsUnavailable, OSError, RuntimeError, ValueError):
+          self.json(503, {'error': 'Tune backup is unavailable'})
+        else:
+          if self.settings_session() == identity:
+            self.attachment('starpilot-flm-tune.json', json.dumps(result, indent=2).encode(), 'application/json; charset=utf-8')
+          else:
+            self.json(401, {'error': 'Sign in to Galaxy'})
+      elif path == '/api/flm/logs/download':
+        if not self.require_session():
+          return
+        if urlsplit(self.path).query:
+          self.json(400, {'error': 'Unexpected FLM log query'})
+          return
+        filename, body = training_results_source.download()
+        from openpilot.starpilot.galaxy.flm_diagnostics import with_dashboard_diagnostics
+        body = with_dashboard_diagnostics(body, drive_stats_source, getattr(server, 'drive_stats_authority', None))
+        if self.require_session():
+          self.attachment(filename, body, 'application/json; charset=utf-8')
       elif path == '/api/flm/training-results':
         if not self.require_session():
           return
@@ -1331,7 +1491,7 @@ def make_server(*, port=8082, host='127.0.0.1', monitor=None, owner=None, crashe
           return
         try:
           result = sound_owner().snapshot()
-        except SoundDownloadError as error:
+        except (SoundDownloadError, AlertPreviewError) as error:
           self.json(error.status, {'error': str(error)})
         except (OSError, ValueError, RuntimeError):
           self.json(503, {'error': 'Sound packs are unavailable'})
@@ -1469,27 +1629,7 @@ def make_server(*, port=8082, host='127.0.0.1', monitor=None, owner=None, crashe
         if self.require_session():
           self.json(404, {'error': 'Capability unavailable'})
       else:
-        try:
-          target = (WEB / unquote(path).lstrip('/')).resolve()
-          if path == '/':
-            target = WEB / 'index.html'
-          if not target.is_relative_to(WEB) or not target.is_file():
-            self.json(404, {'error': 'Page unavailable'})
-            return
-          stat = target.stat()
-          body, packed, content_type = static_asset(str(target), (stat.st_ino, stat.st_mtime_ns, stat.st_size))
-        except (OSError, ValueError):
-          self.json(404, {'error': 'Page unavailable'})
-          return
-        encodings = [entry.strip() for entry in self.headers.get('Accept-Encoding', '').lower().split(',')]
-        compressed = 'gzip' in encodings and packed is not body
-        payload = packed if compressed else body
-        etag = '"' + hashlib.sha256(payload).hexdigest() + '"'
-        headers = {'ETag': etag, 'Vary': 'Accept-Encoding'}
-        if compressed:
-          headers['Content-Encoding'] = 'gzip'
-        unchanged = self.headers.get('If-None-Match') == etag
-        self.respond(304 if unchanged else 200, b'' if unchanged else payload, content_type, asset_headers=headers)
+        browser_assets.serve(self, path)
 
     def do_HEAD(self):
       self.do_GET()
@@ -1582,13 +1722,17 @@ def make_server(*, port=8082, host='127.0.0.1', monitor=None, owner=None, crashe
           self.json(404, {'error': 'Not found'})
         return
       if path not in ('/api/companion/uplink', '/api/companion/settings', '/api/companion/location',
-                      '/api/connect/provider', '/api/auth/login', '/api/auth/logout', '/api/settings/preview', '/api/settings/confirm',
+                      '/api/connect/proxy', '/api/connect/provider', '/api/auth/login', '/api/auth/logout', '/api/settings/preview', '/api/settings/confirm',
                       '/api/settings/recovery/preview', '/api/settings/recovery/confirm',
+                      '/api/settings/flm-backup/preview', '/api/settings/flm-backup/confirm',
+                      '/api/settings/flm-finding/accept',
                       '/api/settings/reset-default', '/api/settings/restore', '/api/recordings/action',
                       '/api/replay/start', '/api/replay/control', '/api/replay/stop',
                       '/api/replay/export-start',
-                      '/api/galaxy/pair', '/api/galaxy/unpair', '/api/galaxy/device-name', '/api/galaxy/hotspot', '/api/cameras/snapshot',
+                      '/api/galaxy/pair', '/api/galaxy/unpair', '/api/galaxy/device-name', '/api/galaxy/hotspot', '/api/galaxy/networks',
+                      '/api/cameras/snapshot', '/api/cameras/white-balance',
                       '/api/starport/layout', '/api/starport/enable', '/api/starport/control', '/api/starport/pairing',
+                      '/api/starport/logs/send',
                       '/api/starport/pairing/response', '/api/starport/pairing/cancel', '/api/starport/pairing/select',
                       '/api/spotify/enable', '/api/spotify/key', '/api/spotify/preferences', '/api/spotify/control', '/api/spotify/maintenance',
                       '/api/ui/layout', '/api/ui/layout/preview', '/api/favorites/slots',
@@ -1597,7 +1741,7 @@ def make_server(*, port=8082, host='127.0.0.1', monitor=None, owner=None, crashe
                       '/api/models/active', '/api/models/preferences', '/api/models/download', '/api/models/download_all',
                       '/api/models/cancel', '/api/models/delete', '/api/models/refresh_manifest', '/api/models/jetlink',
                       '/api/models/laboratory', '/api/models/laboratory/download', '/api/models/laboratory/delete',
-                      '/api/sounds/download', '/api/sounds/cancel', '/api/software/action', '/api/drives/ignore',
+                      '/api/sounds/preview', '/api/sounds/download', '/api/sounds/cancel', '/api/software/action', '/api/drives/ignore',
                       '/api/recordings/delete-videos', '/api/sentry/notifications', '/api/sentry/events/delete', '/api/crash-reports/delete',
                       '/api/navigation/search', '/api/navigation/action', '/api/navigation/offline', '/api/drive-state/action',
                       '/api/toyota-tools/action', '/api/vehicle-selection/preview', '/api/vehicle-selection/confirm'):
@@ -1618,7 +1762,8 @@ def make_server(*, port=8082, host='127.0.0.1', monitor=None, owner=None, crashe
         size = int(self.headers.get('Content-Length', ''))
       except ValueError:
         size = -1
-      max_size = 256 * 1024 if path == '/api/settings/restore' else 17408 if path in ('/api/ui/layout', '/api/ui/layout/preview') else 4096
+      max_size = (256 * 1024 if path == '/api/settings/restore' else 66 * 1024 if path == '/api/settings/flm-backup/preview' else
+                  17408 if path in ('/api/ui/layout', '/api/ui/layout/preview') else 4096)
       if not 0 < size <= max_size:
         self.json(413, {'error': 'Invalid request size'})
         return
@@ -1634,6 +1779,50 @@ def make_server(*, port=8082, host='127.0.0.1', monitor=None, owner=None, crashe
         payload = json.loads(self.rfile.read(size), object_pairs_hook=unique_object)
       except (ValueError, UnicodeError, RecursionError):
         self.json(400, {'error': 'Invalid request'})
+        return
+      if path in ('/api/settings/flm-backup/preview', '/api/settings/flm-backup/confirm'):
+        identity = self.settings_session()
+        if identity is None:
+          self.json(401, {'error': 'Sign in to Galaxy'})
+          return
+        from openpilot.starpilot.galaxy.flm_backup import BackupRefused
+        try:
+          def authorized():
+            return self.settings_session() == identity
+          if path.endswith('/preview'):
+            if type(payload) is not dict or set(payload) != {'backup', 'mode'}:
+              raise BackupRefused('Invalid restore preview.')
+            result = flm_backups().preview(payload['backup'], payload['mode'], identity, authorized=authorized)
+          else:
+            if (type(payload) is not dict or set(payload) != {'intent', 'confirmed'} or
+                type(payload['intent']) is not str or len(payload['intent']) > 64 or payload['confirmed'] is not True):
+              raise BackupRefused('Confirm the restore preview first.')
+            with effect_lock:
+              result = flm_backups().confirm(payload['intent'], identity, authorized=authorized)
+        except (SettingsChanged, BackupRefused) as error:
+          self.json(409 if authorized() else 401, {'error': str(error) if authorized() else 'Sign in to Galaxy'})
+        except (SettingsUnavailable, OSError, RuntimeError, ValueError, TypeError):
+          self.json(503, {'error': 'Tune restore is unavailable. Refresh the saved tune before retrying.'})
+        else:
+          self.json(200 if authorized() else 401, result if authorized() else {'error': 'Sign in to Galaxy'})
+        return
+      if path == '/api/settings/flm-finding/accept':
+        identity = self.settings_session()
+        if identity is None:
+          self.json(401, {'error': 'Sign in to Galaxy'})
+          return
+        from openpilot.starpilot.galaxy.flm_acceptance import accept_finding
+        def authorized():
+          return self.settings_session() == identity
+        try:
+          with effect_lock:
+            result = accept_finding(feature_settings(), training_results_source, payload, authorized=authorized)
+        except (ValueError, SettingsChanged) as error:
+          self.json(409 if authorized() else 401, {'error': str(error) if authorized() else 'Sign in to Galaxy'})
+        except (SettingsUnavailable, OSError, RuntimeError, TypeError, KeyError):
+          self.json(503, {'error': 'Could not confirm this finding was saved. Refresh the saved settings before trying again.'})
+        else:
+          self.json(200 if authorized() else 401, result if authorized() else {'error': 'Sign in to Galaxy'})
         return
       if path.startswith('/api/replay/'):
         replay_api.post(self, path, payload)
@@ -1662,6 +1851,27 @@ def make_server(*, port=8082, host='127.0.0.1', monitor=None, owner=None, crashe
           self.json(400, {'error': str(error)})
         except OSError:
           self.json(503, {'error': 'Companion settings unavailable'})
+        else:
+          self.json(200, result)
+        return
+      if path == '/api/galaxy/networks':
+        identity = self.settings_session()
+        if identity is None:
+          self.json(401, {'error': 'Sign in to Galaxy'})
+          return
+        try:
+          from openpilot.starpilot.galaxy.network_prefs import via_hotspot
+          with effect_lock:
+            result = network_owner().apply(payload, lambda: self.settings_session() == identity and parked(),
+                                           background=via_hotspot(self.client_address[0]))
+        except PermissionError:
+          self.json(409, {'error': 'Park before changing network settings.'})
+        except FileExistsError as error:
+          self.json(409, {'error': str(error)})
+        except ValueError as error:
+          self.json(400, {'error': str(error)})
+        except OSError:
+          self.json(503, {'error': 'Network settings are unavailable.'})
         else:
           self.json(200, result)
         return
@@ -1744,6 +1954,23 @@ def make_server(*, port=8082, host='127.0.0.1', monitor=None, owner=None, crashe
           else:
             self.json(401, {'error': 'Sign in to Galaxy'})
         return
+      if path == '/api/connect/proxy':
+        identity = self.settings_session()
+        try:
+          def authorized():
+            return (identity is not None and self.settings_session() == identity and cloud_allowed() and
+                    (not payload.get('enabled') or access.status().status == AccessStatus.CONFIGURED_LOCAL))
+          result = proxy_settings.save(payload, authorized)
+        except PermissionError as error:
+          self.json(403, {'error': str(error)})
+        except (ValueError, TypeError) as error:
+          self.json(409, {'error': str(error)})
+        except OSError:
+          self.json(503, {'error': 'Reverse proxy settings could not be saved'})
+        else:
+          self.json(200, {**result, 'canEdit': cloud_allowed(),
+                          'passwordConfigured': access.status().status == AccessStatus.CONFIGURED_LOCAL})
+        return
       if path == '/api/connect/provider':
         identity = self.settings_session()
         try:
@@ -1799,28 +2026,38 @@ def make_server(*, port=8082, host='127.0.0.1', monitor=None, owner=None, crashe
               raise ValidationError('Enter a destination to search')
             if 'autocomplete' in payload and payload['autocomplete'] is not True:
               raise ValidationError('Enter a destination to search')
-            result = {'results': (navigation_owner().search_places(payload['query'], identity, payload['searchId'], payload['clientId'],
-                                                                   autocomplete='autocomplete' in payload)
-                                  if 'searchId' in payload else navigation_owner().search(payload['query']))}
+            results = (navigation_owner().search_places(payload['query'], identity, payload['searchId'], payload['clientId'],
+                                                        autocomplete='autocomplete' in payload)
+                       if 'searchId' in payload else navigation_owner().search(payload['query']))
+            result = {'results': results, 'provider': getattr(results, 'provider', 'mapbox')}
           else:
             fields = {'configure': {'patch'}, 'select': {'destination'}, 'selectPlace': {'id', 'searchId'},
                       'cancelSearch': {'searchId'}, 'clear': set(), 'favorite': {'destination'},
                       'favoritePlace': {'id', 'searchId'}, 'removeFavorite': {'id'}, 'labelFavorite': {'id', 'label'},
-                      'removeRecent': {'id'}, 'clearRecents': set(), 'selectRoute': {'index'}}
+                      'removeRecent': {'id'}, 'clearRecents': set(), 'selectRoute': {'index'}, 'testGoogleKey': set(),
+                      'resolveShare': {'text'}, 'share': {'text'}}
             action = payload.get('action')
-            optional = {'label'} if action in ('favorite', 'favoritePlace') and 'label' in payload else set()
+            optional = ({'label'} if action in ('favorite', 'favoritePlace') and 'label' in payload else
+                        {'key'} if action == 'testGoogleKey' and 'key' in payload else
+                        {'intentId'} if action == 'share' and 'intentId' in payload else set())
             if type(action) is not str or action not in fields or set(payload) != {'action', 'revision'} | fields[action] | optional:
               raise ValidationError('Invalid navigation action')
-            needs_park = action == 'configure' and isinstance(payload['patch'], dict) and 'token' in payload['patch']
+            needs_park = action == 'configure' and isinstance(payload['patch'], dict) and bool({'token', 'googleKey'} & payload['patch'].keys())
             def authorized():
               return self.settings_session() == identity and (not needs_park or configuration_allowed())
-            with (nullcontext() if action in ('selectPlace', 'favoritePlace') else effect_lock):
+            with (nullcontext() if action in ('selectPlace', 'favoritePlace', 'testGoogleKey', 'resolveShare', 'share') else effect_lock):
               if not authorized():
-                raise PermissionError('Park your car before changing the Mapbox key' if needs_park else 'Sign in to Galaxy')
+                raise PermissionError('Park your car before changing a map key' if needs_park else 'Sign in to Galaxy')
               nav = navigation_owner()
               keywords = {'expected_revision': payload['revision'], 'authorized': authorized}
               if action == 'configure':
                 result = nav.configure(payload['patch'], **keywords)
+              elif action == 'testGoogleKey':
+                result = dict(nav.snapshot(), googleKeyTest=nav.test_google_key(payload.get('key')))
+              elif action == 'resolveShare':
+                result = dict(nav.snapshot(), sharedText=nav.resolve_share(payload['text']))
+              elif action == 'share':
+                result = nav.share(payload['text'], intent_id=payload.get('intentId'), **keywords)
               elif action == 'selectPlace':
                 result = nav.select_place(payload['id'], payload['searchId'], identity, **keywords)
               elif action == 'cancelSearch':
@@ -1850,7 +2087,8 @@ def make_server(*, port=8082, host='127.0.0.1', monitor=None, owner=None, crashe
         except ConflictError as error:
           self.json(409, {'error': str(error)})
         except ValidationError as error:
-          self.json(400, {'error': str(error)})
+          query = getattr(error, 'query', None)
+          self.json(400, {'error': str(error), **({'query': query} if query else {})})
         except PermissionError as error:
           if self.require_session():
             self.json(409, {'error': str(error)})
@@ -1873,7 +2111,7 @@ def make_server(*, port=8082, host='127.0.0.1', monitor=None, owner=None, crashe
             return False
           return identity is not None and self.settings_session() == identity and parked()
         try:
-          body = snapshots.capture(payload['camera'], permitted=permitted)
+          body = snapshots.capture(payload['camera'], permitted=permitted, parked=True)
           if not permitted():
             raise SnapshotDenied
         except ValueError:
@@ -1886,6 +2124,25 @@ def make_server(*, port=8082, host='127.0.0.1', monitor=None, owner=None, crashe
             self.json(503, {'error': 'No fresh camera frame. Try taking a new snapshot.'})
         else:
           self.respond(200, body, 'image/jpeg')
+        return
+      if path == '/api/cameras/white-balance':
+        if type(payload) is not dict or not (payload == {} or (set(payload) == {'enabled'} and type(payload['enabled']) is bool)):
+          self.json(400, {'error': 'Invalid white balance choice'})
+          return
+        identity = self.settings_session()
+        if identity is None:
+          self.json(401, {'error': 'Sign in to Galaxy'})
+          return
+        from openpilot.common.params import Params
+        params = Params()
+        with effect_lock:
+          if 'enabled' in payload:
+            params.put_bool('CabinWhiteBalance', payload['enabled'])
+          enabled = params.get_bool('CabinWhiteBalance')
+        if self.settings_session() == identity:
+          self.json(200, {'enabled': enabled})
+        else:
+          self.json(401, {'error': 'Sign in to Galaxy'})
         return
       if path == '/api/galaxy/device-name':
         if not self.require_session():
@@ -2169,8 +2426,9 @@ def make_server(*, port=8082, host='127.0.0.1', monitor=None, owner=None, crashe
             if self.settings_session() != identity:
               self.json(401, {'error': 'Sign in to Galaxy'})
               return
-            result = sound_owner().action(path.rsplit('/', 1)[-1], payload)
-        except SoundDownloadError as error:
+            result = (alert_preview.play(payload) if path == '/api/sounds/preview' else
+                      sound_owner().action(path.rsplit('/', 1)[-1], payload))
+        except (SoundDownloadError, AlertPreviewError) as error:
           self.json(error.status, {'error': str(error)})
         except (OSError, ValueError, RuntimeError):
           self.json(503, {'error': 'Sound packs are unavailable'})
@@ -2251,6 +2509,27 @@ def make_server(*, port=8082, host='127.0.0.1', monitor=None, owner=None, crashe
           else:
             self.json(401, {'error': 'Sign in to Galaxy'})
         return
+      if path == '/api/starport/logs/send':
+        if type(payload) is not dict or set(payload) not in ({'message'}, {'message', 'discord'}):
+          self.json(400, {'error': 'Invalid StarPort log send request'})
+          return
+        identity = self.settings_session()
+        if identity is None:
+          self.json(401, {'error': 'Sign in to Galaxy'})
+          return
+        from openpilot.starpilot.galaxy.starport_send import SendBusy, SendRejected
+        try:
+          result = starport_log_sender().start(payload['message'], payload.get('discord', ''))
+        except SendRejected as error:
+          self.json(400, {'error': str(error)})
+        except SendBusy as error:
+          self.json(409, {'error': str(error)})
+        else:
+          if self.settings_session() == identity:
+            self.json(202, result)
+          else:
+            self.json(401, {'error': 'Sign in to Galaxy'})
+        return
       if path == '/api/starport/enable':
         if type(payload) is not dict or set(payload) not in ({'enabled'}, {'enabled', 'enableBluetooth'}) or \
            type(payload['enabled']) is not bool or type(payload.get('enableBluetooth', False)) is not bool or \
@@ -2289,7 +2568,7 @@ def make_server(*, port=8082, host='127.0.0.1', monitor=None, owner=None, crashe
         if action == 'stop' and set(payload) == {'action'}:
           try:
             self.starport_command(identity, 'stop')
-            current = starport_client().call('status').get('status', {})
+            current = starport_client_owner().call('status').get('status', {})
           except ValueError as error:
             self.json(409, {'error': str(error)})
           except (OSError, RuntimeError):
@@ -2305,6 +2584,12 @@ def make_server(*, port=8082, host='127.0.0.1', monitor=None, owner=None, crashe
           return
         if action == 'start' and set(payload) == {'action'}:
           command, arguments = 'start', {}
+        elif action == 'reset_handshake' and set(payload) == {'action'}:
+          command, arguments = 'reset_handshake', {}
+        elif action == 'continue_ladder' and set(payload) == {'action'}:
+          command, arguments = 'continue_ladder', {}
+        elif action == 'dismiss_fix_suggestion' and set(payload) == {'action', 'rule'} and isinstance(payload['rule'], str):
+          command, arguments = 'dismiss_fix_suggestion', {'rule': payload['rule'][:64]}
         elif action == 'auto_connect' and set(payload) == {'action', 'enabled'} and type(payload['enabled']) is bool:
           if not configuration_allowed():
             self.json(403, {'error': 'Park before changing automatic connection'})
@@ -2345,7 +2630,7 @@ def make_server(*, port=8082, host='127.0.0.1', monitor=None, owner=None, crashe
           self.json(400, {'error': 'Invalid Android Auto control request'})
           return
         try:
-          runtime = starport_client().call('status')['status']
+          runtime = starport_client_owner().call('status')['status']
           if runtime.get('pairing_ready'):
             raise ValueError('Finish or cancel pairing first')
           if command == 'start' and not runtime.get('receiver_address') and runtime.get('connection') == 'wireless':
@@ -2353,7 +2638,7 @@ def make_server(*, port=8082, host='127.0.0.1', monitor=None, owner=None, crashe
           if command == 'start' and not starport_setup_owner().identity_status().get('installed'):
             raise ValueError('Verify your Android Auto package first')
           self.starport_command(identity, command, **arguments)
-          current = starport_client().call('status')['status']
+          current = starport_client_owner().call('status')['status']
         except ValueError as error:
           self.json(409, {'error': str(error)})
         except (OSError, RuntimeError, KeyError, TypeError):
@@ -2395,7 +2680,7 @@ def make_server(*, port=8082, host='127.0.0.1', monitor=None, owner=None, crashe
           source = starport_source_registry().mint(identity)
           if self.settings_session() != identity or not configuration_allowed():
             raise ValueError('Galaxy session or Park state changed')
-          starport_client().call('prepare_pairing', source=source)
+          starport_client_owner().call('prepare_pairing', source=source)
         except ValueError as error:
           if source is not None:
             starport_source_registry().revoke_source(source)
@@ -2447,7 +2732,7 @@ def make_server(*, port=8082, host='127.0.0.1', monitor=None, owner=None, crashe
         try:
           if self.settings_session() != identity or not configuration_allowed():
             raise ValueError('Galaxy session or Park state changed')
-          starport_client().call(command, source=source, **arguments)
+          starport_client_owner().call(command, source=source, **arguments)
         except ValueError as error:
           self.json(409, {'error': str(error)})
         except (OSError, RuntimeError):
@@ -2815,7 +3100,7 @@ def make_server(*, port=8082, host='127.0.0.1', monitor=None, owner=None, crashe
       def disconnect():
         if self.settings_session() != identity:
           raise SetupRejected('Galaxy session expired; sign in again')
-        client = starport_client()
+        client = starport_client_owner()
         if client.available:
           runtime = client.call('status')['status']
           if not isinstance(runtime, dict) or type(runtime.get('running')) is not bool:

@@ -34,6 +34,15 @@ V_EGO_STATIONARY = 4.   # no stationary object flag below this speed
 
 RADAR_TO_CAMERA = 1.52  # RADAR is ~ 1.5m ahead from center of mesh frame
 
+# Behind the Mazda Smart CAN Filter the radar drops the lead's track for a burst or a few (median 0.1 s), and the lead
+# falls back to the camera's estimate, often meters and m/s off (routes 0000007a-00000080: 39 of 75 radar-to-camera
+# flips). For up to RADAR_COAST_T after the matched track goes, each lead value is the lower of the camera's and the
+# radar's carried forward, so a gap can only add braking: a closing speed the camera misses is kept, and a nearer
+# camera car still wins. A carried car far nearer than the camera's is taken as gone. (develop, filter branch)
+RADAR_COAST_T = 0.5  # s since the radar message that last carried the track (a late or repeated message does not stretch it)
+RADAR_COAST_NEAR_FRAC, RADAR_COAST_NEAR_MIN = 0.4, 8.0  # m, the farthest the carried car may be nearer than the camera's
+RADAR_COAST_KEYS = ('dRel', 'vRel', 'vLead', 'vLeadK', 'aLeadK')
+
 
 def _clock_pair() -> tuple[int, int, int] | None:
   """Return a bounded MONOTONIC/BOOTTIME pair; missing BOOTTIME stays unknown."""
@@ -201,14 +210,20 @@ def get_lead(v_ego: float, ready: bool, tracks: dict[int, Track], lead_msg: capn
 
 class RadarD:
   def __init__(self, delay: float = 0.0, *, adjacent_enabled: bool = False, radar_available: bool = False,
-               clock_pair_fn=None, honda_bosch_a_radar: bool = False, use_voacc: bool = False):
+               clock_pair_fn=None, honda_bosch_a_radar: bool = False, use_voacc: bool = False,
+               mazda_radar_coast: bool = False):
     self.use_voacc = use_voacc
+    self.coast_enabled = mazda_radar_coast
+    self.coast_lead: dict[str, float] | None = None
+    self.coast_track_id = -1
+    self.coast_seen_t = 0.  # s, time of the radar message that last carried the lead's track
     self.tracks: dict[int, Track] = {}
     self.honda_bosch_a = None
     if honda_bosch_a_radar:
       from openpilot.starpilot.car.honda.radar import BoschALeadPolicy
       self.honda_bosch_a = BoschALeadPolicy()
-    self.kalman_params = KalmanParams(1.0 / 15.0 if self.honda_bosch_a is not None else DT_MDL)
+    from opendbc.car.honda.bosch_a_radar import BOSCH_A_FREQ_HZ
+    self.kalman_params = KalmanParams(1.0 / BOSCH_A_FREQ_HZ if self.honda_bosch_a is not None else DT_MDL)
     self.lead_prob_filters = [FirstOrderFilter(0.0, 0.2, DT_MDL) for _ in range(2)]
 
     self.v_ego = 0.0
@@ -356,10 +371,33 @@ class RadarD:
         self.radar_state.leadOne, self.radar_state.leadTwo = self.honda_bosch_a.leads(sm, self, model_v_ego)
       else:
         self.radar_state.leadOne = get_lead(self.v_ego, self.ready, self.tracks, leads_v3[0], model_v_ego, self.lead_prob_filters[0].x, low_speed_override=True)
+        self.coast(self.radar_state.leadOne, sm.logMonoTime['modelV2'] * 1e-9, sm.logMonoTime['radarTracks'] * 1e-9)
         self.radar_state.leadTwo = get_lead(self.v_ego, self.ready, self.tracks, leads_v3[1], model_v_ego,
                                           self.lead_prob_filters[1].x, low_speed_override=False)
     if self.adjacent_enabled:
       self._qualified_adjacent(sm, rr)
+
+  def coast(self, lead, t: float, radar_t: float) -> None:
+    """leadOne through a short loss of its radar track, as the lower of the camera's values and the radar's carried.
+    t: this model frame's time, s. radar_t: the time of the radar message the tracks came from, s."""
+    if not self.coast_enabled:
+      return
+    if lead.radar:
+      self.coast_lead = {k: float(getattr(lead, k)) for k in RADAR_COAST_KEYS}
+      self.coast_track_id, self.coast_seen_t = lead.radarTrackId, radar_t
+      return
+    seen = self.coast_lead
+    elapsed = t - self.coast_seen_t
+    # only the camera's lead with the track gone (not one the matcher let go of), within the window since it was seen
+    if seen is None or not lead.present or self.coast_track_id in self.tracks or not (0. < elapsed <= RADAR_COAST_T + 1e-6):
+      self.coast_lead = None
+      return
+    carried = dict(seen, dRel=seen['dRel'] + seen['vRel'] * elapsed)
+    if lead.dRel - carried['dRel'] >= max(lead.dRel * RADAR_COAST_NEAR_FRAC, RADAR_COAST_NEAR_MIN):
+      self.coast_lead = None
+      return
+    for k in RADAR_COAST_KEYS:
+      setattr(lead, k, min(float(getattr(lead, k)), carried[k]))
 
   def publish(self, pm: messaging.PubMaster):
     assert self.radar_state is not None
@@ -415,7 +453,8 @@ def main() -> None:
   from opendbc.car.honda.bosch_a_radar import VERIFIED_BOSCH_A_CARS
   honda_bosch_a = CP.brand == "honda" and CP.carFingerprint in VERIFIED_BOSCH_A_CARS and not CP.radarUnavailable
   RD = RadarD(CP.radarDelay, adjacent_enabled=adjacent_enabled, radar_available=not CP.radarUnavailable,
-              honda_bosch_a_radar=honda_bosch_a, use_voacc=voacc_selected(params, CP))
+              honda_bosch_a_radar=honda_bosch_a, use_voacc=voacc_selected(params, CP),
+              mazda_radar_coast=CP.brand == "mazda" and bool(CP.safetyConfigs[0].safetyParam & 16))  # MazdaSafetyFlags.CAN_FILTER
   set_core_affinity([3, 5])
 
   while 1:
