@@ -11,6 +11,7 @@ the result for the setpoint, planner, and ICBM paths. Confirmation prompts freez
 session cap and block synthesized button output. See docs/zoompilot/cruise-arbiter.md.
 """
 from dataclasses import dataclass
+import time
 
 from openpilot.cereal import custom
 from opendbc.car import structs
@@ -112,6 +113,9 @@ class CruiseArbiter:
     self._raise_deferred = False  # a raise prompt waits for a current limit
     self._limit_seen = (0., 0., False, False)  # the resolver's latest (speedLimit, speedLimitFinalLast, valid, current)
     self._limit_seen_frames = 0
+    self._ramp_offer = (0, 0., 0)
+    self._ramp_prompt = None
+    self._last_ramp_id = 0
 
     self.long_enabled_prev = False
     self.long_engaged_timer = 0
@@ -144,6 +148,8 @@ class CruiseArbiter:
       self._set_state(SessionState.disabled)
       self.v_cap = V_CRUISE_UNSET
       self._press.clear()
+      self._ramp_offer = (0, 0., 0)
+      self._ramp_prompt = None
 
   def _applicable_for(self, icbm_active: bool) -> bool:
     return not pcm_machine_owns_sla(self.CP, icbm_active)
@@ -156,7 +162,9 @@ class CruiseArbiter:
   def update_limit(self, LP_SP):
     if not self.applicable:
       return
-    resolver = LP_SP.speedLimit.resolver
+    speed_limit = LP_SP.speedLimit
+    self._ramp_offer = (speed_limit.rampId, float(speed_limit.rampSpeed), speed_limit.rampExpiresMonoTime)
+    resolver = speed_limit.resolver
     seen = (float(resolver.speedLimit), float(resolver.speedLimitFinalLast), bool(resolver.speedLimitValid or resolver.speedLimitLastValid),
             bool(resolver.speedLimitValid))
     if seen != self._limit_seen:
@@ -175,7 +183,7 @@ class CruiseArbiter:
 
   @property
   def prompting(self) -> bool:
-    return self.state == SessionState.preActive
+    return self.state == SessionState.preActive or self._ramp_prompt is not None
 
   @property
   def session_active(self) -> bool:
@@ -389,6 +397,57 @@ class CruiseArbiter:
     self._reprompt_hold = self._reprompt_hold + 1 if due else 0
     return self._reprompt_cooldown <= 0 and self._reprompt_hold >= int(REPROMPT_HOLD / DT_CTRL)
 
+  def _step_ramp(self, CS, long_enabled, v_cruise_kph):
+    ramp_id, speed, expires = self._ramp_offer
+    if not ramp_id and self._ramp_prompt is None:
+      return None
+    now = time.monotonic_ns()
+    speed = speed if 9.99 * CV.MPH_TO_MS <= speed <= 75.01 * CV.MPH_TO_MS else 0.
+    target = round(speed * self._conv)
+    target_kph = target * CV.MS_TO_KPH / self._conv
+    valid = (long_enabled and self.enabled and ramp_id and expires > now and speed > 0.
+             and 0 < target < self._cluster_conv and target_kph < v_cruise_kph < V_CRUISE_UNSET and speed < self.v_cap)
+    if self._ramp_prompt is not None:
+      prompt_id, prompt_speed, until = self._ramp_prompt
+      if not valid or ramp_id != prompt_id or speed != prompt_speed or now >= until:
+        self._ramp_prompt = None
+        # The old prompt owned the press. Its eventual release cannot answer another prompt.
+        for press in self._press.values():
+          press.resolved = True
+        return None
+    elif (valid and ramp_id != self._last_ramp_id and self.state in (*ACTIVE_STATES, SessionState.inactive) and
+          not CS.buttonEvents and not any(not press.released for press in self._press.values())):
+      self._last_ramp_id = ramp_id
+      self._ramp_prompt = (ramp_id, speed, now + int(PRE_ACTIVE_GUARD_PERIOD * 1e9))
+    else:
+      return None
+
+    self._press = {button: press for button, press in self._press.items() if not press.released}
+    for event in CS.buttonEvents:
+      if event.type in PLUS_BUTTONS and event.pressed:
+        self._ramp_prompt = None
+        self._press[event.type.raw] = _Press(_PRESS_PROMPT, resolved=True)
+        return v_cruise_kph
+      if event.type not in MINUS_BUTTONS:
+        continue
+      button = event.type.raw
+      if event.pressed:
+        self._press[button] = _Press(_PRESS_PROMPT, resolved=True)
+      elif (press := self._press.get(button)) is not None:
+        press.released = True
+        self._ramp_prompt = None
+        self._ignored_prompt = False
+        self._raise_deferred = False
+        self._late_answer_timer = 0
+        self._confirm_follow_timer = 0
+        self._set_state(SessionState.inactive)
+        self.v_cap = V_CRUISE_UNSET
+        self._slf_prev = self._slf
+        self.adopted_this_frame = True
+        self.last_intent = CruiseIntent.confirm
+        return target_kph
+    return v_cruise_kph
+
   def step(self, CS, long_enabled: bool, v_cruise_kph: float, v_cruise_cluster_kph: float) -> float:
     """Classify presses, advance the session, and publish its cap in a fixed order."""
     if not self.applicable:
@@ -400,6 +459,9 @@ class CruiseArbiter:
     self._cluster_conv = round(v_cruise_cluster_kph * conv) if v_cruise_cluster_kph not in (V_CRUISE_UNSET, -1) else 0
     self.last_intent = CruiseIntent.none
 
+    self.adopted_this_frame = False
+    if (ramp_setpoint := self._step_ramp(CS, long_enabled, v_cruise_kph)) is not None:
+      return ramp_setpoint
     v_cruise_kph = self._classify_presses(CS, v_cruise_kph)
 
     self.long_engaged_timer = max(0, self.long_engaged_timer - 1)
@@ -500,7 +562,8 @@ class CruiseArbiter:
     if not self.applicable:
       return
     session = cs_sp.zoompilot.cruiseSession
-    session.state = self.state
+    session.state = SessionState.preActive if self._ramp_prompt is not None else self.state
+    session.rampPromptSpeed = self._ramp_prompt[1] if self._ramp_prompt is not None else 0.
     session.vCap = float(self.v_cap)
     session.lastIntent = self.last_intent
     session.announceCounter = self.announce_counter
