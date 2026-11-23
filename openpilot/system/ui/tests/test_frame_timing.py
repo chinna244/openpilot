@@ -92,7 +92,7 @@ def test_nested_phases_record_only_this_frame_and_keep_fixed_names(frame, monkey
   app.measure_frame_phase("ui_state", lambda: app.measure_frame_phase("transition", lambda: advance(0.020, 0.001)))
   app.measure_frame_phase("controllers", lambda: advance(0.002, 0.001))
   assert next(loop)[0]
-  assert set(app._frame_phases) == {"camera", "model"}  # Previous update phases were reset.
+  assert set(app._frame_phases) == {"camera", "model", "stack_tick", "stack_render"}  # Previous update phases were reset.
   with pytest.raises(StopIteration):
     next(loop)
   logged = warning.call_args.args[0]
@@ -104,6 +104,26 @@ def test_nested_phases_record_only_this_frame_and_keep_fixed_names(frame, monkey
   assert len(app._frame_phases) <= len(application.FRAME_PHASES)
   with pytest.raises(ValueError):
     app.measure_frame_phase("arbitrary", lambda: None)
+
+
+def test_render_preparation_and_widget_traversal_are_timed(frame):
+  app, advance, _, warning = frame
+  app._frame_timing_enabled = True
+  app.add_render_prepare(lambda: advance(0.007, 0.005), lambda: None)
+  app._nav_stack_ticks[0].side_effect = lambda: advance(0.008, 0.007)
+  app._nav_stack[0].render.side_effect = lambda _: app.measure_frame_phase("camera", lambda: advance(0.010, 0.003))
+
+  loop = app.render()
+  assert next(loop)[0]
+  with pytest.raises(StopIteration):
+    next(loop)
+
+  assert app.frame_timing.draw_wall_ms == pytest.approx(29)
+  assert app._frame_phases["render_prepare"] == pytest.approx((7, 5))
+  assert app._frame_phases["stack_tick"] == pytest.approx((8, 7))
+  assert app._frame_phases["stack_render"] == pytest.approx((10, 3))
+  assert app._frame_phases["camera"] == pytest.approx((10, 3))
+  assert "stack_render wall/cpu 10.0/3.0ms" in warning.call_args.args[0]
 
 
 def test_screen_off_clears_stale_timing_without_render_or_warning(frame, monkeypatch):

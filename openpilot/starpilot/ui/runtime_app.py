@@ -1472,7 +1472,7 @@ class StarShellSession:
       if rect.width != self._onroad_page_width:
         self._onroad_page_width = rect.width
         self._snapshot_cache = None
-    snapshot = self.snapshot(mode)
+    snapshot = gui_app.measure_frame_phase("snapshot", self.snapshot, mode)
     self._mode = mode
     if mode == ShellMode.ONROAD:
       snapshot = replace(snapshot, onroad=self.input.onroad.present(snapshot.onroad))

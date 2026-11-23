@@ -233,7 +233,9 @@ class FrameTiming(NamedTuple):
 
 
 # StarPilot compact onroad widgets (route 00000002--c9d55e7093: ~15-20 ms of draw was outside every named phase)
-FRAME_PHASES = ("camera", "model", "ui_state", "transition", "controllers", "hud", "torque_bar", "navigation", "alert", "sidebar")
+FRAME_PHASES = ("ui_state", "transition", "controllers", "render_prepare", "stack_tick", "stack_render",
+                "snapshot", "compact_view", "camera", "model", "ordered_widgets", "hud", "torque_bar",
+                "extra_overlays", "slc_actions", "navigation", "alert", "sidebar")
 
 
 class GuiApplication:
@@ -707,7 +709,7 @@ class GuiApplication:
           continue
 
         for prepare in tuple(self._render_prepare):
-          prepare()
+          self.measure_frame_phase("render_prepare", prepare)
 
         if self._render_texture:
           rl.begin_texture_mode(self._render_texture)
@@ -722,11 +724,11 @@ class GuiApplication:
 
         # Allow a Widget to still run a function regardless of the stack depth
         for tick in self._nav_stack_ticks:
-          tick()
+          self.measure_frame_phase("stack_tick", tick)
 
         # Only render top widgets
         for widget in self._nav_stack[-self._nav_stack_widgets_to_render:]:
-          widget.render(rl.Rectangle(0, 0, self.width, self.height))
+          self.measure_frame_phase("stack_render", widget.render, rl.Rectangle(0, 0, self.width, self.height))
 
         frame_time = rl.get_frame_time()
         cpu_time = time.monotonic() - frame_start

@@ -182,7 +182,7 @@ class OnroadView:
     if self.fonts.profile == Profile.LARGE:
       self._large(state)
     else:
-      self._compact(state)
+      gui_app.measure_frame_phase("compact_view", self._compact, state)
 
   def _slc_actions(self, state: OnroadState) -> None:
     sign = self.unified_speed.sign if self.fonts.profile == Profile.LARGE else self.compact_hud._speed_limit_widget
@@ -367,7 +367,7 @@ class OnroadView:
       if draw := callbacks.get(key):
         draw()
     if pending and (only_widget is None or only_widget == ('cruise_limits' if large else 'speed_limit')) and not driver_camera:
-      self._slc_actions(state)
+      gui_app.measure_frame_phase("slc_actions", self._slc_actions, state)
 
   def _legacy_pip_layer(self, state):
     return getattr(self, "pip_layer", None) if state.camera_available else getattr(self, "preview_pip_layer", None)
@@ -509,11 +509,12 @@ class OnroadView:
         rl.draw_texture_ex(self._fade, rl.Vector2(0, 0), 0, 1, rl.WHITE)
         clip.end_scissor_mode()
         clip.begin_scissor_mode(0, 0, 536, 240)
-        self._ordered_widgets(frame, state, driver_camera=driver_camera, stock_layer=stock_layer if use_stock else None)
+        gui_app.measure_frame_phase("ordered_widgets", self._ordered_widgets, frame, state,
+                                    driver_camera=driver_camera, stock_layer=stock_layer if use_stock else None)
         clip.end_scissor_mode()
         clip.begin_scissor_mode(0, 0, 476, 240)
         if self.extra_overlays is not None:
-          self.extra_overlays(frame, state)
+          gui_app.measure_frame_phase("extra_overlays", self.extra_overlays, frame, state)
       else:
         self._prepare_compact_fade()
         rl.draw_texture_ex(self._fade, rl.Vector2(0, 0), 0, 1, rl.WHITE)
@@ -524,7 +525,7 @@ class OnroadView:
           if state.stopped_duration_s is not None:
             self._stopped_timer(state, state.stopped_duration_s)
         if self.extra_overlays is not None:
-          self.extra_overlays(frame, state)
+          gui_app.measure_frame_phase("extra_overlays", self.extra_overlays, frame, state)
         if monitor_layer := getattr(self, "driver_monitor_layer", None):
           monitor_layer(frame, state)
       if not ordered:
@@ -533,7 +534,7 @@ class OnroadView:
         self._clock(state)
         self._weather(state)
       if not ordered and not driver_camera and manual_slc_confirmation(self.fonts.profile, state):
-        self._slc_actions(state)
+        gui_app.measure_frame_phase("slc_actions", self._slc_actions, state)
       signals = state.border_signals
       direction = (-1 if signals.left_blinker else 1 if signals.right_blinker else 0) if signals else 0
       if not ordered and state.alert.size != AlertSize.FULL:
