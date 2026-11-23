@@ -1137,10 +1137,9 @@ def _slc_display(speed_mps: float, metric: bool) -> str:
 def mazda_slc_confirm_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.SubMaster, metric: bool, soft_disable_time: int,
                             personality) -> Alert:
   """develop/filter-dev events_zp speed_limit_pre_active_alert (mici): the press toward the offer confirms it."""
-  from openpilot.starpilot.car.mazda.sla_set_servo import confirm_direction
-  state = sm['slcState']
-  target = float(state.presentationAdjustedLimit)
-  direction = confirm_direction(target, float(CS.cruiseState.speedCluster), metric)
+  from openpilot.starpilot.car.mazda.sla_set_servo import confirm_direction, open_offer_mps
+  target = open_offer_mps(sm['slcState'])
+  direction = confirm_direction(target, float(CS.cruiseState.speedCluster), metric) if target is not None else None
   text = f"Press {'+' if direction == 'accel' else '-'} for\n{_slc_display(target, metric)}" if direction else ""
   return Alert(text, "", AlertStatus.normal, AlertSize.small if text else AlertSize.none,
                Priority.LOW, VisualAlert.none, AudibleAlert.prompt, .1)

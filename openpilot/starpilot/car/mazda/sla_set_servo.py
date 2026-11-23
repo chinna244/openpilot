@@ -47,6 +47,21 @@ def display_conv(is_metric: bool) -> float:
   return CV.MS_TO_KPH if is_metric else CV.MS_TO_MPH
 
 
+def open_offer_mps(state) -> float | None:
+  """The open SLA offer's target, as filter-dev's prompt keeps it for its whole life: the pending decision's own adjusted
+  target, which survives the camera/map source flickering to 'none' (route 00000004--0ed7a0ac2e t=132.44: a - press for
+  30 during such a gap had no presentation target, fell back to StarPilot's '- rejects' and declined the offer). The
+  presentation target only when no pending one is published."""
+  try:
+    if state.hasPending and state.hasPendingAdjustedLimit and state.pendingAdjustedLimit > 0:
+      return float(state.pendingAdjustedLimit)
+    if state.hasPresentationAdjustedLimit and state.presentationAdjustedLimit > 0:
+      return float(state.presentationAdjustedLimit)
+  except (AttributeError, TypeError, ValueError):
+    pass
+  return None
+
+
 def confirm_direction(offer_mps: float, set_mps: float, is_metric: bool) -> str | None:
   """'accel' when the offer is above the dash SET, 'decel' when below, None when equal or unknown."""
   if not (offer_mps > 0. and set_mps > 0.):

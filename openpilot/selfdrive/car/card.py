@@ -99,7 +99,7 @@ from openpilot.starpilot.vehicle_startup import VehicleStartupOwner
 from openpilot.starpilot.controllers.wheel_actions import LIFETIME_NS as WHEEL_ACTION_MAX_AGE_NS, WheelPublisher, key_for
 from openpilot.starpilot.controllers.cruise_action import CruiseActionConsumer, eligible as cruise_action_eligible
 from openpilot.starpilot.car.mazda.sla_set_servo import (MazdaSlaSetServo, eligible as mazda_sla_eligible,
-  directional_answer as mazda_directional_answer)
+  directional_answer as mazda_directional_answer, open_offer_mps as mazda_open_offer_mps)
 from openpilot.starpilot.schema_cache import get_cache, prewarm_cache_contracts, put_cache
 
 REPLAY = "REPLAY" in os.environ
@@ -901,9 +901,9 @@ class Car:
   def mazda_sla_answer(self, consumed, CS, now_ns: int):
     """A press toward the offered target accepts it, away rejects it; an accept arms the SET walk."""
     state = self.sm['slcState'] if self.sm.seen['slcState'] else None
-    if state is None or int(state.presentationId) != consumed.pending.presentation_id or not state.hasPresentationAdjustedLimit:
+    offer = mazda_open_offer_mps(state) if state is not None else None
+    if state is None or int(state.presentationId) != consumed.pending.presentation_id or offer is None:
       return consumed
-    offer = float(state.presentationAdjustedLimit)
     self.mazda_sla_servo.is_metric = self.is_metric
     answer = mazda_directional_answer(consumed.button, offer, float(CS.cruiseState.speedCluster), self.is_metric)
     if answer == 'accel':

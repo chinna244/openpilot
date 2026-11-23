@@ -12,7 +12,7 @@ NOW = 100_000_000_000
 
 
 def slc(**kw):
-  base = dict(enabled=True, displayOnly=False, hasPending=True, automaticAdoptionPending=False,
+  base = dict(enabled=True, displayOnly=False, hasPending=True, automaticAdoptionPending=False, hasPendingAdjustedLimit=True,
               hasPresentationAdjustedLimit=True, presentationAdjustedLimit=30 * MPH, hasAcceptedAdjustedLimit=False,
               acceptedAdjustedLimit=0., acceptedIsPreview=False, acceptedMonoTime=0)
   return SimpleNamespace(**{**base, **kw})
@@ -48,14 +48,14 @@ def text(sd, name):
 
 @pytest.mark.parametrize('set_mph,offer,expected', [(35, 30, 'Press - for\n30 mph'), (30, 36, 'Press + for\n36 mph')])
 def test_open_offer_says_which_press(set_mph, offer, expected):
-  sd = run(slc(presentationAdjustedLimit=offer * MPH), set_mph)
+  sd = run(slc(presentationAdjustedLimit=offer * MPH, pendingAdjustedLimit=offer * MPH), set_mph)
   assert sd.mazda_events.names == ['slcConfirmPrompt']
   sd.set_mph = set_mph
   assert text(sd, 'slcConfirmPrompt') == expected
 
 
 def test_offer_equal_to_set_needs_no_prompt():
-  assert run(slc(presentationAdjustedLimit=30 * MPH), 30).mazda_events.names == []
+  assert run(slc(presentationAdjustedLimit=30 * MPH, pendingAdjustedLimit=30 * MPH), 30).mazda_events.names == []
 
 
 def test_accept_shows_adjusting_for_three_seconds():
@@ -81,6 +81,15 @@ def test_no_alert_when_disengaged_ineligible_or_stale(kw):
 
 
 @pytest.mark.parametrize('state_kw', [dict(enabled=False), dict(displayOnly=True), dict(automaticAdoptionPending=True),
-                                      dict(hasPresentationAdjustedLimit=False)])
+                                      dict(hasPresentationAdjustedLimit=False, hasPendingAdjustedLimit=False)])
 def test_no_prompt_without_a_confirmable_offer(state_kw):
   assert run(slc(**state_kw), 35).mazda_events.names == []
+
+
+def test_prompt_stays_through_a_source_gap():
+  """The camera source flickering to 'none' must not blank the prompt (route 00000004--0ed7a0ac2e t=131-132.5)."""
+  state = slc(hasPresentationAdjustedLimit=False, presentationAdjustedLimit=0., pendingAdjustedLimit=30 * MPH)
+  sd = run(state, 36)
+  assert sd.mazda_events.names == ['slcConfirmPrompt']
+  sd.set_mph = 36
+  assert text(sd, 'slcConfirmPrompt') == 'Press - for\n30 mph'

@@ -16,8 +16,9 @@ def cp(brand='mazda', pcm=True):
   return SimpleNamespace(brand=brand, pcmCruise=pcm, passive=False, dashcamOnly=False)
 
 
-def slc(offer_mph):
-  return SimpleNamespace(hasPresentationAdjustedLimit=True, presentationAdjustedLimit=offer_mph * MPH)
+def slc(offer_mph, presentation=True):
+  return SimpleNamespace(hasPending=True, hasPendingAdjustedLimit=True, pendingAdjustedLimit=offer_mph * MPH,
+                         hasPresentationAdjustedLimit=presentation, presentationAdjustedLimit=offer_mph * MPH if presentation else 0.)
 
 
 def cruise(set_mph):
@@ -35,7 +36,7 @@ def test_other_cars_keep_plus_accept(car):
 
 
 def test_missing_offer_keeps_plus_accept():
-  assert slc_accept_key_plus(cp(), SimpleNamespace(hasPresentationAdjustedLimit=False), cruise(35), False) is True
+  assert slc_accept_key_plus(cp(), SimpleNamespace(hasPending=False, hasPresentationAdjustedLimit=False), cruise(35), False) is True
   assert OnroadState.__dataclass_fields__['slc_accept_key_plus'].default is True
 
 
@@ -43,3 +44,7 @@ def test_widget_draws_the_accept_key_from_state():
   source = inspect.getsource(speed_limit_widget.SpeedLimitWidget.render_confirmation)
   assert "for left, plus in ((start, accept_plus), (start + 18 + 4 + accept + 10, not accept_plus))" in source
   assert "accept_plus = state.slc_accept_key_plus" in source
+
+
+def test_hint_holds_through_a_source_gap():
+  assert slc_accept_key_plus(cp(), slc(30, presentation=False), cruise(36), False) is False

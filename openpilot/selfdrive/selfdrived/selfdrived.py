@@ -456,7 +456,7 @@ class SelfdriveD:
     if not getattr(self, 'mazda_slc_alerts', False) or not self.enabled:
       return
     from openpilot.starpilot.speed_limits.physical_actions import STATE_MAX_AGE_NS
-    from openpilot.starpilot.car.mazda.sla_set_servo import confirm_direction
+    from openpilot.starpilot.car.mazda.sla_set_servo import confirm_direction, open_offer_mps
     now_ns = time.monotonic_ns() if now_ns is None else now_ns
     try:
       stamp = int(self.sm.logMonoTime['slcState'])
@@ -466,8 +466,9 @@ class SelfdriveD:
       state = self.sm['slcState']
       if not state.enabled or state.displayOnly:
         return
-      if (state.hasPending and not state.automaticAdoptionPending and state.hasPresentationAdjustedLimit and
-          confirm_direction(float(state.presentationAdjustedLimit), float(CS.cruiseState.speedCluster), self.is_metric)):
+      offer = open_offer_mps(state)
+      if (state.hasPending and not state.automaticAdoptionPending and offer is not None and
+          confirm_direction(offer, float(CS.cruiseState.speedCluster), self.is_metric)):
         self.mazda_events.add('slcConfirmPrompt')
       elif (state.hasAcceptedAdjustedLimit and not state.acceptedIsPreview and
             0 < int(state.acceptedMonoTime) <= now_ns <= int(state.acceptedMonoTime) + SLC_ADJUST_ALERT_NS):

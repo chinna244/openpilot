@@ -241,7 +241,8 @@ def test_metric_units():
 def test_card_answer_binds_to_the_shown_offer():
   from openpilot.selfdrive.car.card import Car
   pending = SlcPendingConfirmation('s', 3, 38)
-  state = SimpleNamespace(presentationId=38, hasPresentationAdjustedLimit=True, presentationAdjustedLimit=30 * MPH)
+  state = SimpleNamespace(presentationId=38, hasPresentationAdjustedLimit=True, presentationAdjustedLimit=30 * MPH,
+                          hasPending=True, hasPendingAdjustedLimit=True, pendingAdjustedLimit=30 * MPH)
   fake = SimpleNamespace(sm=SimpleNamespace(seen={'slcState': True}, __getitem__=None), is_metric=False,
                          mazda_sla_servo=m.MazdaSlaSetServo(), mazda_sla_confirm_frame=False)
   fake.sm = type('SM', (), {'seen': {'slcState': True}, '__getitem__': lambda self, k: state})()
@@ -311,3 +312,26 @@ def test_changed_acknowledgment_after_a_stale_gap_ends_the_walk():
   loop.accepted_ns = loop.now  # a different planner acknowledgment returns
   loop.run(3)
   assert loop.ecu.set_mph == at and loop.servo.end_reason == 'target_changed'
+
+
+def test_route_132s_press_during_a_source_gap_still_confirms():
+  """Route 00000004--0ed7a0ac2e t=132.44: SET- for an open 30 at SET 36 while the source read 'none' (no presentation
+  target) declined the offer. filter-dev judges the press against the prompt's own target for its whole life."""
+  from openpilot.selfdrive.car.card import Car
+  pending = SlcPendingConfirmation('s', 4, 38)
+  state = SimpleNamespace(presentationId=38, hasPresentationAdjustedLimit=False, presentationAdjustedLimit=0.,
+                          hasPending=True, hasPendingAdjustedLimit=True, pendingAdjustedLimit=30 * MPH)
+  fake = SimpleNamespace(is_metric=False, mazda_sla_servo=m.MazdaSlaSetServo(), mazda_sla_confirm_frame=False)
+  fake.sm = type('SM', (), {'seen': {'slcState': True}, '__getitem__': lambda self, k: state})()
+  out = Car.mazda_sla_answer(fake, SlcConsumedButton(pending, 'decel'), cs(36), 5)
+  assert out.button == 'accel' and fake.mazda_sla_servo.armed.target == 30
+
+
+def test_open_offer_prefers_the_pending_target():
+  both = SimpleNamespace(hasPending=True, hasPendingAdjustedLimit=True, pendingAdjustedLimit=30 * MPH,
+                         hasPresentationAdjustedLimit=True, presentationAdjustedLimit=36 * MPH)
+  assert round(m.open_offer_mps(both) / MPH) == 30
+  only_presentation = SimpleNamespace(hasPending=False, hasPendingAdjustedLimit=False, pendingAdjustedLimit=0.,
+                                      hasPresentationAdjustedLimit=True, presentationAdjustedLimit=36 * MPH)
+  assert round(m.open_offer_mps(only_presentation) / MPH) == 36
+  assert m.open_offer_mps(SimpleNamespace()) is None

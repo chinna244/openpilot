@@ -17,16 +17,18 @@ from typing import Any
 from openpilot.starpilot.galaxy.access import AccessStatus, GalaxyAccessOwner
 from openpilot.starpilot.ui.appearance_preferences import CameraViewChoice, OnroadAppearance, onroad_appearance
 from openpilot.starpilot.ui.brand import DISPLAY_VERSION, home_description
-from openpilot.starpilot.car.mazda.sla_set_servo import confirm_direction as mazda_confirm_direction, eligible as mazda_sla_eligible
+from openpilot.starpilot.car.mazda.sla_set_servo import (confirm_direction as mazda_confirm_direction, eligible as mazda_sla_eligible,
+                                                          open_offer_mps as mazda_open_offer_mps)
 
 
 def slc_accept_key_plus(cp, slc, cruise_state, is_metric: bool) -> bool:
   """Which wheel key accepts the shown offer: + everywhere, except on Mazda factory cruise where the press toward
   the offer accepts (card.mazda_sla_answer uses the same confirm_direction on the same offer and dash SET)."""
   try:
-    if cp is None or slc is None or cruise_state is None or not mazda_sla_eligible(cp) or not slc.hasPresentationAdjustedLimit:
+    offer = mazda_open_offer_mps(slc) if slc is not None else None
+    if cp is None or cruise_state is None or not mazda_sla_eligible(cp) or offer is None:
       return True
-    return mazda_confirm_direction(float(slc.presentationAdjustedLimit), float(cruise_state.speedCluster), is_metric) != 'decel'
+    return mazda_confirm_direction(offer, float(cruise_state.speedCluster), is_metric) != 'decel'
   except (AttributeError, TypeError, ValueError):
     return True
 from openpilot.starpilot.curve_speed.status import CurvatureDisplay, observation as curve_observation
