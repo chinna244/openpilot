@@ -762,6 +762,8 @@ class Car:
       if startup_readiness is not None:
         startup_readiness(self.sm, CS, native=native, panda_ready=angle_panda_ready,
                           now_ns=now_ns, producer=self.slc_producer_session)
+      mazda_tja_latched = bool(self.CP.brand == 'mazda' and getattr(self.aol_card_intent, 'tja_button', False) and
+                               self.aol_card_intent.allowed_latch)
       self.aol_card_intent.update(CS, fault_active=fault_active, now_ns=now_ns, native_rejection_ns=rejection_ns,
                                   standard_enabled=(host_enabled if getattr(self.aol_card_intent, 'observe_stock_engagement', False)
                                                     else host_control_enabled))
@@ -776,6 +778,17 @@ class Car:
         now_ns=now_ns, fault_active=fault_active, native_rejection_ns=rejection_ns,
         observation_valid=bool(engagement_seen and self.sm.valid['selfdriveState'] and self.sm.alive['selfdriveState'] and
           0 < engagement_ns <= now_ns and now_ns - engagement_ns <= AXIS_MAX_AGE_NS))
+      if mazda_tja_latched and not self.aol_card_intent.allowed_latch:
+        # Mazda TJA latch armed -> cleared: this tick's already-computed inputs, observation only
+        cloudlog.event('mazda_tja_latch_cleared', reason=self.aol_card_intent.latch_clear_reason,
+                       native_missing=bool(native is None and not self.sm.seen.get('aolSafetyWire', False)),
+                       native_stale=bool(native is None and self.sm.seen.get('aolSafetyWire', False)),
+                       native_lost=bool(lost) if permission_owner else None, native_reset=bool(native_reset),
+                       native_rejection_ns=int(rejection_ns), transport_reset=bool(transport_reset),
+                       transport_failed=bool(getattr(self.aol_transport_feedback, 'failed', False)),
+                       fault_active=fault_active, cruise_available=bool(CS.cruiseState.available),
+                       cruise_enabled=bool(CS.cruiseState.enabled),
+                       buttons=[(str(be.type), bool(be.pressed)) for be in CS.buttonEvents])
     if self.aol_card_intent is not None and preap_aol:
       self.CI.CS.preap_lateral_authorized = bool(
         native is not None and native.lateralAllowed and self.aol_card_intent.allowed_latch and
