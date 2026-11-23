@@ -96,7 +96,53 @@ HKG_ANGLE_LIMIT_WARNING_DEG = 176.0
 HKG_ANGLE_LIMIT_WARNING_NS = 200_000_000
 
 
+def native_missing_event(*, wire_seen: bool, enabled: bool, active: bool, lost_active_aol: bool, panda_states,
+                         device_started: bool | None):
+  """The event for a missing AOL native (no current aolSafetyWire) once initialized.
+
+  Startup before any wire: commIssue. Ignition-off teardown (route 00000002--c9d55e7093 t=493.130: pandad withdraws
+  the wire with an empty invalid payload as every panda reports ignition off and deviceState reports started=False,
+  nothing enabled or active): none, that
+  withdrawal is the panda following the key. Anything else, including any active axis or ignition still on:
+  controlsMismatch, as before."""
+  if not enabled and not active and not lost_active_aol:
+    if not wire_seen:
+      return EventName.commIssue
+    if device_started is False and panda_states is not None and len(panda_states) > 0 and all(
+        not ps.ignitionLine and not ps.ignitionCan for ps in panda_states):
+      return None  # key off: every panda AND the device agree the drive ended
+  return EventName.controlsMismatch
+
+
+# The key-off evidence that may excuse a missing native must be current: valid, alive and at most this many of its
+# own periods old (pandaStates 10 Hz -> 300 ms, deviceState 2 Hz -> 1.5 s). Route 00000002--c9d55e7093: at the
+# 493.160 event they were 29 ms and 14 ms old. SubMaster.seen alone never expires.
+KEY_OFF_MAX_PERIODS = 3
+
+
+def key_off_input(sm, service: str, now_ns: int):
+  """The service's message when it is fresh and valid enough to prove key-off, else None."""
+  try:
+    from openpilot.cereal.services import SERVICE_LIST
+    stamp = int(sm.logMonoTime[service])
+    max_age_ns = int(KEY_OFF_MAX_PERIODS * 1e9 / SERVICE_LIST[service].frequency)
+    if (sm.seen.get(service, False) and sm.valid.get(service, False) and sm.alive.get(service, False) and
+        0 < stamp <= now_ns and now_ns - stamp <= max_age_ns):
+      return sm[service]
+  except (AttributeError, KeyError, TypeError, ValueError):
+    pass
+  return None
+
 class SelfdriveD:
+  def missing_native_event(self, now_ns: int, *, lost_active_aol: bool):
+    """Called once initialized with no current AOL native: the event to raise (native_missing_event). step() owns
+    lost_active_aol (it also feeds its downstream fault handling) and passes the same value."""
+    pandas = key_off_input(self.sm, 'pandaStates', now_ns)
+    device = key_off_input(self.sm, 'deviceState', now_ns)
+    return native_missing_event(
+      wire_seen=bool(self.sm.seen.get('aolSafetyWire', False)), enabled=bool(self.enabled), active=bool(self.active),
+      lost_active_aol=bool(lost_active_aol), panda_states=pandas, device_started=None if device is None else bool(device.started))
+
   def __init__(self, CP=None):
     self.params = Params()
 
@@ -2312,10 +2358,11 @@ class SelfdriveD:
         return
       native = current_native(self.sm, self.CP, now_ns=now_ns, axis_session_id=self.aol_session_id)
       if native is None and self.initialized:
+        # step()'s own flag: it drives hard_fault, aol_authority_lost and the immediate-disable handling below
         lost_active_aol = self.aol_axis_decision.lateral_active or self.aol_axis_decision.longitudinal_active
-        native_missing_at_startup = (not self.sm.seen['aolSafetyWire'] and not self.enabled and
-                                     not self.active and not lost_active_aol)
-        self.events.add(EventName.commIssue if native_missing_at_startup else EventName.controlsMismatch)
+        missing_event = self.missing_native_event(now_ns, lost_active_aol=bool(lost_active_aol))
+        if missing_event is not None:
+          self.events.add(missing_event)
     self.aol_decision_native = native
     if self.aol_replay:
       previous_intent = getattr(self, 'aol_last_intent', None)
