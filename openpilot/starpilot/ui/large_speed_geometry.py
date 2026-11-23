@@ -9,6 +9,8 @@ MAX_ROW_HEIGHT = 132
 PHYSICAL_SCALE = math.hypot(2160, 1080) / 6 / 300
 LARGE_SIGN_SCALE = PHYSICAL_SCALE * 1.3
 SIGN_WIDTH, SIGN_HEIGHT = 128, 144
+# The compact sign is drawn smaller so it clears the top-right GPU icon (x 422 on the 476 px camera area).
+COMPACT_SIGN_SCALE = 0.65
 LIMIT_ROW_HEIGHT = math.ceil(SIGN_HEIGHT * LARGE_SIGN_SCALE)
 CARD_HEIGHT = LIMIT_ROW_HEIGHT
 GAP = 8

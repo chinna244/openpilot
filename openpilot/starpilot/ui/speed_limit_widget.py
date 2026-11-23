@@ -6,7 +6,7 @@ from typing import cast
 
 from openpilot.starpilot.ui.raylib import rl
 
-from openpilot.starpilot.ui.large_speed_geometry import LARGE_SIGN_SCALE, SIGN_WIDTH, SIGN_HEIGHT, CONFIRMATION_SCALE, PROMPT_SCALE
+from openpilot.starpilot.ui.large_speed_geometry import COMPACT_SIGN_SCALE, LARGE_SIGN_SCALE, SIGN_WIDTH, SIGN_HEIGHT, CONFIRMATION_SCALE, PROMPT_SCALE
 from openpilot.starpilot.ui.onroad_customization import placement
 from openpilot.starpilot.ui.onroad_state import (SIGN_PADDING, OnroadState, manual_slc_confirmation, speed_limit_bounds, slc_controls,
                                                  slc_accept_available)
@@ -120,7 +120,7 @@ class SpeedLimitWidget:
   def __init__(self, fonts: BitmapFonts, profile: Profile):
     self.fonts = fonts
     self.profile = profile
-    self.scale = LARGE_SIGN_SCALE if profile == Profile.LARGE else 1
+    self.scale = LARGE_SIGN_SCALE if profile == Profile.LARGE else COMPACT_SIGN_SCALE
     self.text_scale = self.scale * Profile.COMPACT.font_scale / profile.font_scale
     self.pulse = SpeedLimitPulse()
     self.shapes = SpeedLimitShapes(self.scale, headless_context=getattr(fonts, '_headless_context', False))

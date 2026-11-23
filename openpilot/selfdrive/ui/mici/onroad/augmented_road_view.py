@@ -285,8 +285,9 @@ class AugmentedRoadView(CameraView):
       gui_app.measure_frame_phase("model", self._model_renderer.render_with_lead, rect, lead_indicator,
                                   lead_info_mode, lead_info_metric, lateral_active=lateral_active, paint=paint)
 
-  def render_model_source_layer(self, rect: rl.Rectangle, *, show_long_indicator: bool | None = False) -> None:
-    self._hud_renderer._draw_model_source(rect)
+  def render_model_source_layer(self, rect: rl.Rectangle, *, show_long_indicator: bool | None = False,
+                                can_draw_top_icons: bool | None = None) -> None:
+    self._hud_renderer._draw_model_source(rect, can_draw_top_icons)
     if show_long_indicator is not None:
       self._long_indicator.set_should_draw(show_long_indicator)
       self._long_indicator.render(rect)

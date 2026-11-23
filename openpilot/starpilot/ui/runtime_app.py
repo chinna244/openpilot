@@ -198,7 +198,8 @@ class StarShellSession:
       if profile == Profile.COMPACT:
         self.view.onroad.stock_confidence_layer = lambda rect, state: render_stock_confidence(camera_owner, rect, state)
         self.view.onroad.stock_confidence_reset = camera_owner.reset_stock_confidence_layer
-        self.view.onroad.extra_overlays = lambda rect, state: camera_owner.render_model_source_layer(rect, show_long_indicator=None)
+        self.view.onroad.extra_overlays = lambda rect, state: camera_owner.render_model_source_layer(
+          rect, show_long_indicator=None, can_draw_top_icons=state.alert.size == AlertSize.NONE)
       else:
         self.view.onroad.extra_overlays = lambda rect, state: camera_owner.render_model_source_layer(rect)
     except Exception:

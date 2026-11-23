@@ -8,18 +8,23 @@ from openpilot.system.ui.widgets import Widget
 
 
 class ModelSource(Widget):
-  def __init__(self, scale: int = 1):
+  def __init__(self, scale: int = 1, *, height: int = 44, persistent: bool = False):
+    """persistent: shown for as long as the state lasts (hidden by can_draw) instead of fading out after 2.5 s."""
     super().__init__()
+    self._persistent = persistent
+    self.can_draw = True
     self._engaged = False
     self._small_model_engaged = False
     self._chestnut_drive_frame: int | None = None
     self._fade_time = 0.0
     self._icon: rl.Texture | None = None
     self._alpha_filter = FirstOrderFilter(0.0, 0.1, 1 / gui_app.target_fps)
-    self._loading = gui_app.texture('icons_mici/chestnut.png', 60 * scale, 44 * scale)
-    self._active = gui_app.texture('icons_mici/chestnut_green.png', 60 * scale, 44 * scale)
-    self._failed = gui_app.texture('icons_mici/chestnut_orange.png', 75 * scale, 44 * scale)
-    self._fallback = gui_app.texture('icons_mici/egpu_crossed.png', 60 * scale, 52 * scale)
+    def size(base: int) -> int:
+      return round(base * height / 44) * scale
+    self._loading = gui_app.texture('icons_mici/chestnut.png', size(60), size(44))
+    self._active = gui_app.texture('icons_mici/chestnut_green.png', size(60), size(44))
+    self._failed = gui_app.texture('icons_mici/chestnut_orange.png', size(75), size(44))
+    self._fallback = gui_app.texture('icons_mici/egpu_crossed.png', size(60), size(52))
 
   def _update_state(self) -> None:
     sm = ui_state.sm
@@ -58,7 +63,7 @@ class ModelSource(Widget):
     if icon is not self._icon:
       self._fade_time = now
       self._icon = icon
-    alpha = self._alpha_filter.update(loading or now - self._fade_time < 2.5)
+    alpha = self._alpha_filter.update(self.can_draw if self._persistent else (loading or now - self._fade_time < 2.5))
     if alpha < 1e-2:
       return
 

@@ -4,7 +4,7 @@ from unittest.mock import Mock, patch
 from openpilot.starpilot.ui.raylib import rl
 import pytest
 
-from openpilot.starpilot.ui.large_speed_geometry import LARGE_SIGN_SCALE, SIGN_WIDTH, SIGN_HEIGHT
+from openpilot.starpilot.ui.large_speed_geometry import COMPACT_SIGN_SCALE, LARGE_SIGN_SCALE, SIGN_WIDTH, SIGN_HEIGHT
 from openpilot.starpilot.ui.onroad_state import speed_limit_bounds, slc_controls, SpeedLimitObservation, ObservationKind
 from openpilot.starpilot.ui.presentation import Profile
 from openpilot.starpilot.ui.speed_limit_widget import LABEL_SCALE, SpeedLimitWidget
@@ -34,7 +34,7 @@ def test_sign_layout_and_tap_area_stay_fixed_with_or_without_offset(profile, off
   with patch('openpilot.starpilot.ui.speed_limit_widget.rl.draw_rectangle_rounded') as fill:
     widget.render(current)
   fill.assert_not_called()
-  scale = LARGE_SIGN_SCALE if profile == Profile.LARGE else 1
+  scale = LARGE_SIGN_SCALE if profile == Profile.LARGE else COMPACT_SIGN_SCALE
   bounds = speed_limit_bounds(profile, current)
   tall = speed_limit_bounds(profile, replace(current, show_slc_offset=True))
   assert bounds is not None and tall is not None

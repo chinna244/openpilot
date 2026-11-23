@@ -14,7 +14,7 @@ import pytest
 
 from openpilot.starpilot.ui.presentation import BitmapFonts, FontRole, Profile, default_font_directory, font_filename, font_path, validate_bitmap_font
 from openpilot.starpilot.ui.onroad_customization import default_document, validate_document
-from openpilot.starpilot.ui.large_speed_geometry import LARGE_SIGN_SCALE, SIGN_WIDTH, SIGN_HEIGHT, confirmation_bounds
+from openpilot.starpilot.ui.large_speed_geometry import COMPACT_SIGN_SCALE, LARGE_SIGN_SCALE, SIGN_WIDTH, SIGN_HEIGHT, confirmation_bounds
 from openpilot.starpilot.ui.onroad_state import ObservationKind, slc_controls, speed_limit_bounds
 from openpilot.starpilot.ui.tests.test_speed_stack import road
 from openpilot.starpilot.system.starport.projection_layout import default_layout_for_viewport, validate_layout_for_viewport
@@ -725,10 +725,11 @@ def test_sign_profiles_share_layout_and_keep_aligned_numbers():
             # Numbers, and all Vienna text, share size and position relative to the sign on both profiles.
             assert abs(small_size-large_size) < 1e-9
             small_x, large_x = (fonts_x + sum(f.horizontal_ink(*call[:3])) / 2 for f, fonts_x, call in ((small, a[3], a), (large, b[3], b)))
-            assert abs((small_x-320-64)-(large_x-318-64*LARGE_SIGN_SCALE)/LARGE_SIGN_SCALE/ring) <= 1
+            assert abs((small_x-320-64*COMPACT_SIGN_SCALE)/COMPACT_SIGN_SCALE-(large_x-318-64*LARGE_SIGN_SCALE)/LARGE_SIGN_SCALE/ring) <= 1
             # Except the large no-offset US sign, whose outline centers on its text rather than its 150-unit box.
             if vienna or offset:
-              assert abs((a[4]+sum(small.vertical_ink(*a[:3]))/2-small_center)-(b[4]+sum(large.vertical_ink(*b[:3]))/2-large_center)/LARGE_SIGN_SCALE/ring) <= 1
+              small_y = (a[4]+sum(small.vertical_ink(*a[:3]))/2-small_center)/COMPACT_SIGN_SCALE
+              assert abs(small_y-(b[4]+sum(large.vertical_ink(*b[:3]))/2-large_center)/LARGE_SIGN_SCALE/ring) <= 1
           else:
             # Large labels are up to LABEL_SCALE larger, less when they shrink to fit the sign.
             assert small_size - 1e-9 <= large_size <= small_size * LABEL_SCALE[Profile.LARGE] + 1e-9

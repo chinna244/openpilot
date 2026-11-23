@@ -27,7 +27,7 @@ def test_custom_model_source_layer_uses_native_status_animation(indicator):
   view = Mock(spec=AugmentedRoadView, _hud_renderer=Mock(), _long_indicator=Mock())
   rect = rl.Rectangle(0, 0, 476, 240)
   AugmentedRoadView.render_model_source_layer(view, rect, show_long_indicator=indicator)
-  view._hud_renderer._draw_model_source.assert_called_once_with(rect)
+  view._hud_renderer._draw_model_source.assert_called_once_with(rect, None)
   if indicator is None:
     view._long_indicator.set_should_draw.assert_not_called()
     view._long_indicator.render.assert_not_called()
@@ -331,14 +331,15 @@ def test_large_gpu_layer_uses_centered_right_inset(width):
   assert (rect.x + rect.width, rect.y + rect.height / 2) == (width - 60, 540)
 
 
-def test_compact_gpu_layer_keeps_original_position():
+def test_compact_gpu_layer_sits_in_the_top_right_corner():
   from openpilot.selfdrive.ui.mici.onroad.hud_renderer import HudRenderer
 
   hud = HudRenderer.__new__(HudRenderer)
   hud._model_source = Mock()
   hud._draw_model_source(rl.Rectangle(20, 8, 476, 240))
   rect = hud._model_source.render.call_args.args[0]
-  assert (rect.x + rect.width, rect.y + rect.height / 2) == (486, 209)
+  # 12 px in from the camera area's top-right corner, develop's medium 31 px tall icon
+  assert (rect.x + rect.width, rect.y, rect.height) == (484, 20, 31)
 
 
 def test_startup_invalid_big_frame_remains_loading_until_first_valid_output():

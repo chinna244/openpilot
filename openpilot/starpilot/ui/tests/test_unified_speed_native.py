@@ -340,8 +340,8 @@ def test_sign_text_stays_centered_without_an_arrow(profile, vienna, reason, draw
     if reason in ('equal_speed', 'unknown_speed'):
       continue
     left, right = font.horizontal_ink(text, role, size)
-    from openpilot.starpilot.ui.large_speed_geometry import LIMIT_RECTS, LARGE_SIGN_SCALE
-    center = LIMIT_RECTS[profile][0] + 64 * (1 if profile == Profile.COMPACT else LARGE_SIGN_SCALE)
+    from openpilot.starpilot.ui.large_speed_geometry import COMPACT_SIGN_SCALE, LIMIT_RECTS, LARGE_SIGN_SCALE
+    center = LIMIT_RECTS[profile][0] + 64 * (COMPACT_SIGN_SCALE if profile == Profile.COMPACT else LARGE_SIGN_SCALE)
     assert abs(x + (left + right) / 2 - center) <= .5
 
 

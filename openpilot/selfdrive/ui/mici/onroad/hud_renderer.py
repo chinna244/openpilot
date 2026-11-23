@@ -19,6 +19,9 @@ KM_TO_MILE = 0.621371
 CRUISE_DISABLED_CHAR = '–'
 
 SET_SPEED_PERSISTENCE = 2.5  # seconds
+# the model icon sits medium-size in the top-right corner, like a dashcam's eGPU badge
+MODEL_SOURCE_MARGIN = 12  # px
+MODEL_SOURCE_HEIGHT = 31  # px
 
 
 @dataclass(frozen=True)
@@ -118,7 +121,7 @@ class HudRenderer(Widget):
 
     self._turn_intent = TurnIntent()
     self._torque_bar = TorqueBar()
-    self._model_source = ModelSource()
+    self._model_source = ModelSource(height=MODEL_SOURCE_HEIGHT, persistent=True)
 
     self._txt_wheel: rl.Texture = gui_app.texture('icons_mici/wheel.png', 50, 50)
     self._txt_wheel_critical: rl.Texture = gui_app.texture('icons_mici/wheel_critical.png', 50, 50)
@@ -182,8 +185,10 @@ class HudRenderer(Widget):
 
     self._draw_steering_wheel(rect)
 
-  def _draw_model_source(self, rect: rl.Rectangle) -> None:
-    self._model_source.render(rl.Rectangle(rect.x, rect.y + rect.height - 14 - 50, rect.width - 10, 50))
+  def _draw_model_source(self, rect: rl.Rectangle, can_draw: bool | None = None) -> None:
+    """Top right for as long as the state lasts; fades out under an alert, which takes the top of the screen."""
+    self._model_source.can_draw = getattr(self, '_can_draw_top_icons', True) if can_draw is None else can_draw
+    self._model_source.render(rl.Rectangle(rect.x, rect.y + MODEL_SOURCE_MARGIN, rect.width - MODEL_SOURCE_MARGIN, MODEL_SOURCE_HEIGHT))
 
   def _draw_steering_wheel(self, rect: rl.Rectangle) -> None:
     wheel_txt = self._txt_wheel_critical if self._show_wheel_critical else self._txt_wheel
