@@ -91,6 +91,16 @@ class TestOrdinaryAxis(unittest.TestCase):
     self.assertTrue(all(not axis.desiredLongitudinal for axis in axes))
     self.assertFalse(any(call.args[0] == 'aolIntentWire' for call in sd.pm.send.call_args_list))
 
+    # A valid native frame ends a quiet diagnostic episode, even if deviceState never reports off.
+    vars(sd)['update_events'] = lambda _cs: sd.events.clear()
+    with patch('openpilot.selfdrive.selfdrived.selfdrived.current_native', side_effect=(None, None, off, None)), \
+         patch('openpilot.selfdrive.selfdrived.selfdrived.cloudlog.event') as log_event:
+      for _ in range(4):
+        sd.step()
+      mismatch_records = [call for call in log_event.call_args_list if call.args[:1] == ('aol_native_missing_mismatch',)]
+      self.assertEqual(len(mismatch_records), 2)
+      self.assertTrue(sd.events.contains(ET.IMMEDIATE_DISABLE))
+
   def test_actual_controls_intersects_baseline_without_changing_enabled_or_long(self):
     import os
     from opendbc.car.hyundai.tests.test_ioniq5pe_stock import params

@@ -2416,6 +2416,8 @@ class SelfdriveD:
         missing_event = self.missing_native_event(now_ns, lost_active_aol=bool(lost_active_aol))
         if missing_event is not None:
           self.events.add(missing_event)
+      elif native is not None:
+        self.native_missing_logged = False
     self.aol_decision_native = native
     if self.aol_replay:
       previous_intent = getattr(self, 'aol_last_intent', None)
