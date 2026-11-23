@@ -1,4 +1,6 @@
 """Reason-qualified intent retention; this module never grants an axis."""
+import weakref
+
 from openpilot.cereal import log
 from openpilot.starpilot.aol.transport_pause_conditions import (
   AVAILABILITY_EVENTS as AVAILABILITY_EVENTS, HOST_SOURCE_AVAILABILITY_EVENTS as HOST_SOURCE_AVAILABILITY_EVENTS,
@@ -94,8 +96,92 @@ def stock_lateral_user_event(cp):
   return log.OnroadEvent.EventName.pcmDisable
 
 
+FAILURE_LOG_PERIOD_NS = 10_000_000_000
+# Diagnostic-only fields live outside the instance dict: tests and retention paths compare vars(feedback).
+_DIAG = weakref.WeakKeyDictionary()
+
+
+def _diag_field(name, default):
+  def get(self):
+    return _DIAG.get(self, {}).get(name, default)
+
+  def put(self, value):
+    _DIAG.setdefault(self, {})[name] = value
+  return property(get, put)
+
+
+def _stamps(sm, name):
+  try:
+    return {'log': int(sm.logMonoTime[name]), 'seen': bool(sm.seen[name]), 'valid': bool(sm.valid[name]),
+            'alive': bool(sm.alive[name]), 'updated': bool(getattr(sm, 'updated', {}).get(name, False))}
+  except (AttributeError, KeyError, TypeError, ValueError):
+    return None
+
+
+def failure_record(feedback, sm, cp, cs, now_ns, kwargs) -> dict:
+  """Everything a transport failure was decided on, for an offline replay (observation only)."""
+  from openpilot.starpilot.aol.wire import decode_safety
+  rec = {'site': feedback.fail_site, 'now_ns': int(now_ns), 'checks': feedback.fail_checks,
+         'args': {k: (v if isinstance(v, (bool, int, float, str)) else str(v)) for k, v in kwargs.items()},
+         'feedback': {k: getattr(feedback, k, None) for k in (
+           'sequence', 'paused', 'pending_event', 'awaiting', 'qualified', 'lateral_baseline_ns', 'lateral_source_ns',
+           'lateral_native_ns', 'healthy_feedback_ns', 'healthy_native_ns', 'lateral_only_baseline', 'longitudinal_cancel_ns',
+           'retention_started_ns', 'source_retention_started_ns', 'lag_withdrawal_ns', 'cold_main_wait_ns', 'ever_lateral_active')},
+         'session_set': bool(feedback.session),
+         'prev_signature': list(feedback.signature[1:14]) if feedback.signature is not None else None,
+         'services': {name: _stamps(sm, name) for name in ('aolAxisState', 'aolSafetyWire', 'pandaStates', 'onroadEvents')}}
+  try:
+    axis = sm['aolAxisState']
+    rec['axis'] = {'sequence': int(axis.sequence), 'observed': int(axis.observedMonoTime), 'valid_until': int(axis.validUntilMonoTime),
+                   'source_cs': int(axis.sourceCarStateMonoTime), 'mode': str(axis.mode), 'qualified': bool(axis.qualified),
+                   'lat': bool(axis.lateralActive), 'long': bool(axis.longitudinalActive), 'want_lat': bool(axis.desiredLateral),
+                   'want_long': bool(axis.desiredLongitudinal), 'ack': bool(axis.nativeAcknowledged),
+                   'fault': str(axis.faultReason), 'fault_event': int(axis.faultEventMonoTime),
+                   'same_fault_session': str(axis.faultSessionId) == str(axis.sessionId), 'epoch': int(axis.intentIntegrityEpoch)}
+  except Exception:
+    rec['axis'] = None
+  try:
+    wire = decode_safety(bytes(sm['aolSafetyWire']))
+    rec['safety'] = None if wire is None else {
+      'observed': wire.observedMonoTime, 'valid_until': wire.validUntilMonoTime, 'compatible': wire.compatible,
+      'lat_allowed': wire.lateralAllowed, 'long_allowed': wire.longitudinalAllowed, 'req_lat': wire.requestedLateral,
+      'req_long': wire.requestedLongitudinal, 'source_panda': wire.sourcePandaStatesMonoTime,
+      'slots': [(bool(x.controlsAllowed), int(x.faults), bool(x.heartbeatLost), bool(x.safetyRxChecksInvalid)) for x in wire.pandaInventory]}
+  except Exception:
+    rec['safety'] = None
+  try:
+    rec['events'] = [str(e.name) for e in sm['onroadEvents']]
+  except Exception:
+    rec['events'] = None
+  try:
+    rec['car'] = {'cruise': bool(cs.cruiseState.enabled), 'available': bool(cs.cruiseState.available), 'brake': bool(cs.brakePressed),
+                  'gas': bool(cs.gasPressed), 'standstill': bool(cs.standstill), 'can_valid': bool(cs.canValid),
+                  'can_timeout': bool(cs.canTimeout), 'gear': str(cs.gearShifter), 'steer_fault_temp': bool(cs.steerFaultTemporary),
+                  'steer_fault_perm': bool(cs.steerFaultPermanent), 'v_ego': round(float(cs.vEgo), 2),
+                  'buttons': [(str(b.type), bool(b.pressed)) for b in cs.buttonEvents]}
+  except Exception:
+    rec['car'] = None
+  return rec
+
+
+def log_transport_failure(feedback, sm, cp, cs, now_ns, kwargs) -> None:
+  last = getattr(feedback, 'fail_logged_ns', 0)
+  if last and 0 <= now_ns - last < FAILURE_LOG_PERIOD_NS:
+    return
+  feedback.fail_logged_ns = int(now_ns)
+  try:
+    from openpilot.common.swaglog import cloudlog
+    cloudlog.event('aol_transport_failed', **failure_record(feedback, sm, cp, cs, now_ns, kwargs))
+  except Exception:
+    pass
+
+
 class TransportPauseFeedback:
   """Card accepts pause provenance only after a healthy same-session baseline."""
+  fail_site = _diag_field('fail_site', '')
+  fail_checks = _diag_field('fail_checks', None)
+  fail_logged_ns = _diag_field('fail_logged_ns', 0)
+
   def __init__(self, cp):
     self.cp = cp_identity(cp)
     self.session = ''
@@ -1221,7 +1307,18 @@ class TransportPauseFeedback:
     return bool((granted or withdrawn) and native.observedMonoTime >= self.healthy_native_ns and
       self.healthy_inventory == (native.pandaSerial, tuple(slot.hardwareSerial for slot in native.pandaInventory)))
 
-  def observe(self, sm, cp, cs, now_ns, *, latched=True, cancel_source_ns=0, brake_source_ns=0,
+  def observe(self, sm, cp, cs, now_ns, **kwargs):
+    """Fail-closed transport check (unchanged); the first failure after a healthy run is logged once
+    (rate-limited) with the failing site and the inputs needed to reproduce it offline."""
+    was_failed = self.failed
+    self.fail_site = ''
+    self.fail_checks = None
+    result = self._observe(sm, cp, cs, now_ns, **kwargs)
+    if result and not was_failed:
+      log_transport_failure(self, sm, cp, cs, now_ns, kwargs)
+    return result
+
+  def _observe(self, sm, cp, cs, now_ns, *, latched=True, cancel_source_ns=0, brake_source_ns=0,
               gm_withdrawal_source_ns=0, intent_producer_session='', main_arm_ns=0, startup_calibration_pending=False, intent_paused=False):
     self.ordinary_warning_qualified = False
     self.temporary_host_qualified = False
@@ -1275,10 +1372,12 @@ class TransportPauseFeedback:
       if (sdgm_alpha_lateral_owner(cp) and latched and current and continuity and self.signature is not None and
           signature[14:16] != self.signature[14:16]):
         self.failed = True
+        self.fail_site = 'sdgm_lateral_owner_signature'
         return True
       if ((self.cold_main_wait_ns or self.cold_park_waiting) and current and continuity and self.signature is not None and
           signature[14:16] != self.signature[14:16]):
         self.failed = True
+        self.fail_site = 'cold_main_signature'
         return True
       if (cp.brand == 'gm' and current and continuity and latched and not self.failed and
           not self.ever_lateral_active and not self.pending_event and reason == 'none' and
@@ -1372,6 +1471,7 @@ class TransportPauseFeedback:
           sm.alive['onroadEvents'] and 0 < event_ns < axis.faultEventMonoTime <= stamp and now_ns - event_ns <= AXIS_MAX_AGE_NS)
         if not recovery_ahead:
           self.failed = True
+          self.fail_site = 'cold_main_wait_no_recovery'
           return True
       if current and continuity and self._angle_stop_intent_current(sm, cp, cs, axis, stamp, now_ns,
           latched=latched, producer=intent_producer_session):
@@ -1389,6 +1489,7 @@ class TransportPauseFeedback:
       if (cp.brand == 'gm' and self.lag_withdrawal_ns and current and continuity and reason == 'none' and
           axis.desiredLateral and not axis.lateralActive):
         self.failed = True
+        self.fail_site = 'gm_lag_withdrawal'
         return True
       if cp.brand == 'volkswagen' and current and continuity:
         from openpilot.starpilot.car.volkswagen.aol import retain_eps_recovery
@@ -1539,6 +1640,7 @@ class TransportPauseFeedback:
         self.retention_verified = False
         self.failed = True
         self.lateral_only_baseline = False
+        self.fail_site = 'retention_started'
         return True
       if reason != 'availabilityPause' and not availability_only(sm['onroadEvents']):
         self.retention_started_ns = self.retention_event_ns = 0
@@ -1622,6 +1724,8 @@ class TransportPauseFeedback:
         if current and continuity and baseline and not transport_healthy else None)
       if self._event_first_retention(sm, cp, axis, stamp, now_ns, latched=latched, signature=signature, native=native):
         return False
+      self.fail_checks = (bool(current), bool(continuity), bool(baseline), bool(transport_healthy), native is None,
+                          lateral_native is None, cancel_native is None, reason)
       current = bool(current and (transport_healthy or cancel_native is not None))
       if current and baseline and not latched:
         # Healthy idle ends cold MAIN recovery; cleared wait cannot block requests.
@@ -1637,6 +1741,7 @@ class TransportPauseFeedback:
         continuity = True
       if self.failed:
         self.longitudinal_cancel_ns = 0
+        self.fail_site = 'sticky_failed'
         return True
       if cancel_native is not None:
         if not self.longitudinal_cancel_ns:
@@ -1664,6 +1769,7 @@ class TransportPauseFeedback:
         self.pending_event = 0
         self.failed = hard
         self.lateral_only_baseline = bool(self.lateral_only_baseline and not hard)
+        self.fail_site = 'not_current_or_continuity'
         return hard
       known = bool(self.session)
       if reason == 'none':
@@ -1673,6 +1779,7 @@ class TransportPauseFeedback:
           self.pending_event = 0
           self.failed = hard
           self.lateral_only_baseline = bool(self.lateral_only_baseline and not hard)
+          self.fail_site = 'no_baseline'
           return hard
         event_ns = int(sm.logMonoTime['onroadEvents'])
         faults = [e for e in sm['onroadEvents'] if e.immediateDisable or e.softDisable]
@@ -1685,6 +1792,7 @@ class TransportPauseFeedback:
             self.paused = False
             self.failed = True
             self.lateral_only_baseline = False
+            self.fail_site = 'controls_mismatch_pending'
             return True
           self.awaiting = True
           return False
@@ -1693,6 +1801,7 @@ class TransportPauseFeedback:
           self.paused = False
           self.failed = True
           self.lateral_only_baseline = False
+          self.fail_site = 'pending_event_cleared'
           return True
         cancel_pending = self._longitudinal_cancel_current(sm, cp, cs, axis, now_ns, latched=latched,
           cancel_source_ns=cancel_source_ns, withdrawal_required=False)
@@ -1746,10 +1855,12 @@ class TransportPauseFeedback:
           self.paused = False
           self.failed = True
           self.lateral_only_baseline = False
+          self.fail_site = 'pending_event_mismatch'
           return True
         if not self.qualified and not pending:
           self.failed = True
           self.lateral_only_baseline = False
+          self.fail_site = 'unqualified_pause'
           return True
         if self.qualified:
           self.pending_event = 0
@@ -1764,4 +1875,5 @@ class TransportPauseFeedback:
       self.pending_event = 0
       self.failed = hard
       self.lateral_only_baseline = bool(self.lateral_only_baseline and not hard)
+      self.fail_site = 'exception'
       return hard
