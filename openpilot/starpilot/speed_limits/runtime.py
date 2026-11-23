@@ -13,6 +13,7 @@ from openpilot.starpilot.speed_limits import acceptance as acc
 from openpilot.starpilot.speed_limits import action_arbitration as arb
 from openpilot.starpilot.speed_limits import composition as comp
 from openpilot.starpilot.speed_limits import selection as sel
+from openpilot.starpilot.speed_limits.stability import SourceStabilizer
 from openpilot.starpilot.speed_limits import speed_domain as sd
 from openpilot.starpilot.speed_limits.runtime_settings import ADVANCE_SECONDS, Settings
 from openpilot.starpilot.speed_limits.map_observation import MapSource, copy_frame
@@ -142,6 +143,7 @@ class Runtime:
     self.map_source = MapSource()
     self.advance = Advance()
     self.vision_diagnostic = acc.Observation(acc.ObservationKind.UNKNOWN)
+    self.stabilizer = SourceStabilizer()
     self._last_vision_producer = ''
     self._last_vision_frame = 0
     self._last_vision_eof_boot = 0
@@ -363,6 +365,7 @@ class Runtime:
     host = comp.HostState(bool(CP.openpilotLongitudinalControl), host_long, bool(selfdrive.enabled and selfdrive_fresh),
                           bool(controls.forceDecel) if controls_fresh else True, selected, selected_cluster)
     observations = self._observations(sm, CP, now_ns, now_boot_ns)
+    observations = self.stabilizer.apply(observations, self.settings.selection, now_ns)
     wheel_enabled = (self.settings.wheel_override and not CP.pcmCruise and car_fresh and car_state.canValid and
                      V_CRUISE_MIN <= selected <= V_CRUISE_MAX and selected_cluster == selected and
                      not car_state.brakePressed)
