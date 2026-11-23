@@ -15,7 +15,12 @@ on purpose; map and dashboard changes keep their own semantics):
   source is only briefly stale (HOLD_NS since it was last valid): the committed reading is held and the
   other source masked. An equal reading from a preferred source while the committed source is still
   valid keeps the committed one (same limit, stable identity); a higher one must persist STABLE_NS.
-Gaps where no source is valid pass through unchanged: acceptance keeps a pending offer through them.
+
+When no source is valid at all (route 00000005--a37f13ed24: mapd 'unknown' for 7-9 s at a time while the camera lost
+its reading every second; the pending offer dropped at t=119.1 and was asked again at 120.6), the last reading that
+held its value DROPOUT_SETTLE_NS is kept, as filter-dev's resolver holds the last settled limit (MAP_SETTLE_S 3 s, so a
+cross street shown for 2-4 s is not held). It gives way to any valid reading, to the map's matched road without a
+limit (ABSENT), and after DROPOUT_HOLD_MAX_M driven without one (filter-dev's backstop).
 """
 from collections.abc import Mapping
 
@@ -24,6 +29,8 @@ from openpilot.starpilot.speed_limits.selection import SelectionMode, SelectionP
 
 HOLD_NS = 3_000_000_000
 STABLE_NS = 2_000_000_000
+DROPOUT_SETTLE_NS = 3_000_000_000
+DROPOUT_HOLD_MAX_M = 1000.
 
 
 class SourceStabilizer:
@@ -36,12 +43,44 @@ class SourceStabilizer:
     self.last_valid_ns = 0
     self.challenger: tuple[Source, float] | None = None
     self.challenger_since_ns = 0
+    self.value_since_ns = 0  # since when the committed reading has had its value
+    self.settled: tuple[Source, Observation] | None = None  # the last reading that held its value DROPOUT_SETTLE_NS
+    self.dropout_m = 0.
+    self.last_now_ns: int | None = None
 
   def _commit(self, source: Source, observation: Observation, now_ns: int) -> None:
+    previous = self.observation.candidate.speed_mps if self.observation is not None and self.observation.candidate else None
+    if previous != (observation.candidate.speed_mps if observation.candidate else None):
+      self.value_since_ns = now_ns
     self.source, self.observation, self.last_valid_ns = source, observation, now_ns
     self.challenger, self.challenger_since_ns = None, 0
+    if now_ns - self.value_since_ns >= DROPOUT_SETTLE_NS:
+      self.settled = (source, observation)
 
-  def apply(self, observations: Mapping[Source, Observation], policy: SelectionPolicy, now_ns: int) -> dict:
+  def _dropout(self, out: dict, now_ns: int, v_ego: float | None) -> dict:
+    """No source valid: keep the last settled reading until a source answers or the backstop distance."""
+    if self.settled is None:
+      return out
+    if out.get(Source.MAP) is not None and out[Source.MAP].kind is ObservationKind.ABSENT:
+      self.settled = None  # the map matched a road without a limit: a real answer, not a dropout
+      return out
+    dt = (now_ns - self.last_now_ns) / 1e9 if self.last_now_ns is not None and now_ns > self.last_now_ns else 0.
+    self.dropout_m += max(0., v_ego or 0.) * min(dt, 1.)
+    if self.dropout_m >= DROPOUT_HOLD_MAX_M:
+      self.settled = None
+      return out
+    source, observation = self.settled
+    out[source] = observation
+    return out
+
+  def apply(self, observations: Mapping[Source, Observation], policy: SelectionPolicy, now_ns: int,
+            v_ego: float | None = None) -> dict:
+    try:
+      return self._apply(observations, policy, now_ns, v_ego)
+    finally:
+      self.last_now_ns = now_ns
+
+  def _apply(self, observations, policy, now_ns, v_ego):
     out = dict(observations)
     if not isinstance(policy, SelectionPolicy) or policy.mode is not SelectionMode.ORDERED:
       self.reset()  # Highest/Lowest compare sources by value on purpose
@@ -50,7 +89,10 @@ class SourceStabilizer:
     selected = raw.selected_source
     if selected is None or raw.observation.kind is not ObservationKind.VALID:
       self.challenger, self.challenger_since_ns = None, 0
+      if not any(o is not None and o.kind is ObservationKind.VALID for o in out.values()):
+        return self._dropout(out, now_ns, v_ego)
       return out
+    self.dropout_m = 0.
     if self.source is None or self.observation is None or selected == self.source:
       self._commit(selected, raw.observation, now_ns)
       return out

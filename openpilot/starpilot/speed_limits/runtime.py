@@ -365,7 +365,8 @@ class Runtime:
     host = comp.HostState(bool(CP.openpilotLongitudinalControl), host_long, bool(selfdrive.enabled and selfdrive_fresh),
                           bool(controls.forceDecel) if controls_fresh else True, selected, selected_cluster)
     observations = self._observations(sm, CP, now_ns, now_boot_ns)
-    observations = self.stabilizer.apply(observations, self.settings.selection, now_ns)
+    observations = self.stabilizer.apply(observations, self.settings.selection, now_ns,
+                                         v_ego=float(car_state.vEgo) if ego_valid else None)
     wheel_enabled = (self.settings.wheel_override and not CP.pcmCruise and car_fresh and car_state.canValid and
                      V_CRUISE_MIN <= selected <= V_CRUISE_MAX and selected_cluster == selected and
                      not car_state.brakePressed)

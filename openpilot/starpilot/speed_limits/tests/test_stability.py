@@ -124,3 +124,57 @@ def test_every_order_holds_the_camera_against_higher_fallbacks():
     for t in range(100, 2900, 100):
       got = sel.select_limit(stz.apply(obs(vision='stale', map=30, dashboard=35), policy, t * MS), policy).observation.candidate
       assert round(got.speed_mps / MPH) == 20, (order, t)
+
+
+def apply_v(stz, now_ms, v_ego, **speeds):
+  selection = sel.select_limit(stz.apply(obs(**speeds), POLICY, now_ms * MS, v_ego=v_ego), POLICY)
+  return None if selection.observation.candidate is None else round(selection.observation.candidate.speed_mps / MPH)
+
+
+def settle(stz, value=30, **extra):
+  for t in range(0, 3100, 100):
+    pick(stz, t, map=value, **extra)
+
+
+def test_settled_limit_holds_through_a_full_dropout():
+  """Route 00000005--a37f13ed24 t=118.9-120.6: mapd 'unknown' and the camera gone together dropped the offer and asked
+  again; filter-dev holds the last settled limit through the dropout."""
+  stz = SourceStabilizer()
+  settle(stz)
+  for t in range(3200, 12000, 100):
+    assert apply_v(stz, t, 10., map='stale', vision='stale') == 30
+
+
+def test_a_cross_street_flash_is_not_held():
+  stz = SourceStabilizer()
+  settle(stz, 30)
+  for t in range(3200, 5200, 100):
+    pick(stz, t, map=45)  # 2 s cross street
+  assert apply_v(stz, 5300, 10., map='stale') == 30  # the settled 30, not the flash
+
+
+def test_any_reading_ends_the_hold():
+  stz = SourceStabilizer()
+  settle(stz)
+  assert apply_v(stz, 3200, 10.) == 30
+  assert apply_v(stz, 3300, 10., vision=25) == 25
+
+
+def test_map_matched_road_without_a_limit_ends_the_hold():
+  stz = SourceStabilizer()
+  settle(stz)
+  out = obs()
+  out[M] = acc.Observation(acc.ObservationKind.ABSENT)
+  assert sel.select_limit(stz.apply(out, POLICY, 3200 * MS, v_ego=10.), POLICY).observation.candidate is None
+
+
+def test_backstop_distance_ends_the_hold():
+  stz = SourceStabilizer()
+  settle(stz)
+  t, held = 3100, True
+  while t < 3100 + 60_000:  # 25 m/s for 60 s = 1500 m
+    t += 100
+    held = apply_v(stz, t, 25.) == 30
+    if not held:
+      break
+  assert not held and 3100 + 39_000 <= t <= 3100 + 41_000  # gives way at ~1000 m
