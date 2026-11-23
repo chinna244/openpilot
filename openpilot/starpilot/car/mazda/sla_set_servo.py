@@ -32,6 +32,10 @@ CRUISE_BUTTONS = (ButtonType.accelCruise, ButtonType.decelCruise, ButtonType.res
 ACCEPT_BIND_NS = 2_000_000_000  # the accept must appear in slcState this soon after the press
 REACT_NS = 300_000_000  # error must persist this long before the first press of a walk
 STALL_NS = 2_000_000_000  # sending this long without the dash moving ends the session
+# slcState is 20 Hz and card calls it stale past 100 ms: one late message (route 00000003--941020f467 t=53.546, a
+# 73.6 ms gap) read as a missing target and ended a 19->36 walk at 27. A STALE state only pauses the walk (no press);
+# the same acknowledgment must come back within this, else it ends. A FRESH state without the target ends it at once.
+STATE_GAP_NS = 300_000_000
 MIN_SET_MPH = 20  # the body ECU's lowest SET; never walk below it
 
 
@@ -89,6 +93,7 @@ class MazdaSlaSetServo:
     self.last_set_change_ns = 0
     self.confirmed: int | None = None
     self.bound: tuple[float, int] | None = None
+    self.stale_since_ns = 0
     self.end_reason = ''
 
   @property
@@ -106,7 +111,7 @@ class MazdaSlaSetServo:
     self.end_reason = reason
 
   def update(self, CS, *, enabled: bool, long_active: bool, cancel: bool, resume: bool, accepted_mps: float | None,
-             accepted_ns: int, prompting: bool, now_ns: int, confirm_frame: bool = False) -> str:
+             accepted_ns: int, prompting: bool, now_ns: int, confirm_frame: bool = False, state_fresh: bool = True) -> str:
     """One card frame. accepted_mps: slcState.acceptedAdjustedLimit when fresh and present, else None;
     accepted_ns: its acceptedMonoTime; confirm_frame: this frame's press is the confirm being armed.
 
@@ -148,6 +153,15 @@ class MazdaSlaSetServo:
         return self.NONE
 
     # every press needs the confirmed value still accepted: gone or changed (either way) ends the walk
+    if not state_fresh:
+      if not self.stale_since_ns:
+        self.stale_since_ns = now_ns
+      elif now_ns - self.stale_since_ns > STATE_GAP_NS:
+        self._end('state_stale')
+      self.error_since_ns = 0
+      self.sending_since_ns = 0
+      return self.NONE  # never press on a stale state
+    self.stale_since_ns = 0
     if accepted is None:
       self._end('target_lost')
       return self.NONE

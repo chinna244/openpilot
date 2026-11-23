@@ -921,7 +921,8 @@ class Car:
     button = servo.update(CS, enabled=bool(CC.enabled), long_active=bool(CC.longActive), cancel=bool(CC.cruiseControl.cancel),
                           resume=bool(CC.cruiseControl.resume), accepted_mps=accepted,
                           accepted_ns=int(state.acceptedMonoTime) if state is not None else 0,
-                          prompting=prompting, now_ns=now_ns, confirm_frame=self.mazda_sla_confirm_frame)
+                          prompting=prompting, now_ns=now_ns, confirm_frame=self.mazda_sla_confirm_frame,
+                          state_fresh=slc_physical._state(self.sm, now_ns) is not None)
     if was_active and not (servo.active or servo.armed is not None) and servo.end_reason:
       cloudlog.event('mazda_sla_set_servo_end', reason=servo.end_reason)
     return button

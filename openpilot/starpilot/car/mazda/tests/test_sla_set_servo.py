@@ -61,8 +61,9 @@ class Loop:
       self.accepted, self.accepted_ns = offer_mph * MPH, self.now + 20_000_000
     return answer
 
-  def step(self, *, buttons=(), confirm_frame=False, enabled=True, long_active=True, **kw):
+  def step(self, *, buttons=(), confirm_frame=False, enabled=True, long_active=True, state_fresh=True, **kw):
     out = self.servo.update(cs(self.ecu.set_mph, buttons=buttons, **kw), enabled=enabled, long_active=long_active, cancel=False, resume=False,
+                            state_fresh=state_fresh,
                             accepted_mps=self.accepted if self.now >= self.accepted_ns else None,
                             accepted_ns=self.accepted_ns, prompting=self.prompting, now_ns=self.now,
                             confirm_frame=confirm_frame)
@@ -275,3 +276,38 @@ def test_newer_acceptance_rounding_to_the_same_mph_ends_a_walk_in_progress():
   loop.accepted, loop.accepted_ns = 36.3 * MPH, loop.now  # a newer planner acknowledgment, same rounded mph
   loop.run(3)
   assert loop.ecu.set_mph == at and len(loop.sent) == sent and loop.servo.end_reason == 'target_changed'
+
+
+def test_route_53s_late_slc_state_pauses_then_the_walk_finishes():
+  """Route 00000003--941020f467 t=53.59: one late slcState (73.6 ms gap) ended a 19->36 walk at 27."""
+  loop = Loop(19)
+  loop.confirm('accel', 36)
+  loop.run(1.5)
+  at, sent = loop.ecu.set_mph, len(loop.sent)
+  assert 21 < at < 35
+  loop.run(0.15, state_fresh=False)  # stale for 150 ms: no presses
+  assert len(loop.sent) == sent and loop.servo.active
+  loop.run(4)
+  assert loop.ecu.set_mph == 36 and loop.servo.end_reason == 'settled'
+
+
+def test_stale_state_beyond_the_gap_ends_the_walk():
+  loop = Loop(19)
+  loop.confirm('accel', 36)
+  loop.run(1.0)
+  at = loop.ecu.set_mph
+  loop.run(0.4, state_fresh=False)
+  assert not loop.servo.active and loop.servo.end_reason == 'state_stale'
+  loop.run(3)
+  assert loop.ecu.set_mph == at
+
+
+def test_changed_acknowledgment_after_a_stale_gap_ends_the_walk():
+  loop = Loop(19)
+  loop.confirm('accel', 36)
+  loop.run(1.0)
+  at = loop.ecu.set_mph
+  loop.run(0.1, state_fresh=False)
+  loop.accepted_ns = loop.now  # a different planner acknowledgment returns
+  loop.run(3)
+  assert loop.ecu.set_mph == at and loop.servo.end_reason == 'target_changed'
