@@ -133,6 +133,8 @@ def key_off_input(sm, service: str, now_ns: int):
     pass
   return None
 
+SLC_ADJUST_ALERT_NS = 3_000_000_000
+
 class SelfdriveD:
   def missing_native_event(self, now_ns: int, *, lost_active_aol: bool):
     """Called once initialized with no current AOL native: the event to raise (native_missing_event). step() owns
@@ -245,7 +247,11 @@ class SelfdriveD:
       ignore += ['aolIntentWire']
     if self.axis_transport_required:
       ignore += ['aolSafetyWire']
-    if self.conditional_replay or self.switchback_capable:
+    from openpilot.starpilot.car.mazda.sla_set_servo import eligible as mazda_sla_eligible
+    # Mazda factory cruise: the SLA prompt/adjust alerts (develop/filter-dev events_zp) read slcState
+    self.mazda_slc_alerts = mazda_sla_eligible(self.CP)
+    slc_state_wanted = self.conditional_replay or self.switchback_capable or self.mazda_slc_alerts
+    if slc_state_wanted:
       # This optional proposal never controls the native process-health gate.
       ignore += ['slcState']
     if SIMULATION:
@@ -264,7 +270,7 @@ class SelfdriveD:
                                    'lateralManeuverPlan', 'laneChangeAssistWire', 'starpilotLongitudinalPlan'] +
                                   (['aolIntentWire'] if self.aol_replay else []) +
                                    (['aolSafetyWire'] if self.axis_transport_required else []) +
-                                   (['slcState'] if self.conditional_replay or self.switchback_capable else []) + \
+                                   (['slcState'] if slc_state_wanted else []) + \
                                    self.camera_packets + self.sensor_packets + self.gps_packets + radar_notifications,
                                   ignore_alive=ignore, ignore_avg_freq=ignore,
                                   ignore_valid=ignore, frequency=int(1/DT_CTRL))
@@ -442,6 +448,32 @@ class SelfdriveD:
     if self.CP.brand == 'mazda':
       self.add_mazda_stock_ecu_events(CS)
     self.add_mazda_tja_events(CS)
+    self.add_mazda_slc_events(CS)
+
+  def add_mazda_slc_events(self, CS, now_ns: int | None = None):
+    """Mazda factory cruise, as develop/filter-dev (events_zp speedLimitPreActive / speedLimitActive): an open SLA
+    offer shows which wheel press confirms it ("Press + for" / "Press - for"), and an accept "Adjusting to"."""
+    if not getattr(self, 'mazda_slc_alerts', False) or not self.enabled:
+      return
+    from openpilot.starpilot.speed_limits.physical_actions import STATE_MAX_AGE_NS
+    from openpilot.starpilot.car.mazda.sla_set_servo import confirm_direction
+    now_ns = time.monotonic_ns() if now_ns is None else now_ns
+    try:
+      stamp = int(self.sm.logMonoTime['slcState'])
+      if not (self.sm.seen['slcState'] and self.sm.valid['slcState'] and self.sm.alive['slcState'] and
+              0 < stamp <= now_ns and now_ns - stamp <= STATE_MAX_AGE_NS):
+        return
+      state = self.sm['slcState']
+      if not state.enabled or state.displayOnly:
+        return
+      if (state.hasPending and not state.automaticAdoptionPending and state.hasPresentationAdjustedLimit and
+          confirm_direction(float(state.presentationAdjustedLimit), float(CS.cruiseState.speedCluster), self.is_metric)):
+        self.mazda_events.add('slcConfirmPrompt')
+      elif (state.hasAcceptedAdjustedLimit and not state.acceptedIsPreview and
+            0 < int(state.acceptedMonoTime) <= now_ns <= int(state.acceptedMonoTime) + SLC_ADJUST_ALERT_NS):
+        self.mazda_events.add('slcAdjusting')
+    except (AttributeError, KeyError, TypeError, ValueError):
+      return
 
   def add_mazda_tja_events(self, CS):
     """Develop's MADS banners and camera-fault alerts for Mazda's declared TJA button, whose latch AOL owns."""

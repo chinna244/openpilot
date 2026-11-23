@@ -1130,7 +1130,38 @@ if __name__ == '__main__':
 # Mazda port alerts. StarPilot pins log.capnp (tools/ci/schema_policy.py: no new EventName values), so these
 # display-only ET.PERMANENT alerts live outside the enum and are raised inside selfdrived only, presented
 # like the Tesla stock alerts. Same text, sounds and durations as develop.
+def _slc_display(speed_mps: float, metric: bool) -> str:
+  return f"{round(speed_mps * (CV.MS_TO_KPH if metric else CV.MS_TO_MPH))} {'km/h' if metric else 'mph'}"
+
+
+def mazda_slc_confirm_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.SubMaster, metric: bool, soft_disable_time: int,
+                            personality) -> Alert:
+  """develop/filter-dev events_zp speed_limit_pre_active_alert (mici): the press toward the offer confirms it."""
+  from openpilot.starpilot.car.mazda.sla_set_servo import confirm_direction
+  state = sm['slcState']
+  target = float(state.presentationAdjustedLimit)
+  direction = confirm_direction(target, float(CS.cruiseState.speedCluster), metric)
+  text = f"Press {'+' if direction == 'accel' else '-'} for\n{_slc_display(target, metric)}" if direction else ""
+  return Alert(text, "", AlertStatus.normal, AlertSize.small if text else AlertSize.none,
+               Priority.LOW, VisualAlert.none, AudibleAlert.prompt, .1)
+
+
+def mazda_slc_adjust_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.SubMaster, metric: bool, soft_disable_time: int,
+                           personality) -> Alert:
+  """develop/filter-dev events_zp speed_limit_adjust_alert: names the accepted target the SET walks to."""
+  return Alert(f"Adjusting to\n{_slc_display(float(sm['slcState'].acceptedAdjustedLimit), metric)}", "",
+               AlertStatus.normal, AlertSize.small, Priority.LOW, VisualAlert.none, AudibleAlert.prompt, .1)
+
+
 MAZDA_EVENTS: dict[str, dict[str, Alert | AlertCallbackType]] = {
+  # SLA on Mazda factory cruise (develop/filter-dev): which press confirms the open offer, and the accepted target.
+  "slcConfirmPrompt": {
+    ET.WARNING: mazda_slc_confirm_alert,
+  },
+  "slcAdjusting": {
+    ET.WARNING: mazda_slc_adjust_alert,
+  },
+
   # Mazda alpha long: a SET/RES press the car will not engage on while openpilot does not own the
   # radar or it is being returned. PERMANENT so it reaches a driver with nothing engaged; it grants
   # and blocks nothing (the press itself does nothing on the car).
