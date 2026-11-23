@@ -58,6 +58,7 @@ def _adapter_class():
     KEYS = Keys(link="JetlinkMode", offroad="IsOffroad", progress="JetlinkProgress", spec="JetlinkSpec",
                 big_model="JetlinkModel", charge_phone="JetlinkChargePhone")
     IN_CONTROL_SERVICES = ("carControl", "selfdriveState")
+    PREFETCH_MODEL_GADGET = True
     _aol = None
     _aol_since = 0.
 

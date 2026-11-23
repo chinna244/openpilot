@@ -30,6 +30,91 @@ def test_realtime_starts_after_model_load_and_receipt():
   assert max(line("load_small") + line("loader.join")) < startup_receipt.lineno < line("config_realtime_process")[0] < line("PubMaster")[0]
 
 
+@pytest.mark.parametrize("now,remaining,still_opening", [(14.25, 1.25, False), (16.0, 0.0, True)])
+def test_early_gadget_wait_uses_time_already_spent_loading(monkeypatch, now, remaining, still_opening):
+  from jetlink.openpilot import link as links
+
+  clock = iter((10.0, now))
+  monkeypatch.setattr(links, "time", SimpleNamespace(monotonic=lambda: next(clock)))
+  worker = Mock()
+  worker.is_alive.return_value = still_opening
+  monkeypatch.setattr(links, "threading", SimpleNamespace(Thread=lambda **kwargs: worker))
+  link = Mock()
+  wait_for_gadget = links.start_present_early(link, lambda: None)
+  worker.start.assert_called_once_with()
+  worker.join.assert_not_called()
+
+  wait_for_gadget()
+  worker.join.assert_called_once_with(pytest.approx(remaining))
+  assert link.abandon.call_count == int(still_opening)
+
+
+def test_early_gadget_is_reused_without_moving_gpu_initialization(monkeypatch):
+  from jetlink.openpilot import Jetlink, gadget, joining, link, warp
+
+  events = []
+  client = Mock()
+  small = object()
+  joined = object()
+  parts = SimpleNamespace(log=Mock(), op=SimpleNamespace(PREFETCH_MODEL_GADGET=True),
+                          warps=SimpleNamespace(built=lambda: True))
+  jetlink = Jetlink(parts)
+  monkeypatch.setattr(jetlink, "enabled", lambda: True)
+  monkeypatch.setattr(gadget, "link_configured", lambda: True)
+  monkeypatch.setattr(link, "Link", lambda log: client)
+
+  def start(loan, background):
+    assert loan is client
+    events.append("usb-start")
+    return lambda: events.append("usb-finish")
+
+  monkeypatch.setattr(link, "start_present_early", start)
+  monkeypatch.setattr(warp, "init_device", lambda log: events.append("gpu-setup"))
+  join = Mock(return_value=joined)
+  monkeypatch.setattr(joining, "join", join)
+
+  assert jetlink.prepare()
+  assert events == ["usb-start"]
+  assert jetlink.attach(small, 1344, 760) is joined
+  assert events == ["usb-start", "gpu-setup", "usb-finish"]
+  join.assert_called_once_with(parts, 1344, 760, small, link=client)
+
+
+def test_jetlink_prepares_while_the_local_model_is_still_loading():
+  calls = [(ast.unparse(node.func), node.lineno) for statement in main_body() for node in ast.walk(statement)
+           if isinstance(node, ast.Call)]
+  prepare = [line for name, line in calls if name == 'HOOKS.prepare']
+  load = [line for name, line in calls if name == 'load_small']
+  attach = next(line for name, line in calls if name == 'HOOKS.attach')
+  assert prepare[0] < min(load) <= max(load) < prepare[1] < attach
+
+
+@pytest.mark.parametrize("early, chestnut, recovery, should_retry", [
+  (True, False, False, False), (False, False, False, True),
+  (False, True, False, False), (False, False, True, False),
+])
+def test_jetlink_retries_after_warmup_only_if_eligible(early, chestnut, recovery, should_retry):
+  attach_guard = next(node.test for node in main_body() if isinstance(node, ast.If) and
+                      any(ast.unparse(child.func) == 'HOOKS.attach' for child in ast.walk(node) if isinstance(child, ast.Call)))
+  hooks = Mock()
+  hooks.prepare.return_value = True
+  env = dict(jetlink_ready=early, CHESTNUT=chestnut, recovery_small_only=recovery, HOOKS=hooks)
+  assert eval(compile(ast.Expression(attach_guard), str(MODEL_SOURCE), "eval"), env) == (early or should_retry)
+  assert hooks.prepare.call_count == int(should_retry)
+
+
+def test_small_model_loads_before_waiting_for_car_params():
+  body = main_body()
+  guarded_reads = {ast.unparse(node.test): node.lineno for node in body if isinstance(node, ast.If) and
+                   any(ast.unparse(statement) == "CP = read_car_params()" for statement in node.body)}
+  assert guarded_reads.keys() == {"CHESTNUT", "not CHESTNUT"}
+  big_load = next(node.lineno for node in body if isinstance(node, ast.If) and ast.unparse(node.test) == "CHESTNUT" and
+                  any(isinstance(child, ast.Call) and ast.unparse(child.func) == "loader.start" for child in ast.walk(node)))
+  small_load = next(node.lineno for node in body if isinstance(node, ast.If) and ast.unparse(node.test) == "small_model is None")
+  attach = next(node.lineno for node in body if isinstance(node, ast.If) and "HOOKS.attach" in ast.unparse(node))
+  assert guarded_reads["CHESTNUT"] < big_load < small_load < guarded_reads["not CHESTNUT"] < attach
+
+
 def test_jetlink_gets_the_frames_delay_before_every_run():
   # a model that joins starts on the current delay; check_seam holds the frame_drop_ratio write
   loop = [node for node in main_body() if isinstance(node, ast.While)][-1]  # the frame loop
@@ -230,9 +315,11 @@ def test_big_worker_waits_before_load_and_failure_requests_fresh_small_process(c
          "receipt_owner": receipt, "threading": SimpleNamespace(Thread=Thread), "BIG_MODEL_TIMEOUT": 30,
          "report_load_timeout": Mock(),
          "params": params, "requested_model_id": "big", "ModelVariant": ModelVariant,
-         "CP": SimpleNamespace(brand="mock"), "demo": False,
+         "fixture_cp": SimpleNamespace(brand="mock"), "demo": False,
+         "read_frozen": Mock(), "kona_smoothing": Mock(),
          "wait_for_chestnut_power": lambda CP, timeout: events.append("power"),
-         "jetlink_adapter": SimpleNamespace(hooks=lambda: hooks, coherent_warp=lambda: None), "drop_chestnut": Mock(),
+         "HOOKS": hooks, "jetlink_ready": False,
+         "jetlink_adapter": SimpleNamespace(coherent_warp=lambda: None), "drop_chestnut": Mock(),
          "release_compile_pool": Mock(), "gc": Mock()}
   if laboratory:
     from openpilot.starpilot.models.laboratory_runner import LaboratoryPair
@@ -246,7 +333,9 @@ def test_big_worker_waits_before_load_and_failure_requests_fresh_small_process(c
     env.update(laboratory_request={'enabled': True, 'lateralModel': 'lateral', 'longitudinalModel': 'longitudinal'},
                load_laboratory_pair=load_pair, MODEL_ROOT=Path('/test-models'), LaboratoryPair=LaboratoryPair)
   wrapper = ast.parse("def startup():\n  pass").body[0]
-  wrapper.body = body[start:end] + [ast.Return(value=ast.Call(func=ast.Name(id="locals", ctx=ast.Load()), args=[], keywords=[]))]
+  wrapper.body = ast.parse("CP = fixture_cp").body + body[start:end] + [
+    ast.Return(value=ast.Call(func=ast.Name(id="locals", ctx=ast.Load()), args=[], keywords=[]))]
+
   env["cam_w"], env["cam_h"] = env["vipc_client_main"].width, env["vipc_client_main"].height
   execute([wrapper], env)
   if timeout:

@@ -65,6 +65,7 @@ class Jetlink:
     self._log = parts.log
     # prepare() said yes in this process, so attach() may join modeld
     self._prepared = False
+    self._prefetched_gadget = None
     # what -> the last failure logged reading it; cleared by a read that works
     self._failures: dict[str, str] = {}
     # when this process asked for the Jetson to power off, until it was taken
@@ -157,7 +158,14 @@ class Jetlink:
       return False
     # the last hook before modeld goes SCHED_FIFO on core 7, and the GPU's init
     # spawns a thread that would inherit that. See warp.init_device
-    init_device(self._log)
+    if getattr(self._parts.op, 'PREFETCH_MODEL_GADGET', False) is True:
+      if self._prefetched_gadget is None:
+        from jetlink.openpilot.link import Link, start_present_early
+        from jetlink.transport.priority import background_thread
+        link = Link(self._log)
+        self._prefetched_gadget = (link, start_present_early(link, background_thread))
+    else:
+      init_device(self._log)
     self._prepared = True
     return True
 
@@ -176,9 +184,20 @@ class Jetlink:
     if not self._prepared:
       return None
     from jetlink.openpilot.joining import join
+    prefetched, self._prefetched_gadget = self._prefetched_gadget, None
+    link = None
     try:
-      return join(self._parts, cam_w, cam_h, small)
+      if prefetched is None:
+        return join(self._parts, cam_w, cam_h, small)
+      # Only USB I/O ran early. Keep GPU setup after local warmup and before realtime.
+      from jetlink.openpilot.warp import init_device
+      link, finish = prefetched
+      init_device(self._log)
+      finish()
+      return join(self._parts, cam_w, cam_h, small, link=link)
     except Exception:
+      if link is not None:
+        link.close()
       self._log.exception("jetlink load failed")
       return small
 

@@ -163,8 +163,8 @@ class Link:
     return self.loan
 
 
-def present_early(link: Link, background) -> None:
-  """Take the link now, from a thread that is not modeld's.
+def start_present_early(link: Link, background):
+  """Start taking the link and return a bounded wait for the same attempt.
 
   modeld's main thread is already SCHED_FIFO 54 on core 7, and the FunctionFS
   reader the open creates would inherit that and preempt the frame loop, so the
@@ -191,10 +191,18 @@ def present_early(link: Link, background) -> None:
 
   t = threading.Thread(target=present, name='jetlink-present', daemon=True)
   t.start()
-  t.join(max(0.0, deadline - time.monotonic()) + 0.5)
-  if t.is_alive():
-    link.abandon()
-    link.log.warning("jetlink: presenting the gadget took over %.0f s, the join will", PRESENT_TIMEOUT)
+
+  def finish():
+    t.join(max(0.0, deadline + 0.5 - time.monotonic()))
+    if t.is_alive():
+      link.abandon()
+      link.log.warning("jetlink: presenting the gadget took over %.0f s, the join will", PRESENT_TIMEOUT)
+
+  return finish
+
+
+def present_early(link: Link, background) -> None:
+  start_present_early(link, background)()
 
 
 def connect_patiently(link: Link):

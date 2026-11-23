@@ -342,6 +342,8 @@ def main(demo=False):
   params.remove("ChestnutActive")
 
   gc.disable()
+  HOOKS = jetlink_adapter.hooks()
+  jetlink_ready = HOOKS.prepare(CHESTNUT or recovery_small_only)
 
   # visionipc clients
   while True:
@@ -368,14 +370,14 @@ def main(demo=False):
   if use_extra_client:
     cloudlog.warning(f"connected extra cam with buffer size: {vipc_client_extra.buffer_len} ({vipc_client_extra.width} x {vipc_client_extra.height})")
 
-  if demo:
-    CP = get_demo_car_params()
-  else:
-    CP = messaging.log_from_bytes(params.get("CarParams", block=True), car.CarParams)
-  cloudlog.info("modeld got CarParams: %s", CP.brand)
+  def read_car_params():
+    cp = get_demo_car_params() if demo else messaging.log_from_bytes(params.get("CarParams", block=True), car.CarParams)
+    cloudlog.info("modeld got CarParams: %s", cp.brand)
+    return cp
+
   from openpilot.starpilot.car.subaru.smoothing import read_frozen, seconds as subaru_smooth_seconds, filter_action
-  subaru_smoothing = read_frozen(CP, params)
-  kona_tau = kona_smoothing(CP)
+  if CHESTNUT:
+    CP = read_car_params()  # The GPU worker needs the vehicle's power policy.
 
   st = time.monotonic()
   cloudlog.warning("loading model")
@@ -466,10 +468,15 @@ def main(demo=False):
                          "chestnut-load-failed" if initial_chestnut_fallback else
                          "selected-load-failed" if (selected_small_failed and not model.chestnut) or requested_model_id != model.model_id else None,
                          model_id=model.model_id)
-  HOOKS = jetlink_adapter.hooks()
+  if not CHESTNUT:
+    # The local model depends on the camera, so warm it while card fingerprints.
+    CP = read_car_params()
+  subaru_smoothing = read_frozen(CP, params)
+  kona_tau = kona_smoothing(CP)
+
   jetlink_model = None
-  # before going realtime: the GPU thread it starts would inherit SCHED_FIFO 54 on core 7
-  if HOOKS.prepare(CHESTNUT or recovery_small_only):
+  # If the gadget was still configuring, retry at the original attach point.
+  if jetlink_ready or (not CHESTNUT and not recovery_small_only and HOOKS.prepare(False)):
     # the joining model drives as small_model until the big model is ready
     model = HOOKS.attach(model, small_model, vipc_client_main.width, vipc_client_main.height)
     jetlink_model = model if model is not small_model else None

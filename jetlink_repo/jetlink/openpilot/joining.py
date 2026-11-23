@@ -731,7 +731,7 @@ class JoiningModelState:
       close()
 
 
-def join(parts, cam_w: int, cam_h: int, small) -> JoiningModelState:
+def join(parts, cam_w: int, cam_h: int, small, *, link=None) -> JoiningModelState:
   """The model modeld runs: the small model now, the Jetson once it is there.
   Returns straight away; the join runs in the background.
 
@@ -743,7 +743,9 @@ def join(parts, cam_w: int, cam_h: int, small) -> JoiningModelState:
   op = parts.op
   face = op.model_face()
   ready: dict = {}
-  link = links.Link(parts.log)
+  prefetched = link is not None
+  if not prefetched:
+    link = links.Link(parts.log)
 
   def prepare():
     from jetlink.openpilot.interface import FrameWarp, conformance
@@ -751,7 +753,8 @@ def join(parts, cam_w: int, cam_h: int, small) -> JoiningModelState:
     # the gadget first, so the Jetson enumerates while the warp loads. Left to
     # the join thread the bind lands ~3 s later, behind the small model's
     # first frame, and can stall a frame by hundreds of ms
-    links.present_early(link, background_thread)
+    if not prefetched:
+      links.present_early(link, background_thread)
     cached = parts.spec.load()
     if cached is not None:
       img_h, img_w = cached.model_hw
