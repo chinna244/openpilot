@@ -252,7 +252,8 @@ class SpeedLimitWidget:
       hint_size = 23
       accept, reject = ink_width('ACCEPT', hint_size), ink_width('REJECT', hint_size)
       start = (width - 18 - 4 - accept - 10 - 18 - 4 - reject) / 2
-      for left, plus in ((start, True), (start + 18 + 4 + accept + 10, False)):
+      accept_plus = state.slc_accept_key_plus
+      for left, plus in ((start, accept_plus), (start + 18 + 4 + accept + 10, not accept_plus)):
         self.shapes.wheel_key(plus, x + (left + 9) * scale, content_top + hint_row * scale, scale=scale)
       hint_ink = rl.Color(210, 216, 216, 255)
       text('ACCEPT', hint_size, start + 22 + accept / 2, row_origin + hint_row, hint_ink if slc_accept_available(state) else MUTED)

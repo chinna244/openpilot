@@ -17,6 +17,18 @@ from typing import Any
 from openpilot.starpilot.galaxy.access import AccessStatus, GalaxyAccessOwner
 from openpilot.starpilot.ui.appearance_preferences import CameraViewChoice, OnroadAppearance, onroad_appearance
 from openpilot.starpilot.ui.brand import DISPLAY_VERSION, home_description
+from openpilot.starpilot.car.mazda.sla_set_servo import confirm_direction as mazda_confirm_direction, eligible as mazda_sla_eligible
+
+
+def slc_accept_key_plus(cp, slc, cruise_state, is_metric: bool) -> bool:
+  """Which wheel key accepts the shown offer: + everywhere, except on Mazda factory cruise where the press toward
+  the offer accepts (card.mazda_sla_answer uses the same confirm_direction on the same offer and dash SET)."""
+  try:
+    if cp is None or slc is None or cruise_state is None or not mazda_sla_eligible(cp) or not slc.hasPresentationAdjustedLimit:
+      return True
+    return mazda_confirm_direction(float(slc.presentationAdjustedLimit), float(cruise_state.speedCluster), is_metric) != 'decel'
+  except (AttributeError, TypeError, ValueError):
+    return True
 from openpilot.starpilot.curve_speed.status import CurvatureDisplay, observation as curve_observation
 from openpilot.starpilot.conditional_mode.policy import ModeChoice
 from openpilot.starpilot.conditional_mode.manual import TRAFFIC_MODE_ACTION, read_button_map
@@ -720,6 +732,7 @@ class RuntimeSnapshotAdapter:
       cruise_state is not None and getattr(cruise_state, 'available', False) and
       not (cp is not None and getattr(cp, 'brand', '') == 'toyota' and
            (display_car.standstill or cruise_state.standstill or not cruise_state.enabled)))
+    accept_key_plus = slc_accept_key_plus(cp, slc, cruise_state, bool(ui.is_metric))
     developer_metrics = ()
     if not (onroad_view_only and stopped_timer_profile == "compact"):
       delay_key = ((after, str(cp.carFingerprint), str(cp.steerControlType), str(cp.lateralTuning.which()), float(cp.steerActuatorDelay))
@@ -795,6 +808,7 @@ class RuntimeSnapshotAdapter:
                          stock_cruise_active=stock_cruise,
                          slc_system_long_available=system_long,
                          slc_wheel_confirmation_available=wheel_confirmation,
+                         slc_accept_key_plus=accept_key_plus,
                          curve=curve, show_curve_status=self._show_curve_status,
                          conditional_configured=self._conditional_choice, conditional_effective=conditional,
                          conditional_perception=perception,

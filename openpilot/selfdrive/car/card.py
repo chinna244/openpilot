@@ -34,7 +34,7 @@ from opendbc.car.hyundai.ioniq6_media import Ioniq6MediaButtons
 from opendbc.car.hyundai.values import CAR as HYUNDAI_CAR
 from opendbc.car.interfaces import CarInterfaceBase, RadarInterfaceBase
 from openpilot.selfdrive.pandad import can_capnp_to_list, can_list_to_can_capnp
-from openpilot.selfdrive.car.cruise import LOW_SPEED_CRUISE_ON_SET, SlcWheelContext, VCruiseHelper, slc_target_kph
+from openpilot.selfdrive.car.cruise import LOW_SPEED_CRUISE_ON_SET, SlcConsumedButton, SlcWheelContext, VCruiseHelper, slc_target_kph
 from openpilot.starpilot.speed_limits import physical_actions as slc_physical
 from openpilot.starpilot.aol.intent import AolProcessFaultContext, independent_axis_requested, read_settings
 from openpilot.starpilot.aol.transport_pause import TransportPauseFeedback, cp_identity
@@ -98,6 +98,8 @@ from openpilot.starpilot.controller_extensions import configure_controller, obse
 from openpilot.starpilot.vehicle_startup import VehicleStartupOwner
 from openpilot.starpilot.controllers.wheel_actions import LIFETIME_NS as WHEEL_ACTION_MAX_AGE_NS, WheelPublisher, key_for
 from openpilot.starpilot.controllers.cruise_action import CruiseActionConsumer, eligible as cruise_action_eligible
+from openpilot.starpilot.car.mazda.sla_set_servo import (MazdaSlaSetServo, eligible as mazda_sla_eligible,
+  directional_answer as mazda_directional_answer)
 from openpilot.starpilot.schema_cache import get_cache, prewarm_cache_contracts, put_cache
 
 REPLAY = "REPLAY" in os.environ
@@ -474,6 +476,9 @@ class Car:
 
     self.controller_cruise_consumer = CruiseActionConsumer()
     self.controller_cruise_sock = messaging.sub_sock('slcAction', conflate=False) if cruise_action_eligible(self.CP) else None
+    # Mazda factory cruise: directional prompt answers + factory SET walk to the accepted SLC target
+    self.mazda_sla_servo = MazdaSlaSetServo(self.is_metric) if mazda_sla_eligible(self.CP) else None
+    self.mazda_sla_confirm_frame = False
     self.v_cruise_helper = VCruiseHelper(self.CP)
     self.v_cruise_helper.intervals = read_cruise_intervals(self.params, self.CP)
 
@@ -786,6 +791,7 @@ class Car:
                        native_lost=bool(lost) if permission_owner else None, native_reset=bool(native_reset),
                        native_rejection_ns=int(rejection_ns), transport_reset=bool(transport_reset),
                        transport_failed=bool(getattr(self.aol_transport_feedback, 'failed', False)),
+                       transport_site=str(getattr(self.aol_transport_feedback, 'fail_site', '')),
                        fault_active=fault_active, cruise_available=bool(CS.cruiseState.available),
                        cruise_enabled=bool(CS.cruiseState.enabled),
                        buttons=[(str(be.type), bool(be.pressed)) for be in CS.buttonEvents])
@@ -851,6 +857,9 @@ class Car:
         CS, self.switchback_button_tracker, self.params, self.switchback_settings_owner,
         self.CP, self.sm, now_ns=now_ns, media=media_observation, action=7,
         media_buttons=media_map.buttons if map_current else None, media_map_captured=map_current)
+    self.mazda_sla_confirm_frame = False
+    if consumed is not None and getattr(self, 'mazda_sla_servo', None) is not None:
+      consumed = self.mazda_sla_answer(consumed, published_CS, now_ns)
     if consumed is not None:
       self.slc_receipts.append(('confirmationAccept' if consumed.button == 'accel' else 'confirmationReject',
                                 consumed, 0.0, 0.0, now_ns))
@@ -888,6 +897,34 @@ class Car:
     if target is not None:
       self.slc_wheel_adopt = None
       helper.apply_slc_target(target, self.is_metric)
+
+  def mazda_sla_answer(self, consumed, CS, now_ns: int):
+    """A press toward the offered target accepts it, away rejects it; an accept arms the SET walk."""
+    state = self.sm['slcState'] if self.sm.seen['slcState'] else None
+    if state is None or int(state.presentationId) != consumed.pending.presentation_id or not state.hasPresentationAdjustedLimit:
+      return consumed
+    offer = float(state.presentationAdjustedLimit)
+    self.mazda_sla_servo.is_metric = self.is_metric
+    answer = mazda_directional_answer(consumed.button, offer, float(CS.cruiseState.speedCluster), self.is_metric)
+    if answer == 'accel':
+      self.mazda_sla_servo.arm(offer, now_ns)
+      self.mazda_sla_confirm_frame = True
+    return SlcConsumedButton(consumed.pending, answer)
+
+  def mazda_sla_button(self, CS, CC, now_ns: int) -> str:
+    servo = self.mazda_sla_servo
+    servo.is_metric = self.is_metric
+    state = self.sm['slcState'] if self.sm.seen['slcState'] else None
+    accepted = slc_physical.accepted_target(self.sm, now_ns)
+    prompting = bool(state is not None and slc_physical._state(self.sm, now_ns) is not None and state.hasPending)
+    was_active = servo.active or servo.armed is not None
+    button = servo.update(CS, enabled=bool(CC.enabled), long_active=bool(CC.longActive), cancel=bool(CC.cruiseControl.cancel),
+                          resume=bool(CC.cruiseControl.resume), accepted_mps=accepted,
+                          accepted_ns=int(state.acceptedMonoTime) if state is not None else 0,
+                          prompting=prompting, now_ns=now_ns, confirm_frame=self.mazda_sla_confirm_frame)
+    if was_active and not (servo.active or servo.armed is not None) and servo.end_reason:
+      cloudlog.event('mazda_sla_set_servo_end', reason=servo.end_reason)
+    return button
 
   def update_cruise_speed(self, CS, pending=None, *, wheel_context: SlcWheelContext | None = None):
     self.v_cruise_helper.update_v_cruise(CS, self.sm['carControl'].enabled, self.is_metric, pending,
@@ -1990,7 +2027,12 @@ class Car:
       if self.CP.brand == "mazda" and getattr(self.aol_card_intent, 'tja_button', False):
         # The dash white wheel follows the TJA latch as develop's MADS state did, not momentary latActive.
         self.CI.CC.aol_lateral_latched = bool(self.aol_card_intent.allowed_latch and not self.aol_card_intent.pause_lateral)
+      icbm = self.CI.CC.control_context.intelligentCruiseButtonManagement if getattr(self, 'mazda_sla_servo', None) is not None else None
+      if icbm is not None:
+        icbm.sendButton = self.mazda_sla_button(CS, CC, int(self.can_log_mono_time) if REPLAY and hasattr(self, 'can_log_mono_time') else time.monotonic_ns())
       self.last_actuators_output, can_sends = self.CI.apply(CC, now_nanos)
+      if icbm is not None:
+        icbm.sendButton = 'none'  # never carried into a later neutral apply
       self.publish_sendcan(can_sends, valid=CS.canValid)
       if learning_snapshot is not None and self.learning_send_committed_mono_ns:
         try:

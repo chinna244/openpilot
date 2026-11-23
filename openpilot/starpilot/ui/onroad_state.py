@@ -231,6 +231,7 @@ class OnroadState:
   slc_prompt_open: bool = False
   quick_select_open: bool = False
   slc_wheel_confirmation_available: bool = False
+  slc_accept_key_plus: bool = True  # Mazda factory cruise: - accepts an offer below SET
 
   torque_is_demand: bool = False
 
