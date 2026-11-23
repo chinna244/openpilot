@@ -34,20 +34,21 @@ def message(name, stamp, size=None):
   return m
 
 
-def sample(cp, stamp, sequence, native, *, combined, events=(), panda_stamp=None, raw_controls=False):
+def sample(cp, stamp, sequence, native, *, combined, events=(), panda_stamp=None, raw_controls=False, event_stamp=None):
+  event_stamp = stamp if event_stamp is None else event_stamp
   w = message('aolSafetyWire', native.observedMonoTime, 0)
   w.aolSafetyWire = encode_safety(native)
   a = message('aolAxisState', stamp)
   a.aolAxisState = {'sessionId': 'axis', 'faultSessionId': 'axis', 'sequence': sequence, 'qualified': True,
     'faultReason': 'none', 'observedMonoTime': stamp, 'sourceCarStateMonoTime': stamp, 'validUntilMonoTime': stamp + 30 * MS,
-    'intentProducerSessionId': 'producer', 'intentIntegrityEpoch': 1, 'faultEventMonoTime': stamp,
+    'intentProducerSessionId': 'producer', 'intentIntegrityEpoch': 1, 'faultEventMonoTime': event_stamp,
     'desiredLateral': True, 'lateralActive': True, 'desiredLongitudinal': combined, 'longitudinalActive': combined,
     'nativeAcknowledged': True, 'mode': 'combined' if combined else 'lateralOnly'}
   config = cp.safetyConfigs[0]
   p = message('pandaStates', stamp if panda_stamp is None else panda_stamp, 1)
   p.pandaStates[0] = {'safetyModel': config.safetyModel, 'safetyParam': config.safetyParam,
                       'alternativeExperience': cp.alternativeExperience, 'controlsAllowed': raw_controls}
-  e = message('onroadEvents', stamp, len(events))
+  e = message('onroadEvents', event_stamp, len(events))
   for i, (name, user) in enumerate(events):
     e.onroadEvents[i] = {'name': name, 'userDisable': user}
   return Peers([w.as_reader(), a.as_reader(), p.as_reader(), e.as_reader()])
@@ -115,6 +116,8 @@ def test_unproven_withdrawal_still_fails(route_case, fault):
   elif fault == 'steer_fault':
     cs.steerFaultTemporary = True
   elif fault == 'gas':
+    if route_case == 194:
+      pytest.skip('cruise off + fresh pcmDisable is the cancel evidence; gas held is covered by the 169 tests')
     cs.gasPressed = True
   elif fault == 'immediate':
     m = sm.messages['onroadEvents'].as_builder()
@@ -148,3 +151,91 @@ def test_other_brands_are_unchanged():
   from openpilot.starpilot.aol.tests import test_ford_cancel_raw_health as ford
   cp, cs, f, sm, native, now = ford.fixture()
   assert not ford.invoke(cp, cs, f, sm, now)
+
+
+def gas_fixture():
+  """Route 00000004--0ed7a0ac2e t=169.660: cruise off with the accelerator held, brake up. The panda withdrew long only
+  (wire 169.7259 lat allowed, long withdrawn); card ran at 169.7278 on the new pandaStates (169.7263, controlsAllowed
+  False) against the previous wire (169.6237, long still requested) and cleared the TJA latch."""
+  cp, cs, f, _, native, now = fixture(194)
+  cs.brakePressed = False
+  cs.gasPressed = True
+  # onroadEvents is sent on change: the pcmDisable message is 61 ms old when the panda's withdrawal lands
+  sm = sample(cp, now - MS, 2, native, combined=False, events=EVENTS, event_stamp=now - 61 * MS)
+  return cp, cs, f, sm, native, now
+
+
+EVENTS = (('gasPressedOverride', False), ('pcmDisable', True))
+
+
+def test_gas_held_cruise_off_keeps_lateral():
+  cp, cs, f, sm, native, now = gas_fixture()
+  assert not invoke(cp, cs, f, sm, now)
+  assert not f.failed
+  # next pandad cycle: the wire now shows the panda kept lateral and withdrew long
+  lat_only = replace(native, observedMonoTime=now + 98 * MS, validUntilMonoTime=now + 298 * MS, longitudinalAllowed=False,
+                     requestedLongitudinal=False, sourcePandaStatesMonoTime=now + 98 * MS)
+  sm2 = sample(cp, now + 99 * MS, 3, lat_only, combined=False, events=EVENTS, panda_stamp=now + 98 * MS, event_stamp=now - 61 * MS)
+  assert not invoke(cp, cs, f, sm2, now + 100 * MS)
+  assert not f.failed
+
+
+@pytest.mark.parametrize('fault', ['no_cancel_event', 'cruise_on', 'axis_long', 'lat_denied', 'next_wire_lat_denied',
+                                   'stale_event', 'event_not_acknowledged', 'event_past_safety_age', 'reverse', 'can_invalid'])
+def test_gas_held_unproven_withdrawal_still_fails(fault):
+  cp, cs, f, sm, native, now = gas_fixture()
+  if fault == 'no_cancel_event':
+    sm = sample(cp, now - MS, 2, native, combined=False, events=(('gasPressedOverride', False),), event_stamp=now - 61 * MS)
+  elif fault == 'cruise_on':
+    cs.cruiseState.enabled = True
+    sm = sample(cp, now - MS, 2, native, combined=True)
+  elif fault == 'axis_long':
+    sm = sample(cp, now - MS, 2, native, combined=True, events=EVENTS, event_stamp=now - 61 * MS)
+  elif fault == 'lat_denied':
+    sm = sample(cp, now - MS, 2, replace(native, lateralAllowed=False), combined=False, events=EVENTS, event_stamp=now - 61 * MS)
+  elif fault == 'event_not_acknowledged':
+    sm = sample(cp, now - MS, 2, native, combined=False, events=EVENTS, event_stamp=now - 61 * MS)
+    m = sm.messages['aolAxisState'].as_builder()
+    m.aolAxisState.faultEventMonoTime = now - 90 * MS
+    sm.messages['aolAxisState'] = m.as_reader()
+  elif fault == 'event_past_safety_age':
+    sm = sample(cp, now - MS, 2, native, combined=False, events=EVENTS, event_stamp=now - 250 * MS)
+  elif fault == 'stale_event':
+    m = sm.messages['onroadEvents'].as_builder()
+    m.logMonoTime = NOW - 2_000 * MS
+    sm.messages['onroadEvents'] = m.as_reader()
+    sm.logMonoTime['onroadEvents'] = NOW - 2_000 * MS
+  elif fault == 'reverse':
+    cs.gearShifter = 'reverse'
+  elif fault == 'can_invalid':
+    cs.canValid = False
+  if fault == 'next_wire_lat_denied':
+    assert not invoke(cp, cs, f, sm, now)
+    gone = replace(native, observedMonoTime=now + 98 * MS, validUntilMonoTime=now + 298 * MS, lateralAllowed=False,
+                   longitudinalAllowed=False, requestedLongitudinal=False, sourcePandaStatesMonoTime=now + 98 * MS)
+    sm = sample(cp, now + 99 * MS, 3, gone, combined=False, events=EVENTS, panda_stamp=now + 98 * MS, event_stamp=now - 61 * MS)
+    now += 100 * MS
+  assert invoke(cp, cs, f, sm, now), fault
+
+
+def test_route_194_brake_and_gas_with_cruise_off_keeps_lateral():
+  """Both pedals with cruise already off and a fresh pcmDisable: the cancel evidence carries it (as the gas-held 169 case);
+  the next wire still has to keep lateral allowed."""
+  cp, cs, f, sm, native, now = fixture(194)
+  cs.gasPressed = True
+  assert not invoke(cp, cs, f, sm, now)
+  assert not f.failed
+
+
+
+def test_gas_held_cancel_bridge_ends_without_fresh_panda_data():
+  cp, cs, feedback, first, native, now = gas_fixture()
+  assert not invoke(cp, cs, feedback, first, now)
+
+  # Axis ticks continue, but both the Panda message and its wire remain the same.
+  deadline = native.validUntilMonoTime
+  values = dict(combined=False, events=EVENTS, panda_stamp=first.logMonoTime['pandaStates'],
+                event_stamp=first.logMonoTime['onroadEvents'])
+  assert not invoke(cp, cs, feedback, sample(cp, deadline - 2 * MS, 3, native, **values), deadline - MS)
+  assert invoke(cp, cs, feedback, sample(cp, deadline, 4, native, **values), deadline + MS)
+  assert feedback.failed

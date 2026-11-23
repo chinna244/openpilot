@@ -681,7 +681,8 @@ class Car:
           ford_brake_pause_active(self.CP, CS, self.aol_settings) or
           self.CP.brand == 'volkswagen' and CS.canValid and not CS.canTimeout and
           not CS.steerFaultPermanent and (CS.gearShifter == car.CarState.GearShifter.reverse or
-          getattr(self.aol_card_intent, 'reverse_pause', False))))
+          getattr(self.aol_card_intent, 'reverse_pause', False))),
+        shift_hold=bool(getattr(self.aol_card_intent, 'shift_hold', False)))
       fault_active = True if transport_reset else None
       event_ns = int(self.sm.logMonoTime['onroadEvents'])
       if (getattr(self.aol_card_intent, 'requires_fault_observation', self.aol_card_intent.explicit_latch) and
@@ -1048,7 +1049,8 @@ class Car:
           ford_brake_pause_active(self.CP, CS, self.aol_settings) or
           self.CP.brand == 'volkswagen' and CS.canValid and not CS.canTimeout and
           not CS.steerFaultPermanent and (CS.gearShifter == car.CarState.GearShifter.reverse or
-          getattr(self.aol_card_intent, 'reverse_pause', False)))):
+          getattr(self.aol_card_intent, 'reverse_pause', False))),
+        shift_hold=bool(getattr(self.aol_card_intent, 'shift_hold', False))):
       return True
     events = self.sm['onroadEvents']
     if getattr(self.aol_card_intent, 'shift_hold', False):

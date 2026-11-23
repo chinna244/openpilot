@@ -369,13 +369,20 @@ class TransportPauseFeedback:
     # Cancel needs acknowledged LAT, original deadlines and a fresh withdrawal event.
     ford_cancel_health = bool((ford_withdrawal or mazda_withdrawal) and not cs.cruiseState.enabled and
       not axis.desiredLongitudinal and not axis.longitudinalActive and
-      0 < event_ns <= now_ns and now_ns - event_ns <= AXIS_MAX_AGE_NS and
+      0 < event_ns <= now_ns and (now_ns - event_ns <= AXIS_MAX_AGE_NS or
+        # Mazda: onroadEvents is sent on change and the panda's withdrawal lands ~60 ms after the pcmDisable
+        # (route 00000004--0ed7a0ac2e t=169.666 -> 169.726); the event the axis acknowledged stays the evidence
+        # for the safety-wire age only.
+        mazda_withdrawal and axis.faultEventMonoTime == event_ns and now_ns - event_ns <= SAFETY_MAX_AGE_NS) and
       any(event.userDisable and event.name in (log.OnroadEvent.EventName.buttonCancel,
         log.OnroadEvent.EventName.pcmDisable) for event in sm['onroadEvents']) and
       0 < int(sm.logMonoTime['pandaStates']) <= now_ns and
       now_ns - int(sm.logMonoTime['pandaStates']) <= SAFETY_MAX_AGE_NS)
     brake_health = bool(((ford_withdrawal or classic_brake or mazda_withdrawal) and cs.brakePressed or volkswagen_withdrawal or
-      ford_cancel_health) and (not cs.gasPressed or volkswagen_withdrawal) and
+      ford_cancel_health) and (not cs.gasPressed or volkswagen_withdrawal or
+      # Mazda cruise-off with the accelerator held (route 00000004--0ed7a0ac2e t=169.728): the fresh pcmDisable is the
+      # withdrawal evidence, the gas pedal is not; the next wire still has to keep lateral allowed.
+      mazda_withdrawal and ford_cancel_health) and
       native is not None and native.sourcePandaStatesMonoTime > 0 and
       native.sourcePandaStatesMonoTime < int(sm.logMonoTime['pandaStates']) and
       all(not slot.controlsAllowed for slot, config in zip(sm['pandaStates'], cp.safetyConfigs, strict=True)
@@ -1267,6 +1274,37 @@ class TransportPauseFeedback:
       native.observedMonoTime >= self.healthy_native_ns and self.healthy_inventory ==
         (native.pandaSerial, tuple(slot.hardwareSerial for slot in native.pandaInventory)))
 
+  def _mazda_shift_pause_current(self, sm, cp, cs, axis, stamp, now_ns, *, latched, producer):
+    """Mazda TJA low-speed shift hold (stock_intent.shift_hold): selfdrived's axis reports the wrongGear soft disable
+    as availabilityPause (route 00000004--0ed7a0ac2e t=419.022, D->unknown->N->R stopped). With steering already
+    withheld at the panda, that is the paused latch, not a failed transport. Any other fault, stale or invalid input,
+    or a wire still granting/requesting control is not."""
+    from opendbc.car import structs
+    from opendbc.car.mazda.stock_aol import qualified as mazda_qualified
+    if (not latched or self.failed or not self.session or not producer or
+        not (cp.brand == 'mazda' and mazda_qualified(cp, marked_only=True) and cp.safetyConfigs[0].safetyParam & 8) or
+        cs.gearShifter not in (structs.CarState.GearShifter.unknown, structs.CarState.GearShifter.park,
+                               structs.CarState.GearShifter.reverse, structs.CarState.GearShifter.neutral) or
+        not cs.canValid or cs.canTimeout or cs.steerFaultPermanent or cs.accFaulted or cs.vehicleSensorsInvalid or
+        str(axis.sessionId) != self.session or str(axis.faultSessionId) != self.session or
+        str(axis.intentProducerSessionId) != producer or str(axis.faultReason) != 'availabilityPause' or
+        str(axis.mode) != 'off' or axis.lateralActive or axis.longitudinalActive):
+      return False
+    event_ns = int(sm.logMonoTime['onroadEvents'])
+    user_ok = (log.OnroadEvent.EventName.wrongGear, log.OnroadEvent.EventName.reverseGear,
+               log.OnroadEvent.EventName.pcmDisable, log.OnroadEvent.EventName.pedalPressed)
+    if (not sm.seen['onroadEvents'] or not sm.valid['onroadEvents'] or not sm.alive['onroadEvents'] or
+        not 0 < event_ns == axis.faultEventMonoTime <= stamp or now_ns - event_ns > 1_500_000_000 or
+        not any(event.name == log.OnroadEvent.EventName.wrongGear for event in sm['onroadEvents']) or
+        any(event.immediateDisable or event.softDisable and event.name != log.OnroadEvent.EventName.wrongGear or
+            event.userDisable and event.name not in user_ok for event in sm['onroadEvents'])):
+      return False
+    native = _healthy_transport_native(sm, cp, cs, self.session, now_ns, require_longitudinal=False)
+    return bool(native is not None and native.pandaInventory and
+      not (native.requestedLateral or native.lateralAllowed or native.requestedLongitudinal or native.longitudinalAllowed) and
+      native.observedMonoTime >= self.healthy_native_ns and self.healthy_inventory ==
+        (native.pandaSerial, tuple(slot.hardwareSerial for slot in native.pandaInventory)))
+
   def _inactive_source_pause_current(self, sm, cp, cs, axis, stamp, now_ns, *, latched, producer):
     from openpilot.starpilot.car.subaru.paused_intent import retain_stopped_source_feedback
     if retain_stopped_source_feedback(self, sm, cp, cs, axis, stamp, now_ns, latched=latched, producer=producer):
@@ -1330,7 +1368,8 @@ class TransportPauseFeedback:
     return result
 
   def _observe(self, sm, cp, cs, now_ns, *, latched=True, cancel_source_ns=0, brake_source_ns=0,
-              gm_withdrawal_source_ns=0, intent_producer_session='', main_arm_ns=0, startup_calibration_pending=False, intent_paused=False):
+              gm_withdrawal_source_ns=0, intent_producer_session='', main_arm_ns=0, startup_calibration_pending=False, intent_paused=False,
+              shift_hold=False):
     self.ordinary_warning_qualified = False
     self.temporary_host_qualified = False
     self.subaru_main_retained_native_ns = 0
@@ -1373,6 +1412,9 @@ class TransportPauseFeedback:
           return False
       if not current and continuity and self._inactive_gear_source_gap(sm, cp, cs, axis, stamp, now_ns, latched=latched,
           producer=intent_producer_session):
+        return False
+      if (current and continuity and shift_hold and reason == 'availabilityPause' and
+          self._mazda_shift_pause_current(sm, cp, cs, axis, stamp, now_ns, latched=latched, producer=intent_producer_session)):
         return False
       if current and continuity and reason == 'availabilityPause' and self._inactive_source_pause_current(
           sm, cp, cs, axis, stamp, now_ns, latched=latched, producer=intent_producer_session):
