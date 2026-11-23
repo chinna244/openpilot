@@ -98,6 +98,13 @@ GAS_COAST_JERK = 0.3  # m/s^3
 AGGRESSIVE_ACCEL_BOOST = 0.1  # m/s^2
 
 
+def mazda_slc_cruise_floor(cruise_min: float, slc_owned: bool) -> float:
+  """Mazda: a lowered SLA/SLC limit brakes as develop/filter-dev's set-speed drop does (A_CRUISE_MIN), not as hard as
+  a firmer StarPilot braking profile (route 00000003--941020f467 t=126: 35->30 braked -1.10 vs filter-dev -0.52 for
+  39->35). Leads, curves, Force Stop, SCC, the model and navigation keep their own braking."""
+  return max(cruise_min, A_CRUISE_MIN) if slc_owned else cruise_min
+
+
 def get_mazda_cruise_accel(v_cruise, v_ego, a_cruise_prev, a_target_prev, dt, cruise_min=A_CRUISE_MIN, max_accel=ACCEL_MAX):
   """Mazda: develop's cruise law (upstream #39266): the set speed error smoothed over 1 s, clipped to [cruise_min,
   max_accel], jerk-limited by J_CRUISE_VALS from the lower of the last candidate and the last plan. The bounds are
@@ -514,6 +521,9 @@ class LongitudinalPlanner:
     if self.mazda:
       # develop's law, whatever experimentalMode says; then Smart Cruise Control's rebuild while it is the target
       mazda_min = max(ACCEL_MIN, -cruise_profile.cruise_brake_magnitude) if cruise_profile is not None else max(ACCEL_MIN, global_floor)
+      mazda_min = mazda_slc_cruise_floor(mazda_min, slc_owned=bool(
+        ceiling.effective_mps is not None and v_cruise == ceiling.effective_mps and not relevant_lead and
+        curve.effective_mps is None and navigation_target is None and self.force_stop_plan.speed_ceiling_mps is None))
       mazda_max = min(x for x in (ACCEL_MAX, cruise_profile.acceleration_max if cruise_profile is not None else None,
                                   selected_acceleration) if x is not None)
       def mazda_cruise(a_prev, a_target_prev, dt, unlimited=False):
