@@ -208,6 +208,40 @@ def _mazda() -> bool:
     return False
 
 
+def _timed_attach(attach, model, small, cam_w, cam_h):
+  """Startup diagnostic (route 00000003--941020f467: ~5.2 s between CarParams and the first frame, inside attach): time
+  jetlink's GPU bring-up and join, the rest being the gadget wait. Observation only: both are wrapped for this one
+  call and restored, and anything going wrong here falls back to the plain attach."""
+  import time
+  timings = {}
+  try:
+    from jetlink.openpilot import joining, warp
+  except Exception:
+    return attach(model, small, cam_w, cam_h)
+  original_init, original_join = warp.init_device, joining.join
+
+  def timed(name, function):
+    def wrapper(*args, **kwargs):
+      start = time.monotonic()
+      try:
+        return function(*args, **kwargs)
+      finally:
+        timings[name] = round(time.monotonic() - start, 3)
+    return wrapper
+
+  warp.init_device, joining.join = timed('gpu_init_s', original_init), timed('join_s', original_join)
+  start = time.monotonic()
+  try:
+    return attach(model, small, cam_w, cam_h)
+  finally:
+    warp.init_device, joining.join = original_init, original_join
+    total = round(time.monotonic() - start, 3)
+    try:
+      _cloudlog().event('jetlink_attach_timing', total_s=total, other_s=round(total - sum(timings.values()), 3), **timings)
+    except Exception:
+      pass
+
+
 def _gps_hooks(hooks_class):
   """jetlink's Hooks, plus the Jetson's USB GPS (starpilot/gps/jetson.py, port of zoompilot develop's fallback): the
   joined model asks for telemetry about once a second, and each frame's new fix goes to ubloxd. Never at the frame
@@ -221,7 +255,7 @@ def _gps_hooks(hooks_class):
       self._gps_on = None  # Mazdas only; decided once, at attach or the first frame
 
     def attach(self, model, small, cam_w, cam_h):
-      joined = super().attach(model, small, cam_w, cam_h)
+      joined = _timed_attach(super().attach, model, small, cam_w, cam_h)
       self._gps_on = _mazda()
       if self._gps_on and joined is not model and joined is not small:
         try:
