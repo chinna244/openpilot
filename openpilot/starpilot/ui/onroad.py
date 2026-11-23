@@ -518,9 +518,9 @@ class OnroadView:
         self._prepare_compact_fade()
         rl.draw_texture_ex(self._fade, rl.Vector2(0, 0), 0, 1, rl.WHITE)
         if state.alert.size == AlertSize.NONE and not driver_camera:
-          self.compact_hud.render(state)
+          gui_app.measure_frame_phase("hud", self.compact_hud.render, state)
           if placement(state.customization, "compact", "torque_bar")["enabled"]:
-            self.torque_bar.render(frame, state, 536)
+            gui_app.measure_frame_phase("torque_bar", self.torque_bar.render, frame, state, 536)
           if state.stopped_duration_s is not None:
             self._stopped_timer(state, state.stopped_duration_s)
         if self.extra_overlays is not None:
@@ -528,7 +528,7 @@ class OnroadView:
         if monitor_layer := getattr(self, "driver_monitor_layer", None):
           monitor_layer(frame, state)
       if not ordered:
-        self.navigation.render(state)
+        gui_app.measure_frame_phase("navigation", self.navigation.render, state)
         self._driving_mode(state)
         self._clock(state)
         self._weather(state)
@@ -541,7 +541,7 @@ class OnroadView:
       if not ordered and not driver_camera and state.appearance.camera_view != CameraViewChoice.NONE and \
          (pip_layer := self._legacy_pip_layer(state)) is not None:
         pip_layer(frame, state)
-      self.alert.render(frame, state.alert, signal_direction=direction)
+      gui_app.measure_frame_phase("alert", self.alert.render, frame, state.alert, signal_direction=direction)
     finally:
       clip.end_scissor_mode()
     self._preview_badge(state)
@@ -551,7 +551,7 @@ class OnroadView:
         stock_layer(rail, state)
         self.compact_sidebar.render_personality(rail, state)
       else:
-        self.compact_sidebar.render(rail, state)
+        gui_app.measure_frame_phase("sidebar", self.compact_sidebar.render, rail, state)
     clip.begin_scissor_mode(0, 0, 476, 240)
     try:
       rl.draw_rectangle_rounded_lines_ex(rl.Rectangle(4, 4, 468, 232), 0.12, 16, 8, color)

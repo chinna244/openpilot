@@ -232,7 +232,8 @@ class FrameTiming(NamedTuple):
   present_cpu_ms: float
 
 
-FRAME_PHASES = ("camera", "model", "ui_state", "transition", "controllers")
+# StarPilot compact onroad widgets (route 00000002--c9d55e7093: ~15-20 ms of draw was outside every named phase)
+FRAME_PHASES = ("camera", "model", "ui_state", "transition", "controllers", "hud", "torque_bar", "navigation", "alert", "sidebar")
 
 
 class GuiApplication:
