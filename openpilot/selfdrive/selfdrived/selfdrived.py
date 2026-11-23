@@ -141,9 +141,29 @@ class SelfdriveD:
     lost_active_aol (it also feeds its downstream fault handling) and passes the same value."""
     pandas = key_off_input(self.sm, 'pandaStates', now_ns)
     device = key_off_input(self.sm, 'deviceState', now_ns)
-    return native_missing_event(
+    event = native_missing_event(
       wire_seen=bool(self.sm.seen.get('aolSafetyWire', False)), enabled=bool(self.enabled), active=bool(self.active),
       lost_active_aol=bool(lost_active_aol), panda_states=pandas, device_started=None if device is None else bool(device.started))
+    # Diagnostic only (route 00000004--0ed7a0ac2e t=434.068: one parked key-off controlsMismatch with no proof of which
+    # key-off input was missing): log what this step saw, once per episode. The event is unchanged.
+    quiet = event == EventName.controlsMismatch and not self.enabled and not self.active and not lost_active_aol
+    if quiet and not getattr(self, 'native_missing_logged', False):
+      def seen(service):
+        try:
+          stamp = int(self.sm.logMonoTime[service])
+          return {'age_ms': round((now_ns - stamp) / 1e6, 1) if stamp else None, 'seen': bool(self.sm.seen.get(service, False)),
+                  'valid': bool(self.sm.valid.get(service, False)), 'alive': bool(self.sm.alive.get(service, False))}
+        except (AttributeError, KeyError, TypeError, ValueError):
+          return None
+      try:
+        cloudlog.event('aol_native_missing_mismatch', now_ns=int(now_ns), pandaStates=seen('pandaStates'),
+                       deviceState=seen('deviceState'), aolSafetyWire=seen('aolSafetyWire'), panda_proof=pandas is not None,
+                       ignition=None if pandas is None else [(bool(p.ignitionLine), bool(p.ignitionCan)) for p in pandas],
+                       device_started=None if device is None else bool(device.started))
+      except Exception:
+        pass
+    self.native_missing_logged = bool(quiet)
+    return event
 
   def __init__(self, CP=None):
     self.params = Params()

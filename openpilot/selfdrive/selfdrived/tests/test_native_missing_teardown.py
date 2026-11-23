@@ -136,3 +136,32 @@ def test_step_uses_the_call_site():
   call = source.index('missing_event = self.missing_native_event(')
   assert 'lost_active_aol = self.aol_axis_decision.lateral_active or self.aol_axis_decision.longitudinal_active' in \
     source[call - 400:call]
+
+
+def test_route_04_key_off_mismatch_diagnostic_logs_once_and_changes_nothing(monkeypatch):
+  """Route 00000004--0ed7a0ac2e t=434.068: log what the step saw (here: deviceState started=False not yet received)."""
+  logged = []
+  monkeypatch.setattr(selfdrived.cloudlog, 'event', lambda name, **kw: logged.append((name, kw)))
+  sm = FakeSM()
+  sm.data['deviceState'] = SimpleNamespace(started=True)
+  sd = SimpleNamespace(sm=sm, enabled=False, active=False)
+  for _ in range(3):
+    assert selfdrived.SelfdriveD.missing_native_event(sd, T_EVENT, lost_active_aol=False) == E.controlsMismatch
+  assert len(logged) == 1 and logged[0][0] == 'aol_native_missing_mismatch'
+  kw = logged[0][1]
+  assert kw['device_started'] is True and kw['panda_proof'] and kw['ignition'] == [(False, False)]
+  assert kw['deviceState']['age_ms'] == (T_EVENT - T_DEVICE) / 1e6
+  # key-off proven: nothing raised, episode ends; a later episode logs again
+  sm.data['deviceState'] = SimpleNamespace(started=False)
+  assert selfdrived.SelfdriveD.missing_native_event(sd, T_EVENT, lost_active_aol=False) is None
+  sm.data['deviceState'] = SimpleNamespace(started=True)
+  selfdrived.SelfdriveD.missing_native_event(sd, T_EVENT, lost_active_aol=False)
+  assert len(logged) == 2
+
+
+def test_key_off_diagnostic_skips_real_authority_loss(monkeypatch):
+  logged = []
+  monkeypatch.setattr(selfdrived.cloudlog, 'event', lambda name, **kw: logged.append(name))
+  sd = SimpleNamespace(sm=FakeSM(), enabled=True, active=True)
+  assert selfdrived.SelfdriveD.missing_native_event(sd, T_EVENT, lost_active_aol=True) == E.controlsMismatch
+  assert not logged
