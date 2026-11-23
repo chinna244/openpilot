@@ -1050,6 +1050,10 @@ class Car:
           getattr(self.aol_card_intent, 'reverse_pause', False)))):
       return True
     events = self.sm['onroadEvents']
+    if getattr(self.aol_card_intent, 'shift_hold', False):
+      # Mazda TJA: a low-speed shift pauses the latch (steering withheld) instead of disarming it
+      events = [event for event in events if not (event.name == log.OnroadEvent.EventName.wrongGear and
+                                                  event.softDisable and not event.immediateDisable)]
     if self.aol_transport_feedback.retention_qualified or self.aol_transport_feedback.retention_pending:
       from openpilot.starpilot.aol.transport_pause import AVAILABILITY_EVENTS
       events = [event for event in events if not

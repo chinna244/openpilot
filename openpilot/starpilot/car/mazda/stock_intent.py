@@ -6,6 +6,16 @@ from openpilot.starpilot.aol.intent import AolCardIntent, AOL_TOGGLE, ButtonType
 # develop (car_specific.py): the camera's fault holds lateral this long past its clear, so a fault flickering
 # as it clears cannot toggle steering
 CAMERA_FAULT_CLEAR_FRAMES = 100
+# A shift (P/R/N, or the one-sample-to-0.6 s 'unknown' the gear signal reads between positions) pauses the TJA
+# latch at low speed as develop/filter-dev MADS does (wrongGear below 2.5 m/s -> paused), instead of disarming it
+# (route 00000002--c9d55e7093 t=72.205 P->unknown 0.54 s->R, t=471.934 D->unknown->N->unknown->R). Steering stays
+# withheld until Drive and the normal health/authority checks; an unknown that lasts or keeps returning is not a shift.
+SHIFT_HOLD_MAX_SPEED = 2.5  # m/s
+UNKNOWN_GEAR_MAX_FRAMES = 100  # 1 s at card's 100 Hz
+UNKNOWN_EPISODE_WINDOW_FRAMES = 1000  # 10 s
+UNKNOWN_EPISODES_MAX = 4
+GearShifter = structs.CarState.GearShifter
+SHIFT_GEARS = (GearShifter.park, GearShifter.reverse, GearShifter.neutral)
 
 
 class MazdaStockCardIntent(AolCardIntent):
@@ -18,6 +28,10 @@ class MazdaStockCardIntent(AolCardIntent):
     self.observe_stock_engagement = not self.tja_button
     self.camera_fault_clear_frames = CAMERA_FAULT_CLEAR_FRAMES
     self.lkas_off = False
+    self.shift_hold = False
+    self.shift_frame = 0
+    self.unknown_frames = 0
+    self.unknown_episodes: list[int] = []
     self.pending_rejection_ns = 0
     self.independent_cruise_buttons = self.tja_button
     self.main_seen = False
@@ -98,9 +112,10 @@ class MazdaStockCardIntent(AolCardIntent):
       # The panda can withhold lateral for the camera's fault one sample before card parses it: hold a native
       # rejection one sample, and drop it when the fault's pause shows up instead.
       rejection = kwargs.get('native_rejection_ns', 0)
-      if not rejection or self.lateral_held:
+      held = self.lateral_held or self.shift_hold
+      if not rejection or held:
         self.pending_rejection_ns = 0
-        kwargs['native_rejection_ns'] = 0 if self.lateral_held else rejection
+        kwargs['native_rejection_ns'] = 0 if held else rejection
       elif not self.pending_rejection_ns:
         self.pending_rejection_ns = rejection
         kwargs['native_rejection_ns'] = 0
@@ -191,7 +206,7 @@ class MazdaStockCardIntent(AolCardIntent):
       # As develop's MADS with the declared TJA button: only TJA turns steering on or off; SET/RES, cancel and
       # main never do. Ordinary cruise engagement gets no lateral of its own while the latch is off. The camera's
       # fault and the car's lane keep switched off pause it, keeping the latch and cruise, and resume on their own.
-      self.pause_lateral = not self.allowed_latch or self.lateral_held
+      self.pause_lateral = not self.allowed_latch or self.lateral_held or self.shift_hold
 
   @property
   def lateral_held(self):
@@ -206,13 +221,28 @@ class MazdaStockCardIntent(AolCardIntent):
     self.camera_fault_clear_frames = 0 if CS.steerFaultPermanent else min(self.camera_fault_clear_frames + 1,
                                                                           CAMERA_FAULT_CLEAR_FRAMES)
     self.lkas_off = bool(CS.invalidLkasSetting)
-    if self.lateral_held:
+    self._observe_shift(CS)
+    if self.lateral_held or self.shift_hold:
       self.pause_lateral = True  # this frame, before the AOL owners read it
     if not CS.steerFaultPermanent:
       return CS
     view = structs.CarState(**CS.to_dict())
     view.steerFaultPermanent = False
     return view.as_reader()
+
+  def _observe_shift(self, CS) -> None:
+    self.shift_frame += 1
+    unknown = CS.gearShifter == GearShifter.unknown
+    if unknown:
+      if self.unknown_frames == 0:
+        self.unknown_episodes.append(self.shift_frame)
+      self.unknown_frames += 1
+    else:
+      self.unknown_frames = 0
+    self.unknown_episodes = [f for f in self.unknown_episodes if self.shift_frame - f < UNKNOWN_EPISODE_WINDOW_FRAMES]
+    benign_unknown = unknown and self.unknown_frames <= UNKNOWN_GEAR_MAX_FRAMES and len(self.unknown_episodes) <= UNKNOWN_EPISODES_MAX
+    self.shift_hold = bool(CS.canValid and not CS.canTimeout and not CS.steerFaultPermanent and
+                           abs(CS.vEgo) < SHIFT_HOLD_MAX_SPEED and (CS.gearShifter in SHIFT_GEARS or benign_unknown))
 
   def _arm_from_full_engagement(self, CS, *, source_ns):
     if not self.tja_button:
