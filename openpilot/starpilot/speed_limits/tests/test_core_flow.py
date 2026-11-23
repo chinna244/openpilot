@@ -239,7 +239,9 @@ def test_source_gap_uses_the_previous_limit_and_current_offset(drive, missing, s
   assert sm['carState'].vCruise == 100.
 
 
-def test_previous_limit_resumes_after_disengagement_and_session_reset(drive):
+def test_previous_limit_resumes_after_disengagement_but_not_a_new_session(drive):
+  """Automatic adoption re-adopts the held limit on re-engagement; a new session (drive) never reuses the last one's
+  acceptance (as filter-dev, route 00000005--a37f13ed24 t=34.5)."""
   sm, cp = drive
   runtime = controller()
   tick(runtime, sm, cp, 0)
@@ -251,7 +253,7 @@ def test_previous_limit_resumes_after_disengagement_and_session_reset(drive):
   sm['controlsState'].longControlState = 'pid'
   assert tick(runtime, sm, cp, 2).result.ceiling.speed_mps == 25.
   runtime.reset()
-  assert tick(runtime, sm, cp, 3).result.ceiling.speed_mps == 25.
+  assert tick(runtime, sm, cp, 3).result.ceiling is None
 
 
 def test_force_deceleration_suppresses_a_cap_without_forgetting_source_gap_continuity(drive):

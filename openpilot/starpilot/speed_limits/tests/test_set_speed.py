@@ -345,7 +345,9 @@ def test_source_loss_preserves_latest_received_limit_and_offset_without_actions(
   runtime.reset()
   reset = tick(runtime, sm, cp, 2.3)
   shown = resolve_unified_speed(replace(screen, speed_limit=speed_limit_from_message(reset.message.slcState)))
-  assert (shown.posted_text, shown.offset_text, shown.status) == ('90', '+2', 'Unavailable')
+  # a new session decides afresh (as filter-dev): with no source yet it shows what a drive's start shows
+  assert not reset.message.slcState.hasAccepted
+  assert shown.posted_text == '–' and not shown.pending
 
 
 @pytest.mark.parametrize('limit', [12., 25.])

@@ -350,7 +350,8 @@ def test_short_zone_can_qualify_exit_immediately_without_hidden_dwell():
   assert exit_offer.result.ceiling.speed_mps == 22.
   assert drive.runtime.history_limit.candidate.speed_mps == 15.
   drive.runtime.reset()
-  assert drive.tick(alive=False).message.slcState.acceptedSpeedLimit == 15.
+  assert drive.runtime.history_limit.candidate.speed_mps == 15.
+  assert drive.tick(alive=False).message.slcState.acceptedSpeedLimit == 0.  # a new session decides afresh
 
 
 def test_time_edits_keep_decision_and_off_withdraws_without_set_rollback():
@@ -868,14 +869,18 @@ def test_early_limit_replaces_history_only_after_current_road_confirms_it():
   assert gap.acceptedSpeedLimit == 25. and gap.acceptedIsPreview
   assert drive.runtime.history_limit.candidate.speed_mps == 20.
   drive.runtime.reset()
-  assert drive.tick(alive=False).message.slcState.acceptedSpeedLimit == 20.
-
+  # a new session decides the limit afresh (as filter-dev): the history is kept, but not as this engagement's acceptance
+  assert drive.runtime.history_limit.candidate.speed_mps == 20.
+  assert drive.tick(alive=False).message.slcState.acceptedSpeedLimit == 0.
+  # fresh, the current road's limit is decided first; the early limit applies on the next frame
+  assert drive.tick(target=25.).message.slcState.acceptedSpeedLimit in (20., 25.)
   assert drive.tick(target=25.).message.slcState.acceptedSpeedLimit == 25.
   arrived = drive.tick(current=25., way=2, target=0.).message.slcState
   assert arrived.acceptedSpeedLimit == 25. and not arrived.acceptedIsPreview
   assert drive.runtime.history_limit.candidate.speed_mps == 25.
   drive.runtime.reset()
-  assert drive.tick(alive=False).message.slcState.acceptedSpeedLimit == 25.
+  assert drive.runtime.history_limit.candidate.speed_mps == 25.
+  assert drive.tick(alive=False).message.slcState.acceptedSpeedLimit == 0.
 
 
 @pytest.mark.parametrize('choice', [None, 'accept', 'reject'])

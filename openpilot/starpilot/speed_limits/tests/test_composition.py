@@ -132,6 +132,7 @@ class CompositionTests(unittest.TestCase):
 
   def test_rejected_lower_limit_survives_source_loss_and_reconnect(self):
     confirmation = replace(POLICY, confirm_lower=True)
+    self.state = replace(self.state, engaged_once=True)  # mid-engagement: the carried acceptance is this engagement's
     initial = self.run_frame(frame(0, speed=25.0, policy=confirmation))
     self.assertEqual(initial.ceiling.speed_mps, 27.0)
     initial_accepted = acc.AcceptedLimit(observations(25.)[sel.Source.DASHBOARD].candidate, SESSION, 0)
@@ -260,3 +261,52 @@ class CompositionTests(unittest.TestCase):
 
 if __name__ == "__main__":
   unittest.main()
+
+
+CONFIRM = acc.Policy(confirm_lower=True, confirm_higher=True)
+OFF_AUTHORITY = acc.Authority(acc.Mode.LONGITUDINAL_ONLY, acc.LongitudinalOwner.SYSTEM, False, False, False, False)
+OFF_HOST = comp.HostState(True, False, False, False, 100.0, 100.0)
+
+
+class EngagementTests(unittest.TestCase):
+  """As filter-dev's Speed Limit Assist: every engagement decides the limit afresh (route 00000005--a37f13ed24 t=34.5:
+  the last drive's 36 counted as accepted at engagement, no prompt, SET stayed 19)."""
+
+  def setUp(self):
+    carried = acc.AcceptedLimit(observations(25.)[sel.Source.DASHBOARD].candidate, SESSION, 0)
+    self.state = comp.new_session(SESSION, carried)
+
+  def step(self, now, **kw):
+    result = comp.step(self.state, frame(now, **kw))
+    self.state = result.state
+    return result
+
+  def test_carried_acceptance_does_not_stand_in_for_this_engagement(self):
+    first = self.step(0, speed=25., policy=CONFIRM)
+    self.assertFalse(first.errors)
+    self.assertIsNotNone(first.acceptance.state.pending)  # the driver is asked
+    self.assertIsNone(first.ceiling)
+
+  def test_set_already_at_the_target_accepts_silently(self):
+    kph = sd.slc_target_kph(27., False)  # limit 25 m/s + the 2 m/s offset, as card writes SET
+    current = replace(frame(0, speed=25., policy=CONFIRM, host=comp.HostState(True, True, True, False, kph, kph)), is_metric=False)
+    result = comp.step(self.state, current)
+    self.assertFalse(result.errors)
+    self.assertIsNone(result.acceptance.state.pending)
+    self.assertIsNotNone(result.ceiling)
+    self.assertEqual(result.acceptance.basis, 'accepted')
+
+  def test_brief_glitch_is_not_a_new_engagement(self):
+    self.step(0, speed=25.)  # engaged, automatic: accepted
+    pend = replace(POLICY, confirm_higher=True)
+    self.step(100_000_000, speed=25., authority=OFF_AUTHORITY, host=OFF_HOST)
+    back = self.step(400_000_000, speed=25., policy=pend)
+    self.assertIsNone(back.acceptance.state.pending)
+    self.assertIsNotNone(back.ceiling)
+
+  def test_reengagement_after_the_guard_decides_again(self):
+    self.step(0, speed=25.)
+    self.step(100_000_000, speed=25., authority=OFF_AUTHORITY, host=OFF_HOST)
+    back = self.step(700_000_000, speed=25., policy=CONFIRM)
+    self.assertIsNotNone(back.acceptance.state.pending)
+    self.assertIsNone(back.ceiling)

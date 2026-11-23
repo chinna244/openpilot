@@ -14,7 +14,9 @@ from openpilot.starpilot.ui.unified_speed_presentation import resolve_unified_sp
 
 
 @pytest.mark.parametrize('source', ['dashboard', 'map', 'vision'])
-def test_saved_previous_limit_caps_native_planner_after_restart_without_a_current_source(tmp_path, source):
+def test_saved_previous_limit_does_not_cap_after_restart_until_decided_again(tmp_path, source):
+  """As filter-dev: a limit accepted in an earlier drive never stands in for this engagement's decision (route
+  00000005--a37f13ed24 t=34.5: the last drive's 36 counted as accepted, no prompt, SET stayed 19)."""
   drive = RetentionDrive(tmp_path)
   accepted, _, _ = drive.step(0)
   previous = accepted.result.state.acceptance.accepted
@@ -27,18 +29,11 @@ def test_saved_previous_limit_caps_native_planner_after_restart_without_a_curren
   drive.sm['slcDashboardObservation'].status = 'unknown'
   output, view, target = drive.step(1000, received=False)
   assert not output.result.errors
-  assert target == pytest.approx(45, abs=1e-4)
-  assert output.message.slcState.observationKind != 'valid'
-  assert output.message.slcState.presentationId == 0
-  assert output.message.slcState.acceptedMonoTime == 0
-  assert output.message.slcState.hasCeiling and not output.message.slcState.hasPending
-  shown = resolve_unified_speed(view)
-  assert (shown.posted_text, shown.status) == ('45', 'Using speed limit')
-  assert shown.source == source
+  assert not output.message.slcState.hasCeiling and not output.message.slcState.hasPending
+  assert not output.message.slcState.hasAccepted
 
   proposed, _, target = drive.step(1050, limit=50)
   assert proposed.message.slcState.hasPending
-  assert target == pytest.approx(45, abs=1e-4)
   state = proposed.message.slcState
   action = Action(drive.runtime.session_id, 1, state.decisionId, state.presentationId, 'accept')
   adopted, _, target = drive.step(1100, limit=50, request=action)

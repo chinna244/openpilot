@@ -58,6 +58,13 @@ class State:
   pedal_blocked_until_release: bool = False
   wheel_override_metric: bool | None = None
   wheel_override_since_ns: int = 0
+  engaged_once: bool = False  # this session has been on the engaged path
+  disengaged_since_ns: int | None = None  # the first frame off it since the last engaged frame
+
+
+# filter-dev's Speed Limit Assist (DISABLED_GUARD_PERIOD): an engagement after at least this long disengaged decides the
+# limit afresh, so a brief host glitch does not ask again.
+ENGAGEMENT_GUARD_NS = 500_000_000
 
 
 @dataclass(frozen=True)
@@ -79,7 +86,9 @@ def _state_valid(state: object) -> bool:
           acc.number(state.pedal_target_mps) and (state.last_now_ns is None or acc.integer(state.last_now_ns)) and
           type(state.reset_required) is bool and type(state.pedal_blocked_until_release) is bool and
           (state.wheel_override_metric is None or type(state.wheel_override_metric) is bool) and
-          acc.integer(state.wheel_override_since_ns))
+          acc.integer(state.wheel_override_since_ns) and
+          type(state.engaged_once) is bool and
+          (state.disengaged_since_ns is None or acc.integer(state.disengaged_since_ns)))
 
 
 def _host_valid(host: object) -> bool:
@@ -132,7 +141,18 @@ def step(state: State, frame: Frame) -> Result:
   engaged_path = (frame.authority.can_control and (host_long or frame.authority.accelerator_override) and
                   selected_initialized and not frame.acceptance_policy.display_only)
   active_path = engaged_path and not host.force_decel
-  base = replace(state, last_now_ns=frame.now_ns, pedal_target_mps=0., wheel_override_metric=None, wheel_override_since_ns=0)
+  fresh_engagement = engaged_path and (not state.engaged_once or state.disengaged_since_ns is not None and
+                                      frame.now_ns - state.disengaged_since_ns >= ENGAGEMENT_GUARD_NS)
+  base = replace(state, last_now_ns=frame.now_ns, pedal_target_mps=0., wheel_override_metric=None, wheel_override_since_ns=0,
+                 engaged_once=state.engaged_once or engaged_path,
+                 disengaged_since_ns=None if engaged_path else (state.disengaged_since_ns if state.disengaged_since_ns is not None
+                                                                else frame.now_ns))
+  if fresh_engagement:
+    # As filter-dev's Speed Limit Assist: every engagement decides the limit afresh. A SET already at the target accepts it
+    # silently, otherwise the driver is asked; an acceptance from before (another engagement, or the last drive) never
+    # stands in for it (route 00000005--a37f13ed24 t=34.5: the last drive's 36 counted as accepted, no prompt, SET 19).
+    base = replace(base, acceptance=replace(base.acceptance, accepted=None, rejected=None, pending=None,
+                                            timer_running=False, received_speed_mps=None))
 
   if frame.classified_cruise is not None:
     classified = frame.classified_cruise
