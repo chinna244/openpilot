@@ -321,6 +321,15 @@ class MadsCarController:
     closed, and a white wheel HUD state that became unsafe is withdrawn immediately, outside
     the cadence.
     """
+    white_allowed = self.white_hud_allowed(CC, CC_SP, CS, handback_active)
+    if white_allowed:
+      self.mads_white_hud_off_frames = min(self.mads_white_hud_off_frames + 1, MADS_WHITE_HUD_OFF_CONFIRM_FRAMES)
+    else:
+      self.mads_white_hud_off_frames = 0
+    return white_allowed and self.mads_white_hud_off_frames >= MADS_WHITE_HUD_OFF_CONFIRM_FRAMES
+
+  def white_hud_allowed(self, CC, CC_SP, CS, handback_active: bool) -> bool:
+    """This frame's white-wheel gate, before the camera frame's 0.5 s confirmation."""
     session_ambiguous = handback_active or CC_SP.stockEcuHandBack
     mrcc_off = (not session_ambiguous and not CS.mrcc_armed_raw and
                 not CS.cruise_available and not CS.cruise_enabled)
@@ -340,7 +349,7 @@ class MadsCarController:
                        CC_SP.intelligentCruiseButtonManagement.sendButton in BUTTONS or
                        CC.cruiseControl.cancel or CC.cruiseControl.resume)
 
-    white_allowed = (
+    return (
       bool(self.CP_SP.flags & MazdaFlagsSP.TJA_BUTTON) and
       CS.cam_laneinfo_live and
       white_hud_allowlist_base(CS.cam_laneinfo_raw) is not None and
@@ -348,11 +357,6 @@ class MadsCarController:
       not button_activity and
       ((CC_SP.mads.active and mrcc_off) or cruising)
     )
-    if white_allowed:
-      self.mads_white_hud_off_frames = min(self.mads_white_hud_off_frames + 1, MADS_WHITE_HUD_OFF_CONFIRM_FRAMES)
-    else:
-      self.mads_white_hud_off_frames = 0
-    return white_allowed and self.mads_white_hud_off_frames >= MADS_WHITE_HUD_OFF_CONFIRM_FRAMES
 
   def white_hud_frame(self, CS, alert, white: bool):
     """The alert frame as sent: the camera's own allowlisted idle base with TJA=2 when white."""

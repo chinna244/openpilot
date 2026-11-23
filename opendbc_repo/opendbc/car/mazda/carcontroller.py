@@ -482,8 +482,12 @@ class CarController(CarControllerBase, IntelligentCruiseButtonManagementInterfac
         # The cruise frame is ours under alpha long, so it also carries the white wheel while openpilot steers
         # (MADS) with cruise on, engaged or not, when the camera frame's white state stays off (it fails closed on
         # any cruise). The camera frame itself is untouched, and the car's own cruise never sees this frame.
+        # With MAIN off it also covers the camera frame's 0.5 s confirmation and 2 Hz cadence: a TJA press arms the
+        # car's MRCC standby until our undo press drops it (~0.45 s), and the white wheel would go dark until TJA=2
+        # (route 00000001, 70.73-71.39 s). Same gate as the camera frame, so a held button or alert still blocks it.
         cruise_on = long_engaged or CS.out.cruiseState.available
-        lkas_white = bus == 0 and (self.mads_white_hud_on_bus or (cruise_on and CC_SP.mads.active))
+        white_pending = CC_SP.mads.active and self.white_hud_allowed(CC, CC_SP, CS, self.radar_session.handback_active)
+        lkas_white = bus == 0 and (self.mads_white_hud_on_bus or (cruise_on and CC_SP.mads.active) or white_pending)
         can_sends.append(mazdacan.create_crz_ctrl(self.packer, bus, long_engaged, acc_available, gap, acc_active_2,
                                                   lead_distance=lead_distance, hbc_request=CS.hbc_request,
                                                   lkas_white=lkas_white))
