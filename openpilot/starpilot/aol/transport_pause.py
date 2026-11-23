@@ -301,6 +301,16 @@ class TransportPauseFeedback:
       not cs.vehicleSensorsInvalid and cs.gearShifter == structs.CarState.GearShifter.drive)
     # Require fresh LAT and all health/fault checks.
     ford_long = bool(ford_qualified(cp, marked_only=True) and cp.openpilotLongitudinalControl)
+    # Mazda: a brake/cancel withdraws long at the panda (pandaStates.controlsAllowed False) in the same pandad cycle
+    # as the wire that withdraws it, 0.3 ms apart; card can read the new pandaStates against the previous wire, which
+    # still requests long (route 00000003--941020f467 t=194.234 and 294.046, aol_transport_failed
+    # not_current_or_continuity with transport_healthy False). Same bounded window as Ford's.
+    from opendbc.car.mazda.stock_aol import qualified as mazda_stock_qualified
+    mazda_withdrawal = bool(cp.brand == 'mazda' and mazda_stock_qualified(cp, marked_only=True) and
+      cp.openpilotLongitudinalControl and
+      (cs.brakePressed or not cs.cruiseState.enabled or not axis.desiredLongitudinal and not axis.longitudinalActive) and
+      cs.cruiseState.available and not cs.doorOpen and not cs.seatbeltUnlatched and not cs.vehicleSensorsInvalid and
+      cs.gearShifter == structs.CarState.GearShifter.drive)
     from opendbc.car.volkswagen.long_aol import qualified as volkswagen_long_qualified
     cancel_event_ns = int(sm.logMonoTime['onroadEvents'])
     volkswagen_cancel = bool(0 < cancel_event_ns <= now_ns and now_ns - cancel_event_ns <= AXIS_MAX_AGE_NS and
@@ -315,7 +325,8 @@ class TransportPauseFeedback:
       (volkswagen_brake or physical_cancel(cs, cp) or volkswagen_cancel or
        0 < self.longitudinal_cancel_ns <= now_ns <= self.longitudinal_cancel_ns + SAFETY_MAX_AGE_NS or
        not axis.desiredLongitudinal and not axis.longitudinalActive))
-    early_long = gm or cp.brand == 'hyundai' and early_native_long_withdrawal_supported(cp) or ev9 or ford_withdrawal or ford_long or volkswagen_withdrawal
+    early_long = (gm or cp.brand == 'hyundai' and early_native_long_withdrawal_supported(cp) or ev9 or ford_withdrawal or ford_long or
+                  volkswagen_withdrawal or mazda_withdrawal)
     from openpilot.starpilot.car.gm.aol import f1_conventional_lateral_owner, gm_physical_pedal_withdrawal
     gm_pedal = gm_physical_pedal_withdrawal(cp, cs) and not f1_conventional_lateral_owner(cp)
     classic_brake = classic_brake_withdrawal(cp, cs)
@@ -341,7 +352,7 @@ class TransportPauseFeedback:
       not 0 < self.lateral_source_ns <= axis.sourceCarStateMonoTime <= axis.observedMonoTime <= now_ns or
       now_ns - axis.sourceCarStateMonoTime > AXIS_MAX_AGE_NS or
       not cs.canValid or cs.canTimeout or cs.steerFaultTemporary or cs.steerFaultPermanent or cs.accFaulted or
-      cs.steeringDisengage or physical_cancel(cs, cp) and not (ford_withdrawal or volkswagen_withdrawal) or
+      cs.steeringDisengage or physical_cancel(cs, cp) and not (ford_withdrawal or volkswagen_withdrawal or mazda_withdrawal) or
       not sm.seen['onroadEvents'] or not sm.valid['onroadEvents'] or not sm.alive['onroadEvents'] or
       not 0 < int(sm.logMonoTime['onroadEvents']) <= now_ns or
       now_ns - int(sm.logMonoTime['onroadEvents']) > 1_500_000_000 or
@@ -350,20 +361,20 @@ class TransportPauseFeedback:
             (gm_pedal or classic_brake or volkswagen_brake and volkswagen_withdrawal or released_volkswagen_brake) and
             event.name == log.OnroadEvent.EventName.pedalPressed or
             volkswagen_withdrawal and event.name in (log.OnroadEvent.EventName.buttonCancel, log.OnroadEvent.EventName.pcmDisable) or
-            ford_withdrawal and event.name in (log.OnroadEvent.EventName.pedalPressed, log.OnroadEvent.EventName.pcmDisable,
-              log.OnroadEvent.EventName.buttonCancel)) for event in sm['onroadEvents'])):
+            (ford_withdrawal or mazda_withdrawal) and event.name in (log.OnroadEvent.EventName.pedalPressed,
+              log.OnroadEvent.EventName.pcmDisable, log.OnroadEvent.EventName.buttonCancel)) for event in sm['onroadEvents'])):
       return None
     native = independent_lateral_health(sm, cp, cs, self.session, now_ns)
     # Brake health may precede axis status.
     # Cancel needs acknowledged LAT, original deadlines and a fresh withdrawal event.
-    ford_cancel_health = bool(ford_withdrawal and not cs.cruiseState.enabled and
+    ford_cancel_health = bool((ford_withdrawal or mazda_withdrawal) and not cs.cruiseState.enabled and
       not axis.desiredLongitudinal and not axis.longitudinalActive and
       0 < event_ns <= now_ns and now_ns - event_ns <= AXIS_MAX_AGE_NS and
       any(event.userDisable and event.name in (log.OnroadEvent.EventName.buttonCancel,
         log.OnroadEvent.EventName.pcmDisable) for event in sm['onroadEvents']) and
       0 < int(sm.logMonoTime['pandaStates']) <= now_ns and
       now_ns - int(sm.logMonoTime['pandaStates']) <= SAFETY_MAX_AGE_NS)
-    brake_health = bool(((ford_withdrawal or classic_brake) and cs.brakePressed or volkswagen_withdrawal or
+    brake_health = bool(((ford_withdrawal or classic_brake or mazda_withdrawal) and cs.brakePressed or volkswagen_withdrawal or
       ford_cancel_health) and (not cs.gasPressed or volkswagen_withdrawal) and
       native is not None and native.sourcePandaStatesMonoTime > 0 and
       native.sourcePandaStatesMonoTime < int(sm.logMonoTime['pandaStates']) and
