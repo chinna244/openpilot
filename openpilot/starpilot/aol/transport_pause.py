@@ -96,6 +96,8 @@ def stock_lateral_user_event(cp):
   return log.OnroadEvent.EventName.pcmDisable
 
 
+# Mazda withdrawal bridge: the withdrawn pandaStates is the pandad cycle right after the bridged wire (10 Hz, with jitter)
+MAZDA_RACE_PANDA_GAP_NS = 150_000_000
 FAILURE_LOG_PERIOD_NS = 10_000_000_000
 # Diagnostic-only fields live outside the instance dict: tests and retention paths compare vars(feedback).
 _DIAG = weakref.WeakKeyDictionary()
@@ -385,6 +387,12 @@ class TransportPauseFeedback:
       mazda_withdrawal and ford_cancel_health) and
       native is not None and native.sourcePandaStatesMonoTime > 0 and
       native.sourcePandaStatesMonoTime < int(sm.logMonoTime['pandaStates']) and
+      # Mazda: the bridge covers only the pandad race (new pandaStates read against the wire of the cycle before it):
+      # the withdrawn pandaStates is the next pandad cycle and card is within its first frames. A stalled wire or a
+      # late card no longer rides the previous wire's lateral grant for its 200 ms lease.
+      (not mazda_withdrawal or
+       int(sm.logMonoTime['pandaStates']) - native.sourcePandaStatesMonoTime <= MAZDA_RACE_PANDA_GAP_NS and
+       now_ns - int(sm.logMonoTime['pandaStates']) <= AXIS_MAX_AGE_NS) and
       all(not slot.controlsAllowed for slot, config in zip(sm['pandaStates'], cp.safetyConfigs, strict=True)
           if str(config.safetyModel) not in ('silent', 'noOutput')))
     vw_brake_lateral_only = bool((volkswagen_brake and volkswagen_withdrawal or released_volkswagen_brake) and

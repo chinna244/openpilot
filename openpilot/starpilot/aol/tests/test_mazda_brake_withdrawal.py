@@ -232,10 +232,44 @@ def test_gas_held_cancel_bridge_ends_without_fresh_panda_data():
   cp, cs, feedback, first, native, now = gas_fixture()
   assert not invoke(cp, cs, feedback, first, now)
 
-  # Axis ticks continue, but both the Panda message and its wire remain the same.
-  deadline = native.validUntilMonoTime
-  values = dict(combined=False, events=EVENTS, panda_stamp=first.logMonoTime['pandaStates'],
-                event_stamp=first.logMonoTime['onroadEvents'])
-  assert not invoke(cp, cs, feedback, sample(cp, deadline - 2 * MS, 3, native, **values), deadline - MS)
-  assert invoke(cp, cs, feedback, sample(cp, deadline, 4, native, **values), deadline + MS)
+  # Axis ticks continue, but both the Panda message and its wire remain the same: the bridge covers only the pandad
+  # race, so it ends 30 ms after the withdrawn pandaStates, not at the old wire's 200 ms lease.
+  panda = first.logMonoTime['pandaStates']
+  values = dict(combined=False, events=EVENTS, panda_stamp=panda, event_stamp=first.logMonoTime['onroadEvents'])
+  assert not invoke(cp, cs, feedback, sample(cp, panda + 28 * MS, 3, native, **values), panda + 29 * MS)
+  assert invoke(cp, cs, feedback, sample(cp, panda + 30 * MS, 4, native, **values), panda + 31 * MS)
   assert feedback.failed
+
+
+def race_frame(case, stamp, panda_stamp):
+  """Axis and events fresh at stamp; the withdrawn pandaStates at panda_stamp; the bridged wire is the fixture's (NOW)."""
+  cp, cs, f, _, native, _ = fixture(194 if case != 'brake294' else 294)
+  if case == 'gas169':
+    cs.brakePressed, cs.gasPressed = False, True
+    sm = sample(cp, stamp, 2, native, combined=False, events=EVENTS, event_stamp=stamp - 61 * MS, panda_stamp=panda_stamp)
+  elif case == 'brake194':
+    sm = sample(cp, stamp, 2, native, combined=False, events=(('pedalPressed', True), ('pcmDisable', True)), panda_stamp=panda_stamp)
+  else:
+    sm = sample(cp, stamp, 2, native, combined=True, panda_stamp=panda_stamp)
+  return cp, cs, f, sm
+
+
+@pytest.mark.parametrize('case', ['brake194', 'brake294', 'gas169'])
+@pytest.mark.parametrize('fault', ['wire_stalled', 'card_late'])
+def test_bridge_only_covers_the_pandad_race(case, fault):
+  """A stalled wire (pandaStates 180 ms past it, wire lease still valid) or a card reading the withdrawn pandaStates
+  41 ms late must not ride the previous wire's lateral grant."""
+  if fault == 'wire_stalled':
+    stamp = panda = NOW + 180 * MS
+  else:
+    panda, stamp = NOW + 100 * MS, NOW + 140 * MS
+  cp, cs, f, sm = race_frame(case, stamp, panda)
+  assert invoke(cp, cs, f, sm, stamp + MS), (case, fault)
+
+
+@pytest.mark.parametrize('case', ['brake194', 'gas169'])
+def test_bridge_window_edges_still_hold(case):
+  """pandaStates 150 ms after the bridged wire (pandad jitter) and card 29 ms after it: still the race."""
+  edge = NOW + 150 * MS
+  cp, cs, f, sm = race_frame(case, edge, edge)
+  assert not invoke(cp, cs, f, sm, edge + 29 * MS)
