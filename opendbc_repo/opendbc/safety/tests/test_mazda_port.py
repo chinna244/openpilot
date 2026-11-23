@@ -177,3 +177,24 @@ def test_aol_camera_press_off_needs_the_lateral_grant(safety, word):
     h.feed()
   assert h.lat() == 1
   assert h.safety.safety_tx_hook(h.msg('CRZ_BTNS', dict(idle, CTR=6), 2))
+
+
+@pytest.mark.parametrize('main', [False, True])
+def test_aol_white_wheel_crz_ctrl_is_accepted_on_word_27(safety, main):
+  """The car's config (word 27, AOL lateral granted by TJA, no long permission): the cruise frame the controller
+  sends while MADS steers, white wheel (byte 4 0x20) or not, passes with MAIN off or on; CRZ_ACTIVE is still refused."""
+  import unittest
+  from opendbc.car.mazda import mazdacan
+  from opendbc.safety.tests.test_mazda_measured_profiles import MazdaAolHarness
+  h = MazdaAolHarness(unittest.TestCase(), 27)
+  h.arm()
+  for _ in range(30):
+    h.tick()
+    h.feed(main=main)
+  assert h.lat() == 1 and h.safety.aol_get_permission_mask() == 1
+  for white in (True, False):
+    _, dat, _ = mazdacan.create_crz_ctrl(h.packer, 0, False, main, 2 if main else 0, False, lkas_white=white)
+    assert bool(dat[4] & 0x20) == white
+    assert h.safety.safety_tx_hook(libsafety_py.make_CANPacket(0x21c, 0, dat)), (white, dat.hex())
+  _, active, _ = mazdacan.create_crz_ctrl(h.packer, 0, True, True, 2, False, lkas_white=True)
+  assert not h.safety.safety_tx_hook(libsafety_py.make_CANPacket(0x21c, 0, active))
