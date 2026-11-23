@@ -27,6 +27,8 @@ ButtonType = structs.CarState.ButtonEvent.Type
 LONG_BUSES = (0, 2)
 # The alert frame's cadence.
 HUD_ALERT_FRAMES = 50
+# below this the white wheel treats steering as stopped: lateral releases near 0.3 m/s before the standstill flag
+WHITE_HUD_STOP_SPEED = 1.0  # m/s
 CANCEL_SETTLE_FRAMES = int(CarControllerParams.CANCEL_SETTLE_T / DT_CTRL)
 # The dash hands-on-wheel frame waits this long after lateral or cruise comes on: the driver is
 # on the button, and the EPS-standby banner (1.8 s) can outlive the block that raised it.
@@ -161,7 +163,11 @@ class CarController(CarControllerBase, IntelligentCruiseButtonManagementInterfac
     latched = getattr(self, 'aol_lateral_latched', None)
     self.control_context.mads.available = mads and not self.CP.passive and not CS.out.steerFaultPermanent
     self.control_context.mads.enabled = mads and (CC.latActive if latched is None else latched)
-    self.control_context.mads.active = mads and (CC.latActive if latched is None else latched and (CC.latActive or CS.out.standstill))
+    # Lateral drops below ~0.7 mph before the car's standstill flag sets (and the flag clears before lateral returns
+    # pulling away), so the white wheel went dark for 0.1-0.25 s at every stop (route 00000005--a37f13ed24 t=220.8,
+    # 240.3, 281.8). Crawling counts as the stop; a pause while moving still drops it (latched excludes pauses).
+    stopping = CS.out.standstill or CS.out.vEgo < WHITE_HUD_STOP_SPEED
+    self.control_context.mads.active = mads and (CC.latActive if latched is None else latched and (CC.latActive or stopping))
     return self.update_with_context(CC, self.control_context, CS, now_nanos)
 
   def update_with_context(self, CC, CC_SP, CS, now_nanos):

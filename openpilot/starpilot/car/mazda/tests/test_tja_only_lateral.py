@@ -93,7 +93,7 @@ class _Controller:
   (True, False, False, True, False),  # latched but paused moving
   (False, True, False, False, False),
 ))
-def test_white_wheel_follows_the_latch(latched, lat_active, standstill, enabled, active):
+def test_white_wheel_follows_the_latch(latched, lat_active, standstill, enabled, active, v_ego=None):
   from opendbc.car.mazda.carcontroller import CarController
   cp = tja_cp()
   cc = CarController.__new__(CarController)
@@ -103,6 +103,14 @@ def test_white_wheel_follows_the_latch(latched, lat_active, standstill, enabled,
     cc.aol_lateral_latched = latched
   seen = {}
   cc.update_with_context = lambda CC, ctx, CS, now: seen.update(enabled=ctx.mads.enabled, active=ctx.mads.active)
-  CS = SimpleNamespace(out=SimpleNamespace(steerFaultPermanent=False, standstill=standstill))
+  v = (0. if standstill else 10.) if v_ego is None else v_ego
+  CS = SimpleNamespace(out=SimpleNamespace(steerFaultPermanent=False, standstill=standstill, vEgo=v))
   CarController.update(cc, SimpleNamespace(latActive=lat_active), CS, 0)
   assert seen == {'enabled': enabled, 'active': active}
+
+
+@pytest.mark.parametrize('v_ego,active', ((0.6, True), (0.95, True), (1.5, False)))
+def test_white_wheel_stays_on_while_crawling_into_or_out_of_a_stop(v_ego, active):
+  """Route 00000005--a37f13ed24 t=220.82/221.87/240.26: lateral off below ~0.7 mph before the standstill flag sets
+  (and after it clears pulling away): the latched wheel stays white; a pause while really moving still drops it."""
+  test_white_wheel_follows_the_latch(True, False, False, True, active, v_ego=v_ego)
