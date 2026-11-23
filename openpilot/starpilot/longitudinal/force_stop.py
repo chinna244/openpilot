@@ -13,6 +13,12 @@ STOP_COMMIT_TIME_S = .5
 SIGN_CONFIRM_STEP_S = 2 * DT_MDL
 SIGN_MAX_SPEED_MPS = 17.88
 SIGN_MODEL_AGREE_M = 50.0
+# Coming out of a turn the model's plan is briefly short (route 00000003--941020f467 t=74.8: plan end 23 m, 8 mph at
+# 4 s, no sign, the model asking +0.8) and the stop-light detector read it as a stop: Force Stop braked 12->10 mph with
+# nothing to stop for. For this long after the wheel was past POST_TURN_STEER_DEG, the model path may not start an
+# approach or a stop unless the model itself says stop. Signs, the queue line and a stop already forcing are unchanged.
+POST_TURN_STEER_DEG = 90.0
+POST_TURN_HOLDOFF_NS = 2_500_000_000
 SIGN_SEED_M = 27.0
 SIGN_ESTIMATE_HOLD_NS = 2_000_000_000
 SIGN_BRAKING_PROOF_NS = 250_000_000
@@ -117,6 +123,7 @@ class ForceStop:
     self.entry_speed = None
     self.activation_gate = False
     self.stop_seen_ns = 0
+    self.turn_seen_ns = 0
     self.standstill_since_ns = 0
     self.standstill_clear_ns = 0
     self.standstill_reason = None
@@ -214,6 +221,9 @@ class ForceStop:
     if frame.standstill:
       self.stop_seen_ns = 0
     stop_then_turn = bool(self.stop_seen_ns and now - self.stop_seen_ns < 4_000_000_000)
+    if abs(frame.steering_angle_deg) >= POST_TURN_STEER_DEG:
+      self.turn_seen_ns = now
+    post_turn = bool(self.turn_seen_ns and now - self.turn_seen_ns < POST_TURN_HOLDOFF_NS and not frame.model_should_stop)
     turn = speed <= 18 * 0.44704 and frame.blinker and abs(frame.steering_angle_deg) >= 25 and not stop_then_turn
     curved = available and abs(curvature) >= .003 and not stop_then_turn
     model_active = available and horizon < (108.0 if self.activation_gate and frame.light else 100.0)
@@ -237,7 +247,7 @@ class ForceStop:
     else:
       self.braking_samples = ()
     permitted = spatial_permitted and not frame.tracking_lead and not lead
-    model_path = frame.light and model_active and permitted and not curved
+    model_path = frame.light and model_active and permitted and not curved and (self.forcing or not post_turn)
     plausible = sign_estimate is None or speed * speed <= 2 * SIGN_LONG_PATH_MAX_DECEL * max(sign_estimate, 1.0)
     current_range = frame.vision_distance_m
     ranged_sign = (not frame.standstill and offset_ft == 0 and tune.distance_bias_m == 0 and not frame.dashboard_sign and
@@ -382,7 +392,7 @@ class ForceStop:
       self.ranged_stop = False
       self._clear_standstill()
       self.distance = self.distance_cap = horizon if available else 0.0
-      if frame.light and permitted and not curved and not overridden:
+      if frame.light and permitted and not curved and not overridden and not post_turn:
         approach = horizon
         effective = approach + offset + tune.distance_bias_m
         if effective > tune.handoff_m:
