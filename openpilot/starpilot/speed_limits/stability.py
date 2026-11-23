@@ -31,6 +31,9 @@ HOLD_NS = 3_000_000_000
 STABLE_NS = 2_000_000_000
 DROPOUT_SETTLE_NS = 3_000_000_000
 DROPOUT_HOLD_MAX_M = 1000.
+# filter-dev's SPEED_LIMIT_CHANGED_HOLD_PERIOD: a higher camera reading must hold this long before it replaces a settled
+# limit (route 00000005--a37f13ed24 t=117.97 and 120.59: one 60 mph sighting, 0.95 s each, asked "+ for 70" in a 25 zone)
+RAISE_HOLD_NS = 1_000_000_000
 
 
 class SourceStabilizer:
@@ -47,6 +50,8 @@ class SourceStabilizer:
     self.settled: tuple[Source, Observation] | None = None  # the last reading that held its value DROPOUT_SETTLE_NS
     self.dropout_m = 0.
     self.last_now_ns: int | None = None
+    self.raise_key: float | None = None
+    self.raise_since_ns = 0
 
   def _commit(self, source: Source, observation: Observation, now_ns: int) -> None:
     previous = self.observation.candidate.speed_mps if self.observation is not None and self.observation.candidate else None
@@ -58,19 +63,25 @@ class SourceStabilizer:
       self.settled = (source, observation)
 
   def _dropout(self, out: dict, now_ns: int, v_ego: float | None) -> dict:
-    """No source valid: keep the last settled reading until a source answers or the backstop distance."""
-    if self.settled is None:
-      return out
+    """No source valid: as filter-dev's last limit, keep the last reading; one that held less than DROPOUT_SETTLE_NS and
+    is higher than the last settled one gives way to it (a lower short reading stays, it may be a real sign)."""
+    self.raise_key = None
+    if self.observation is None or self.source is None or self.settled is None:
+      return out  # nothing has held yet: the gap passes through and acceptance keeps a pending offer
     if out.get(Source.MAP) is not None and out[Source.MAP].kind is ObservationKind.ABSENT:
-      self.settled = None  # the map matched a road without a limit: a real answer, not a dropout
+      self.settled = self.observation = self.source = None  # the map matched a road without a limit: a real answer
       return out
     dt = (now_ns - self.last_now_ns) / 1e9 if self.last_now_ns is not None and now_ns > self.last_now_ns else 0.
     self.dropout_m += max(0., v_ego or 0.) * min(dt, 1.)
     if self.dropout_m >= DROPOUT_HOLD_MAX_M:
-      self.settled = None
+      self.settled = self.observation = self.source = None
       return out
-    source, observation = self.settled
-    out[source] = observation
+    held = (self.source, self.observation)
+    short = now_ns - self.value_since_ns < DROPOUT_SETTLE_NS
+    if (short and self.settled is not None and
+        self.observation.candidate.speed_mps > self.settled[1].candidate.speed_mps):
+      held = self.settled
+    out[held[0]] = held[1]
     return out
 
   def apply(self, observations: Mapping[Source, Observation], policy: SelectionPolicy, now_ns: int,
@@ -93,6 +104,17 @@ class SourceStabilizer:
         return self._dropout(out, now_ns, v_ego)
       return out
     self.dropout_m = 0.
+    if (selected == self.source == Source.VISION and self.observation is not None and self.settled is not None and
+        raw.observation.candidate.speed_mps > self.observation.candidate.speed_mps):
+      value = raw.observation.candidate.speed_mps
+      if self.raise_key != value:
+        self.raise_key, self.raise_since_ns = value, now_ns
+      if now_ns - self.raise_since_ns < RAISE_HOLD_NS:
+        self.last_valid_ns = now_ns
+        out[selected] = self.observation  # the settled limit stands until the higher reading has held
+        return out
+    else:
+      self.raise_key = None
     if self.source is None or self.observation is None or selected == self.source:
       self._commit(selected, raw.observation, now_ns)
       return out

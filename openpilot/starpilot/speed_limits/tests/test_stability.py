@@ -85,10 +85,24 @@ def test_equal_limit_from_map_while_camera_is_briefly_stale_keeps_identity():
   assert later == first and later.source == 'vision'
 
 
-def test_no_valid_source_passes_through():
+def test_no_valid_source_passes_through_before_anything_held():
   stz = SourceStabilizer()
   pick(stz, 0, vision=20)
   assert pick(stz, 100, vision='stale') is None
+
+
+def test_short_higher_reading_gives_way_to_the_settled_one_in_a_dropout():
+  stz = SourceStabilizer()
+  settle(stz, 30)
+  pick(stz, 3200, map=45)
+  assert apply_v(stz, 3300, 10.) == 30
+
+
+def test_short_lower_reading_stays_in_a_dropout():
+  stz = SourceStabilizer()
+  settle(stz, 30)
+  pick(stz, 3200, map=20)
+  assert apply_v(stz, 3300, 10.) == 20
 
 
 def test_fallback_never_raises_or_replaces_the_pending_offer():
@@ -178,3 +192,30 @@ def test_backstop_distance_ends_the_hold():
     if not held:
       break
   assert not held and 3100 + 39_000 <= t <= 3100 + 41_000  # gives way at ~1000 m
+
+
+def settle_vision(stz, value=25):
+  for t in range(0, 3100, 100):
+    pick(stz, t, vision=value)
+
+
+def test_single_higher_camera_sighting_does_not_raise_a_settled_limit():
+  """Route 00000005--a37f13ed24 t=117.97: one 60 mph sighting for 0.95 s in a 25 zone asked '+ for 70'."""
+  stz = SourceStabilizer()
+  settle_vision(stz, 25)
+  for t in range(3200, 4100, 100):  # 0.9 s
+    assert pick(stz, t, vision=60) == 25
+  assert pick(stz, 4200, vision='stale') == 25
+
+
+def test_higher_camera_reading_that_holds_applies():
+  stz = SourceStabilizer()
+  settle_vision(stz, 25)
+  results = [pick(stz, t, vision=35) for t in range(3200, 4500, 100)]
+  assert results[0] == 25 and results[-1] == 35
+
+
+def test_lower_camera_reading_still_applies_at_once():
+  stz = SourceStabilizer()
+  settle_vision(stz, 35)
+  assert pick(stz, 3200, vision=25) == 25
