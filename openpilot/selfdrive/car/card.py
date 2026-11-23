@@ -795,6 +795,10 @@ class Car:
         not self.aol_card_intent.pause_lateral and CS.canValid and not CS.canTimeout and
         CS.gearShifter == structs.CarState.GearShifter.drive and not CS.doorOpen and
         not CS.steerFaultPermanent and not CS.steeringDisengage)
+    if self.aol_card_intent is not None and mazda_aol and self.aol_card_intent.explicit_latch:
+      # Mazda's ACC_ACTIVE/CRZ_ACTIVE wait for Panda's long grant (CarController.aol_long_grant). None: no fresh native.
+      self.CI.CC.aol_long_native = None if native is None else (
+        bool(native.requestedLongitudinal and native.longitudinalAllowed), int(native.observedMonoTime))
     if self.aol_card_intent is not None:
       self.aol_card_intent.update_auxiliary(CS, media=media_observation,
         media_eligible=ioniq6_media_eligible(self.CP), fault_active=fault_active)

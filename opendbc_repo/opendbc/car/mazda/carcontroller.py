@@ -149,6 +149,8 @@ class CarController(CarControllerBase, IntelligentCruiseButtonManagementInterfac
     self.lead_icon = LeadIcon()
     self.dash_steer_warning = DashSteerWarning()
     self.dash_warning_on_bus = False
+    self.aol_long_granted = False
+    self.aol_long_floor_obs = 0
 
   def update(self, CC, CS, now_nanos):
     # StarPilot's native lateral owner (AOL) stands in for the source's MADS: without it there is no
@@ -369,6 +371,31 @@ class CarController(CarControllerBase, IntelligentCruiseButtonManagementInterfac
     """
     return not self.CP.openpilotLongitudinalControl and CC.cruiseControl.resume
 
+  def aol_long_grant(self, CC, CC_SP) -> bool:
+    """Under AOL, Panda's long permission is the host's request, not the PEDALS edge: ACC_ACTIVE and CRZ_ACTIVE
+    before it are refused and the car sees the CRZ_INFO counter jump (route 00000001, 4 of 5 engagements, 30-90 ms).
+    Card sets aol_long_native from the current aolSafetyWire: None without a fresh native (its freshness rules), else
+    (requested and allowed, observedMonoTime). A grant counts only when reported after the engagement began, so the next
+    SET cannot reuse the last one. A fresh denial, disengagement or hand-back clears it at once; the last report is kept
+    only within the native freshness window (card re-reads it until current_native expires it), and once it expires the
+    frames stay inactive until a fresh grant for this engagement.
+    Without AOL (card never sets it) the engaged bits follow CC.enabled as before.
+    """
+    native = getattr(self, 'aol_long_native', False)
+    if native is False:
+      return True
+    engaged = CC.enabled and not CC_SP.stockEcuHandBack
+    if not engaged:
+      self.aol_long_granted = False
+      if native is not None:
+        self.aol_long_floor_obs = max(self.aol_long_floor_obs, native[1])
+    elif native is None:
+      self.aol_long_granted = False
+    else:
+      granted, observed = native
+      self.aol_long_granted = granted and observed > self.aol_long_floor_obs
+    return self.aol_long_granted
+
   def update_longitudinal(self, CC, CC_SP, CS):
     can_sends = []
 
@@ -440,7 +467,8 @@ class CarController(CarControllerBase, IntelligentCruiseButtonManagementInterfac
     # Engaged bits follow CC.enabled. Gas is an override, not a disengagement.
     owned = self.can_filter.control_active if self.can_filter is not None else self.radar_session.control_active
     control_ready = owned and bus_healthy and CS.out.canValid
-    long_engaged = CC.enabled and control_ready
+    long_granted = self.aol_long_grant(CC, CC_SP)  # every frame: disengaged frames clear it
+    long_engaged = CC.enabled and control_ready and long_granted
     long_active = CC.longActive and control_ready
     sm = self.stop_and_go
     sm.update(long_engaged, stopping, CS.out.standstill, CC.actuators.accel, CS.body_hold,
