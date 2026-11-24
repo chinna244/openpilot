@@ -140,3 +140,46 @@ class TestLocalizedPresentation(unittest.TestCase):
     dashboard._draw_text(dashboard._font_bold, 'PERSONAL RECORDS', SimpleNamespace(x=10, y=20), 20, 0, 'color')
     fonts.measure.assert_called_once_with('PERSONAL RECORDS', FontRole.BOLD, 20)
     fonts.draw.assert_called_once_with('PERSONAL RECORDS', FontRole.BOLD, 20, 10, 20, 'color', spacing=0)
+
+
+class TestGlyphInkWarmup(unittest.TestCase):
+  """Route 08 t=70.4: the first speed sign decoded three 2048 px Inter atlases on the UI thread (a 661 ms frame).
+  On-device fonts measure glyph ink off the render thread at load; headless (test/preview) fonts stay lazy."""
+
+  def fonts(self, headless):
+    import re
+    from openpilot.starpilot.ui.presentation import default_font_directory
+    texture_ids = iter(range(100, 200))
+
+    def load_font(path):
+      text = Path(path).read_text(errors='ignore')
+      recs = [SimpleNamespace(x=int(m[0]), y=int(m[1]), width=int(m[2]), height=int(m[3]))
+              for m in re.findall(r'char id=\d+\s+x=(\d+)\s+y=(\d+)\s+width=(\d+)\s+height=(\d+)', text)]
+      return SimpleNamespace(texture=SimpleNamespace(id=next(texture_ids)), glyphCount=len(recs), recs=recs)
+    patches = [patch("openpilot.starpilot.ui.presentation.rl.is_window_ready", return_value=True),
+               patch("openpilot.starpilot.ui.presentation.validate_bitmap_font"),
+               patch("openpilot.starpilot.ui.presentation.rl.get_font_default", return_value=SimpleNamespace(texture=SimpleNamespace(id=1))),
+               patch("openpilot.starpilot.ui.presentation.rl.load_font", side_effect=load_font),
+               patch("openpilot.starpilot.ui.presentation.rl.gen_texture_mipmaps"),
+               patch("openpilot.starpilot.ui.presentation.rl.set_texture_filter")]
+    for p in patches:
+      p.start()
+      self.addCleanup(p.stop)
+    return BitmapFonts(Profile.LARGE, default_font_directory(), headless_context=headless)
+
+  def test_warmed_off_the_render_thread_and_identical_to_lazy(self):
+    import threading
+    warm = self.fonts(headless=False)
+    for thread in threading.enumerate():
+      if thread.name == "font-ink-warm":
+        thread.join(timeout=30)
+    roles = (FontRole.MEDIUM, FontRole.SEMI_BOLD, FontRole.BOLD, FontRole.SET_SPEED)
+    for role in roles:
+      self.assertIn(font_filename(Profile.LARGE, role), warm._glyph_ink)
+    lazy = self.fonts(headless=True)
+    self.assertEqual(lazy._glyph_ink, {})  # headless contexts never start the thread
+    with patch("openpilot.starpilot.ui.presentation.Image.open", side_effect=AssertionError("decoded on the render thread")):
+      for role in roles:
+        warm._glyph_columns(role)  # served from the warmed cache
+    for role in roles:
+      self.assertEqual(warm._glyph_columns(role), lazy._glyph_columns(role))

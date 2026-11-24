@@ -6,6 +6,7 @@ from functools import lru_cache
 from pathlib import Path
 import hashlib
 import json
+import threading
 
 import numpy as np
 from PIL import Image
@@ -97,6 +98,15 @@ def validate_bitmap_font(path: Path) -> None:
     raise ValueError(f"Invalid bitmap font {path.name}: {error}") from error
 
 
+def _glyph_rects(font) -> tuple[tuple[int, int, int, int], ...] | None:
+  """Plain copies of a loaded font's atlas rectangles, readable off the render thread."""
+  try:
+    return tuple((int(font.recs[i].x), int(font.recs[i].y), int(font.recs[i].width), int(font.recs[i].height))
+                 for i in range(font.glyphCount))
+  except (AttributeError, TypeError, IndexError):
+    return None
+
+
 class BitmapFonts:
   """Own font textures without changing global text APIs or loading device services.
 
@@ -118,6 +128,8 @@ class BitmapFonts:
     self._vertical_ink: dict[tuple, tuple[float, float]] = {}
     self._horizontal_ink: dict[tuple, tuple[float, float]] = {}
     self._glyph_ink: dict[str, dict[int, tuple[int, int] | None]] = {}
+    self._glyph_recs: dict[str, tuple[tuple[int, int, int, int], ...]] = {}
+    self._ink_lock = threading.Lock()
     self._codepoints: dict[str, frozenset[int]] = {}
     default_texture_id = rl.get_font_default().texture.id
     try:
@@ -135,9 +147,16 @@ class BitmapFonts:
         if filename != "unifont.fnt":
           rl.gen_texture_mipmaps(font.texture)
           rl.set_texture_filter(font.texture, rl.TextureFilter.TEXTURE_FILTER_TRILINEAR)
+        recs = _glyph_rects(font)
+        if recs is not None:
+          self._glyph_recs[filename] = recs
     except Exception:
       self.close()
       raise
+    if not headless_context:
+      # Route 08 t=70.4 (route 02 t=95.1): the first speed sign measured glyph ink for three 2048 px Inter atlases on
+      # the UI thread, a 551-661 ms frame while driving. Decode them now, off the render thread.
+      threading.Thread(target=self._warm_glyph_ink, name="font-ink-warm", daemon=True).start()
 
   def font(self, role: FontRole, *, fallback: bool = False) -> rl.Font:
     if not self._fonts:
@@ -256,17 +275,36 @@ class BitmapFonts:
     """
     filename = font_filename(self.profile, role)
     if filename not in self._glyph_ink:
-      font = self.font(role)
-      with Image.open(font_path(self._directory, filename).with_suffix('.png')) as atlas:
-        alpha = np.asarray(atlas.convert('RGBA').getchannel('A'))
-      columns = {}
-      for index in range(font.glyphCount):
-        rec = font.recs[index]
-        cell = alpha[int(rec.y):int(rec.y + rec.height), int(rec.x):int(rec.x + rec.width)]
-        inked = np.flatnonzero(cell.max(0) > 40) if cell.size else []
-        columns[index] = (int(inked[0]), int(inked[-1])) if len(inked) else None
-      self._glyph_ink[filename] = columns
+      self.font(role)  # closed resources raise as before
+      with self._ink_lock:
+        if filename not in self._glyph_ink:
+          self._glyph_ink[filename] = self._measure_glyph_ink(filename)
     return self._glyph_ink[filename]
+
+  def _measure_glyph_ink(self, filename: str) -> dict[int, tuple[int, int] | None]:
+    """Inked columns per glyph from the atlas PNG and the load-time glyph rectangles (no Raylib access)."""
+    with Image.open(font_path(self._directory, filename).with_suffix('.png')) as atlas:
+      alpha = np.asarray(atlas.convert('RGBA').getchannel('A'))
+    recs = self._glyph_recs.get(filename)
+    if recs is None:
+      recs = _glyph_rects(self._fonts[filename]) or ()
+    columns = {}
+    for index, (x, y, width, height) in enumerate(recs):
+      cell = alpha[y:y + height, x:x + width]
+      inked = np.flatnonzero(cell.max(0) > 40) if cell.size else []
+      columns[index] = (int(inked[0]), int(inked[-1])) if len(inked) else None
+    return columns
+
+  def _warm_glyph_ink(self) -> None:
+    for role in (FontRole.MEDIUM, FontRole.SEMI_BOLD, FontRole.BOLD, FontRole.SET_SPEED, FontRole.SPEED, FontRole.NORMAL):
+      filename = font_filename(self.profile, role)
+      with self._ink_lock:
+        if not self._fonts or filename in self._glyph_ink or filename not in self._glyph_recs:
+          continue
+        try:
+          self._glyph_ink[filename] = self._measure_glyph_ink(filename)
+        except Exception:  # the render-thread path measures (and reports) it on first use instead
+          continue
 
   def draw(self, text: str, role: FontRole, size: float, x: float, y: float, color: rl.Color = rl.WHITE,
            *, spacing: float = 0, fallback: bool = False) -> None:
@@ -296,7 +334,9 @@ class BitmapFonts:
     self._language_fonts.clear()
     self._vertical_ink.clear()
     self._horizontal_ink.clear()
-    self._glyph_ink.clear()
+    with self._ink_lock:
+      self._glyph_ink.clear()
+      self._glyph_recs.clear()
     self._codepoints.clear()
     self._measurements.clear()
 
