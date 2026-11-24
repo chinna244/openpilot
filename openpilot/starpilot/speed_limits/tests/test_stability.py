@@ -219,3 +219,69 @@ def test_lower_camera_reading_still_applies_at_once():
   stz = SourceStabilizer()
   settle_vision(stz, 35)
   assert pick(stz, 3200, vision=25) == 25
+
+
+def test_a_discarded_higher_reading_never_returns_in_the_same_dropout():
+  """Review of 3b5d2b1b0: settled 25, a 60 that held 1.2 s, then every source gone. The dropout falls back to 25 and
+  stays there: time without a source is not time the 60 held."""
+  stz = SourceStabilizer()
+  settle_vision(stz, 25)
+  for t in range(3200, 4500, 100):  # past the raise guard: 60 is committed but never settles
+    pick(stz, t, vision=60)
+  for t in range(4600, 12000, 100):
+    assert apply_v(stz, t, 10.) == 25, t
+
+
+def test_after_a_dropout_only_fresh_evidence_raises():
+  stz = SourceStabilizer()
+  settle_vision(stz, 25)
+  for t in range(3200, 4500, 100):
+    pick(stz, t, vision=60)
+  for t in range(4600, 8000, 100):
+    apply_v(stz, t, 10.)
+  assert pick(stz, 8100, vision=60) == 25  # a fresh 60 must hold the raise guard again
+  assert [pick(stz, t, vision=60) for t in range(8200, 9300, 100)][-1] == 60
+
+
+def test_camera_raise_over_a_settled_map_limit_is_guarded():
+  """Review of 3b5d2b1b0: settled map 25 plus one preferred Vision 60 sample selected 60 at once."""
+  stz = SourceStabilizer()
+  settle(stz, 25)
+  assert pick(stz, 3200, vision=60, map=25) == 25
+  assert pick(stz, 3300, vision='stale', map=25) == 25  # a single sample, then the camera goes stale
+  assert pick(stz, 3400, vision='stale', map='stale') == 25  # and a full dropout keeps the settled map 25
+
+
+def test_camera_raise_over_a_settled_map_limit_applies_once_it_holds():
+  stz = SourceStabilizer()
+  settle(stz, 25)
+  results = [pick(stz, t, vision=60, map=25) for t in range(3200, 4400, 100)]
+  assert results[0] == 25 and results[-1] == 60
+
+
+def test_camera_raise_over_a_stale_settled_map_limit_holds_the_map_limit():
+  stz = SourceStabilizer()
+  settle(stz, 25)
+  assert pick(stz, 3200, vision=60, map='stale') == 25
+
+
+def test_backstop_marks_the_hold_expired_once():
+  stz = SourceStabilizer()
+  settle(stz)
+  t, expired = 3100, []
+  while t < 3100 + 45_000:
+    t += 100
+    apply_v(stz, t, 25.)
+    expired.append(stz.expired)
+  assert expired.count(True) == 1
+
+
+def test_unconfigured_source_does_not_block_the_dropout_hold():
+  """Review of 2dc4bb06d: a dashboard reading outside a Maps-only policy prevented the dropout hold."""
+  policy = sel.SelectionPolicy(sel.SelectionMode.ORDERED, (M, None), False)
+  stz = SourceStabilizer()
+  at = lambda t, **kw: sel.select_limit(stz.apply(obs(**kw), policy, t * MS, v_ego=10.), policy).observation.candidate
+  for t in range(0, 3100, 100):
+    at(t, map=30)
+  held = at(3200, map='stale', dashboard=45)
+  assert held is not None and round(held.speed_mps / MPH) == 30

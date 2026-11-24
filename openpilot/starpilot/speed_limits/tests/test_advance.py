@@ -977,3 +977,18 @@ def test_same_speed_replacement_gets_a_fresh_decision_and_deadline():
   assert revised.pendingSpeedLimit == first.pendingSpeedLimit and revised.acceptedSpeedLimit == 20.
   assert revised.decisionId != first.decisionId and revised.pendingSinceMonoTime == drive.now
   assert drive.tick(**replacement, at=deadline+1).message.slcState.decisionId == revised.decisionId
+
+
+def test_dropout_backstop_also_ends_the_accepted_cap():
+  """Review of 2dc4bb06d: the 1 km cutoff ended source selection while the planner kept the same accepted ceiling."""
+  drive = Drive()
+  for _ in range(70):  # 3.5 s: the map's 20 settles
+    drive.tick(target=0.)
+  assert drive.runtime.state.acceptance.accepted.candidate.speed_mps == 20.
+  held = [drive.tick(target=0., alive=False, speed=25.) for _ in range(200)]  # 10 s, 250 m: held
+  assert drive.runtime.state.acceptance.accepted is not None
+  assert held[-1].message.slcState.acceptedSpeedLimit == 20.
+  for _ in range(700):  # past 1000 m
+    out = drive.tick(target=0., alive=False, speed=25.)
+  assert drive.runtime.state.acceptance.accepted is None
+  assert out.message.slcState.acceptedSpeedLimit == 0.

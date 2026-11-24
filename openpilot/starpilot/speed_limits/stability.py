@@ -52,6 +52,7 @@ class SourceStabilizer:
     self.last_now_ns: int | None = None
     self.raise_key: float | None = None
     self.raise_since_ns = 0
+    self.expired = False  # this frame's dropout hold reached DROPOUT_HOLD_MAX_M: the held limit no longer bounds control
 
   def _commit(self, source: Source, observation: Observation, now_ns: int) -> None:
     previous = self.observation.candidate.speed_mps if self.observation is not None and self.observation.candidate else None
@@ -75,13 +76,16 @@ class SourceStabilizer:
     self.dropout_m += max(0., v_ego or 0.) * min(dt, 1.)
     if self.dropout_m >= DROPOUT_HOLD_MAX_M:
       self.settled = self.observation = self.source = None
+      self.expired = True
       return out
-    held = (self.source, self.observation)
     short = now_ns - self.value_since_ns < DROPOUT_SETTLE_NS
     if (short and self.settled is not None and
         self.observation.candidate.speed_mps > self.settled[1].candidate.speed_mps):
-      held = self.settled
-    out[held[0]] = held[1]
+      # Decide once, at the dropout: time without any source is not time the short higher reading held, and only a
+      # fresh reading may raise the settled limit again.
+      self.source, self.observation = self.settled
+      self.value_since_ns = now_ns - DROPOUT_SETTLE_NS
+    out[self.source] = self.observation
     return out
 
   def apply(self, observations: Mapping[Source, Observation], policy: SelectionPolicy, now_ns: int,
@@ -92,26 +96,33 @@ class SourceStabilizer:
       self.last_now_ns = now_ns
 
   def _apply(self, observations, policy, now_ns, v_ego):
+    self.expired = False
     out = dict(observations)
     if not isinstance(policy, SelectionPolicy) or policy.mode is not SelectionMode.ORDERED:
       self.reset()  # Highest/Lowest compare sources by value on purpose
       return out
     raw = select_limit(out, policy)
     selected = raw.selected_source
-    if selected is None or raw.observation.kind is not ObservationKind.VALID:
+    if selected is None:
+      # Source loss is judged on the sources this policy selects from: an unconfigured one does not count.
       self.challenger, self.challenger_since_ns = None, 0
-      if not any(o is not None and o.kind is ObservationKind.VALID for o in out.values()):
-        return self._dropout(out, now_ns, v_ego)
-      return out
+      return self._dropout(out, now_ns, v_ego)
     self.dropout_m = 0.
-    if (selected == self.source == Source.VISION and self.observation is not None and self.settled is not None and
+    if (selected == Source.VISION and self.observation is not None and self.settled is not None and
         raw.observation.candidate.speed_mps > self.observation.candidate.speed_mps):
+      # Whichever source the settled limit came from, a higher camera reading must hold RAISE_HOLD_NS first.
       value = raw.observation.candidate.speed_mps
       if self.raise_key != value:
         self.raise_key, self.raise_since_ns = value, now_ns
       if now_ns - self.raise_since_ns < RAISE_HOLD_NS:
-        self.last_valid_ns = now_ns
-        out[selected] = self.observation  # the settled limit stands until the higher reading has held
+        if self.source == Source.VISION:
+          self.last_valid_ns = now_ns
+          out[selected] = self.observation  # the settled limit stands until the higher reading has held
+        else:
+          out[selected] = Observation(ObservationKind.UNKNOWN)
+          own = out.get(self.source)
+          if own is None or own.kind is not ObservationKind.VALID:
+            out[self.source] = self.observation
         return out
     else:
       self.raise_key = None
