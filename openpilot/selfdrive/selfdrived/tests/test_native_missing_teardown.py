@@ -165,3 +165,48 @@ def test_key_off_diagnostic_skips_real_authority_loss(monkeypatch):
   sd = SimpleNamespace(sm=FakeSM(), enabled=True, active=True)
   assert selfdrived.SelfdriveD.missing_native_event(sd, T_EVENT, lost_active_aol=True) == E.controlsMismatch
   assert not logged
+
+
+def key_off_site(sm, now_ns, sd=None):
+  sd = sd or SimpleNamespace(sm=sm, enabled=False, active=False)
+  return sd, selfdrived.SelfdriveD.missing_native_event(sd, now_ns, lost_active_aol=False)
+
+
+def test_routes_06_07_device_report_from_before_the_key_waits_for_the_next():
+  """Routes 00000006 t=266.06 / 00000007 t=376.25: panda ignition off (26 ms old), deviceState still the started=True
+  report from 224-521 ms before the key turned: no controlsMismatch while the next device report is due."""
+  sm = FakeSM()
+  sm.data['deviceState'] = SimpleNamespace(started=True)
+  sm.logMonoTime['deviceState'] = T_PANDA - 300 * MS  # predates the key off
+  sd, event = key_off_site(sm, T_EVENT)
+  assert event is None
+  sm.data['deviceState'] = SimpleNamespace(started=False)  # the next report agrees
+  sm.logMonoTime['deviceState'] = T_EVENT + 100 * MS
+  assert key_off_site(sm, T_EVENT + 110 * MS, sd)[1] is None
+
+
+def test_a_newer_started_report_after_the_key_off_still_raises():
+  sm = FakeSM()
+  sm.data['deviceState'] = SimpleNamespace(started=True)
+  sm.logMonoTime['deviceState'] = T_PANDA - 300 * MS
+  sd, _ = key_off_site(sm, T_EVENT)
+  sm.logMonoTime['deviceState'] = T_PANDA + 50 * MS  # a report after the key off still says started
+  assert key_off_site(sm, T_EVENT + 60 * MS, sd)[1] == E.controlsMismatch
+
+
+def test_waiting_for_the_device_report_is_bounded():
+  sm = FakeSM()
+  sm.data['deviceState'] = SimpleNamespace(started=True)
+  sm.logMonoTime['deviceState'] = T_PANDA - 300 * MS
+  sd, _ = key_off_site(sm, T_EVENT)
+  sm.logMonoTime['pandaStates'] = T_PANDA + 1_100 * MS  # pandas keep reporting off; no newer device report
+  assert key_off_site(sm, T_PANDA + 1_100 * MS + MS, sd)[1] == E.controlsMismatch
+
+
+@pytest.mark.parametrize('kw', [dict(enabled=True), dict(active=True)])
+def test_old_device_report_never_excuses_an_engaged_loss(kw):
+  sm = FakeSM()
+  sm.data['deviceState'] = SimpleNamespace(started=True)
+  sm.logMonoTime['deviceState'] = T_PANDA - 300 * MS
+  sd = SimpleNamespace(sm=sm, **{'enabled': False, 'active': False, **kw})
+  assert key_off_site(sm, T_EVENT, sd)[1] == E.controlsMismatch

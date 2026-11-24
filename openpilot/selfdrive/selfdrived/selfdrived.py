@@ -97,7 +97,7 @@ HKG_ANGLE_LIMIT_WARNING_NS = 200_000_000
 
 
 def native_missing_event(*, wire_seen: bool, enabled: bool, active: bool, lost_active_aol: bool, panda_states,
-                         device_started: bool | None):
+                         device_started: bool | None, device_predates_key_off: bool = False):
   """The event for a missing AOL native (no current aolSafetyWire) once initialized.
 
   Startup before any wire: commIssue. Ignition-off teardown (route 00000002--c9d55e7093 t=493.130: pandad withdraws
@@ -108,9 +108,12 @@ def native_missing_event(*, wire_seen: bool, enabled: bool, active: bool, lost_a
   if not enabled and not active and not lost_active_aol:
     if not wire_seen:
       return EventName.commIssue
-    if device_started is False and panda_states is not None and len(panda_states) > 0 and all(
+    if (device_started is False or device_predates_key_off) and panda_states is not None and len(panda_states) > 0 and all(
         not ps.ignitionLine and not ps.ignitionCan for ps in panda_states):
-      return None  # key off: every panda AND the device agree the drive ended
+      # key off: every panda AND the device agree the drive ended. deviceState (2 Hz) can still be its report from
+      # before the key turned (routes 00000006/00000007: 224-521 ms old, started=True, panda already off): a newer
+      # report decides, within KEY_OFF_DEVICE_WAIT_NS
+      return None
   return EventName.controlsMismatch
 
 
@@ -118,6 +121,8 @@ def native_missing_event(*, wire_seen: bool, enabled: bool, active: bool, lost_a
 # own periods old (pandaStates 10 Hz -> 300 ms, deviceState 2 Hz -> 1.5 s). Route 00000002--c9d55e7093: at the
 # 493.160 event they were 29 ms and 14 ms old. SubMaster.seen alone never expires.
 KEY_OFF_MAX_PERIODS = 3
+# deviceState is 2 Hz: after the panda reports the key off, a device report from before it waits this long for the next
+KEY_OFF_DEVICE_WAIT_NS = 1_000_000_000
 
 
 def key_off_input(sm, service: str, now_ns: int):
@@ -141,9 +146,19 @@ class SelfdriveD:
     lost_active_aol (it also feeds its downstream fault handling) and passes the same value."""
     pandas = key_off_input(self.sm, 'pandaStates', now_ns)
     device = key_off_input(self.sm, 'deviceState', now_ns)
+    panda_off = bool(pandas is not None and len(pandas) > 0 and all(not ps.ignitionLine and not ps.ignitionCan for ps in pandas))
+    if not panda_off:
+      self.key_off_since_ns = None
+    elif getattr(self, 'key_off_since_ns', None) is None:
+      self.key_off_since_ns = int(self.sm.logMonoTime['pandaStates'])  # the first panda report of the key off
+    key_off_since = getattr(self, 'key_off_since_ns', None)
+    device_predates = bool(panda_off and device is not None and key_off_since is not None and
+                           int(self.sm.logMonoTime['deviceState']) < key_off_since and
+                           0 <= now_ns - key_off_since <= KEY_OFF_DEVICE_WAIT_NS)
     event = native_missing_event(
       wire_seen=bool(self.sm.seen.get('aolSafetyWire', False)), enabled=bool(self.enabled), active=bool(self.active),
-      lost_active_aol=bool(lost_active_aol), panda_states=pandas, device_started=None if device is None else bool(device.started))
+      lost_active_aol=bool(lost_active_aol), panda_states=pandas, device_started=None if device is None else bool(device.started),
+      device_predates_key_off=device_predates)
     # Diagnostic only (route 00000004--0ed7a0ac2e t=434.068: one parked key-off controlsMismatch with no proof of which
     # key-off input was missing): log what this step saw, once per episode. The event is unchanged.
     quiet = event == EventName.controlsMismatch and not self.enabled and not self.active and not lost_active_aol
