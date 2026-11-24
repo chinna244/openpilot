@@ -46,52 +46,92 @@ class SourceStabilizer:
     self.last_valid_ns = 0
     self.challenger: tuple[Source, float] | None = None
     self.challenger_since_ns = 0
-    self.value_since_ns = 0  # since when the committed reading has had its value
-    self.settled: tuple[Source, Observation] | None = None  # the last reading that held its value DROPOUT_SETTLE_NS
+    self.settled: tuple[Source, Observation] | None = None  # the last limit the FINAL selection showed DROPOUT_SETTLE_NS
+    self.shown: tuple[float, int] | None = None  # (speed, since): the final selection's continuous run; None on an empty frame
     self.dropout_m = 0.
     self.last_now_ns: int | None = None
     self.raise_key: float | None = None
     self.raise_since_ns = 0
-    self.expired = False  # this frame's dropout hold reached DROPOUT_HOLD_MAX_M: the held limit no longer bounds control
+    # the speed a higher camera reading is judged against: the last committed limit once anything has settled. It outlives
+    # the held reading (a map no-limit withdrawal, the backstop), so a camera raise is guarded until it qualifies
+    self.trusted_mps: float | None = None
+    self.expired = False  # this frame's dropout reached DROPOUT_HOLD_MAX_M: no carried limit bounds control any more
+    self.valid_ns: dict[Source, int] = {}  # when each source last had a valid reading
 
   def _commit(self, source: Source, observation: Observation, now_ns: int) -> None:
-    previous = self.observation.candidate.speed_mps if self.observation is not None and self.observation.candidate else None
-    if previous != (observation.candidate.speed_mps if observation.candidate else None):
-      self.value_since_ns = now_ns
     self.source, self.observation, self.last_valid_ns = source, observation, now_ns
     self.challenger, self.challenger_since_ns = None, 0
-    if now_ns - self.value_since_ns >= DROPOUT_SETTLE_NS:
-      self.settled = (source, observation)
+    if self.settled is not None or self.trusted_mps is not None:
+      self.trusted_mps = observation.candidate.speed_mps
 
-  def _dropout(self, out: dict, now_ns: int, v_ego: float | None) -> dict:
+  def _dropout(self, out: dict, now_ns: int, v_ego: float | None, *, guarded: bool = False) -> dict:
     """No source valid: as filter-dev's last limit, keep the last reading; one that held less than DROPOUT_SETTLE_NS and
     is higher than the last settled one gives way to it (a lower short reading stays, it may be a real sign)."""
-    self.raise_key = None
+    if not guarded:
+      self.raise_key = None  # no camera reading at all; a guarded one keeps its timer
+    if any(out.get(source) is not None and out[source].kind is ObservationKind.ABSENT for source in (Source.MAP, self.source)):
+      # the map (or the committed source) answered "no limit": a real answer, settled or not; it is never held again
+      self.settled = self.observation = self.source = None
+      return out
     if self.observation is None or self.source is None or self.settled is None:
       return out  # nothing has held yet: the gap passes through and acceptance keeps a pending offer
-    if out.get(Source.MAP) is not None and out[Source.MAP].kind is ObservationKind.ABSENT:
-      self.settled = self.observation = self.source = None  # the map matched a road without a limit: a real answer
-      return out
-    dt = (now_ns - self.last_now_ns) / 1e9 if self.last_now_ns is not None and now_ns > self.last_now_ns else 0.
-    self.dropout_m += max(0., v_ego or 0.) * min(dt, 1.)
-    if self.dropout_m >= DROPOUT_HOLD_MAX_M:
-      self.settled = self.observation = self.source = None
-      self.expired = True
-      return out
-    short = now_ns - self.value_since_ns < DROPOUT_SETTLE_NS
+    short = self.settled is None or self.settled[1] != self.observation  # the committed reading has not settled
     if (short and self.settled is not None and
         self.observation.candidate.speed_mps > self.settled[1].candidate.speed_mps):
       # Decide once, at the dropout: time without any source is not time the short higher reading held, and only a
       # fresh reading may raise the settled limit again.
       self.source, self.observation = self.settled
-      self.value_since_ns = now_ns - DROPOUT_SETTLE_NS
+      self.trusted_mps = self.observation.candidate.speed_mps
+      self.last_valid_ns = self.valid_ns.get(self.source, 0)  # the restored source's own freshness, not the discarded one's
     out[self.source] = self.observation
     return out
+
+  def _backstop(self, observations, out: dict, policy: SelectionPolicy, now_ns: int, v_ego: float | None) -> dict:
+    """filter-dev's 1 km backstop, judged once per frame on the FINAL arbitration: a fresh reading of this frame resets
+    it; a retained reading or no reading at all adds the distance driven. Crossing DROPOUT_HOLD_MAX_M (once) withdraws
+    every retained reading on that same frame and marks it expired, so whatever cap was carried ends with it."""
+    final = select_limit(out, policy).selected_source
+    if final is not None and observations[final].kind is ObservationKind.VALID and out[final] == observations[final]:
+      self.dropout_m = 0.
+      return out
+    dt = (now_ns - self.last_now_ns) / 1e9 if self.last_now_ns is not None and now_ns > self.last_now_ns else 0.
+    before = self.dropout_m
+    self.dropout_m += max(0., v_ego or 0.) * min(dt, 1.)
+    if not before < DROPOUT_HOLD_MAX_M <= self.dropout_m:
+      return out
+    self.settled = self.observation = self.source = None
+    self.expired = True
+    stripped = {}
+    for source, observation in out.items():
+      if observation != observations[source] and observation is not None and observation.kind is ObservationKind.VALID:
+        # a retained reading: back to what the source reported (a guarded camera reading stays masked)
+        observation = observations[source] if observations[source].kind is not ObservationKind.VALID else Observation(ObservationKind.UNKNOWN)
+      stripped[source] = observation
+    return stripped
+
+  def _settle(self, out: dict, policy: SelectionPolicy, now_ns: int) -> None:
+    """A limit settles once the FINAL selection has shown its speed continuously for DROPOUT_SETTLE_NS, fresh or held
+    through a short camera gap. Any frame showing no limit restarts the run: time with nothing shown never counts."""
+    final = select_limit(out, policy).selected_source
+    if final is None:
+      self.shown = None
+      return
+    speed = out[final].candidate.speed_mps
+    if self.shown is None or self.shown[0] != speed:
+      self.shown = (speed, now_ns)
+    if (now_ns - self.shown[1] >= DROPOUT_SETTLE_NS and self.observation is not None and self.source is not None and
+        self.observation.candidate.speed_mps == speed and (self.settled is None or self.settled[1] != self.observation)):
+      self.settled = (self.source, self.observation)
+      self.trusted_mps = speed
 
   def apply(self, observations: Mapping[Source, Observation], policy: SelectionPolicy, now_ns: int,
             v_ego: float | None = None) -> dict:
     try:
-      return self._apply(observations, policy, now_ns, v_ego)
+      out = self._apply(observations, policy, now_ns, v_ego)
+      if isinstance(policy, SelectionPolicy) and policy.mode is SelectionMode.ORDERED:
+        out = self._backstop(observations, out, policy, now_ns, v_ego)
+        self._settle(out, policy, now_ns)
+      return out
     finally:
       self.last_now_ns = now_ns
 
@@ -101,31 +141,34 @@ class SourceStabilizer:
     if not isinstance(policy, SelectionPolicy) or policy.mode is not SelectionMode.ORDERED:
       self.reset()  # Highest/Lowest compare sources by value on purpose
       return out
-    raw = select_limit(out, policy)
-    selected = raw.selected_source
-    if selected is None:
-      # Source loss is judged on the sources this policy selects from: an unconfigured one does not count.
-      self.challenger, self.challenger_since_ns = None, 0
-      return self._dropout(out, now_ns, v_ego)
-    self.dropout_m = 0.
-    if (selected == Source.VISION and self.observation is not None and self.settled is not None and
-        raw.observation.candidate.speed_mps > self.observation.candidate.speed_mps):
-      # Whichever source the settled limit came from, a higher camera reading must hold RAISE_HOLD_NS first.
-      value = raw.observation.candidate.speed_mps
+    for source, observation in out.items():
+      if observation is not None and observation.kind is ObservationKind.VALID:
+        self.valid_ns[source] = now_ns
+    if self.settled is not None and out.get(self.settled[0]) is not None and out[self.settled[0]].kind is ObservationKind.ABSENT:
+      self.settled = None  # that source has since answered "no limit": its old settled reading is withdrawn, never restored
+    # Whichever source the trusted limit came from, a camera reading above it must hold RAISE_HOLD_NS before it counts as
+    # evidence at all (selected, held against, or replacing the camera's own committed value), each different value on its
+    # own timer, even when the held reading was withdrawn or expired meanwhile. Until then the camera is judged silent.
+    camera = out.get(Source.VISION)
+    value = camera.candidate.speed_mps if camera is not None and camera.kind is ObservationKind.VALID else None
+    guarded = False
+    if value is not None and self.trusted_mps is not None and value > self.trusted_mps:
       if self.raise_key != value:
         self.raise_key, self.raise_since_ns = value, now_ns
       if now_ns - self.raise_since_ns < RAISE_HOLD_NS:
+        guarded = True
+        out[Source.VISION] = Observation(ObservationKind.UNKNOWN)
         if self.source == Source.VISION:
-          self.last_valid_ns = now_ns
-          out[selected] = self.observation  # the settled limit stands until the higher reading has held
-        else:
-          out[selected] = Observation(ObservationKind.UNKNOWN)
-          own = out.get(self.source)
-          if own is None or own.kind is not ObservationKind.VALID:
-            out[self.source] = self.observation
-        return out
+          self.last_valid_ns = now_ns  # the camera is still reading signs: its committed limit is not stale
     else:
       self.raise_key = None
+    raw = select_limit(out, policy)
+    selected = raw.selected_source
+    if selected is None:
+      self.challenger, self.challenger_since_ns = None, 0
+      # Source loss is judged on the sources this policy selects from: an unconfigured one does not count. A guarded
+      # camera reading is not a usable one either: the same dropout rules apply, only its raise timer runs on.
+      return self._dropout(out, now_ns, v_ego, guarded=guarded)
     if self.source is None or self.observation is None or selected == self.source:
       self._commit(selected, raw.observation, now_ns)
       return out
@@ -165,6 +208,12 @@ class SourceStabilizer:
       out[selected] = Observation(ObservationKind.UNKNOWN)
     if not challenged:
       self.challenger, self.challenger_since_ns = None, 0
+    if own_valid and select_limit(out, policy).selected_source == self.source:
+      # the camera's own fresh reading won the final arbitration (a preferred source masked): it is the limit now, for
+      # the raise guard and a later dropout alike; a preferred challenger keeps its timer
+      challenger, since = self.challenger, self.challenger_since_ns
+      self._commit(self.source, own, now_ns)
+      self.challenger, self.challenger_since_ns = challenger, since
     if held:
       out[self.source] = self.observation  # nothing lower: the camera's reading stands through the gap
     return out

@@ -154,3 +154,38 @@ def test_drive_settle_order_gap_still_needs_steering_withheld():
   m.aolAxisState.faultEventMonoTime = stamp - 10 * MS
   sm.messages['aolAxisState'] = m.as_reader()
   assert observe(f, sm, cp, cs, now, shift_hold=True)
+
+
+def reverse_history(f, native, cp, cs, stamp):
+  """Three seconds of a stopped Reverse shift hold from the fixture's first shift frame; returns the Drive frame's stamp
+  (Codex review of 49bd11b2c)."""
+  cs.gearShifter = 'reverse'
+  for t in range(stamp, stamp + 3_000 * MS, 100 * MS):
+    assert not observe(f, shift_frame(native, cp, t), cp, cs, t + MS, shift_hold=True)
+  cs.gearShifter = 'drive'
+  return stamp + 3_000 * MS
+
+
+def test_drive_settle_event_strictly_newer_than_the_axis_keeps_latch():
+  cp, cs, f, native, stamp, now = setup()
+  stamp = reverse_history(f, native, cp, cs, stamp)
+  now = stamp + MS
+  sm = shift_frame(native, cp, stamp)
+  m = sm.messages['aolAxisState'].as_builder()
+  m.aolAxisState.faultEventMonoTime = stamp - 5 * MS
+  sm.messages['aolAxisState'] = m.as_reader()
+  sm.logMonoTime['onroadEvents'] = stamp + 5 * MS  # published after the axis it lags
+  assert not observe(f, sm, cp, cs, stamp + 10 * MS, shift_hold=True)
+  assert not f.failed
+
+
+def test_drive_settle_event_30ms_older_than_the_axis_fails():
+  cp, cs, f, native, stamp, now = setup()
+  stamp = reverse_history(f, native, cp, cs, stamp)
+  now = stamp + MS
+  sm = shift_frame(native, cp, stamp)
+  m = sm.messages['aolAxisState'].as_builder()
+  m.aolAxisState.faultEventMonoTime = stamp - MS
+  sm.messages['aolAxisState'] = m.as_reader()
+  sm.logMonoTime['onroadEvents'] = stamp - 31 * MS
+  assert observe(f, sm, cp, cs, now, shift_hold=True)

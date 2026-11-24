@@ -297,8 +297,12 @@ def test_disengagement_cancels_early_confirmation_and_reengagement_gets_a_fresh_
   drive.sm['selfdriveState'].enabled = True
   drive.sm['controlsState'].longControlState = 'pid'
   resumed = drive.tick(at=start+20_000_000_000).message.slcState
-  assert resumed.hasPending and resumed.decisionId != first.decisionId
-  assert resumed.pendingSinceMonoTime == drive.now
+  # a fresh engagement decides the current limit before any preview (filter-dev's SLA, Codex review of b063ca0e5)
+  assert resumed.hasPending and resumed.pendingSpeedLimit == 20. and resumed.decisionId != first.decisionId
+  assert drive.tick(action=drive.action(resumed, 'accept')).message.slcState.acceptedSpeedLimit == 20.
+  preview = drive.tick().message.slcState
+  assert preview.hasPending and preview.pendingSpeedLimit == 15. and preview.decisionId != first.decisionId
+  assert preview.pendingSinceMonoTime == drive.now
   restarted = drive.now
   stale_action = drive.tick(action=drive.action(first, 'accept'))
   assert stale_action.message.slcState.hasPending
@@ -1013,3 +1017,49 @@ def test_dropout_backstop_also_ends_the_accepted_cap():
     out = drive.tick(target=0., alive=False, speed=25.)
   assert drive.runtime.state.acceptance.accepted is None
   assert out.message.slcState.acceptedSpeedLimit == 0.
+
+
+def test_reengagement_with_another_boundary_ahead_asks_for_the_current_limit_first():
+  """Codex review of b063ca0e5: the same re-engagement with an in-range 25 preview ahead prompted for 25, because the
+  last engagement's rejection still marked the current 15 as resolved."""
+  drive = Drive(confirm=True)
+  first = drive.tick().message.slcState
+  assert drive.tick(action=drive.action(first, 'reject')).message.slcState.actionStatus == 'reject'
+  for _ in range(4):
+    drive.tick(current=15., target=0., way=2)
+  start = drive.now
+  drive.sm['carControl'].enabled = drive.sm['carControl'].longActive = False
+  drive.sm['selfdriveState'].enabled = False
+  drive.sm['controlsState'].longControlState = 'off'
+  drive.tick(current=15., target=0., way=2, at=start + 1_000_000_000)
+  drive.sm['carControl'].enabled = drive.sm['carControl'].longActive = True
+  drive.sm['selfdriveState'].enabled = True
+  drive.sm['controlsState'].longControlState = 'pid'
+  resumed = drive.tick(current=15., target=25., way=2, target_way=3, boundary='b' * 64, distance=60.,
+                       at=start + 2_000_000_000).message.slcState
+  assert resumed.hasPending and resumed.pendingSpeedLimit == 15.
+
+
+def test_dropout_backstop_ends_a_cap_that_never_settled():
+  drive = Drive()  # the accepted 20 has been seen for one frame only
+  for _ in range(900):  # 45 s at 25 m/s
+    out = drive.tick(target=0., alive=False, speed=25.)
+  assert drive.runtime.state.acceptance.accepted is None and drive.runtime.history_limit is None
+  assert out.message.slcState.acceptedSpeedLimit == 0.
+
+
+def test_an_accept_on_the_expiry_frame_installs_no_cap():
+  """Codex review: a manual accept on the expiry frame installed a new 17 m/s cap and repopulated history."""
+  drive = Drive(confirm=True)
+  offer = drive.tick(current=25., target=0.).message.slcState
+  assert offer.hasPending and offer.pendingSpeedLimit == 25.
+  t = drive.now
+  for _ in range(9):  # 1 s ticks at 100 m/s: 900 m of dropout
+    t += 1_000_000_000
+    state = drive.tick(current=25., target=0., alive=False, speed=100., at=t).message.slcState
+  assert state.hasPending, 'the offer must still be open for this test to mean anything'
+  t += 1_000_000_000
+  action = Action(drive.runtime.session_id, t, state.decisionId, state.presentationId, 'accept')
+  drive.tick(current=25., target=0., alive=False, speed=100., at=t, action=action)
+  assert drive.runtime.state.acceptance.accepted is None and drive.runtime.history_limit is None
+  assert drive.runtime.state.acceptance.pending is None

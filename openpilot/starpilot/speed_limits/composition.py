@@ -125,6 +125,11 @@ def is_fresh_engagement(state: State, frame: Frame) -> bool:
                                    frame.now_ns - state.disengaged_since_ns >= ENGAGEMENT_GUARD_NS)
 
 
+def fresh_decision(acceptance: acc.State) -> acc.State:
+  """What a fresh engagement keeps of the last one's decision: nothing."""
+  return replace(acceptance, accepted=None, rejected=None, pending=None, timer_running=False, received_speed_mps=None)
+
+
 def step(state: State, frame: Frame) -> Result:
   if not _state_valid(state):
     return Result(state, status="invalid_state", errors=("invalid composition state",))
@@ -163,8 +168,7 @@ def step(state: State, frame: Frame) -> Result:
     # As filter-dev's Speed Limit Assist: every engagement decides the limit afresh. A SET already at the target accepts it
     # silently, otherwise the driver is asked; an acceptance from before (another engagement, or the last drive) never
     # stands in for it (route 00000005--a37f13ed24 t=34.5: the last drive's 36 counted as accepted, no prompt, SET 19).
-    base = replace(base, acceptance=replace(base.acceptance, accepted=None, rejected=None, pending=None,
-                                            timer_running=False, received_speed_mps=None))
+    base = replace(base, acceptance=fresh_decision(base.acceptance))
 
   if frame.classified_cruise is not None:
     classified = frame.classified_cruise

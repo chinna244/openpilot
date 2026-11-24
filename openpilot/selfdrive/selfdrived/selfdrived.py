@@ -142,7 +142,10 @@ SLC_ADJUST_ALERT_NS = 3_000_000_000
 
 def track_key_off(sd, now_ns: int) -> None:
   """Every step, wire healthy or not: sd.key_off_since_ns is the first fresh panda report of the current key off. Only
-  a fresh report with an ignition on clears it; missing or stale panda telemetry keeps what is known."""
+  a fresh report with an ignition on clears it; missing or stale panda telemetry keeps what is known. A replay tracks on
+  its recorded car clock only: without one, now_ns is wall time and nothing is tracked."""
+  if REPLAY and not getattr(sd, 'aol_car_state_log_ns', 0):
+    return
   pandas = key_off_input(sd.sm, 'pandaStates', now_ns)
   if pandas is None or len(pandas) == 0:
     return

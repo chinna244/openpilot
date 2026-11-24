@@ -245,3 +245,31 @@ def test_missing_panda_telemetry_does_not_restart_the_key_off():
   sm.valid['pandaStates'] = True
   key_off_frame(sm, T_PANDA + 1_100 * MS, T_PANDA - 300 * MS)
   assert key_off_site(sm, T_PANDA + 1_100 * MS + MS, sd)[1] == E.controlsMismatch  # the wait stays bounded
+
+
+def test_step_tracks_key_off_before_and_outside_the_native_wire_branch():
+  """Codex review of 0ba6401f7: the production call, not only the helper, must run on healthy-wire frames."""
+  lines = inspect.getsource(selfdrived.SelfdriveD.step).splitlines()
+  track = next(i for i, line in enumerate(lines) if 'track_key_off(self' in line)
+  branch = next(i for i, line in enumerate(lines) if "if self.aol_replay or getattr(self, 'ordinary_axis_ack_required'" in line)
+  assert track < branch
+  def indent(line):
+    return len(line) - len(line.lstrip())
+  assert indent(lines[track]) == indent(lines[branch])  # at step level, not inside a branch
+
+
+@pytest.mark.parametrize('site', ['step_tracking', 'missing_wire'])
+def test_replay_without_a_recorded_car_clock_tracks_nothing(monkeypatch, site):
+  """Codex review: with REPLAY and no recorded car timestamp, the missing-wire path still tracked on wall time."""
+  monkeypatch.setattr(selfdrived, 'REPLAY', True)
+  sm = FakeSM()
+  key_off_frame(sm, T_PANDA, T_PANDA - 300 * MS)
+  sd = SimpleNamespace(sm=sm, enabled=False, active=False)
+  if site == 'step_tracking':
+    selfdrived.track_key_off(sd, T_EVENT)
+  else:
+    selfdrived.SelfdriveD.missing_native_event(sd, T_EVENT, lost_active_aol=False)
+  assert getattr(sd, 'key_off_since_ns', None) is None
+  sd.aol_car_state_log_ns = T_EVENT  # with the recorded clock it tracks
+  selfdrived.track_key_off(sd, T_EVENT)
+  assert sd.key_off_since_ns == T_PANDA

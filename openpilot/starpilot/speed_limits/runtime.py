@@ -367,10 +367,13 @@ class Runtime:
     observations = self._observations(sm, CP, now_ns, now_boot_ns)
     observations = self.stabilizer.apply(observations, self.settings.selection, now_ns,
                                          v_ego=float(car_state.vEgo) if ego_valid else None)
-    if self.stabilizer.expired and self.state.acceptance.accepted is not None:
-      # filter-dev's 1 km backstop drops the limit itself, so the held reading's accepted cap ends with it.
-      self.state = replace(self.state, acceptance=replace(self.state.acceptance, accepted=None))
+    if self.stabilizer.expired:
+      # filter-dev's 1 km backstop drops the limit itself: the carried cap, its history and any offer still open end
+      # together, so an action on this frame cannot install a cap from the expired episode.
+      self.state = replace(self.state, acceptance=replace(self.state.acceptance, accepted=None, pending=None,
+                                                          presentation=None, timer_running=False, received_speed_mps=None))
       self.history_limit = None
+      self.current_presentation = None
     wheel_enabled = (self.settings.wheel_override and not CP.pcmCruise and car_fresh and car_state.canValid and
                      V_CRUISE_MIN <= selected <= V_CRUISE_MAX and selected_cluster == selected and
                      not car_state.brakePressed)
@@ -384,9 +387,11 @@ class Runtime:
                       filtered_ego_delta_mps=self._smoothed_ego_delta(
                         ego, CP, int(sm.logMonoTime.get('carState', 0)), standstill=bool(car_state.standstill)))
     maps_selected = self._maps_selected
-    if self.advance.encounter is not None and comp.is_fresh_engagement(self.state, frame):
-      # step() clears this engagement's decision; the last engagement's preview decline must not mask the current limit.
+    if comp.is_fresh_engagement(self.state, frame):
+      # step() decides this engagement afresh; apply that before proposing, so neither the last engagement's preview
+      # encounter nor its accept/reject decides what is resolved or offered now.
       self.advance = Advance()
+      self.state = replace(self.state, acceptance=comp.fresh_decision(self.state.acceptance))
     encounter = self.advance.encounter
     if not maps_selected and encounter is None:
       return frame
