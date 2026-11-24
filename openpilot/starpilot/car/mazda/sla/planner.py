@@ -3,10 +3,13 @@
 Per modelV2 tick: build the source snapshot, run the resolver, mirror the session card published, and hand plannerd
 the plan cap (the mirror's ramped target) and the slcState.mazdaSla fields card and selfdrived read.
 """
+from dataclasses import replace
+
 from openpilot.common.gps import get_gps_location_service
 from openpilot.starpilot.car.mazda.sla import V_CRUISE_UNSET
 from openpilot.starpilot.car.mazda.sla.mirror import SpeedLimitAssistMirror
 from openpilot.starpilot.car.mazda.sla.resolver import Sources, SpeedLimitResolver
+from openpilot.starpilot.speed_limits.map_source import EVENT_MAX_AGE_NS
 
 
 DASHBOARD_MAX_AGE_NS = 500_000_000  # card publishes it at 100 Hz
@@ -54,6 +57,8 @@ class MazdaSlaPlanner:
     self.mirror = SpeedLimitAssistMirror()
     self.servo_v_target = V_CRUISE_UNSET
     self.limiter_active = False
+    self.matched_road: tuple[str | int, float] | None = None
+    self.vision_fence_ns = 0
 
   def services(self) -> list[str]:
     return ['slcDashboardObservation', 'slcVisionObservation', 'mapdOut', self.gps_service, 'starpilotCarState']
@@ -61,7 +66,22 @@ class MazdaSlaPlanner:
   def step(self, sm, now_ns: int) -> float | None:
     """Returns the plan cap in m/s, or None for no cap."""
     v_ego = float(sm['carState'].vEgo)
-    self.resolver.update(v_ego, sources_from_sm(sm, now_ns, self.gps_service))
+    sources = sources_from_sm(sm, now_ns, self.gps_service)
+    if usable(sm, 'mapdOut', now_ns, EVENT_MAX_AGE_NS):
+      road = sm['mapdOut']
+      if getattr(road, 'wayId', 0) > 0 and str(road.roadStatus) in ('matchedLimit', 'matchedNoLimit'):
+        # Ignore serialization precision when identifying the same posted limit.
+        identity = (road.wayRef or road.roadName or road.wayName or int(road.wayId), round(sources.map_limit, 3))
+        if self.matched_road is not None and identity != self.matched_road:
+          self.vision_fence_ns = sources.map_ns
+        self.matched_road = identity
+    # The camera republishes its last sign while no new sign is detected. A
+    # fresh heartbeat cannot carry that evidence onto a different mapped road or speed-limit zone.
+    if sources.vision > 0. and self.vision_fence_ns:
+      supported_ns = int(sm['slcVisionObservation'].vision.observedMonoTime)
+      if not self.vision_fence_ns <= supported_ns <= now_ns:
+        sources = replace(sources, vision=0.)
+    self.resolver.update(v_ego, sources)
     # card's session counts only while valid and current: an old one must not keep a cap on the plan
     session = sm['starpilotCarState'].mazdaSlaSession if usable(sm, 'starpilotCarState', now_ns, SESSION_MAX_AGE_NS) else None
     self.mirror.update(session, v_ego)
@@ -89,3 +109,4 @@ class MazdaSlaPlanner:
     out.limiterActive = bool(self.limiter_active)
     out.offerTarget = float(m.offer_target)
     out.sessionValid = bool(m.session_valid)
+    out.roadChangeMonoTime = self.vision_fence_ns

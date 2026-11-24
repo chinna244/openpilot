@@ -387,6 +387,7 @@ struct SlcState @0xa1680744031fdb2d {
     limiterActive @11 :Bool; # the cap drives the plan this tick (filter-dev longitudinalPlanSource != cruise)
     offerTarget @12 :Float32; # m/s, the session's settled target: what the prompt names and a press is judged against
     sessionValid @13 :Bool; # the mirror holds a session card published; announceCounter means nothing without one
+    roadChangeMonoTime @14 :UInt64; # planner confirmed a new mapped road or speed-limit zone
   }
 
   struct SourceReading {

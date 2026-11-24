@@ -50,7 +50,8 @@ class MazdaSlaSession:
     self.button_timers = {'decelCruise': 0, 'accelCruise': 0}
     self.button_change_states = {'decelCruise': (False, False), 'accelCruise': (False, False)}
     self.prompting_published = False
-    self._fresh_frames = 0  # ICBM's prompting: plannerd's mirrored assist state (a hop stale), set by card
+    self._fresh_frames = 0
+    self._road_change_ns = 0
     self.enabled_prev = False
     self.enable_timers = dict.fromkeys(ENABLE_BUTTONS, 0)
     self.reconcile_frames = 0
@@ -83,6 +84,14 @@ class MazdaSlaSession:
     # card: update_speed_limit_assist(LP_SP)
     # StarPilot: decisions only on fresh plannerd data. Expired -> close the offer, presses are manual; recovered -> the limit
     # must hold LIMIT_SETTLE on fresh data again before anything is offered or answered
+    road_changed = False
+    if resolver is not None:
+      road_change_ns = int(getattr(resolver, 'roadChangeMonoTime', 0))
+      road_changed = road_change_ns != self._road_change_ns
+      self._road_change_ns = road_change_ns
+      if road_changed:
+        arb.expire_inputs()
+        self._fresh_frames = 0
     if resolver is None:
       if self._fresh_frames:
         arb.expire_inputs()
@@ -136,10 +145,9 @@ class MazdaSlaSession:
     # card_ext.update_v_cruise_post: the plan regime plannerd reported, then reconcile
     self._reconcile(CS, limiter_active)
 
-    if servo_v_target is None or not servo_v_target > 0.:
-      # plannerd's data expired (stale, unfilled or never published): no factory SET press, the queued one is dropped, and
-      # the walk restarts from a fresh decision once data returns. filter-dev keeps walking on its last plan target here;
-      # the port stops (review, 2026-11-24): a stale plan must not move the factory SET
+    if road_changed or servo_v_target is None or not servo_v_target > 0.:
+      # Discard queued SET presses at a road change or when the planner target expires.
+      # The walk starts from a fresh decision once the planner supplies a target again.
       self._next_button, self._next_hold = 'none', False
       self.send_button, self.hold = 'none', False
       self.servo.reset()

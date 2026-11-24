@@ -311,3 +311,46 @@ def test_untouched_offer_is_asked_again_on_fresh_data():
   rows, p, o0, o1 = _hidden_offer_case(lambda p, o0, o1: 4400)
   again = [s for s in spans(rows) if s[2] == 'Press - for 30 mph' and s[0] > rows[o1].ts]
   assert len(again) == 1 and again[0][0] >= rows[o1].ts + 2.0
+
+
+def test_vision_support_does_not_carry_onto_a_new_matched_road(monkeypatch):
+  p = _planner()
+  now = 10**12
+  observed = now - 1_000_000_000
+  received = []
+  monkeypatch.setattr(p.resolver, 'update', lambda _, sources: received.append(sources))
+
+  def step(time, road, way_id, *, support=observed, valid_map=True, speed_mph=25):
+    sm = _sm(time)
+    sm.put('slcVisionObservation', NS(vision=NS(status='valid', speedMps=30 / MPH, observedMonoTime=support)), time)
+    if road is not None:
+      sm.put('mapdOut', NS(wayId=way_id, roadName=road, wayRef='', wayName=road, roadStatus='matchedLimit',
+                           speedLimit=speed_mph / MPH, nextSpeedLimit=0., nextSpeedLimitDistance=0.), time)
+      sm.valid['mapdOut'] = valid_map
+    p.step(sm, time)
+    return round(received[-1].vision * MPH)
+
+  assert step(now, 'East Howard Avenue', 1) == 30
+  assert step(now + 100_000_000, 'East Howard Avenue', 2, speed_mph=25.000001) == 30  # same limit, different precision
+  assert step(now + 200_000_000, 'Parallel Road', 3, valid_map=False) == 30
+  assert step(now + 300_000_000, 'South Iowa Avenue', 4) == 0
+  assert step(now + 400_000_000, None, 0) == 0  # a brief map loss cannot revive the old sign
+  assert step(now + 500_000_000, 'South Iowa Avenue', 5, support=now + 400_000_000) == 30
+  assert step(now + 600_000_000, 'South Iowa Avenue', 6, support=now + 400_000_000, speed_mph=30) == 0
+
+
+def test_press_at_a_map_zone_change_cannot_answer_the_old_offer():
+  rig = Rig(card=True)
+  fill = rig.planner.fill
+  initial = run(Rig(card=True), 1000, lambda _: 25, dash=36)
+  boundary = first(initial, lambda r: r.state == AssistState.preActive) + 100
+
+  def fill_with_zone(out):
+    fill(out)
+    out.roadChangeMonoTime = 10**12 if rig.frame >= boundary else 0
+
+  rig.planner.fill = fill_with_zone
+  rows = run(rig, 1600, lambda i: 25 if i < boundary else 30, presses=tap(boundary + 10), dash=36)
+  assert rows[boundary - 10].state == AssistState.preActive
+  assert rows[boundary + 50].cap == 255. and setpoint(rows[boundary + 50]) == 35
+  assert not [span for span in spans(rows) if span[2].startswith('Adjusting')]
