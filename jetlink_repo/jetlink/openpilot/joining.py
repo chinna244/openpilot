@@ -731,7 +731,7 @@ class JoiningModelState:
       close()
 
 
-def join(parts, cam_w: int, cam_h: int, small, *, link=None) -> JoiningModelState:
+def join(parts, cam_w: int, cam_h: int, small, *, link=None, finish_prefetch=None) -> JoiningModelState:
   """The model modeld runs: the small model now, the Jetson once it is there.
   Returns straight away; the join runs in the background.
 
@@ -783,6 +783,10 @@ def join(parts, cam_w: int, cam_h: int, small, *, link=None) -> JoiningModelStat
     return JetlinkModelState(client, spec, warp, face=face, log=parts.log, event=op.event)
 
   def connect(should_stop=None):
+    nonlocal finish_prefetch
+    if finish_prefetch is not None:
+      finish, finish_prefetch = finish_prefetch, None
+      finish()
     return links.open_link(parts, link, should_stop)
 
   return JoiningModelState(small, connect, build, prepare, reset_small=lambda: ready['reset_small'](),

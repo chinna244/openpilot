@@ -189,12 +189,10 @@ class Jetlink:
     try:
       if prefetched is None:
         return join(self._parts, cam_w, cam_h, small)
-      # Only USB I/O ran early. Keep GPU setup after local warmup and before realtime.
-      from jetlink.openpilot.warp import init_device
+      # The local model has already warmed its GPU. Close out USB prefetch on the join
+      # worker; the shared warp is still prepared before the local frame loop starts.
       link, finish = prefetched
-      init_device(self._log)
-      finish()
-      return join(self._parts, cam_w, cam_h, small, link=link)
+      return join(self._parts, cam_w, cam_h, small, link=link, finish_prefetch=finish)
     except Exception:
       if link is not None:
         link.close()

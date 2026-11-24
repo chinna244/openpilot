@@ -474,6 +474,7 @@ def main(demo=False):
   subaru_smoothing = read_frozen(CP, params)
   kona_tau = kona_smoothing(CP)
 
+  release_compile_pool()
   jetlink_model = None
   # If the gadget was still configuring, retry at the original attach point.
   if jetlink_ready or (not CHESTNUT and not recovery_small_only and HOOKS.prepare(False)):
@@ -485,7 +486,6 @@ def main(demo=False):
       start_latency_writer(jetlink_model)
   params.put_bool("ChestnutLoading", False)
   cloudlog.warning(f"models loaded in {time.monotonic() - st:.1f}s, modeld starting")
-  release_compile_pool()
   # gc stays off for the realtime loop, so drop the load's cyclic garbage once now
   gc.collect()
 

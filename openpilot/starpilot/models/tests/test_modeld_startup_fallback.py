@@ -49,7 +49,7 @@ def test_early_gadget_wait_uses_time_already_spent_loading(monkeypatch, now, rem
   assert link.abandon.call_count == int(still_opening)
 
 
-def test_early_gadget_is_reused_without_moving_gpu_initialization(monkeypatch):
+def test_early_gadget_attachment_uses_the_warmed_local_gpu_without_waiting(monkeypatch):
   from jetlink.openpilot import Jetlink, gadget, joining, link, warp
 
   events = []
@@ -76,8 +76,28 @@ def test_early_gadget_is_reused_without_moving_gpu_initialization(monkeypatch):
   assert jetlink.prepare()
   assert events == ["usb-start"]
   assert jetlink.attach(small, 1344, 760) is joined
-  assert events == ["usb-start", "gpu-setup", "usb-finish"]
-  join.assert_called_once_with(parts, 1344, 760, small, link=client)
+  assert events == ["usb-start"]
+  finish = join.call_args.kwargs["finish_prefetch"]
+  join.assert_called_once_with(parts, 1344, 760, small, link=client, finish_prefetch=finish)
+  finish()
+  assert events == ["usb-start", "usb-finish"]
+
+
+def test_jetlink_worker_waits_for_the_prefetch_once(monkeypatch):
+  from jetlink.openpilot import joining, link
+
+  client = Mock()
+  finish = Mock()
+  open_link = Mock(return_value=object())
+  monkeypatch.setattr(link, "open_link", open_link)
+  monkeypatch.setattr(joining, "JoiningModelState", lambda small, connect, *args, **kwargs: connect)
+  parts = SimpleNamespace(log=Mock(), progress=Mock(), op=Mock(), models=Mock())
+  connect = joining.join(parts, 1344, 760, object(), link=client, finish_prefetch=finish)
+  finish.assert_not_called()
+  connect()
+  connect()
+  finish.assert_called_once_with()
+  assert open_link.call_count == 2
 
 
 def test_jetlink_prepares_while_the_local_model_is_still_loading():
@@ -87,6 +107,8 @@ def test_jetlink_prepares_while_the_local_model_is_still_loading():
   load = [line for name, line in calls if name == 'load_small']
   attach = next(line for name, line in calls if name == 'HOOKS.attach')
   assert prepare[0] < min(load) <= max(load) < prepare[1] < attach
+  release = next(line for name, line in calls if name == 'release_compile_pool')
+  assert max(load) < release < attach
 
 
 @pytest.mark.parametrize("early, chestnut, recovery, should_retry", [
