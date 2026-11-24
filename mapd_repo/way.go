@@ -2,6 +2,7 @@ package main
 
 import (
 	"errors"
+	"math"
 	"time"
 
 	"pfeifer.dev/mapd/cereal/custom"
@@ -102,13 +103,100 @@ func plausibleLoadedWays(offlineMaps *maps.Offline, location log.GpsLocationData
 	return ways
 }
 
+// Junction exception to the ambiguity rule (MATCHING.md): the road matched on the previous fix is kept while the car
+// drives straight along it and every competitor is either a connected piece of the same road with the same limit or a
+// clearly crossing street. Anything else, including a turn, a slow or unreliable heading, or a parallel road, stays
+// ambiguous.
+const (
+	junctionMinSpeed      = 3.0   // m/s: below it the GPS heading is not trusted
+	junctionMaxBearingAcc = 10.0  // deg
+	junctionAlignedSin    = 0.259 // |sin| of heading vs the kept road: within 15 deg
+	junctionCrossingSin   = 0.766 // |sin| of heading vs a competitor: at least 50 deg off
+)
+
+func sameRoadLimit(a, b *maps.Way) bool {
+	return a.Name() != "" && a.Name() == b.Name() && a.MaxSpeed() == b.MaxSpeed() &&
+		a.MaxSpeedForward() == b.MaxSpeedForward() && a.MaxSpeedBackward() == b.MaxSpeedBackward() &&
+		a.MaxSpeedConditional() == b.MaxSpeedConditional() && a.MaxSpeedForwardConditional() == b.MaxSpeedForwardConditional() &&
+		a.MaxSpeedBackwardConditional() == b.MaxSpeedBackwardConditional()
+}
+
+func waysConnected(a, b *maps.Way) bool {
+	a0, a1 := a.Nodes.At(0), a.Nodes.At(a.Nodes.Len()-1)
+	b0, b1 := b.Nodes.At(0), b.Nodes.At(b.Nodes.Len()-1)
+	return a0.Equals(b0) || a0.Equals(b1) || a1.Equals(b0) || a1.Equals(b1)
+}
+
+func junctionKeep(currentWay CurrentWay, candidates []maps.Way, location log.GpsLocationData) (maps.Way, bool) {
+	speed, bearing := float64(location.Speed()), location.BearingDeg()
+	if currentWay.Way.Nodes.Len() < 2 || !(speed >= junctionMinSpeed) || math.IsInf(speed, 0) || !(bearing >= 0 && bearing <= 360) {
+		return maps.Way{}, false
+	}
+	if acc := location.BearingAccuracyDeg(); !(acc > 0 && acc <= junctionMaxBearingAcc) {
+		return maps.Way{}, false
+	}
+	var current *maps.Way
+	for i := range candidates {
+		if candidates[i].Id() == currentWay.Way.Id() {
+			current = &candidates[i]
+		}
+	}
+	if current == nil {
+		return maps.Way{}, false
+	}
+	direction, err := current.OnWay(location, 2)
+	currentMatch, narrowErr := current.OnWay(location, current.DistanceMultiplier())
+	alignment, alignErr := current.BearingAlignment(location)
+	if err != nil || narrowErr != nil || alignErr != nil || alignment > junctionAlignedSin || direction.IsForward != currentWay.OnWay.IsForward {
+		return maps.Way{}, false
+	}
+	// Preserve the current way while narrow, or transfer only to a connected, aligned piece.
+	var kept *maps.Way
+	if currentMatch.OnWay {
+		kept = current
+	}
+	for i := range candidates {
+		w := &candidates[i]
+		if w == current {
+			continue
+		}
+		if sameRoadLimit(current, w) && waysConnected(current, w) {
+			broad, err := w.OnWay(location, 2)
+			currentLimit := CurrentWay{Way: *current, OnWay: direction}
+			candidateLimit := CurrentWay{Way: *w, OnWay: broad}
+			if err == nil && broad.OnWay && currentLimit.EffectiveMaxSpeed() == candidateLimit.EffectiveMaxSpeed() &&
+				currentLimit.ConditionalMaxSpeedRaw() == candidateLimit.ConditionalMaxSpeedRaw() {
+				if kept == nil {
+					narrow, err := w.OnWay(location, w.DistanceMultiplier())
+					aligned, alignErr := w.BearingAlignment(location)
+					if err == nil && narrow.OnWay && alignErr == nil && aligned <= junctionAlignedSin {
+						kept = w
+					}
+				}
+				continue
+			}
+		}
+		if s, err := w.BearingAlignment(location); err != nil || s < junctionCrossingSin {
+			return maps.Way{}, false // parallel, or not clearly crossing
+		}
+	}
+	if kept == nil {
+		return maps.Way{}, false
+	}
+	return *kept, true
+}
+
 func GetCurrentWay(currentWay CurrentWay, nextWays []maps.NextWayResult, offlineMaps *maps.Offline, location log.GpsLocationData) (CurrentWay, error) {
 	candidates := plausibleLoadedWays(offlineMaps, location)
 	if len(candidates) == 0 {
 		return CurrentWay{SelectionType: custom.WaySelectionType_fail}, errors.New("no plausible loaded-tile way")
 	}
 	if len(candidates) > 1 {
-		return CurrentWay{SelectionType: custom.WaySelectionType_fail}, ErrAmbiguousWay
+		kept, ok := junctionKeep(currentWay, candidates, location)
+		if !ok {
+			return CurrentWay{SelectionType: custom.WaySelectionType_fail}, ErrAmbiguousWay
+		}
+		candidates = []maps.Way{kept}
 	}
 	// Use the loaded tile's representation, even when a prior sticky way has the
 	// same ID. This prevents an old tile's geometry/limit from being republished.
