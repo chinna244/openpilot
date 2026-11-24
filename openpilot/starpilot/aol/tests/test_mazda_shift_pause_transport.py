@@ -47,11 +47,18 @@ def test_shift_hold_keeps_latch(gear):
   assert not f.failed
 
 
-def test_shift_path_refuses_drive():
-  """Drive is not a shift: the new path never retains it (Drive keeps its existing availability handling)."""
+def test_drive_in_the_settle_window_keeps_latch():
+  """Route 00000007--7d9475933b t=362.19: R->N->D, the first Drive frame still carried the shift's availabilityPause."""
+  cp, cs, f, native, stamp, now = setup()
+  cs.gearShifter = 'drive'
+  assert not observe(f, shift_frame(native, cp, stamp), cp, cs, now, shift_hold=True)
+
+
+def test_shift_path_refuses_drive_at_speed():
   cp, cs, f, native, stamp, now = setup()
   observe(f, shift_frame(native, cp, stamp - 50 * MS), cp, cs, now - 50 * MS, shift_hold=True)
   cs.gearShifter = 'drive'
+  cs.vEgo = cs.vEgoRaw = 3.
   sm = shift_frame(native, cp, stamp)
   axis = sm['aolAxisState']
   assert not f._mazda_shift_pause_current(sm, cp, cs, axis, int(sm.logMonoTime['aolAxisState']), now, latched=True,

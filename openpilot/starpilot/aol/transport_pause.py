@@ -1292,7 +1292,9 @@ class TransportPauseFeedback:
     if (not latched or self.failed or not self.session or not producer or
         not (cp.brand == 'mazda' and mazda_qualified(cp, marked_only=True) and cp.safetyConfigs[0].safetyParam & 8) or
         cs.gearShifter not in (structs.CarState.GearShifter.unknown, structs.CarState.GearShifter.park,
-                               structs.CarState.GearShifter.reverse, structs.CarState.GearShifter.neutral) or
+                               structs.CarState.GearShifter.reverse, structs.CarState.GearShifter.neutral,
+                               structs.CarState.GearShifter.drive) or  # Drive only in the shift's settle window
+        cs.gearShifter == structs.CarState.GearShifter.drive and abs(cs.vEgo) >= 2.5 or
         not cs.canValid or cs.canTimeout or cs.steerFaultPermanent or cs.accFaulted or cs.vehicleSensorsInvalid or
         str(axis.sessionId) != self.session or str(axis.faultSessionId) != self.session or
         str(axis.intentProducerSessionId) != producer or str(axis.faultReason) != 'availabilityPause' or

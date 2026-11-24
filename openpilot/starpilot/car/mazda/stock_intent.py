@@ -14,6 +14,10 @@ SHIFT_HOLD_MAX_SPEED = 2.5  # m/s
 UNKNOWN_GEAR_MAX_FRAMES = 100  # 1 s at card's 100 Hz
 UNKNOWN_EPISODE_WINDOW_FRAMES = 1000  # 10 s
 UNKNOWN_EPISODES_MAX = 4
+# Back in Drive, selfdrived's wrongGear (and the axis' availabilityPause) lag the gear by a cycle or more: the shift's own
+# leftovers are not a disarming fault for this long (route 00000007--7d9475933b t=362.19, R->N->D, cleared on the first
+# Drive frame). Lateral itself is not held for it.
+SHIFT_SETTLE_FRAMES = 100  # 1 s at card's 100 Hz
 GearShifter = structs.CarState.GearShifter
 SHIFT_GEARS = (GearShifter.park, GearShifter.reverse, GearShifter.neutral)
 
@@ -29,6 +33,7 @@ class MazdaStockCardIntent(AolCardIntent):
     self.camera_fault_clear_frames = CAMERA_FAULT_CLEAR_FRAMES
     self.lkas_off = False
     self.shift_hold = False
+    self.shift_settle_frames = 0
     self.shift_frame = 0
     self.unknown_frames = 0
     self.unknown_episodes: list[int] = []
@@ -241,8 +246,21 @@ class MazdaStockCardIntent(AolCardIntent):
       self.unknown_frames = 0
     self.unknown_episodes = [f for f in self.unknown_episodes if self.shift_frame - f < UNKNOWN_EPISODE_WINDOW_FRAMES]
     benign_unknown = unknown and self.unknown_frames <= UNKNOWN_GEAR_MAX_FRAMES and len(self.unknown_episodes) <= UNKNOWN_EPISODES_MAX
+    was_holding = self.shift_hold
     self.shift_hold = bool(CS.canValid and not CS.canTimeout and not CS.steerFaultPermanent and
                            abs(CS.vEgo) < SHIFT_HOLD_MAX_SPEED and (CS.gearShifter in SHIFT_GEARS or benign_unknown))
+    if self.shift_hold or not (CS.canValid and not CS.canTimeout and not CS.steerFaultPermanent and
+                               CS.gearShifter == GearShifter.drive):
+      self.shift_settle_frames = 0
+    elif was_holding:
+      self.shift_settle_frames = SHIFT_SETTLE_FRAMES
+    else:
+      self.shift_settle_frames = max(0, self.shift_settle_frames - 1)
+
+  @property
+  def shift_settling(self) -> bool:
+    """Just back in Drive from a shift hold: its lagging wrongGear/availabilityPause is not a disarming fault."""
+    return self.shift_settle_frames > 0
 
   def _arm_from_full_engagement(self, CS, *, source_ns):
     if not self.tja_button:

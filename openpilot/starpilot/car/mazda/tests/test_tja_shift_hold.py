@@ -148,3 +148,41 @@ def test_explicit_tja_off_during_a_shift_turns_it_off():
   assert not rig.intent.allowed_latch
   rig.run(G.drive, 0.5)
   assert not rig.steering_requested()
+
+
+def test_route_362s_lagging_wrong_gear_back_in_drive_keeps_the_latch():
+  """Route 00000007--7d9475933b t=362.19: R->N->D; selfdrived's wrongGear still stood on the first Drive frames."""
+  rig = Rig(G.drive)
+  rig.run(G.drive, 0.5)
+  rig.run(G.unknown, 0.04)
+  rig.run(G.neutral, 0.3)
+  rig.run(G.reverse, 2.0)
+  rig.run(G.neutral, 0.3)
+  rig.run(G.drive, 0.05, events=[wrong_gear()])  # the shift's own event, a few cycles late
+  assert rig.intent.allowed_latch
+  rig.run(G.drive, 0.5)
+  assert rig.steering_requested()
+
+
+def test_settle_window_ends_after_one_second_in_drive():
+  rig = Rig(G.drive)
+  rig.run(G.drive, 0.5)
+  rig.run(G.reverse, 1.0)
+  rig.run(G.drive, 0.98)
+  assert rig.intent.shift_settling
+  rig.run(G.drive, 0.05)
+  assert not rig.intent.shift_settling
+
+
+def test_no_settle_window_without_a_shift_hold():
+  rig = Rig(G.drive)
+  rig.run(G.drive, 1.0)
+  assert not rig.intent.shift_settling
+
+
+def test_settle_window_is_not_a_steering_pause():
+  rig = Rig(G.drive)
+  rig.run(G.drive, 0.5)
+  rig.run(G.reverse, 1.0)
+  rig.run(G.drive, 0.05)
+  assert rig.intent.shift_settling and rig.steering_requested()

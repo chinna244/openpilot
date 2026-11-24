@@ -682,7 +682,7 @@ class Car:
           self.CP.brand == 'volkswagen' and CS.canValid and not CS.canTimeout and
           not CS.steerFaultPermanent and (CS.gearShifter == car.CarState.GearShifter.reverse or
           getattr(self.aol_card_intent, 'reverse_pause', False))),
-        shift_hold=bool(getattr(self.aol_card_intent, 'shift_hold', False)))
+        shift_hold=bool(getattr(self.aol_card_intent, 'shift_hold', False) or getattr(self.aol_card_intent, 'shift_settling', False)))
       fault_active = True if transport_reset else None
       event_ns = int(self.sm.logMonoTime['onroadEvents'])
       if (getattr(self.aol_card_intent, 'requires_fault_observation', self.aol_card_intent.explicit_latch) and
@@ -1050,10 +1050,10 @@ class Car:
           self.CP.brand == 'volkswagen' and CS.canValid and not CS.canTimeout and
           not CS.steerFaultPermanent and (CS.gearShifter == car.CarState.GearShifter.reverse or
           getattr(self.aol_card_intent, 'reverse_pause', False))),
-        shift_hold=bool(getattr(self.aol_card_intent, 'shift_hold', False))):
+        shift_hold=bool(getattr(self.aol_card_intent, 'shift_hold', False) or getattr(self.aol_card_intent, 'shift_settling', False))):
       return True
     events = self.sm['onroadEvents']
-    if getattr(self.aol_card_intent, 'shift_hold', False):
+    if getattr(self.aol_card_intent, 'shift_hold', False) or getattr(self.aol_card_intent, 'shift_settling', False):
       # Mazda TJA: a low-speed shift pauses the latch (steering withheld) instead of disarming it
       events = [event for event in events if not (event.name == log.OnroadEvent.EventName.wrongGear and
                                                   event.softDisable and not event.immediateDisable)]
