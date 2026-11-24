@@ -126,8 +126,7 @@ def test_planner_cruise_candidate_holds_the_cap_with_actuator_lag():
   kappa = 0.05
   p = H.planner()
   p.CP.longitudinalActuatorDelay = 0.36
-  p.scc.scc.vision.params = FakeParams(SmartCruiseControlVision=True, CurveSpeedProfile=1)
-  p.scc.scc.map.params = FakeParams(SmartCruiseControlMap=False, CurveSpeedProfile=1)
+  p.scc.scc.vision.params = FakeParams(CurveSpeedController=True, CurveSpeedProfile=1)
   p.v_desired_filter.x = 8.
 
   v, a, delayed = 8., 0., deque([0.] * 7)

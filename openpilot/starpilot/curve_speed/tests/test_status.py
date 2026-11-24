@@ -47,6 +47,21 @@ class TestCurveStatus(unittest.TestCase):
                                       persistence_status='idle', road_curvature=cast(float, np.float32(0.01)) if numpy_applied is not None else None)
     return packet, stamp
 
+  def test_mazda_status_shows_the_vision_solver_control(self):
+    host = CurveHost(enabled=True, replay=True)
+    result = NS(candidate_mps=None, ceiling_mps=None, training=True, progress=0.0, binding_distance_m=0.0,
+                reason='native', learning_reason='learning')
+    for binding in (True, False):
+      planner = NS(scc=NS(binding=binding, output_v_target=15.0), last_curve_ceiling_applied=False,
+                   last_curve_ceiling_status='absent')
+      event = StatusPublisher().attach(None, host, result, planner, now_ns=NOW, model_ns=NOW - 1_000_000,
+                                       persistence_status='idle')
+      curve = observation(event.slcState, NOW)
+      assert curve is not None
+      self.assertEqual((curve.applied, curve.controlling, curve.glow), (binding,) * 3)
+      self.assertEqual(curve.ceiling_mps, 15.0 if binding else None)
+      self.assertFalse(curve.training)
+
   def test_planner_attach_serializes_numpy_scalars_without_crashing(self):
     for applied in (False, True):
       with self.subTest(applied=applied):

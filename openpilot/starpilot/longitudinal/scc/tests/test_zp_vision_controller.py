@@ -32,7 +32,7 @@ class TestLifecycle(VisionCase):
     assert self.scc_v.output_a_target == 0.
 
   def test_param_disable(self):
-    self.params.put_bool("SmartCruiseControlVision", False, block=True)
+    self.params.put_bool("CurveSpeedController", False, block=True)
     self.scc_v.enabled = False
     self.run_road(V_EGO, curve_at(50.))
     assert self.scc_v.state == VisionState.disabled

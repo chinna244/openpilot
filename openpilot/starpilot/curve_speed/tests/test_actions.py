@@ -51,6 +51,63 @@ class TestLearningActions(unittest.TestCase):
     self.assertEqual(self.raw(LEGACY_KEY), before)
     self.assertIsNone(self.raw(MASTER_KEY))
 
+  def corrections_path(self):
+    return Path(self.params.get_param_path('CurveCorrectionData'))
+
+  def apply_corrections(self, snapshot=None):
+    snapshot = snapshot or learning_snapshot(self.params, corrections=True)
+    return apply_learning(self.params, 'curve_reset', snapshot.sources, authorized=lambda: True, corrections=True)
+
+  def test_mazda_reset_clears_only_the_corrections(self):
+    self.corrections_path().write_bytes(b'{"version":1,"scales":[1.05,1.0,1.0]}')
+    legacy = self.raw(LEGACY_KEY)
+    snapshot = learning_snapshot(self.params, corrections=True)
+    self.assertEqual(snapshot.corrections, (1.05, 1.0, 1.0))
+    self.assertTrue(snapshot.resettable)
+    self.assertEqual(self.apply_corrections(snapshot).reason, 'saved')
+    self.assertEqual(self.corrections_path().read_bytes(), b'{"version":1,"scales":[1.0,1.0,1.0]}')
+    self.assertIsNone(self.raw(DOCUMENT_KEY))  # native learning untouched
+    self.assertEqual(self.raw(LEGACY_KEY), legacy)
+    after = learning_snapshot(self.params, corrections=True)
+    self.assertEqual(after.corrections, (1.0, 1.0, 1.0))
+    self.assertFalse(after.resettable)
+
+  def test_mazda_unit_or_absent_corrections_are_not_resettable(self):
+    self.assertFalse(learning_snapshot(self.params, corrections=True).resettable)
+    self.assertEqual(self.apply_corrections().reason, 'no_saved_learning')
+
+  def test_mazda_malformed_or_oversized_corrections_can_be_recovered(self):
+    for raw in (b'{', b'x' * 5000):
+      self.corrections_path().write_bytes(raw)
+      snapshot = learning_snapshot(self.params, corrections=True)
+      self.assertIsNone(snapshot.corrections)
+      self.assertTrue(snapshot.readable and snapshot.resettable)
+      self.assertEqual(self.apply_corrections(snapshot).reason, 'saved')
+      self.assertEqual(self.corrections_path().read_bytes(), b'{"version":1,"scales":[1.0,1.0,1.0]}')
+
+  def test_mazda_corrections_changed_after_the_snapshot_block_the_reset(self):
+    self.corrections_path().write_bytes(b'{"version":1,"scales":[1.05,1.0,1.0]}')
+    snapshot = learning_snapshot(self.params, corrections=True)
+    self.corrections_path().write_bytes(b'{"version":1,"scales":[1.08,1.0,1.0]}')
+    self.assertEqual(self.apply_corrections(snapshot).reason, 'source_changed')
+    self.assertEqual(self.corrections_path().read_bytes(), b'{"version":1,"scales":[1.08,1.0,1.0]}')
+
+  def test_mazda_reset_waits_for_the_running_planner(self):
+    self.corrections_path().write_bytes(b'{"version":1,"scales":[1.05,1.0,1.0]}')
+    owner = self.owner()
+    owner.make_host()  # plannerd holds the learning lease for its whole run
+    snapshot = learning_snapshot(self.params, corrections=True)
+    self.assertFalse(snapshot.resettable)
+    self.assertEqual(self.apply_corrections(snapshot).reason, 'learning_active')
+
+  def test_other_vehicles_ignore_the_corrections_document(self):
+    before = learning_snapshot(self.params)
+    self.corrections_path().write_bytes(b'x' * 5000)
+    after = learning_snapshot(self.params)
+    self.assertEqual(after, before)
+    self.assertEqual(self.apply(snapshot=after).reason, 'saved')
+    self.assertEqual(self.corrections_path().read_bytes(), b'x' * 5000)
+
   def test_reset_recovers_invalid_canonical_without_reviving_legacy(self):
     Path(self.params.get_param_path(DOCUMENT_KEY)).write_bytes(b'{')
     snapshot = learning_snapshot(self.params)

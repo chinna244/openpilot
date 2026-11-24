@@ -25,12 +25,10 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"LiveTorqueParametersSP", {PERSISTENT | DONT_LOG, BYTES}},
     {"Blendful", {PERSISTENT, BOOL, "1"}},
     {"BigModelSmoothing", {PERSISTENT, BOOL, "1"}},
-    // Mazda: develop's Smart Cruise Control (starpilot/longitudinal/scc), develop's keys. Vision defaults on (develop: off) as
-    // the develop car drove it (route 7c initData: SmartCruiseControlVision 1, SmartCruiseControlMap 0); no StarPilot toggle yet
+    // Smart Cruise Control vision (starpilot/longitudinal/scc). Mazda runs it under CurveSpeedController; this develop key
+    // only enables sunnypilot's controller on the other brands' wrapper (zoompilot/curve_speed_profile.py)
     {"SmartCruiseControlVision", {PERSISTENT, BOOL, "1"}},
-    {"SmartCruiseControlMap", {PERSISTENT, BOOL, "0"}},
     {"CurveSpeedProfile", {PERSISTENT, INT, "1"}},  // curve planners' lateral ceiling: 0 Gentle, 1 Normal, 2 Sporty
-    {"MapTargetVelocities", {CLEAR_ON_ONROAD_TRANSITION, STRING}},  // develop's mapd output; StarPilot's mapd path is used instead
     {"MazdaStockEcuStatus", {CLEAR_ON_MANAGER_START | CLEAR_ON_OFFROAD_TRANSITION, JSON}},
     {"MazdaStockEcuState", {CLEAR_ON_MANAGER_START | CLEAR_ON_OFFROAD_TRANSITION, STRING}},
     {"StockEcuHandBackRequest", {CLEAR_ON_MANAGER_START | CLEAR_ON_ONROAD_TRANSITION, JSON}},
@@ -405,6 +403,7 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"ShowCSCStatus", {PERSISTENT | DONT_LOG, BOOL, "0"}},
     {"CurvatureData", {PERSISTENT | DONT_LOG, JSON}},
     {"CurveComfortData", {PERSISTENT | DONT_LOG, JSON}},
+    {"CurveCorrectionData", {PERSISTENT | DONT_LOG, JSON}},
     {"SLCOffsetSchedule", {PERSISTENT | DONT_LOG, JSON}},
     {"MapdShadowEnabled", {PERSISTENT | DONT_LOG, BOOL, "0"}},
     {"OffroadPowerPreferences", {PERSISTENT | DONT_LOG, JSON}},

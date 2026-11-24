@@ -73,6 +73,8 @@ class CurveHost:
     self.lead_drive_id = 0
     self.previous_long_active = False
     self.previous_active_headway: float | None = None
+    # this frame's lead verdict (False: no lead followed; None: unknown), for the Mazda curve controller's pause
+    self.last_following_lead: bool | None = None
 
   def _reset_leads(self) -> None:
     self.leads.reset()
@@ -82,6 +84,7 @@ class CurveHost:
 
   def sample(self, sm, CP, now_ns: int, *, drive_id: int = 0, event=None, follow_time_s: float | None = None,
              cruise_ceiling_mps: float | None = None):
+    self.last_following_lead = None
     frame = frame_from_submaster(sm, CP, now_ns, drive_id=drive_id)
     if cruise_ceiling_mps is not None:
       if not math.isfinite(cruise_ceiling_mps) or cruise_ceiling_mps <= 0:
@@ -154,4 +157,5 @@ class CurveHost:
                                         observed.tracked is not None else None)
       except (KeyError, AttributeError, TypeError, ValueError, OverflowError):
         self._reset_leads()
+    self.last_following_lead = frame.following_lead
     return self.runtime.step(frame, event=event)

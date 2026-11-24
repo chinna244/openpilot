@@ -5,7 +5,7 @@ This file is part of zoompilot and is licensed under the MIT License.
 See the LICENSE.md file in the root directory for more details.
 
 Curve Speed profiles: one setting that scales the lateral-acceleration ceiling every curve
-planner drives to, on every brand. Map targets are speeds, so they scale by the square root.
+planner drives to, on every brand.
 Budgets, gates and latches stay as tuned. The sunnypilot controllers are wrapped here, not
 edited, so their files stay byte-identical to upstream.
 """
@@ -13,7 +13,6 @@ import math
 
 from openpilot.common.realtime import DT_MDL
 from openpilot.starpilot.longitudinal.scc import PARAMS_UPDATE_PERIOD
-from openpilot.starpilot.longitudinal.scc.map_controller import SmartCruiseControlMap as SPMap
 from openpilot.starpilot.longitudinal.scc.vision_controller import SmartCruiseControlVision as SPVision
 
 PARAM = "CurveSpeedProfile"
@@ -30,12 +29,6 @@ def read_scale(params) -> float:
   return SCALES[min(max(idx, 0), len(SCALES) - 1)]
 
 
-def scale_targets(targets: list, speed_scale: float) -> list:
-  """Map target velocities at speed_scale, in place: every caller hands over the list
-  velocities_from_param just parsed."""
-  for p in targets:
-    p["velocity"] *= speed_scale
-  return targets
 
 
 class CurveSpeedProfile:
@@ -65,23 +58,6 @@ class VisionProfile(CurveSpeedProfile):
     self._refresh_profile()
 
 
-class MapProfile(CurveSpeedProfile):
-  """The controller reads MapTargetVelocities into target_velocities every frame; scaling on
-  that assignment covers the selection and the held-target match alike."""
-  _target_velocities: list = []
-
-  @property
-  def target_velocities(self) -> list:
-    return self._target_velocities
-
-  @target_velocities.setter
-  def target_velocities(self, targets: list) -> None:
-    self._target_velocities = scale_targets(targets, self.speed_scale)
-
-  def update_params(self) -> None:
-    super().update_params()
-    self._refresh_profile()
-
 
 class SmartCruiseControlVision(VisionProfile, SPVision):
   """sunnypilot's vision controller with its flat ceiling scaled."""
@@ -90,7 +66,3 @@ class SmartCruiseControlVision(VisionProfile, SPVision):
     # v_target is only computed with long enabled; elsewhere it is stale and must not compound
     if self.long_enabled:
       self.v_target *= self.speed_scale
-
-
-class SmartCruiseControlMap(MapProfile, SPMap):
-  """sunnypilot's map controller with its targets scaled."""

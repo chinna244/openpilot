@@ -192,8 +192,8 @@ class LongitudinalPlanner:
       self.lead_forecast.install(self.mpc)
     # Mazda: develop's planner around the MPC. The model (e2e) candidate, with develop's curve offset and firm stop, is
     # always in the minimum and the cruise candidate follows develop's law, whatever experimentalMode says (develop's
-    # planner never reads it); the MPC follows at develop's town gap; Smart Cruise Control's vision and map targets
-    # lower the cruise target (scc/); StarPilot's AccelBoost is not used.
+    # planner never reads it); the MPC follows at develop's town gap; Smart Cruise Control's vision target (the Curve
+    # Speed Controller) lowers the cruise target (scc/); StarPilot's AccelBoost is not used.
     self.mazda = self.cruise_handover
     self.curve_speed = CurveSpeed(dt) if self.mazda else None
     self.firm_stop = FirmStop(dt) if self.mazda else None
@@ -243,7 +243,9 @@ class LongitudinalPlanner:
              lead_approach_key: LeadApproachKey | None = None,
              force_stop_provider: Callable[[float], StopPlan] | None = None,
              faster_lead_takeoff: bool = False, takeoff_drive_id: int = 0,
-             now_ns: int | None = None, drive_id: int = 0, wheel_coast=None, experimental_speed_nudge: bool = True):
+             now_ns: int | None = None, drive_id: int = 0, wheel_coast=None, experimental_speed_nudge: bool = True,
+             curve_lead_pause: bool = False):
+    """curve_lead_pause: Mazda, the Curve Speed Controller's "Pause while following a lead" applies this cycle."""
     if curve_ceiling is not None and curve_provider is not None:
       raise ValueError('choose explicit Curve ceiling or same-cycle provider')
     if self.plan_drive_id != drive_id:
@@ -319,10 +321,11 @@ class LongitudinalPlanner:
     a_cruise_prev = self.a_cruise
     scc_v_target = v_cruise
     if self.scc is not None:
-      # develop's update_targets on the filtered speed: SCC's vision and map targets against the cruise target, and the MPC seed
+      # develop's update_targets on the filtered speed: SCC's vision target against the cruise target, and the MPC seed
       v_set = 0. if sm['controlsState'].forceDecel else v_cruise_kph * CV.KPH_TO_MS
       scc_v_target, self.output_a_target = self.scc.update_targets(
-        sm, self.v_desired_filter.x, self.output_a_target, 0. if sm['controlsState'].forceDecel else v_cruise, v_set, self.a_cruise)
+        sm, self.v_desired_filter.x, self.output_a_target, 0. if sm['controlsState'].forceDecel else v_cruise, v_set, self.a_cruise,
+        lead_pause=curve_lead_pause)
       v_cruise = min(v_cruise, scc_v_target)
 
     if self.CP.openpilotLongitudinalControl:
@@ -402,6 +405,10 @@ class LongitudinalPlanner:
       except (AttributeError, IndexError, TypeError, ValueError, OverflowError):
         selected_follow = None
       curve_ceiling = curve_provider(selected_follow)
+    if self.scc is not None:
+      # Mazda: the vision solver under the Curve Speed Controller toggle is the one curve controller; the native
+      # envelope still runs (learning, status) but never caps the cruise target
+      curve_ceiling = None
     curve = select_curve_ceiling(
       curve_ceiling, model_ns=getattr(sm, 'logMonoTime', {}).get('modelV2', 0),
       driver_v_cruise_kph=sm['carState'].vCruise, effective_cruise_mps=v_cruise,
@@ -518,6 +525,7 @@ class LongitudinalPlanner:
       self._track_cruise_handover(sm, reset_state, v_ego, v_cruise)
     cruise_args = (accel_coast, self.allow_throttle, cruise_profile)
     cruise_kwargs = {'base_brake_floor': global_floor, 'selected_acceleration_max': selected_acceleration, 'faster_takeoffs': faster_takeoffs}
+    scc_owns_cruise = False
     if self.mazda:
       # develop's law, whatever experimentalMode says; then Smart Cruise Control's rebuild while it is the target
       mazda_min = max(ACCEL_MIN, -cruise_profile.cruise_brake_magnitude) if cruise_profile is not None else max(ACCEL_MIN, global_floor)
@@ -530,6 +538,8 @@ class LongitudinalPlanner:
         a = get_mazda_cruise_accel(v_cruise, v_ego, a_prev, a_target_prev, dt, cruise_min=mazda_min, max_accel=mazda_max)
         return self.scc.update_cruise_accel(a, unlimited=unlimited) if self.scc is not None else a
       self.a_cruise = mazda_cruise(self.a_cruise, prev_output_a_target, self.dt)
+      # the cruise law ran on SCC's own target: no later ceiling (Force Stop, navigation, coast, force decel) lowered it
+      scc_owns_cruise = self.scc is not None and self.scc.source == SccSource.sccVision and v_cruise == scc_v_target
     else:
       self.a_cruise = get_cruise_accel(sm['selfdriveState'].experimentalMode, v_cruise, v_ego,
                                        self.a_cruise, steer_angle_without_offset, self.CP, self.dt,
@@ -549,6 +559,7 @@ class LongitudinalPlanner:
                      any(lead.present for lead in (sm['radarState'].leadOne, sm['radarState'].leadTwo))))
       if button_target is not None:
         self.a_cruise = button_target
+        scc_owns_cruise = False
     cruise_should_stop = should_stop(v_ego, self.a_cruise)
     a_cruise = self.a_cruise
     if self.cruise_handover:
@@ -618,7 +629,8 @@ class LongitudinalPlanner:
       candidates.append((output_a_target_e2e, LongitudinalPlanSource.e2e, output_should_stop_e2e))
 
     mpc_source = self.mpc.source
-    output_a_target, self.mpc.source, _ = min(candidates, key=lambda c: c[0])
+    selected = min(range(len(candidates)), key=lambda i: candidates[i][0])  # the same first minimum min() picks
+    output_a_target, self.mpc.source, _ = candidates[selected]
     # A curve candidate alone cannot own driver feedback. Lead/e2e braking and
     # an equal or lower SLC ceiling retain their own attribution.
     self.last_curve_ceiling_applied = (curve.effective_mps is not None and self.a_cruise < output_a_target_mpc and
@@ -687,11 +699,19 @@ class LongitudinalPlanner:
     self.output_a_target = np.clip(output_a_target, ACCEL_MIN, accel_ceiling)
     self.a_target_published = float(self.output_a_target)
     self.source_published = self.mpc.source
+    published, published_selected = candidates, selected
     if lift_published:
       published = list(candidates)
       published[1] = (a_cruise, LongitudinalPlanSource.cruise, cruise_should_stop)
-      a_published, self.source_published, _ = min(published, key=lambda c: c[0])
+      published_selected = min(range(len(published)), key=lambda i: published[i][0])
+      a_published, self.source_published, _ = published[published_selected]
       self.a_target_published = float(np.clip(a_published, ACCEL_MIN, accel_ceiling))
+    if self.scc is not None:
+      # the Curve Speed Controller's corrections (and its status) count only when what was sent is the cruise candidate
+      # built on SCC's own target: not the MPC (whatever source it reports, e.g. a Force Stop obstacle's "cruise"), the
+      # model, a lower ceiling, the button cruise, or any later cap, lift or clip that changed it
+      self.scc.binding = bool(scc_owns_cruise and published_selected == 1 and
+                              abs(self.a_target_published - float(published[1][0])) < 1e-6)
 
     self.v_desired_filter.x = self.v_desired_filter.x + self.dt * (self.output_a_target + a_prev) / 2.0
 

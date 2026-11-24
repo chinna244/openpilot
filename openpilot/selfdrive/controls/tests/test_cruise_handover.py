@@ -33,8 +33,7 @@ class MockSubMaster(dict):
 
 def build_sm(v_cruise_kph=FAST, a_ego=-0.6, gas=False, brake=False, enabled=True, override=False, model_a=0.2, lead=None,
              force_decel=False):
-  services = {s: getattr(messaging.new_message(s), s) for s in ("vehicleParameters", "mapdExtendedOut", "deviceState",
-                                                                "gpsLocationExternal", "gpsLocation")}
+  services = {s: getattr(messaging.new_message(s), s) for s in ("vehicleParameters", "deviceState")}
   cs = messaging.new_message('carState')
   cs.carState.vEgo, cs.carState.aEgo, cs.carState.vCruise, cs.carState.vCruiseCluster = V_EGO, a_ego, v_cruise_kph, v_cruise_kph
   cs.carState.gasPressed, cs.carState.brakePressed = gas, brake
@@ -441,9 +440,9 @@ def test_a_curve_or_speed_limit_target_after_engaging_brakes_as_it_asks(monkeypa
   # the settle is for the driver's set speed only: an SCC or SLA target is not lifted
   orig = SmartCruiseTargets.update_targets
 
-  def as_scc(self, *args):
-    out = orig(self, *args)
-    self.source = SCC_SOURCES[1]
+  def as_scc(self, *args, **kwargs):
+    out = orig(self, *args, **kwargs)
+    self.source = SCC_SOURCES[0]
     return out
   monkeypatch.setattr(SmartCruiseTargets, 'update_targets', as_scc)
   p = planner()
@@ -503,8 +502,8 @@ def test_a_curve_target_mid_window_brakes_from_the_cruise_state_at_once(monkeypa
   orig = SmartCruiseTargets.update_targets
   scc = {'on': False}
 
-  def maybe_scc(self, *args):
-    out = orig(self, *args)
+  def maybe_scc(self, *args, **kwargs):
+    out = orig(self, *args, **kwargs)
     if scc['on']:
       self.source = SCC_SOURCES[0]
     return out
@@ -640,8 +639,8 @@ def test_a_curve_target_while_coasting_brakes_from_the_cruise_state_at_once(monk
   orig = SmartCruiseTargets.update_targets
   scc = {'on': False}
 
-  def maybe_scc(self, *args):
-    out = orig(self, *args)
+  def maybe_scc(self, *args, **kwargs):
+    out = orig(self, *args, **kwargs)
     if scc['on']:
       self.source = SCC_SOURCES[0]
     return out

@@ -4,6 +4,7 @@ from typing import TypedDict
 from unittest.mock import patch, Mock
 
 import pytest
+from types import SimpleNamespace
 
 from opendbc.car.honda.interface import CarInterface as HondaInterface
 from opendbc.car.honda.values import CAR as HONDA
@@ -429,7 +430,7 @@ def test_native_planner_speed_nudge_off_removes_entire_automatic_floor(factory, 
   assert planner.encouragement.boost == pytest.approx(MAX_BOOST)
 
 
-@pytest.mark.parametrize('host', [None, object()])
+@pytest.mark.parametrize('host', [None, SimpleNamespace(runtime=SimpleNamespace(no_lead=False), last_following_lead=None)])
 def test_plannerd_forwards_speed_nudge_choice_through_both_curve_paths(host):
   from openpilot.selfdrive.controls.plannerd import update_curve_frame
   planner = Mock()

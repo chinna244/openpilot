@@ -715,6 +715,63 @@ class FeatureSettingsOwnerTests(unittest.TestCase):
     self.assertEqual(canonical.read_bytes(), b'{"version":1,"buckets":{}}')
     self.assertEqual(legacy.read_bytes(), b'{"0.001":{"average":2.0,"count":2}}')
 
+  def test_mazda_curve_page_shows_and_resets_the_learned_corrections(self):
+    from opendbc.car import structs
+    self.owner.vehicle_params = lambda: structs.CarParams(brand="mazda", openpilotLongitudinalControl=True)
+    corrections = Path(self.params.get_param_path("CurveCorrectionData"))
+    corrections.write_bytes(b'{"version":1,"scales":[1.03,1.0,0.97]}')
+    state = self.owner.snapshot("curve", parked=True, system_long=True, lateral_context=True, metric=False)
+    labels = [row.label for row in state.rows]
+    self.assertNotIn("Learning progress", labels)
+    self.assertNotIn("Saved cornering comfort", labels)
+    shown = next(row for row in state.rows if row.label == "Learned corrections")
+    self.assertEqual(shown.value, "35 mph +3% · 55 mph +0% · 70 mph -3%")
+    reset = self._row("curve", "curve_reset")
+    self.assertTrue(reset.available)
+    request = FeatureSettingsRequest(reset.key, reset.source, "confirm", confirmation=True,
+      vehicle_fingerprint=reset.vehicle_fingerprint, dependencies=reset.dependencies)
+    self.assertTrue(self.owner.apply(request))
+    self.assertEqual(corrections.read_bytes(), b'{"version":1,"scales":[1.0,1.0,1.0]}')
+    shown = next(row for row in self.owner.snapshot("curve", parked=True, system_long=True, lateral_context=True,
+                                                    metric=False).rows if row.label == "Learned corrections")
+    self.assertEqual(shown.value, "35 mph +0% · 55 mph +0% · 70 mph +0%")
+
+  def test_mazda_curve_page_flags_unreadable_corrections(self):
+    from opendbc.car import structs
+    self.owner.vehicle_params = lambda: structs.CarParams(brand="mazda", openpilotLongitudinalControl=True)
+    Path(self.params.get_param_path("CurveCorrectionData")).write_bytes(b'{')
+    state = self.owner.snapshot("curve", parked=True, system_long=True, lateral_context=True, metric=False)
+    self.assertEqual(next(row for row in state.rows if row.label == "Learned corrections").value, "Unavailable")
+    self.assertTrue(self._row("curve", "curve_reset").available)
+
+  def test_mazda_curve_choices_ignore_invalid_native_learning(self):
+    from opendbc.car import structs
+    self.owner.vehicle_params = lambda: structs.CarParams(brand="mazda", openpilotLongitudinalControl=True)
+    Path(self.params.get_param_path("CurveComfortData")).write_bytes(b'{')
+    master = self._row("curve", "CurveSpeedController")
+    self.assertTrue(master.available)
+    self.assertTrue(self.owner.apply(row_change(master)))
+    self.assertEqual(self.params.get("CurveSpeedController"), True)
+
+  def test_mazda_curve_choice_is_bound_to_the_corrections_it_was_shown_with(self):
+    from opendbc.car import structs
+    self.owner.vehicle_params = lambda: structs.CarParams(brand="mazda", openpilotLongitudinalControl=True)
+    corrections = Path(self.params.get_param_path("CurveCorrectionData"))
+    corrections.write_bytes(b'{"version":1,"scales":[1.03,1.0,1.0]}')
+    request = row_change(self._row("curve", "CurveSpeedController"))
+    corrections.write_bytes(b'{"version":1,"scales":[1.05,1.0,1.0]}')
+    self.assertFalse(self.owner.apply(request))
+    self.assertTrue(self.owner.apply(row_change(self._row("curve", "CurveSpeedController"))))
+
+  def test_other_vehicles_ignore_an_unreadable_corrections_document(self):
+    Path(self.params.get_param_path("CurvatureData")).write_bytes(b'{"0.001":{"average":2.0,"count":2}}')
+    before = self._row("curve", "curve_reset")
+    Path(self.params.get_param_path("CurveCorrectionData")).write_bytes(b'x' * 5000)
+    after = self._row("curve", "curve_reset")
+    self.assertEqual((after.available, after.dependencies), (before.available, before.dependencies))
+    master = self._row("curve", "CurveSpeedController")
+    self.assertTrue(master.available)
+
   def test_curve_learning_action_rechecks_parked_vehicle(self):
     Path(self.params.get_param_path("CurvatureData")).write_bytes(b'{"0.001":{"average":2.0,"count":2}}')
     adopt = self._row("curve", "curve_reset")

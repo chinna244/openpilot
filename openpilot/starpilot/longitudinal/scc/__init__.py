@@ -4,11 +4,10 @@ Copyright (c) 2021-, Haibin Wen, sunnypilot, and a number of other contributors.
 This file is part of sunnypilot and is licensed under the MIT License.
 See the LICENSE.md file in the root directory for more details.
 
-Smart Cruise Control (vision and map curve speed) as chinna244/openpilot develop runs it
+Smart Cruise Control (vision curve speed) as chinna244/openpilot develop runs it
 (openpilot/sunnypilot/selfdrive/controls/lib/smart_cruise_control, mazda-smart-can-filter-dev 197598c0f6), for the Mazda
 port. Same laws and constants; StarPilot has no sunnypilot cereal structs, Params period or navd, so the pieces they
-provided are defined here, and the map targets come from StarPilot's mapd (scc/mapd_targets.py) instead of the
-MapTargetVelocities param develop's mapd writes.
+provided are defined here. The map controller (SCC-M) is not ported: the vision solver is the one curve controller.
 """
 from dataclasses import dataclass
 from enum import IntEnum

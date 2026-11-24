@@ -24,12 +24,9 @@ def make_smart_cruise_control(CP):
   from openpilot.starpilot.longitudinal.scc.smart_cruise_control import SmartCruiseControl
   scc = SmartCruiseControl()
   if runs_zoompilot_planners(CP):
-    from openpilot.starpilot.longitudinal.scc.zoompilot.map_controller import SmartCruiseControlMap
     from openpilot.starpilot.longitudinal.scc.zoompilot.vision_controller import SmartCruiseControlVision
     scc.vision = SmartCruiseControlVision(CP)
-    scc.map = SmartCruiseControlMap(CP)
   else:
     from openpilot.starpilot.longitudinal.scc.zoompilot import curve_speed_profile
     scc.vision = curve_speed_profile.SmartCruiseControlVision()
-    scc.map = curve_speed_profile.SmartCruiseControlMap()
   return scc

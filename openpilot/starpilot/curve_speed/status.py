@@ -62,6 +62,19 @@ class StatusPublisher:
       'persistenceStatus': persistence_status, 'glow': bool(runtime.glow), 'curveOnly': curve_only,
       'hasRoadCurvature': road_curvature is not None, 'roadCurvature': float(road_curvature or 0.0),
     }
+    scc = getattr(planner, 'scc', None)
+    if type(getattr(scc, 'binding', None)) is bool:
+      # Mazda: the vision solver is the curve controller and the native envelope only gives status, so show the
+      # solver's control: its target when the published plan followed it; native passive learning is not used there
+      target = getattr(scc, 'output_v_target', None)
+      binding = scc.binding and finite_number(target) and 0 < target <= 100
+      curve = event.slcState.curve
+      curve.documentValid = True
+      curve.training = False
+      curve.hasCeiling, curve.ceilingMps = bool(binding), float(target) if binding else 0.0
+      curve.applied = curve.controlling = curve.glow = bool(binding and runtime.enabled)
+      curve.plannerStatus = 'selected' if binding else 'absent'
+      curve.reason = 'vision' if binding else 'not_binding'
     return event
 
 

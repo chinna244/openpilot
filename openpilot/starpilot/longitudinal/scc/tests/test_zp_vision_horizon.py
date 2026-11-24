@@ -154,7 +154,7 @@ class TestLookaheadWire:
 
   def setup_method(self):
     self.params = Params()
-    self.params.put_bool("SmartCruiseControlVision", True, block=True)
+    self.params.put_bool("CurveSpeedController", True, block=True)
     self.scc_v = SmartCruiseControlVision(make_cp())
 
   def step(self, v=V_EGO, kappa_fn=lambda s: 0., long_enabled=True):
@@ -177,7 +177,7 @@ class TestLookaheadWire:
     assert self.scc_v.v_ahead_min == 0.
 
   def test_toggle_off_reports_no_lookahead(self):
-    self.params.put_bool("SmartCruiseControlVision", False, block=True)
+    self.params.put_bool("CurveSpeedController", False, block=True)
     scc = SmartCruiseControlVision(make_cp())
     sm = {'modelV2': model_for_road(V_EGO, curve_at(60.)).modelV2,
           'controlsState': messaging.new_message('controlsState').controlsState,

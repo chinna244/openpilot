@@ -6,14 +6,11 @@ See the LICENSE.md file in the root directory for more details.
 """
 import openpilot.cereal.messaging as messaging
 from openpilot.starpilot.longitudinal.scc.vision_controller import SmartCruiseControlVision
-from openpilot.starpilot.longitudinal.scc.map_controller import SmartCruiseControlMap
 
 
 class SmartCruiseControl:
   def __init__(self):
     self.vision = SmartCruiseControlVision()
-    self.map = SmartCruiseControlMap()
 
   def update(self, sm: messaging.SubMaster, long_enabled: bool, long_override: bool, v_ego: float, a_ego: float, v_cruise: float) -> None:
-    self.map.update(sm, long_enabled, long_override, v_ego, a_ego, v_cruise)
     self.vision.update(sm, long_enabled, long_override, v_ego, a_ego, v_cruise)

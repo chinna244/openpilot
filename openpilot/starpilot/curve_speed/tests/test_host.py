@@ -151,6 +151,20 @@ class TestCurveHost(unittest.TestCase):
     self.assertNotIn(False, [frame.following_lead for frame in frames])
     self.assertTrue(frames[-1].following_lead)
 
+  def test_last_following_lead_reports_this_frames_verdict(self):
+    # the Mazda curve controller's lead pause reads it after each sample
+    for lead in (False, True):  # the lead case last: present_lead() changes the shared radar message
+      host = CurveHost(enabled=True, no_lead=True, replay=True)
+      frames = self.capture_frames(host)
+      if lead:
+        self.present_lead()
+      for n in range(1, 21):
+        stamp = NOW + n * 50_000_000
+        self.sm.logMonoTime = dict.fromkeys(self.sm.messages, stamp)
+        host.sample(self.sm, self.cp, stamp, follow_time_s=1.45)
+        self.assertIs(host.last_following_lead, frames[-1].following_lead)
+      self.assertIs(host.last_following_lead, lead)
+
   def test_actual_serialized_schema_projection(self):
     events = {name: messaging.new_message(name) for name in self.sm.messages}
     events['modelV2'].modelV2.orientationRate.z = [0.25] * 33

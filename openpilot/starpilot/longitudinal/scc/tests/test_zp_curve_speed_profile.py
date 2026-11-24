@@ -7,8 +7,6 @@ See the LICENSE.md file in the root directory for more details.
 Curve Speed profiles scale the lateral ceiling on both planner paths. Normal must leave every
 output bit-identical to the unscaled planners.
 """
-import copy
-import json
 import math
 
 import numpy as np
@@ -21,22 +19,20 @@ from openpilot.starpilot.longitudinal.scc import PARAMS_UPDATE_PERIOD
 from openpilot.starpilot.longitudinal.scc import vision_controller as sp_vision
 from openpilot.starpilot.longitudinal.scc.speed_profile import allowed_speed
 from openpilot.starpilot.longitudinal.scc.zoompilot import curve_speed_profile as profile
-from openpilot.starpilot.longitudinal.scc.zoompilot import map_controller as zp_map
 from openpilot.starpilot.longitudinal.scc.zoompilot import vision_controller as zp_vision
 from openpilot.starpilot.longitudinal.scc.tests.vision_harness import make_cp, model_for_road, vehicle_params
 
 GENTLE, NORMAL, SPORTY = 0, 1, 2
 KAPPAS = np.linspace(0.0005, 0.03, 200)
-TARGETS = [{"velocity": 20.0, "latitude": 1.0, "longitude": 2.0}, {"velocity": 13.3, "latitude": 1.1, "longitude": 2.1}]
 
 
 @pytest.fixture
 def params():
   p = Params()
   p.put_bool("SmartCruiseControlVision", True, block=True)
-  p.put_bool("SmartCruiseControlMap", True, block=True)
+  p.put_bool("CurveSpeedController", True, block=True)
   yield p
-  for key in ("CurveSpeedProfile", "SmartCruiseControlVision", "SmartCruiseControlMap"):
+  for key in ("CurveSpeedProfile", "SmartCruiseControlVision", "CurveSpeedController"):
     p.remove(key)
 
 
@@ -114,30 +110,6 @@ class TestVisionControllers:
       scc.update(sm_for(20., 0.01), False, False, 20., 0., 25.)
     assert scc.v_target == v_target
 
-
-class TestMapControllers:
-  @pytest.mark.parametrize("make", [profile.SmartCruiseControlMap, lambda: zp_map.SmartCruiseControlMap(make_cp())])
-  @pytest.mark.parametrize("stored", [GENTLE, NORMAL, SPORTY])
-  def test_targets_scale_by_the_root(self, params, make, stored):
-    params.put("CurveSpeedProfile", stored, block=True)
-    scc = make()
-    scc.target_velocities = copy.deepcopy(TARGETS)
-    root = math.sqrt(profile.SCALES[stored])
-    assert [p["velocity"] for p in scc.target_velocities] == [p["velocity"] * root for p in TARGETS]
-    assert [(p["latitude"], p["longitude"]) for p in scc.target_velocities] == [(p["latitude"], p["longitude"]) for p in TARGETS]
-    if stored == NORMAL:
-      assert scc.target_velocities == TARGETS
-
-  def test_targets_are_parsed_fresh_each_frame(self, params):
-    """The setter scales in place: the controllers' list must be their own each frame."""
-    from openpilot.starpilot.longitudinal.scc.map_controller import velocities_from_param
-    params.put("MapTargetVelocities", json.dumps(TARGETS), block=True)
-    try:
-      first, second = (velocities_from_param("MapTargetVelocities", params) for _ in range(2))
-      assert first == second == TARGETS
-      assert first is not second and first[0] is not second[0]
-    finally:
-      params.remove("MapTargetVelocities")
 
 
 class TestRefresh:

@@ -124,7 +124,7 @@ class VisionCase:
 
   def setup_method(self):
     self.params = Params()
-    self.params.put_bool("SmartCruiseControlVision", True, block=True)
+    self.params.put_bool("CurveSpeedController", True, block=True)
     self.scc_v = SmartCruiseControlVision(make_cp())
 
   @staticmethod

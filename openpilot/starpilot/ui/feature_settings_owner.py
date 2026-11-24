@@ -78,7 +78,9 @@ from openpilot.starpilot.curve_speed.preferences import (
   MASTER_KEY as CURVE_MASTER_KEY, NO_LEAD_KEY as CURVE_NO_LEAD_KEY,
   DOCUMENT_LIMIT as CURVE_DOCUMENT_LIMIT, read_learning,
 )
-from openpilot.starpilot.curve_speed.actions import ACTION_KEYS as CURVE_ACTION_KEYS, apply_learning, learning_snapshot
+from openpilot.starpilot.curve_speed.actions import ACTION_KEYS as CURVE_ACTION_KEYS, CORRECTIONS_LIMIT as CURVE_CORRECTIONS_LIMIT, \
+  apply_learning, learning_snapshot
+from openpilot.starpilot.curve_speed import corrections as curve_corrections
 
 
 from openpilot.starpilot.controllers.toyota_cruise import capability as toyota_cruise_capability
@@ -678,13 +680,25 @@ class FeatureSettingsOwner:
 
   def _raw(self, key: str) -> bytes | None:
     limit = 65536 if key == PERSONALITY_PROFILES_PARAM else 16384 if key == DOCUMENT_KEY else \
-      CURVE_DOCUMENT_LIMIT if key in (CURVE_DOCUMENT_KEY, CURVE_LEGACY_KEY) else 128
+      CURVE_DOCUMENT_LIMIT if key in (CURVE_DOCUMENT_KEY, CURVE_LEGACY_KEY) else \
+      CURVE_CORRECTIONS_LIMIT if key == curve_corrections.KEY else 128
     return self._read_saved(key, limit)[0]
 
   def _readable(self, key: str) -> bool:
     limit = 65536 if key == PERSONALITY_PROFILES_PARAM else 16384 if key == DOCUMENT_KEY else \
-      CURVE_DOCUMENT_LIMIT if key in (CURVE_DOCUMENT_KEY, CURVE_LEGACY_KEY) else 128
+      CURVE_DOCUMENT_LIMIT if key in (CURVE_DOCUMENT_KEY, CURVE_LEGACY_KEY) else \
+      CURVE_CORRECTIONS_LIMIT if key == curve_corrections.KEY else 128
     return self._read_saved(key, limit)[1]
+
+  def _curve_dependencies(self, vehicle_cp) -> tuple[tuple[str, bytes | None], ...]:
+    """The saved learning a Curve page choice was made against: the Mazda corrections, or the native document."""
+    if curve_corrections.runs_on(vehicle_cp):
+      return ((curve_corrections.KEY, self._raw(curve_corrections.KEY)),)
+    document_raw = self._raw(CURVE_DOCUMENT_KEY)
+    dependencies = ((CURVE_DOCUMENT_KEY, document_raw),)
+    if document_raw is None:
+      dependencies += ((CURVE_LEGACY_KEY, self._raw(CURVE_LEGACY_KEY)),)
+    return dependencies
 
   def _default(self, key: str) -> str:
     if key == "AlwaysOnLateral":
@@ -1119,11 +1133,8 @@ class FeatureSettingsOwner:
       allowed = configurable and system_long and self.authority("long")
       vehicle_cp = self.vehicle_params()
       curve_supported = feature_longitudinal_supported(vehicle_cp)
-      learning = learning_snapshot(self.params)
-      document_raw = self._raw(CURVE_DOCUMENT_KEY)
-      dependencies = ((CURVE_DOCUMENT_KEY, document_raw),)
-      if document_raw is None:
-        dependencies += ((CURVE_LEGACY_KEY, self._raw(CURVE_LEGACY_KEY)),)
+      learning = learning_snapshot(self.params, corrections=curve_corrections.runs_on(vehicle_cp))
+      dependencies = self._curve_dependencies(vehicle_cp)
       master, _, _ = self._value(CURVE_MASTER_KEY)
       master_row = self._bool_row(CURVE_MASTER_KEY, "Curve Speed Controller", allowed and (learning.valid or master == "1"))
       rows.append(replace(master_row, dependencies=dependencies,
@@ -1139,16 +1150,23 @@ class FeatureSettingsOwner:
                                  "Unavailable with the current vehicle or feature settings"))
       rows.append(self._bool_row("ShowCSCStatus", "Show Curve status", allowed,
                                  reason="Display preference only; it does not enable control"))
-      rows.append(FeatureRow("", "Saved learning", "Valid" if learning.valid else "Unavailable",
-                             reason="Used automatically when Curve Speed Controller is on" if learning.valid else
-                                    "Saved data remains untouched; runtime control is disabled"))
-      rows.append(FeatureRow("", "Learning progress", f"{learning.progress:.1f}%" if learning.progress is not None else "Unavailable",
-                             reason="Saved coverage across curve types, learned while you control speed without a lead vehicle"
-                                    if learning.progress is not None else learning.reason))
-      rows.append(FeatureRow("", "Saved cornering comfort",
-                             f"{learning.comfort:.2f} m/s²" if learning.has_samples and learning.comfort is not None else
-                             "No learned samples" if learning.valid else "Unavailable",
-                             reason="Saved calibration, not a live reading" if learning.valid else learning.reason))
+      if curve_corrections.runs_on(vehicle_cp):
+        # Mazda: the Curve Speed Controller learns only from the driver's gas and brake corrections (curve_speed/corrections)
+        rows.append(FeatureRow("", "Learned corrections",
+                               curve_corrections.describe(learning.corrections) if learning.corrections is not None else "Unavailable",
+                               reason="Your gas and brake presses in curves move each speed's limit by up to 10%"
+                                      if learning.corrections is not None else "Saved corrections are unreadable; reset to clear them"))
+      else:
+        rows.append(FeatureRow("", "Saved learning", "Valid" if learning.valid else "Unavailable",
+                               reason="Used automatically when Curve Speed Controller is on" if learning.valid else
+                                      "Saved data remains untouched; runtime control is disabled"))
+        rows.append(FeatureRow("", "Learning progress", f"{learning.progress:.1f}%" if learning.progress is not None else "Unavailable",
+                               reason="Saved coverage across curve types, learned while you control speed without a lead vehicle"
+                                      if learning.progress is not None else learning.reason))
+        rows.append(FeatureRow("", "Saved cornering comfort",
+                               f"{learning.comfort:.2f} m/s²" if learning.has_samples and learning.comfort is not None else
+                               "No learned samples" if learning.valid else "Unavailable",
+                               reason="Saved calibration, not a live reading" if learning.valid else learning.reason))
       rows.append(FeatureRow("curve_reset", "Reset Saved Curve Learning", "", learning.sources[0][1],
                              available=parked and allowed and learning.resettable,
                              reason="" if learning.resettable else "No saved learning" if learning.valid and not learning.has_samples else
@@ -1612,12 +1630,13 @@ class FeatureSettingsOwner:
                 self.authority("long") and self.authority("parked_preferences"))
       if not authorized():
         return False
-      learning = learning_snapshot(self.params)
+      corrections = curve_corrections.runs_on(self.vehicle_params())
+      learning = learning_snapshot(self.params, corrections=corrections)
       if (not learning.readable or learning.sources != request.dependencies or
           learning.sources[0][1] != request.expected or
           not learning.resettable):
         return False
-      result = apply_learning(self.params, key, request.dependencies, authorized=authorized)
+      result = apply_learning(self.params, key, request.dependencies, authorized=authorized, corrections=corrections)
       return result.committed and result.reason == "saved"
     if key in LANE_CHANGE_KEYS:
       return self.lane_changes.apply(request)
@@ -1680,13 +1699,12 @@ class FeatureSettingsOwner:
            any(not self._readable(name) for name, _ in request.dependencies):
           return False
       if key in CURVE_KEYS:
-        current_document = self._raw(CURVE_DOCUMENT_KEY)
-        expected_dependencies = ((CURVE_DOCUMENT_KEY, current_document),)
-        if current_document is None:
-          expected_dependencies += ((CURVE_LEGACY_KEY, self._raw(CURVE_LEGACY_KEY)),)
-        if request.dependencies != expected_dependencies or not self._readable(source_key):
+        vehicle_cp = self.vehicle_params()
+        if request.dependencies != self._curve_dependencies(vehicle_cp) or not self._readable(source_key):
           return False
-        if (key != CURVE_MASTER_KEY or request.value != "Off") and not read_learning(self.params).valid:
+        # Mazda: the native learning document is not used there, so it cannot block these choices
+        if (key != CURVE_MASTER_KEY or request.value != "Off") and not curve_corrections.runs_on(vehicle_cp) and \
+           not read_learning(self.params).valid:
           return False
       if key in SOURCE_PRIORITY_KEYS and request.capability != self._source_capability():
         return False

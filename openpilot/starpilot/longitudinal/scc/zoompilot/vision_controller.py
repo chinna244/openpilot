@@ -17,7 +17,7 @@ import openpilot.cereal.messaging as messaging
 from openpilot.common.constants import ACCELERATION_DUE_TO_GRAVITY
 from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.car.cruise import V_CRUISE_UNSET
-from openpilot.starpilot.longitudinal.scc import MIN_V
+from openpilot.starpilot.longitudinal.scc import MIN_V, PARAMS_UPDATE_PERIOD
 from openpilot.starpilot.longitudinal.scc.limits import (
   A_PUB_MIN, COMMIT_FRAC, get_planning_limits, publish_ramp)
 from openpilot.starpilot.longitudinal.scc.speed_profile import (
@@ -27,6 +27,9 @@ from openpilot.starpilot.longitudinal.scc.vision_controller import (
 from openpilot.starpilot.longitudinal.scc.zoompilot.curve_speed_profile import VisionProfile
 
 __all__ = ['ACTIVE_STATES', 'ENABLED_STATES', 'SmartCruiseControlVision', 'VisionState']
+
+# StarPilot port: the Curve Speed Controller toggle is the one curve-speed switch; this solver is its engine
+CURVE_PARAM = "CurveSpeedController"
 
 # Curves are taken at or below this lateral acceleration (v^2 * curvature), m/s2, keyed on the
 # curve's own speed, not the set speed. Tolerance falls with speed, but banked highway curves
@@ -156,10 +159,16 @@ _LEAVING_LAT_ACC_TH = 1.3  # turning displays as leaving below this
 _FINISH_LAT_ACC_TH = 1.1  # leaving ends below this
 
 
-def curve_table(scale: float = 1.0) -> tuple[np.ndarray, np.ndarray]:
+def curve_table(scale: float = 1.0, corrections: tuple[float, ...] = (1.0, 1.0, 1.0)) -> tuple[np.ndarray, np.ndarray]:
   """The ceiling by curvature at a Curve Speed profile's scale: the ceiling and its curvature keys
-  both scale."""
-  return np.array(_A_LAT_KAPPA_BP) * scale, np.array(_A_LAT_KAPPA) * scale
+  both scale. corrections: the driver's learned scale at each table speed (_A_LAT_CURVE_BP order)."""
+  m = np.array(corrections[::-1], dtype=float)
+  return np.array(_A_LAT_KAPPA_BP) * scale * m, np.array(_A_LAT_KAPPA) * scale * m
+
+
+def table_lat(v: float) -> float:
+  """The unscaled ceiling at curve speed v, m/s2, before the planning margin."""
+  return float(np.interp(v, _A_LAT_CURVE_BP, _A_LAT_CURVE))
 
 
 _NORMAL_TABLE = curve_table()
@@ -191,16 +200,29 @@ def path_roll(road_roll: float, model) -> np.ndarray | float:
 
 
 class SmartCruiseControlVision(VisionProfile, UpstreamVision):
+  corrections: tuple[float, ...] = (1.0, 1.0, 1.0)
+
   def __init__(self, CP):
     super().__init__()
     self.limits = get_planning_limits(CP)
     self._reset_solver()
     self.a_out = 0.
     self.v_ego_car = 0.
+    self.enabled = self.params.get_bool(CURVE_PARAM)
+
+  def _update_params(self) -> None:
+    super()._update_params()
+    if self.frame % int(PARAMS_UPDATE_PERIOD / DT_MDL) == 0:
+      self.enabled = self.params.get_bool(CURVE_PARAM)
 
   def _set_scale(self, scale: float) -> None:
     super()._set_scale(scale)
-    self._curve_table = curve_table(scale)
+    self._curve_table = curve_table(scale, self.corrections)
+
+  def set_corrections(self, corrections: tuple[float, ...]) -> None:
+    if tuple(corrections) != self.corrections:
+      self.corrections = tuple(corrections)
+      self._curve_table = curve_table(self.lat_scale, self.corrections)
 
   def _reset_solver(self) -> None:
     self.solver_valid = False

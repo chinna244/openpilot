@@ -23,6 +23,7 @@ from openpilot.starpilot.longitudinal.encouragement import NudgePreferences
 from openpilot.starpilot.longitudinal.force_stop_runtime import ForceStopRuntime
 from openpilot.starpilot.longitudinal.stop_resume import collect_resume
 from openpilot.starpilot.longitudinal.lead_approach_runtime import LeadApproachPreferences
+from openpilot.starpilot.curve_speed import corrections as curve_corrections
 from openpilot.starpilot.curve_speed.host import CurveHost
 from openpilot.starpilot.curve_speed.runtime import DriverEvent as CurveDriverEvent
 from openpilot.starpilot.curve_speed.preferences import PreferenceHost as CurvePreferenceHost
@@ -118,6 +119,26 @@ def curve_for_frame(host: CurveHost | None, sm, CP, now_ns: int, *, drive_id: in
   if type(model_ns) is not int or model_ns <= 0:
     return None, result
   return CurveCeiling(result.ceiling_mps, model_ns), result
+
+
+def close_curve_learning(planner: LongitudinalPlanner, curve_preferences: CurvePreferenceHost) -> None:
+  """The Mazda corrections' write in flight finishes before the learning lease is released: a parked reset waits for
+  the lease, so it can never be overwritten by this planner's last save. A write that will not finish keeps the lease
+  (and so blocks the reset) until the process ends."""
+  if planner.scc is not None and not planner.scc.close_corrections():
+    cloudlog.error("curve corrections: write still in flight at shutdown; keeping the learning lease")
+    return
+  curve_preferences.close()
+
+
+def corrections_owned(curve_preferences: CurvePreferenceHost | None) -> bool:
+  """The Mazda curve corrections may learn only while this planner holds the curve learning lease."""
+  return curve_preferences is not None and curve_preferences.session_fd is not None
+
+
+def native_curve_learning_saved(planner: LongitudinalPlanner) -> bool:
+  """Mazda: the native envelope only gives status (the vision solver is the curve controller); its learning is not saved."""
+  return planner.scc is None
 
 
 def confirm_curve_frame(host: CurveHost | None, planner: LongitudinalPlanner, now_ns: int) -> None:
@@ -255,7 +276,9 @@ def update_curve_frame(planner: LongitudinalPlanner, sm, CP, now_ns: int, *, hos
                  curve_provider=provider, traffic_mode=traffic_mode, lane_change_policy=lane_change_policy,
                  global_braking_response=global_braking_response, selected_profiles=selected_profiles, conditional_handoff=conditional_handoff,
                  lead_approach_key=lead_approach_key, force_stop_provider=force_stop_provider, faster_lead_takeoff=faster_lead_takeoff, wheel_coast=wheel_coast,
-                   takeoff_drive_id=drive_id, now_ns=now_ns, drive_id=drive_id, experimental_speed_nudge=experimental_speed_nudge)
+                   takeoff_drive_id=drive_id, now_ns=now_ns, drive_id=drive_id, experimental_speed_nudge=experimental_speed_nudge,
+                 # Mazda: last cycle's lead verdict from this host gates the Curve Speed Controller's vision target
+                 curve_lead_pause=bool(host.runtime.no_lead and host.last_following_lead is not False))
   confirm_curve_frame(host, planner, now_ns)
   return results[0] if results else None
 
@@ -333,7 +356,9 @@ def starpilot_main():
   # current-source and longitudinal authority checks still run every frame.
   slc_available = slc_transport_capable(CP, os.environ)
   profile_replay = feature_enabled(params, CP, 'profile', os.environ)
-  curve_replay = feature_enabled(params, CP, 'curve', os.environ)
+  # Mazda: the curve host always runs, whatever the toggle says at start: its lead detector serves "Pause while following
+  # a lead" if the toggle is turned on mid-drive, and its learning lease keeps a parked reset out while this planner runs
+  curve_replay = feature_enabled(params, CP, 'curve', os.environ) or curve_corrections.runs_on(CP)
   conditional_replay = feature_enabled(params, CP, 'conditional', os.environ)
   # A validated Traffic gesture uses its frozen default profile even when
   # CustomPersonalities is off; saved custom category values still require
@@ -348,6 +373,8 @@ def starpilot_main():
   curve_preferences = CurvePreferenceHost(params) if curve_replay else None
   curve_host = curve_preferences.make_host(replay='REPLAY' in os.environ) if curve_preferences is not None else None
   curve_status = CurveStatusPublisher() if curve_host is not None else None
+  if longitudinal_planner.scc is not None:
+    longitudinal_planner.scc.take_ownership(corrections_owned(curve_preferences))
   force_stop_owner = ForceStopRuntime(params) if CP.openpilotLongitudinalControl else None
   takeoff_preferences = TakeoffPreferences(params) if CP.openpilotLongitudinalControl else None
   stop_resume_sock = messaging.sub_sock("carState", conflate=False) if force_stop_owner is not None else None
@@ -390,15 +417,6 @@ def starpilot_main():
     optional_slc.append('slcVisionObservation')
   subscribed_services.extend(optional_slc)
   subscribed_services.append('starpilotNavigation')
-  if longitudinal_planner.scc is not None:
-    # Mazda Smart Cruise Control's map targets: the GPS fix and StarPilot mapd's path
-    from openpilot.common.gps import get_gps_location_service
-    from openpilot.starpilot.longitudinal.scc.mapd_targets import MAPD_SERVICE
-    for service in (get_gps_location_service(params), MAPD_SERVICE):
-      if service not in subscribed_services:
-        subscribed_services.append(service)
-      if service not in optional_slc:
-        optional_slc.append(service)
   optional_conditional = ['starpilotNavigation'] + (['starpilotRadarState'] if conditional_host is not None else []) + optional_slc
   sm = messaging.SubMaster(subscribed_services, poll='modelV2',
                            ignore_alive=optional_conditional, ignore_valid=optional_conditional,
@@ -558,7 +576,8 @@ def starpilot_main():
                                           faster_lead_takeoff=faster_lead_takeoff, wheel_coast=(wheel_coast, params),
                                           experimental_speed_nudge=nudge_preferences.sample(now_ns))
         if curve_preferences is not None and curve_host is not None and curve_result is not None:
-          curve_preferences.persist(curve_host, curve_result, now_ns)
+          if native_curve_learning_saved(longitudinal_planner):
+            curve_preferences.persist(curve_host, curve_result, now_ns)
           assert curve_status is not None
           curve_geometry = road_curvature(sm['modelV2'], sm['carState'].vEgo) if curve_result.candidate_mps is not None else None
           planner_status = curve_status.attach(planner_status, curve_host, curve_result, longitudinal_planner,
@@ -628,7 +647,7 @@ def starpilot_main():
     if conditional_host is not None:
       conditional_host.close()
     if curve_preferences is not None:
-      curve_preferences.close()
+      close_curve_learning(longitudinal_planner, curve_preferences)
 
 def main():
   # Manager stops plannerd offroad. Select once before constructing any planner
