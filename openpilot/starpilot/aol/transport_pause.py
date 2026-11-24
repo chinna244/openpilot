@@ -1303,13 +1303,18 @@ class TransportPauseFeedback:
         str(axis.intentProducerSessionId) != producer or str(axis.faultReason) != 'availabilityPause' or
         str(axis.mode) != 'off' or axis.lateralActive or axis.longitudinalActive):
       return False
+    stable_non_drive = cs.gearShifter in (structs.CarState.GearShifter.park, structs.CarState.GearShifter.reverse,
+                                         structs.CarState.GearShifter.neutral)
     event_ns = int(sm.logMonoTime['onroadEvents'])
     user_ok = (log.OnroadEvent.EventName.wrongGear, log.OnroadEvent.EventName.reverseGear,
                log.OnroadEvent.EventName.pcmDisable, log.OnroadEvent.EventName.pedalPressed)
     fault_event_ns = int(axis.faultEventMonoTime)
     if (not sm.seen['onroadEvents'] or not sm.valid['onroadEvents'] or not sm.alive['onroadEvents'] or
         not 0 < fault_event_ns <= stamp or not 0 < event_ns <= now_ns or
-        abs(event_ns - fault_event_ns) > MAZDA_SHIFT_EVENT_GAP_NS or now_ns - event_ns > 1_500_000_000 or
+        abs(event_ns - fault_event_ns) > MAZDA_SHIFT_EVENT_GAP_NS or
+        # onroadEvents is published on change: in a steady Park/Reverse/Neutral its age is not staleness (route
+        # 00000008--80148a3eeb t=479.37); the axis carrying this fault is checked current every frame.
+        not stable_non_drive and now_ns - event_ns > 1_500_000_000 or
         not any(event.name == log.OnroadEvent.EventName.wrongGear for event in sm['onroadEvents']) or
         any(event.immediateDisable or event.softDisable and event.name != log.OnroadEvent.EventName.wrongGear or
             event.userDisable and event.name not in user_ok for event in sm['onroadEvents'])):

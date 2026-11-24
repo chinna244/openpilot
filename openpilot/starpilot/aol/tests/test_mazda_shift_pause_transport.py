@@ -169,7 +169,6 @@ def reverse_history(f, native, cp, cs, stamp):
 def test_drive_settle_event_strictly_newer_than_the_axis_keeps_latch():
   cp, cs, f, native, stamp, now = setup()
   stamp = reverse_history(f, native, cp, cs, stamp)
-  now = stamp + MS
   sm = shift_frame(native, cp, stamp)
   m = sm.messages['aolAxisState'].as_builder()
   m.aolAxisState.faultEventMonoTime = stamp - 5 * MS
@@ -189,3 +188,42 @@ def test_drive_settle_event_30ms_older_than_the_axis_fails():
   sm.messages['aolAxisState'] = m.as_reader()
   sm.logMonoTime['onroadEvents'] = stamp - 31 * MS
   assert observe(f, sm, cp, cs, now, shift_hold=True)
+
+
+@pytest.mark.parametrize('gear', ['park', 'reverse', 'neutral'])
+def test_steady_gear_with_unchanged_events_keeps_latch(gear):
+  """Route 00000008--80148a3eeb t=477.69 -> 479.37: shifted to Park, selfdrived's events stopped changing, so onroadEvents
+  (published on change) aged past 1.5 s while the axis was current every frame; the transport failed the latch
+  (aol_transport_failed not_current_or_continuity -> mazda_tja_latch_cleared disarming_fault). Reverse survived only
+  because steerOverride kept toggling the event set."""
+  cp, cs, f, native, stamp, now = setup()
+  cs.gearShifter = gear
+  first = stamp
+  for k in range(0, 500, 10):  # 5 s at 10 Hz samples
+    t = stamp + k * 10 * MS
+    sm = shift_frame(native, cp, t)
+    m = sm.messages['aolAxisState'].as_builder()
+    m.aolAxisState.faultEventMonoTime = first  # the shift's event, still the axis's fault
+    sm.messages['aolAxisState'] = m.as_reader()
+    sm.logMonoTime['onroadEvents'] = first  # unchanged since the shift
+    assert not observe(f, sm, cp, cs, t + MS, shift_hold=True), k
+  assert not f.failed
+
+
+@pytest.mark.parametrize('gear', ['drive', 'unknown'])
+def test_transitional_gear_keeps_the_event_age_bound(gear):
+  cp, cs, f, native, stamp, now = setup()
+  cs.gearShifter = gear
+  first = stamp
+  failed_at = None
+  for k in range(0, 300, 10):
+    t = stamp + k * 10 * MS
+    sm = shift_frame(native, cp, t)
+    m = sm.messages['aolAxisState'].as_builder()
+    m.aolAxisState.faultEventMonoTime = first
+    sm.messages['aolAxisState'] = m.as_reader()
+    sm.logMonoTime['onroadEvents'] = first
+    if observe(f, sm, cp, cs, t + MS, shift_hold=True):
+      failed_at = k
+      break
+  assert failed_at is not None and 140 <= failed_at <= 160  # Transitional gears keep the short pause window
