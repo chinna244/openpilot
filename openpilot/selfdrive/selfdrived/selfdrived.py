@@ -140,6 +140,18 @@ def key_off_input(sm, service: str, now_ns: int):
 
 SLC_ADJUST_ALERT_NS = 3_000_000_000
 
+def track_key_off(sd, now_ns: int) -> None:
+  """Every step, wire healthy or not: sd.key_off_since_ns is the first fresh panda report of the current key off. Only
+  a fresh report with an ignition on clears it; missing or stale panda telemetry keeps what is known."""
+  pandas = key_off_input(sd.sm, 'pandaStates', now_ns)
+  if pandas is None or len(pandas) == 0:
+    return
+  if any(ps.ignitionLine or ps.ignitionCan for ps in pandas):
+    sd.key_off_since_ns = None
+  elif getattr(sd, 'key_off_since_ns', None) is None:
+    sd.key_off_since_ns = int(sd.sm.logMonoTime['pandaStates'])
+
+
 class SelfdriveD:
   def missing_native_event(self, now_ns: int, *, lost_active_aol: bool):
     """Called once initialized with no current AOL native: the event to raise (native_missing_event). step() owns
@@ -147,10 +159,7 @@ class SelfdriveD:
     pandas = key_off_input(self.sm, 'pandaStates', now_ns)
     device = key_off_input(self.sm, 'deviceState', now_ns)
     panda_off = bool(pandas is not None and len(pandas) > 0 and all(not ps.ignitionLine and not ps.ignitionCan for ps in pandas))
-    if not panda_off:
-      self.key_off_since_ns = None
-    elif getattr(self, 'key_off_since_ns', None) is None:
-      self.key_off_since_ns = int(self.sm.logMonoTime['pandaStates'])  # the first panda report of the key off
+    track_key_off(self, now_ns)
     key_off_since = getattr(self, 'key_off_since_ns', None)
     device_predates = bool(panda_off and device is not None and key_off_since is not None and
                            int(self.sm.logMonoTime['deviceState']) < key_off_since and
@@ -2411,6 +2420,8 @@ class SelfdriveD:
     intent_companion = getattr(self, 'aol_intent_companion', None)
     intent_drained = (self.aol_event_intent_drained and self.aol_step_intent_drain_ok if self.aol_event_intent_drained is not None else
                       not self.aol_replay or intent_companion is None or self.drain_axis_intent(intent_companion))
+    car_log_ns = getattr(self, 'aol_car_state_log_ns', 0)
+    track_key_off(self, car_log_ns if REPLAY and car_log_ns else time.monotonic_ns())
     if self.aol_replay or getattr(self, 'ordinary_axis_ack_required', False):
       now_ns = self.aol_car_state_log_ns if REPLAY and self.aol_car_state_log_ns else time.monotonic_ns()
       # Intent draining can cross the source cutoff. Check the original proof

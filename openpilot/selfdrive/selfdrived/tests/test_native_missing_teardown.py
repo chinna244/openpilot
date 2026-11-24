@@ -210,3 +210,38 @@ def test_old_device_report_never_excuses_an_engaged_loss(kw):
   sm.logMonoTime['deviceState'] = T_PANDA - 300 * MS
   sd = SimpleNamespace(sm=sm, **{'enabled': False, 'active': False, **kw})
   assert key_off_site(sm, T_EVENT, sd)[1] == E.controlsMismatch
+
+
+def key_off_frame(sm, panda_ns, device_ns, *, on=False, started=True):
+  sm.data['pandaStates'] = [panda(can=on)]
+  sm.logMonoTime['pandaStates'] = panda_ns
+  sm.data['deviceState'] = SimpleNamespace(started=started)
+  sm.logMonoTime['deviceState'] = device_ns
+
+
+def test_second_key_off_in_the_same_process_gets_the_grace():
+  """Review of 8da5f31cc: the drive between two key-offs had a healthy wire, so the ignition-on reports never cleared the
+  first key-off and the second one raised controlsMismatch."""
+  sm = FakeSM()
+  key_off_frame(sm, T_PANDA, T_PANDA - 300 * MS)
+  sd, event = key_off_site(sm, T_EVENT)
+  assert event is None
+  t = T_EVENT
+  for _ in range(100):  # the next drive: wire healthy, only the step's tracking sees the panda
+    t += 100 * MS
+    key_off_frame(sm, t - 10 * MS, t - 200 * MS, on=True)
+    selfdrived.track_key_off(sd, t)
+  key_off_frame(sm, t + 90 * MS, t - 200 * MS)  # second key off: device report from before it
+  assert key_off_site(sm, t + 110 * MS, sd)[1] is None
+
+
+def test_missing_panda_telemetry_does_not_restart_the_key_off():
+  sm = FakeSM()
+  key_off_frame(sm, T_PANDA, T_PANDA - 300 * MS)
+  sd, _ = key_off_site(sm, T_EVENT)
+  sm.valid['pandaStates'] = False
+  selfdrived.track_key_off(sd, T_EVENT + 100 * MS)
+  assert sd.key_off_since_ns == T_PANDA
+  sm.valid['pandaStates'] = True
+  key_off_frame(sm, T_PANDA + 1_100 * MS, T_PANDA - 300 * MS)
+  assert key_off_site(sm, T_PANDA + 1_100 * MS + MS, sd)[1] == E.controlsMismatch  # the wait stays bounded
