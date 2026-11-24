@@ -115,3 +115,42 @@ def test_unproven_shift_still_fails(fault):
     m.aolAxisState.intentProducerSessionId = 'other'
     sm.messages['aolAxisState'] = m.as_reader()
   assert observe(f, sm, cp, cs, now, shift_hold=True), fault
+
+
+def drive_settle_frame(native, cp, stamp, event_offset_ms):
+  """R->D settle window with onroadEvents one selfdrived cycle off the event the axis acknowledged."""
+  sm = shift_frame(native, cp, stamp)
+  m = sm.messages['aolAxisState'].as_builder()
+  m.aolAxisState.faultEventMonoTime = stamp - 10 * MS
+  sm.messages['aolAxisState'] = m.as_reader()
+  sm.logMonoTime['onroadEvents'] = stamp - 10 * MS + event_offset_ms * MS
+  return sm
+
+
+@pytest.mark.parametrize('offset_ms', [10, -10])
+def test_drive_settle_survives_a_one_cycle_event_order_gap(offset_ms):
+  """After a 3 s reverse, the gear event 10 ms behind (or ahead of) the axis must not clear the TJA latch."""
+  cp, cs, f, native, stamp, now = setup()
+  cs.gearShifter = 'drive'
+  sm = drive_settle_frame(native, cp, stamp, offset_ms)
+  assert not observe(f, sm, cp, cs, now + 10 * MS, shift_hold=True)
+  assert not f.failed
+
+
+def test_drive_settle_order_gap_is_bounded():
+  cp, cs, f, native, stamp, now = setup()
+  cs.gearShifter = 'drive'
+  sm = drive_settle_frame(native, cp, stamp, 30)
+  assert observe(f, sm, cp, cs, now + 30 * MS, shift_hold=True)
+
+
+def test_drive_settle_order_gap_still_needs_steering_withheld():
+  cp, cs, f, native, stamp, now = setup()
+  cs.gearShifter = 'drive'
+  wire = replace(native, observedMonoTime=stamp - MS, validUntilMonoTime=stamp + 199 * MS, lateralAllowed=True,
+                 longitudinalAllowed=False, requestedLateral=False, requestedLongitudinal=False, sourcePandaStatesMonoTime=stamp - MS)
+  sm = shift_frame(native, cp, stamp, wire=wire)
+  m = sm.messages['aolAxisState'].as_builder()
+  m.aolAxisState.faultEventMonoTime = stamp - 10 * MS
+  sm.messages['aolAxisState'] = m.as_reader()
+  assert observe(f, sm, cp, cs, now, shift_hold=True)

@@ -98,6 +98,9 @@ def stock_lateral_user_event(cp):
 
 # Mazda withdrawal bridge: the withdrawn pandaStates is the pandad cycle right after the bridged wire (10 Hz, with jitter)
 MAZDA_RACE_PANDA_GAP_NS = 150_000_000
+# Mazda shift pause: the onroadEvents card holds may be one selfdrived cycle (100 Hz, with jitter) off the one the axis
+# acknowledged (R->D settle window, gear event 10 ms behind the axis); the held events must still prove the pause.
+MAZDA_SHIFT_EVENT_GAP_NS = 20_000_000
 FAILURE_LOG_PERIOD_NS = 10_000_000_000
 # Diagnostic-only fields live outside the instance dict: tests and retention paths compare vars(feedback).
 _DIAG = weakref.WeakKeyDictionary()
@@ -1303,8 +1306,10 @@ class TransportPauseFeedback:
     event_ns = int(sm.logMonoTime['onroadEvents'])
     user_ok = (log.OnroadEvent.EventName.wrongGear, log.OnroadEvent.EventName.reverseGear,
                log.OnroadEvent.EventName.pcmDisable, log.OnroadEvent.EventName.pedalPressed)
+    fault_event_ns = int(axis.faultEventMonoTime)
     if (not sm.seen['onroadEvents'] or not sm.valid['onroadEvents'] or not sm.alive['onroadEvents'] or
-        not 0 < event_ns == axis.faultEventMonoTime <= stamp or now_ns - event_ns > 1_500_000_000 or
+        not 0 < fault_event_ns <= stamp or not 0 < event_ns <= now_ns or
+        abs(event_ns - fault_event_ns) > MAZDA_SHIFT_EVENT_GAP_NS or now_ns - event_ns > 1_500_000_000 or
         not any(event.name == log.OnroadEvent.EventName.wrongGear for event in sm['onroadEvents']) or
         any(event.immediateDisable or event.softDisable and event.name != log.OnroadEvent.EventName.wrongGear or
             event.userDisable and event.name not in user_ok for event in sm['onroadEvents'])):
