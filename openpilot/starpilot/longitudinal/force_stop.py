@@ -43,6 +43,26 @@ RESUME_LAUNCH_MAX_MPS = 4.5
 # releases it: gas always, RES only at a confirmed stop sign. It is re-armed once the car has moved.
 HOLD_REARM_SPEED = 1.0
 HOLD_LEAD_M = 10.0  # a car this close is the queue ahead (its departure releases as before); farther is not
+# A held no-lead stop also ends on a verified green: the model itself drives on (its plan runs to GREEN_MIN_PLAN_END_MPS
+# and it no longer brakes) with no turn or lane-change desire in its state (route 08 375.5: the bad departure came from a turn
+# desire), every frame for GREEN_CONFIRM_NS. Never at a stop sign: no sign may have been seen within GREEN_SIGN_CLEAR_M of
+# driving (route 0a 218.9: the sign was lost 3.6 s before the line and the stop read as a light, and the model plans to go
+# at a stop sign within seconds). A dropped stop, a timer or a blinker alone never releases it; Always Hold never does.
+# Routes 04-0a, 13 engaged no-lead stops: fires at the 7 light stops only at their greens (0a 250.1: 258.1 s, before the gas at
+# 258.5), never at the 6 stop-sign stops; before a green the model's go plan never passed 3.5 mph. The model's plan geometry
+# jitters backwards at a standstill (route 0a: perception 'unavailable' the whole stop), so it is not required here.
+GREEN_MIN_ACCEL = 0.0  # m/s^2, the model's desired acceleration (0a's green ramped 0.04 -> 0.12 in the first second)
+GREEN_MIN_PLAN_END_MPS = 6.0  # the model plan's end speed
+GREEN_CONFIRM_NS = 500_000_000
+GREEN_MIN_HOLD_NS = 1_000_000_000  # the stop itself settles first
+GREEN_SIGN_CLEAR_M = 60.0
+
+
+def update_sign_clear(clear_m: float, sign_seen: bool, speed_mps: float, dt_s: float) -> float:
+  """Distance driven since stop-sign evidence was last seen; dt is bounded so a gap never counts as driving."""
+  if sign_seen or not (math.isfinite(speed_mps) and math.isfinite(dt_s)):
+    return 0.0
+  return min(1000.0, clear_m + abs(speed_mps) * min(max(dt_s, 0.0), 2 * DT_MDL))
 
 
 @dataclass(frozen=True)
@@ -100,6 +120,10 @@ class StopFrame:
   acceleration_ns: int = 0
   sample_ns: int = 0
   res_pressed: bool = False  # the press was a physical RES: only it releases or launches from a standstill hold
+  model_accel_mps2: float | None = None  # modelV2.action.desiredAcceleration
+  model_plan_end_mps: float | None = None  # modelV2.velocity.x[-1]
+  model_desire_none: bool = False  # modelV2.meta.desireState: no turn, lane change or keep desire
+  sign_clear_m: float = 0.0  # driven since the last stop-sign evidence, watched by the runtime (0: unknown)
 
 
 @dataclass(frozen=True)
@@ -135,6 +159,7 @@ class ForceStop:
     self.resume_until_ns = 0
     self.launch_until_ns = 0
     self.released_here = False
+    self.green_since_ns = 0
     self.entry_speed = None
     self.activation_gate = False
     self.stop_seen_ns = 0
@@ -336,7 +361,15 @@ class ForceStop:
     # SET+ at a standstill hold answers an SLA offer or changes SET; it never releases the hold or starts a launch
     driver_release = (frame.pedal_override or frame.resume_requested and self.standstill_reason is None or
                       frame.res_pressed and self.standstill_reason == 'sign')
-    if self.standstill_reason is not None and (driver_release or hold_expired):
+    green = (self.standstill_reason in ('light', 'unclassified') and frame.enabled and frame.standstill and no_lead and
+             not frame.always_hold and not frame.sign and not self.sign_confirmed and frame.sign_clear_m >= GREEN_SIGN_CLEAR_M and
+             now - self.standstill_since_ns >= GREEN_MIN_HOLD_NS and
+             frame.model_desire_none and frame.model_accel_mps2 is not None and frame.model_accel_mps2 >= GREEN_MIN_ACCEL and
+             frame.model_plan_end_mps is not None and math.isfinite(frame.model_plan_end_mps) and
+             frame.model_plan_end_mps >= GREEN_MIN_PLAN_END_MPS and math.isfinite(frame.model_accel_mps2))
+    self.green_since_ns = (self.green_since_ns or now) if green else 0
+    green_release = green and now - self.green_since_ns >= GREEN_CONFIRM_NS
+    if self.standstill_reason is not None and (driver_release or hold_expired or green_release):
       self.override_until_ns = now + 10_000_000_000
       self.released_here = True
       self._clear_standstill()

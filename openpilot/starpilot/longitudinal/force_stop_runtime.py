@@ -11,7 +11,7 @@ from openpilot.starpilot.conditional_mode.stop import (
 )
 from openpilot.starpilot.lead_tracking import LeadDetector
 from openpilot.starpilot.longitudinal.enhanced_stop_hold import selected as always_hold_selected
-from openpilot.starpilot.longitudinal.force_stop import ForceStop, StopFrame, StopPlan, vehicle_tune
+from openpilot.starpilot.longitudinal.force_stop import ForceStop, StopFrame, StopPlan, update_sign_clear, vehicle_tune
 from openpilot.starpilot.model_geometry import road_curvature, standstill_clear_horizon, standstill_release_speed
 from openpilot.starpilot.saved_source import read_saved
 from openpilot.starpilot.longitudinal.stop_resume import StopResume
@@ -48,6 +48,20 @@ def dashboard_stop_sign(sm, *, now_ns: int, drive_id: int) -> bool:
     return False
 
 
+SIGN_WATCH_GAP_S = 1.0
+# the sign reader publishes at ~5 Hz with pauses up to 2.2 s (routes 04-0a); silent longer, it is not watching
+SIGN_READER_MAX_AGE_NS = 3_000_000_000
+
+
+def sign_reader_watching(sm, now_ns: int) -> bool:
+  """The stop-sign reader is publishing: only then does driving without a sign count as a clear block."""
+  reader = 'slcVisionObservation'
+  try:
+    return bool(sm.seen[reader] and sm.valid[reader] and 0 <= now_ns - int(sm.logMonoTime[reader]) <= SIGN_READER_MAX_AGE_NS)
+  except (AttributeError, KeyError, TypeError, ValueError):
+    return False
+
+
 class ForceStopRuntime:
   def __init__(self, params):
     self.params = params
@@ -68,6 +82,8 @@ class ForceStopRuntime:
     self.offset = 0
     self.options = CEMOptions()
     self.clock_offset = None
+    self.sign_clear_m = 0.0  # driven since stop-sign evidence (0: unknown)
+    self.sign_watch_ns = 0
 
   def reset(self):
     self.vision_stop.reset()
@@ -112,6 +128,7 @@ class ForceStopRuntime:
                   bool(cp.dashcamOnly), bool(cp.notCar))
       if identity != self.identity or drive_id != self.drive_id:
         self.reset()
+        self.sign_clear_m, self.sign_watch_ns = 0.0, 0  # another drive or car: nothing is known about this block
         self.identity, self.drive_id = identity, drive_id
         self.always_hold = always_hold_selected(self.params)
       offset = now_boot_ns - now_ns
@@ -184,19 +201,27 @@ class ForceStopRuntime:
       resume_requested = self.resume.consume(now_ns=now_ns, drive_id=drive_id, car_ns=int(sm.logMonoTime['carState']))
       # Keep model perception warm during AOL and a manual brake stop. Only
       # actual longitudinal ownership may produce a stop target or hold.
+      # Stop signs are watched on every fresh frame (also through a brake tap or lateral-only driving), so a verified
+      # green can prove the block it stopped in has none. A drive or car change, a gap or a silent reader makes it unknown (0).
+      vision_sign = self.vision_stop.observe_message(
+        sm, now_ns=now_ns, now_boot_ns=now_boot_ns, drive_id=drive_id)
+      vision_fresh = bool(vision_sign and 0 <= now_ns - vision_sign <= CONTROL_STOP_MAX_AGE_NS)
+      dashboard_sign = dashboard_stop_sign(sm, now_ns=now_ns, drive_id=drive_id)
+      # one late frame (route 08 300.95: 181 ms) keeps what was watched; a longer gap leaves the block unknown
+      gap_s = (stamp - self.sign_watch_ns) / 1e9 if self.sign_watch_ns else 0.0
+      if gap_s > SIGN_WATCH_GAP_S or not sign_reader_watching(sm, now_ns):
+        self.sign_clear_m = 0.0
+      self.sign_clear_m = update_sign_clear(self.sign_clear_m, vision_fresh or dashboard_sign, float(car.vEgo), gap_s)
+      self.sign_watch_ns = stamp
       if not control.longActive or not state.enabled or car.brakePressed:
         self.resume.reset()
         self.policy.reset()
         self.plan = StopPlan()
         return self.plan
-      vision_sign = self.vision_stop.observe_message(
-        sm, now_ns=now_ns, now_boot_ns=now_boot_ns, drive_id=drive_id)
-      vision_fresh = bool(vision_sign and 0 <= now_ns - vision_sign <= CONTROL_STOP_MAX_AGE_NS)
       vision_distance = None
       if vision_fresh and self.vision_stop.distance_m is not None:
         self.vision_ranged_ns = vision_sign
         vision_distance = self.vision_stop.distance_m - float(car.vEgo) * (stamp - vision_sign) / 1e9
-      dashboard_sign = dashboard_stop_sign(sm, now_ns=now_ns, drive_id=drive_id)
       # A stationary forecast tail alone does not identify a fixed stop line.
       frame = StopFrame(stamp, float(car.vEgo), horizon, light_context, horizon is not None and horizon < 50,
                         bool(model.action.shouldStop), bool(car.standstill), True, bool(car.gasPressed),
@@ -209,6 +234,11 @@ class ForceStopRuntime:
                         acceleration_mps2=float(car.aEgo), actuator_delay_s=float(cp.longitudinalActuatorDelay),
                         vision_source_ns=int(vision_sign) if vision_fresh else 0,
                         acceleration_ns=int(sm.logMonoTime['carState']), sample_ns=now_ns,
+                        model_accel_mps2=float(model.action.desiredAcceleration),
+                        model_plan_end_mps=(float(model.velocity.x[-1]) if len(model.velocity.x) and
+                                            math.isfinite(model.velocity.x[-1]) else None),
+                        model_desire_none=bool(len(model.meta.desireState) and model.meta.desireState[0] >= 0.5),
+                        sign_clear_m=self.sign_clear_m,
                         moving_preview=bool(perception_available and not model.action.shouldStop and
                                             len(model.velocity.x) == len(model.position.x) and
                                             math.isfinite(model.velocity.x[-1])))
