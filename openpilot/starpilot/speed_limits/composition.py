@@ -111,6 +111,20 @@ def new_session(session_id: str, previous_limit: acc.AcceptedLimit | None = None
   return State(session_id, acc.new_session(session_id, previous_limit))
 
 
+def _engaged_path(frame: Frame) -> bool:
+  host = frame.host
+  selected_initialized = host.driver_v_cruise_kph > 0 and host.driver_v_cruise_kph != 255.0
+  host_long = host.system_long_available and host.long_control_active and host.selfdrive_enabled
+  return bool(frame.authority.can_control and (host_long or frame.authority.accelerator_override) and
+              selected_initialized and not frame.acceptance_policy.display_only)
+
+
+def is_fresh_engagement(state: State, frame: Frame) -> bool:
+  """step() decides the limit afresh on this frame; the runtime clears its map preview decision before proposing."""
+  return _engaged_path(frame) and (not state.engaged_once or state.disengaged_since_ns is not None and
+                                   frame.now_ns - state.disengaged_since_ns >= ENGAGEMENT_GUARD_NS)
+
+
 def step(state: State, frame: Frame) -> Result:
   if not _state_valid(state):
     return Result(state, status="invalid_state", errors=("invalid composition state",))
@@ -138,11 +152,9 @@ def step(state: State, frame: Frame) -> Result:
       frame.authority.accelerator_override and not (host.system_long_available and host.selfdrive_enabled and frame.pedal_pressed is True)):
     return Result(replace(state, last_now_ns=frame.now_ns, reset_required=True),
                   status="host_authority_disagreement", errors=("host and system-long authority disagree",))
-  engaged_path = (frame.authority.can_control and (host_long or frame.authority.accelerator_override) and
-                  selected_initialized and not frame.acceptance_policy.display_only)
+  engaged_path = _engaged_path(frame)
   active_path = engaged_path and not host.force_decel
-  fresh_engagement = engaged_path and (not state.engaged_once or state.disengaged_since_ns is not None and
-                                      frame.now_ns - state.disengaged_since_ns >= ENGAGEMENT_GUARD_NS)
+  fresh_engagement = is_fresh_engagement(state, frame)
   base = replace(state, last_now_ns=frame.now_ns, pedal_target_mps=0., wheel_override_metric=None, wheel_override_since_ns=0,
                  engaged_once=state.engaged_once or engaged_path,
                  disengaged_since_ns=None if engaged_path else (state.disengaged_since_ns if state.disengaged_since_ns is not None

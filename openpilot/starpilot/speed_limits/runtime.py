@@ -384,6 +384,9 @@ class Runtime:
                       filtered_ego_delta_mps=self._smoothed_ego_delta(
                         ego, CP, int(sm.logMonoTime.get('carState', 0)), standstill=bool(car_state.standstill)))
     maps_selected = self._maps_selected
+    if self.advance.encounter is not None and comp.is_fresh_engagement(self.state, frame):
+      # step() clears this engagement's decision; the last engagement's preview decline must not mask the current limit.
+      self.advance = Advance()
     encounter = self.advance.encounter
     if not maps_selected and encounter is None:
       return frame

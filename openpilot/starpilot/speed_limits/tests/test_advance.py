@@ -979,6 +979,27 @@ def test_same_speed_replacement_gets_a_fresh_decision_and_deadline():
   assert drive.tick(**replacement, at=deadline+1).message.slcState.decisionId == revised.decisionId
 
 
+def test_reengagement_on_a_rejected_preview_road_asks_for_the_current_limit():
+  """Review of c235a5473: a rejected upcoming limit, disengaged over 0.5 s, re-engaged on that road: the last
+  engagement's preview decline must not mask the now-current limit's prompt."""
+  drive = Drive(confirm=True)
+  first = drive.tick().message.slcState
+  assert drive.tick(action=drive.action(first, 'reject')).message.slcState.actionStatus == 'reject'
+  for _ in range(4):
+    drive.tick(current=15., target=0., way=2)  # crossed: 15 is now the current road's limit
+  assert drive.runtime.advance.encounter is not None and drive.runtime.advance.encounter.declined
+  start = drive.now
+  drive.sm['carControl'].enabled = drive.sm['carControl'].longActive = False
+  drive.sm['selfdriveState'].enabled = False
+  drive.sm['controlsState'].longControlState = 'off'
+  drive.tick(current=15., target=0., way=2, at=start + 1_000_000_000)
+  drive.sm['carControl'].enabled = drive.sm['carControl'].longActive = True
+  drive.sm['selfdriveState'].enabled = True
+  drive.sm['controlsState'].longControlState = 'pid'
+  resumed = drive.tick(current=15., target=0., way=2, at=start + 2_000_000_000).message.slcState
+  assert resumed.hasPending and resumed.pendingSpeedLimit == 15.
+
+
 def test_dropout_backstop_also_ends_the_accepted_cap():
   """Review of 2dc4bb06d: the 1 km cutoff ended source selection while the planner kept the same accepted ceiling."""
   drive = Drive()
