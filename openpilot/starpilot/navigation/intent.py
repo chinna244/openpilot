@@ -12,6 +12,20 @@ SERVICE = 'starpilotNavigation'
 MAX_AGE_NS = 2_500_000_000
 NAVIGATION_BRAKE_MAGNITUDE = 1.0
 TARGET_MPH = {'uturn': 5., 'sharpLeft': 10., 'sharpRight': 10., 'left': 14., 'right': 14.}
+# A turn desire makes the model drive on, so it may only start once the car and the model already are (filter-dev route
+# 43 + 84 lesson; StarPilot route 08 t=375.35: blinker at 0.39 m/s into a red light, the model plan went 0.4 -> 20 m).
+TURN_MIN_SPEED = 0.5
+TURN_MIN_PLAN_END_SPEED = 3.5 * CV.MPH_TO_MS
+TURN_DESIRES = (log.Desire.turnLeft, log.Desire.turnRight)
+
+
+def turn_drives_on(v_ego, plan_end_speed) -> bool:
+  """plan_end_speed: the last model frame's velocity.x[-1], from before this desire is sent; unknown never admits."""
+  try:
+    return bool(math.isfinite(v_ego) and v_ego >= TURN_MIN_SPEED and plan_end_speed is not None and
+                math.isfinite(plan_end_speed) and plan_end_speed >= TURN_MIN_PLAN_END_SPEED)
+  except TypeError:
+    return False
 
 
 def current_instruction(sm, now_ns: int):
@@ -114,7 +128,18 @@ class TurnIntent:
     self.key = None
     self.stop_hold = False
 
-  def select(self, sm, now_ns: int, current_desire, *, supported: bool, model_stop: bool):
+  def select(self, sm, now_ns: int, current_desire, *, supported: bool, model_stop: bool, plan_end_speed=None):
+    selected = self._select(sm, now_ns, current_desire, supported=supported, model_stop=model_stop)
+    if selected != current_desire and selected in TURN_DESIRES:
+      try:
+        v_ego = sm['carState'].vEgo
+      except (AttributeError, KeyError, TypeError):
+        v_ego = math.nan
+      if not turn_drives_on(v_ego, plan_end_speed):
+        return current_desire
+    return selected
+
+  def _select(self, sm, now_ns: int, current_desire, *, supported: bool, model_stop: bool):
     try:
       cs = sm['carState']
       signaling = bool(cs.leftBlinker or cs.rightBlinker)

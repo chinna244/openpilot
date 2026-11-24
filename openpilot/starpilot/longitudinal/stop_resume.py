@@ -4,6 +4,7 @@ from opendbc.car.structs import car
 
 
 BUTTONS = frozenset((car.CarState.ButtonEvent.Type.accelCruise, car.CarState.ButtonEvent.Type.resumeCruise))
+RES = int(car.CarState.ButtonEvent.Type.resumeCruise)
 MAX_AGE_NS = 150_000_000
 
 
@@ -16,6 +17,8 @@ class StopResume:
     self.last_ns = 0
     self.held = set()
     self.pending_ns = 0
+    self.pending_res = False  # the pending press includes a physical RES (not only SET+, which answers SLA offers)
+    self.consumed_res = False
     self.ready = False
 
   def observe(self, event, *, now_ns: int, drive_id: int):
@@ -46,21 +49,27 @@ class StopResume:
     for button in events:
       if button.pressed:
         if int(button.type.raw) not in self.held:
+          if stamp != self.pending_ns:
+            self.pending_res = False
           self.pending_ns = stamp
+          self.pending_res |= int(button.type.raw) == RES
         self.held.add(int(button.type.raw))
       else:
         self.held.discard(int(button.type.raw))
 
   def consume(self, *, now_ns: int, drive_id: int, car_ns: int) -> bool:
+    self.consumed_res = False
     if (drive_id != self.drive_id or self.pending_ns <= drive_id or
         now_ns - self.pending_ns > MAX_AGE_NS):
       self.pending_ns = 0
+      self.pending_res = False
       return False
     # A valid received edge may be newer than the planner's frozen frame.
     # Defer it until both that frame and its carState have caught up.
     if self.pending_ns > min(now_ns, car_ns):
       return False
     self.pending_ns = 0
+    self.consumed_res, self.pending_res = self.pending_res, False
     return True
 
 

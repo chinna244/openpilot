@@ -153,8 +153,15 @@ class DepartureNotifications:
       valid &= (not tracked or lead is not None and
                 all(isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x) for x in (distance, lead_speed)))
       dashboard_sign = dashboard_stop_sign(sm, now_ns=now, drive_id=drive)
+      # Route 08 t=376.45: a turn desire made the model "go" at a red light and Green Light chimed. Under a turn or
+      # lane-change desire the model's go is the desire, not the light, so it cannot clear the stop.
+      desire_state = list(sm['modelV2'].meta.desireState)
+      desire_go = len(desire_state) > 4 and max(desire_state[1:5]) >= 0.5
+      # While Force Stop holds a no-lead stop the driver releases it; the model's clear is not a green light there.
+      stop_plan = getattr(planner, 'force_stop_plan', None)
+      held = bool(getattr(stop_plan, 'manual_hold', False) or getattr(planner, 'stop_hold_latched', False))
       return self.episode.step(drive=drive, model_ns=model_ns, now_ns=now, stationary=stationary, valid=bool(valid),
-        light=light, model_stopped=bool(stopped or action_stop), tracked=tracked, distance=distance, lead_speed=lead_speed,
+        light=light, model_stopped=bool(stopped or action_stop or desire_go or held), tracked=tracked, distance=distance, lead_speed=lead_speed,
         lead_id=(bool(sm['radarState'].leadOne.radar), radar_id), enabled=self.enabled, sign=dashboard_sign)
     except (AttributeError, KeyError, TypeError, ValueError, OverflowError, RuntimeError):
       self.projector = None

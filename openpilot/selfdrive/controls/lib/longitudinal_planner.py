@@ -37,7 +37,7 @@ from openpilot.starpilot.longitudinal.throttle_gate import ModelThrottleGate
 from openpilot.starpilot.longitudinal.ioniq6_start import eligible as ioniq6_long_eligible
 from openpilot.starpilot.longitudinal.lane_change_gap import LaneChangeGap, project as project_lane_gap
 from openpilot.starpilot.longitudinal.experimental_release import ConditionalHandoff, ExperimentalRelease, project as project_release
-from openpilot.starpilot.longitudinal.force_stop import StopPlan
+from openpilot.starpilot.longitudinal.force_stop import RESUME_LAUNCH_MAX_MPS, StopPlan
 from openpilot.starpilot.longitudinal.force_stop_braking import distance_target, eligible as distance_braking_eligible
 from openpilot.starpilot.longitudinal.follow_jerk import FollowJerk
 from openpilot.starpilot.longitudinal.highlander_cruise import owner_for as highlander_cruise_owner
@@ -58,6 +58,9 @@ A_CRUISE_MIN = -0.5
 CRUISE_ACCEL_RESPONSE_TIME = 2.0
 SLC_BRAKE_ONSET_JERK = 0.15  # m/s^3: how fast braking may build after an SLC overshoot
 SLC_BRAKE_ONSET_ACCEL = -0.3  # m/s^2: past this the brakes are engaged and normal jerk resumes
+RESUME_LAUNCH_FADE_JERK = 1.0  # m/s^3: a stop-sign RES launch that ends before the model caught up lets go this gently
+STOP_HOLD_LATCH_MAX_V = 0.3  # m/s: a Force Stop standstill hold outlives a perception reset only while still stopped
+RESUME_LAUNCH_MODEL_BRAKE = -1.0  # m/s^2: the model braking this hard is a new hazard, not its hold at the line (-0.5)
 CONTROL_N_T_IDX = ModelConstants.T_IDXS[:CONTROL_N]
 MIN_ALLOW_THROTTLE_SPEED = 2.5
 NATIVE_ALLOW_THROTTLE_PROBABILITY = 0.4
@@ -223,6 +226,10 @@ class LongitudinalPlanner:
     self.profile_smoother = ProfileSmoother()
     self.last_profile: AppliedProfile | None = None
     self.force_stop_plan = StopPlan()
+    self.resume_launch_floor: float | None = None
+    self.resume_launch_state: str | None = None  # None, 'active', 'fade' or 'done' (until the launch window closes)
+    self.resume_launch_model_released = False
+    self.stop_hold_latched = False
     from openpilot.starpilot.audio.departure_alert import DepartureNotifications
     self.departure_notifications = DepartureNotifications()
     self.follow_jerk = FollowJerk(CP)
@@ -233,6 +240,39 @@ class LongitudinalPlanner:
     self.vision_stop_buffer = vision_stop_owner(CP)
     self.ford_stop_approach = ford_stop_owner(CP, STOP_DISTANCE - .5) or vw_stop_owner(CP, STOP_DISTANCE - .5)
     self.preap_adaptive = preap_adaptive_owner(CP)
+
+  def _resume_launch(self, v_ego, model_accel, model_stop, mpc_accel, clear, action):
+    """Stop-sign RES launch (Force Stop resume_launch): the plain no-lead cruise launch (MPC and cruise) while the model
+    still holds at the line. Ends at once on any stop or brake; handed back once the model asks as much; ended at the
+    speed cap before that, it fades instead of stepping."""
+    raw_accel, raw_stop = float(action.desiredAcceleration), bool(action.shouldStop)
+    launch = self.force_stop_plan.resume_launch
+    if not launch and self.resume_launch_state == 'active':
+      ended_at_cap = v_ego >= 0.9 * RESUME_LAUNCH_MAX_MPS
+      self.resume_launch_state = 'fade' if ended_at_cap and self.resume_launch_floor is not None else None
+    if launch and self.resume_launch_state is None:
+      self.resume_launch_state, self.resume_launch_floor, self.resume_launch_model_released = 'active', None, False
+    elif not launch and self.resume_launch_state == 'done':
+      self.resume_launch_state = None
+    if self.resume_launch_state == 'active':
+      self.resume_launch_model_released |= not raw_stop
+      hazard = (not clear or raw_accel <= RESUME_LAUNCH_MODEL_BRAKE or
+                self.resume_launch_model_released and raw_stop)
+      floor = max(0.2, min(mpc_accel, self.a_cruise))
+      if hazard or raw_accel >= floor:
+        self.resume_launch_state, self.resume_launch_floor = 'done', None
+        return model_accel, model_stop
+      self.resume_launch_floor = floor
+      return floor, False
+    if self.resume_launch_state == 'fade':
+      floor = (self.resume_launch_floor or 0.) - RESUME_LAUNCH_FADE_JERK * self.dt
+      if not clear or raw_accel <= RESUME_LAUNCH_MODEL_BRAKE or raw_stop or raw_accel >= floor:
+        self.resume_launch_state, self.resume_launch_floor = None, None
+        return model_accel, model_stop
+      self.resume_launch_floor = floor
+      return floor, False
+    self.resume_launch_floor = None
+    return model_accel, model_stop
 
   def update(self, sm, *, cruise_ceiling: CruiseCeiling | None = None,
              profile_tuning: ProfileTuning | None = None, curve_ceiling: CurveCeiling | None = None,
@@ -343,8 +383,19 @@ class LongitudinalPlanner:
     follow = approach_follow if approach_follow is not None else gap_follow
     selected_follow = follow if follow is not None else base_follow
     self.force_stop_plan = force_stop_provider(selected_follow) if force_stop_provider is not None else StopPlan()
-    if (reset_state or not profile_eligible or self.force_stop_plan.model_ns != getattr(sm, 'logMonoTime', {}).get('modelV2') or
-        sm['carState'].gasPressed or sm['carState'].brakePressed or sm['controlsState'].forceDecel):
+    driver_or_off = bool(reset_state or not profile_eligible or sm['carState'].gasPressed or sm['carState'].brakePressed or
+                         sm['controlsState'].forceDecel)
+    policy_ran = self.force_stop_plan.model_ns == getattr(sm, 'logMonoTime', {}).get('modelV2')
+    # Route 08 t=300.95: one model frame 181 ms past its EOF reset Force Stop and its standstill hold vanished for that
+    # frame. A hold is only given up by the driver (gas, brake, disengage) or by Force Stop itself, never by a reset.
+    if driver_or_off or v_ego > STOP_HOLD_LATCH_MAX_V:
+      self.stop_hold_latched = False
+    elif policy_ran:
+      self.stop_hold_latched = bool(self.force_stop_plan.manual_hold or
+                                    self.force_stop_plan.forcing and self.force_stop_plan.should_stop and
+                                    sm['carState'].standstill)
+    stop_hold_latch = self.stop_hold_latched and not policy_ran
+    if driver_or_off or not policy_ran:
       self.force_stop_plan = StopPlan()
     if self.force_stop_plan.speed_ceiling_mps is not None:
       v_cruise = min(v_cruise, self.force_stop_plan.speed_ceiling_mps)
@@ -463,12 +514,15 @@ class LongitudinalPlanner:
       # develop's curve offset: -0.5 at a jerk of 0.5 while 2.8 m/s^2 lateral is predicted within 6 s
       output_a_target_e2e += self.curve_speed.update(sm['modelV2'], sm['vehicleParameters'].roll)
     output_should_stop_e2e = sm['modelV2'].action.shouldStop
-    if (self.force_stop_plan.resume_override and not self.force_stop_plan.forcing and
-        not self.force_stop_plan.should_stop and not reset_state and not self.fcw and self.allow_throttle and
-        abs(v_ego) < 2.0 and v_cruise > 0.3 and self.mpc.solution_status == 0 and
-        not any(lead.present for lead in (sm['radarState'].leadOne, sm['radarState'].leadTwo))):
+    resume_clear = (not self.force_stop_plan.forcing and not self.force_stop_plan.should_stop and not reset_state and
+                    not self.fcw and self.allow_throttle and v_cruise > 0.3 and self.mpc.solution_status == 0 and
+                    not any(lead.present for lead in (sm['radarState'].leadOne, sm['radarState'].leadTwo)))
+    if self.force_stop_plan.resume_override and resume_clear and abs(v_ego) < 2.0:
       output_a_target_e2e = max(output_a_target_e2e, 0.2)
       output_should_stop_e2e = False
+    output_a_target_e2e, output_should_stop_e2e = self._resume_launch(
+      v_ego, output_a_target_e2e, output_should_stop_e2e, output_a_target_mpc,
+      resume_clear and not output_should_stop_mpc, sm['modelV2'].action)
 
     relevant_lead = any(braking_lead_relevant(lead, v_ego) for lead in
                         (sm['radarState'].leadOne, sm['radarState'].leadTwo))
@@ -638,7 +692,8 @@ class LongitudinalPlanner:
     # Mazda (develop): Force Stop asks for the stopping state only as slow as every other stop does; above it Mazda's
     # STOPPING barely brakes (develop route 59 t=227.8: 0.64 m/s, 3.8 s to stand still), so its ceiling and the firm
     # finish brake it down
-    force_should_stop = self.force_stop_plan.should_stop and (self.CP.brand != 'mazda' or v_ego < FIRM_STOP_PLAN_V)
+    force_should_stop = (self.force_stop_plan.should_stop and (self.CP.brand != 'mazda' or v_ego < FIRM_STOP_PLAN_V) or
+                         stop_hold_latch)
     self.output_should_stop = force_should_stop or any(should_stop for _, _, should_stop in candidates)
     # Mazda: the model candidate is always in (develop), so there is no Experimental mode exit to restrain and no
     # Experimental-only lead departure floor; CEM's mode choice changes nothing in this planner
@@ -696,6 +751,8 @@ class LongitudinalPlanner:
       output_a_target, self.output_should_stop = self.ford_stop_approach.sample(
         sm, now_ns=sample_now_ns, drive_id=drive_id, target=float(output_a_target),
         stopping=self.output_should_stop, accel_min=ACCEL_MIN, active=profile_eligible and not reset_state)
+    if stop_hold_latch:
+      output_a_target, self.output_should_stop = min(output_a_target, 0.), True
     self.output_a_target = np.clip(output_a_target, ACCEL_MIN, accel_ceiling)
     self.a_target_published = float(self.output_a_target)
     self.source_published = self.mpc.source

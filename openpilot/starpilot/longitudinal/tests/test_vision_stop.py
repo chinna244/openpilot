@@ -43,7 +43,10 @@ class TestVisionForceStop(unittest.TestCase):
       if action == 'pedal_override':
         sm['carState'].gasPressed = True
       else:
-        self.owner.resume.consume = lambda **kwargs: True
+        def physical_res(**kwargs):
+          self.owner.resume.consumed_res = True  # a sign hold releases on RES, not SET+
+          return True
+        self.owner.resume.consume = physical_res
       plan = self.sample(sm)
       self.assertFalse(plan.forcing)
       self.assertFalse(plan.manual_hold)

@@ -57,12 +57,12 @@ def test_confirmed_forecast_admits_earlier_hint_and_cancels_pending_lane_change(
   intent, helper = TurnIntent(params, cp), DesireHelper()
   sm, now, _ = frame(-1, direction)
   sm['carState'].leftBlinker = sm['carState'].rightBlinker = False
-  assert intent.select(sm, now, helper.desire, supported=True, model_stop=False) == log.Desire.none
+  assert intent.select(sm, now, helper.desire, supported=True, model_stop=False, plan_end_speed=5.) == log.Desire.none
   assert intent.automatic_turn_enabled
   for tick in range(5):
     sm, now, model = frame(tick, direction)
     with patch('openpilot.starpilot.lateral.signal_turn.boottime_ns', return_value=now + OFFSET):
-      selected = intent.select(sm, now, helper.desire, supported=True, model_stop=False)
+      selected = intent.select(sm, now, helper.desire, supported=True, model_stop=False, plan_end_speed=5.)
     ready = intent.signal_model.observe(sm, model, model_ns=now, now_ns=now, now_boot_ns=now + OFFSET,
                                         valid=True, enabled=True, lane_change_state=helper.lane_change_state)
     helper.update(sm['carState'], True, 1., navigation_turn=ready)
@@ -75,7 +75,7 @@ def test_confirmed_forecast_admits_earlier_hint_and_cancels_pending_lane_change(
       assert helper.lane_change_state == log.LaneChangeState.off
   sm['carState'].steeringPressed = True
   with patch('openpilot.starpilot.lateral.signal_turn.boottime_ns', return_value=now + OFFSET):
-    assert intent.select(sm, now, helper.desire, supported=True, model_stop=False) == log.Desire.none
+    assert intent.select(sm, now, helper.desire, supported=True, model_stop=False, plan_end_speed=5.) == log.Desire.none
   helper.update(sm['carState'], True, 1., navigation_turn=ready)
   assert helper.lane_change_state == log.LaneChangeState.off
 

@@ -138,10 +138,10 @@ class ForceStopTests(unittest.TestCase):
     self.owner.step(frame(0, light=False, horizon_m=190., resume_requested=True), self.tune)
     self.assertEqual(self.owner.override_until_ns, 0)
     self.assertEqual(self.owner.resume_until_ns, 0)
-    held = frame(1, speed_mps=0., horizon_m=30., standstill=True, raw_model_stopped=True)
+    held = frame(1, speed_mps=0., horizon_m=30., standstill=True, raw_model_stopped=True, light=False, sign=True)
     self.owner.reset()
     self.assertTrue(self.owner.step(held, self.tune).should_stop)
-    released = self.owner.step(replace(held, model_ns=held.model_ns + TICK, resume_requested=True), self.tune)
+    released = self.owner.step(replace(held, model_ns=held.model_ns + TICK, resume_requested=True, res_pressed=True), self.tune)
     self.assertFalse(released.should_stop)
     self.assertFalse(released.forcing)
     self.assertTrue(released.resume_override)
@@ -176,10 +176,11 @@ class ForceStopTests(unittest.TestCase):
     for tick in range(36, 75):
       self.assertTrue(self.owner.step(frame(tick, speed_mps=-1e-44, standstill=True, horizon_m=None,
                                           road_curvature=None, light=False, perception_available=False), self.tune).should_stop)
-    expired = self.owner.step(frame(75, speed_mps=0., standstill=True, horizon_m=None,
-                                    road_curvature=None, light=False, perception_available=False), self.tune)
-    self.assertFalse(expired.forcing)
-    self.assertFalse(expired.manual_hold)
+    # no lead: the hold no longer expires on its own (route 08)
+    kept = self.owner.step(frame(75, speed_mps=0., standstill=True, horizon_m=None,
+                                 road_curvature=None, light=False, perception_available=False), self.tune)
+    self.assertTrue(kept.forcing)
+    self.assertTrue(kept.should_stop)
 
   def test_missing_perception_distance_uses_actual_model_interval(self):
     for tick in range(15):
@@ -230,23 +231,26 @@ class ForceStopTests(unittest.TestCase):
           self.assertEqual(plan.speed_ceiling_mps, 0.)
         released = self.owner.step(frame(415, speed_mps=0., horizon_m=190., light=False, standstill=True,
                                          always_hold=True, **{action: True}), self.tune)
-        self.assertFalse(released.manual_hold)
-        self.assertFalse(released.forcing)
-        self.assertFalse(released.should_stop)
+        gas = action == 'pedal_override'  # route 08: RES never releases a held non-sign stop
+        self.assertEqual(released.manual_hold, not gas)
+        self.assertEqual(released.forcing, not gas)
+        self.assertEqual(released.should_stop, not gas)
 
-  def test_always_hold_does_not_acquire_an_idle_stop_or_change_the_approach(self):
+  def test_always_hold_does_not_change_the_approach_and_idle_no_lead_stop_is_held(self):
     from dataclasses import replace
     from openpilot.starpilot.longitudinal.force_stop import ForceStop
     baseline = ForceStop()
     for tick in range(80):
       current = frame(tick, horizon_m=30., always_hold=True)
       self.assertEqual(self.owner.step(current, self.tune), baseline.step(replace(current, always_hold=False), self.tune))
-    self.owner.reset()
-    for tick in range(100):
-      plan = self.owner.step(frame(tick, speed_mps=0., horizon_m=190., light=False, standstill=True, always_hold=True), self.tune)
-      self.assertFalse(plan.manual_hold)
-      self.assertFalse(plan.forcing)
-
+    # Route 08: any engaged no-lead stop is held (no traffic-light state to release it); behind a queued car it is not
+    for lead, held in (({}, True), ({'lead_present': True, 'lead_distance_m': 6., 'lead_speed_mps': 0.}, False)):
+      self.owner.reset()
+      for tick in range(100):
+        plan = self.owner.step(frame(tick, speed_mps=0., horizon_m=190., light=False, standstill=True, always_hold=True,
+                                     **lead), self.tune)
+        self.assertEqual(plan.manual_hold, held)
+        self.assertEqual(plan.forcing, held)
   def test_always_hold_preserves_disabled_and_invalid_source_reset(self):
     for changes in ({'enabled': False}, {'model_ns': 0}):
       with self.subTest(changes=changes):
@@ -255,54 +259,46 @@ class ForceStopTests(unittest.TestCase):
         self.assertFalse(self.owner.step(frame(1, speed_mps=0., horizon_m=30., standstill=True,
                                                always_hold=True, **changes), self.tune).manual_hold)
 
-  def test_standstill_hold_expires_after_two_seconds_without_rearming(self):
-    for tick in range(40):
+  def test_standstill_hold_without_lead_never_expires(self):
+    for tick in range(240):
       plan = self.owner.step(frame(tick, speed_mps=0., horizon_m=30., raw_model_stopped=True, standstill=True), self.tune)
       self.assertTrue(plan.forcing)
       self.assertTrue(plan.should_stop)
       self.assertTrue(plan.manual_hold)
-    for tick in range(40, 240):
-      plan = self.owner.step(frame(tick, speed_mps=0., horizon_m=30., raw_model_stopped=True, standstill=True), self.tune)
-      self.assertFalse(plan.forcing)
-      self.assertFalse(plan.should_stop)
-      self.assertFalse(plan.manual_hold)
-
-  def test_moving_stop_hold_expires_after_two_seconds(self):
+  def test_moving_stop_hold_without_lead_does_not_expire(self):
     for tick in range(15):
       self.owner.step(frame(tick, horizon_m=30.), self.tune)
-    for tick in range(15, 55):
+    for tick in range(15, 255):
       plan = self.owner.step(frame(tick, speed_mps=0., horizon_m=30., standstill=True), self.tune)
       self.assertTrue(plan.manual_hold)
-    plan = self.owner.step(frame(55, speed_mps=0., horizon_m=30., standstill=True), self.tune)
-    self.assertFalse(plan.forcing)
-    self.assertFalse(plan.should_stop)
-
-  def test_standstill_hold_releases_after_open_scene_dwell(self):
+      self.assertTrue(plan.should_stop)
+  def test_open_scene_never_releases_a_no_lead_hold(self):
+    # Route 08 t=376: the model dropped its stop at a red light; an open scene is not a green light
     self.assertTrue(self.owner.step(frame(0, speed_mps=0., horizon_m=30., raw_model_stopped=True,
                                          standstill=True), self.tune).manual_hold)
-    for tick in range(1, 16):
+    for tick in range(1, 200):
       plan = self.owner.step(frame(tick, speed_mps=0., horizon_m=190., light=False, standstill=True), self.tune)
       self.assertTrue(plan.manual_hold)
-    plan = self.owner.step(frame(16, speed_mps=0., horizon_m=190., light=False, standstill=True), self.tune)
-    self.assertFalse(plan.manual_hold)
-    self.assertFalse(plan.forcing)
-    self.assertFalse(plan.should_stop)
-
+      self.assertTrue(plan.should_stop)
   def test_manual_hold_survives_roll_until_each_driver_action(self):
-    for action in ('resume_requested', 'pedal_override'):
-      self.owner.reset()
-      held = self.owner.step(frame(0, speed_mps=0., horizon_m=30., raw_model_stopped=True, standstill=True), self.tune)
-      self.assertTrue(held.manual_hold)
-      for tick in range(1, 31):
-        plan = self.owner.step(frame(tick, speed_mps=.01, horizon_m=30., raw_model_stopped=True, standstill=False), self.tune)
-        self.assertTrue(plan.manual_hold)
-        self.assertEqual(plan.speed_ceiling_mps, 0.)
-      release = self.owner.step(frame(31, speed_mps=0., horizon_m=30., raw_model_stopped=True, standstill=True,
-                                     **{action: True}), self.tune)
-      self.assertFalse(release.manual_hold)
-      self.assertFalse(release.forcing)
-      self.assertFalse(release.should_stop)
-
+    # Route 08: a held light or unclassified stop is released by the gas only, never by RES
+    for light, action, releases in ((False, 'resume_requested', False), (False, 'pedal_override', True),
+                                    (True, 'resume_requested', False), (True, 'pedal_override', True)):
+      with self.subTest(light=light, action=action):
+        self.owner.reset()
+        held = self.owner.step(frame(0, speed_mps=0., horizon_m=30., raw_model_stopped=True, standstill=True, light=light),
+                               self.tune)
+        self.assertTrue(held.manual_hold)
+        for tick in range(1, 31):
+          plan = self.owner.step(frame(tick, speed_mps=.01, horizon_m=30., raw_model_stopped=True, standstill=False,
+                                       light=light), self.tune)
+          self.assertTrue(plan.manual_hold)
+          self.assertEqual(plan.speed_ceiling_mps, 0.)
+        release = self.owner.step(frame(31, speed_mps=0., horizon_m=30., raw_model_stopped=True, standstill=True,
+                                       light=light, **{action: True}), self.tune)
+        self.assertEqual(release.manual_hold, not releases)
+        self.assertEqual(release.forcing, not releases)
+        self.assertEqual(release.should_stop, not releases)
   def test_dashboard_sign_arms_only_slow_and_with_model_agreement(self):
     for changes, armed in (({}, True), ({'speed_mps': 18.5}, False), ({'horizon_m': 60.}, False),
                            ({'tracking_lead': True}, False)):
@@ -316,7 +312,10 @@ class ForceStopTests(unittest.TestCase):
           self.assertLessEqual(plan.tracked_distance_m, 27.)
 
   def test_dashboard_sign_hold_waits_for_each_driver_action(self):
-    for action in ('pedal_override', 'resume_requested'):
+    # gas or a physical RES releases a sign hold; SET+ (resume_requested without res_pressed) answers SLA and never does
+    for action, changes, releases in (('gas', {'pedal_override': True}, True),
+                                      ('RES', {'resume_requested': True, 'res_pressed': True}, True),
+                                      ('SET+', {'resume_requested': True}, False)):
       with self.subTest(action=action):
         self.owner.reset()
         for tick in range(15):
@@ -325,13 +324,13 @@ class ForceStopTests(unittest.TestCase):
           plan = self.owner.step(frame(tick, speed_mps=0., horizon_m=190., light=False, standstill=True), self.tune)
           self.assertTrue(plan.manual_hold)
           self.assertTrue(plan.should_stop)
-        released = self.owner.step(frame(415, speed_mps=0., horizon_m=190., light=False, standstill=True,
-                                         **{action: True}), self.tune)
-        self.assertFalse(released.manual_hold)
-        self.assertFalse(released.forcing)
+        released = self.owner.step(frame(415, speed_mps=0., horizon_m=190., light=False, standstill=True, **changes), self.tune)
+        self.assertEqual(released.manual_hold, not releases)
+        self.assertEqual(released.forcing, not releases)
+        self.assertEqual(released.resume_launch, action == 'RES')  # confirmed sign: only a physical RES launches
         for tick in range(416, 600):
           plan = self.owner.step(frame(tick, speed_mps=0., horizon_m=190., light=False, standstill=True), self.tune)
-          self.assertFalse(plan.forcing)
+          self.assertEqual(plan.forcing, not releases)
 
   def test_latched_sign_survives_light_and_sign_dropout(self):
     for tick in range(15):
@@ -515,16 +514,18 @@ class ForceStopTests(unittest.TestCase):
     for cause in ('speed', 'lead', 'tracked', 'timeout'):
       with self.subTest(cause=cause):
         self.owner.reset()
-        held = frame(0, speed_mps=0., horizon_m=30., standstill=True, raw_model_stopped=True)
+        held = frame(0, speed_mps=0., horizon_m=30., standstill=True, raw_model_stopped=True, light=False, sign=True)
         self.owner.step(held, self.tune)
-        self.assertTrue(self.owner.step(replace(held, model_ns=BASE + TICK, resume_requested=True), self.tune).resume_override)
+        self.assertTrue(self.owner.step(replace(held, model_ns=BASE + TICK, resume_requested=True, res_pressed=True),
+                                         self.tune).resume_override)
         for tick in range(2, 123 if cause == 'timeout' else 3):
           changes = {'speed': {'speed_mps': 2.}, 'lead': {'lead_present': True},
                      'tracked': {'tracking_lead': True}, 'timeout': {}}[cause]
           result = self.owner.step(replace(held, model_ns=BASE + tick * TICK, **changes), self.tune)
         self.assertFalse(result.resume_override)
     self.owner.reset()
-    first = self.owner.step(frame(0, speed_mps=0., horizon_m=30., standstill=True, raw_model_stopped=True, resume_requested=True), self.tune)
+    first = self.owner.step(frame(0, speed_mps=0., horizon_m=30., standstill=True, raw_model_stopped=True, light=False, sign=True,
+                                     resume_requested=True, res_pressed=True), self.tune)
     self.assertFalse(first.resume_override)
 
 def preview_frame(tick, **changes):

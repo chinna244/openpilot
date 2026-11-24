@@ -139,3 +139,31 @@ class StopResumeTests(unittest.TestCase):
     collect_resume(self.owner, None, lambda _: queue.popleft() if queue else None, now_ns=BASE + 320_000_000, drive_id=DRIVE)
     self.assertEqual(len(queue), 1)
     self.assertFalse(self.consume(32))
+
+
+class StopResumeButtonKindTests(unittest.TestCase):
+  """Route 08 t=257.44: SET+ answers an SLA offer at a stop; only a physical RES may release or launch a standstill hold."""
+  def run_press(self, kinds):
+    owner = StopResume()
+    owner.observe(event(0), now_ns=BASE + 1, drive_id=DRIVE)
+    owner.observe(event(1, [(k, True) for k in kinds]), now_ns=BASE + 10_000_001, drive_id=DRIVE)
+    owner.observe(event(2, [(k, False) for k in kinds]), now_ns=BASE + 20_000_001, drive_id=DRIVE)
+    pressed = owner.consume(now_ns=BASE + 30_000_001, drive_id=DRIVE, car_ns=BASE + 30_000_000)
+    return pressed, owner.consumed_res
+
+  def test_kind(self):
+    self.assertEqual(self.run_press(['accelCruise']), (True, False))
+    self.assertEqual(self.run_press(['resumeCruise']), (True, True))
+
+  def test_set_plus_then_res_are_separate_presses(self):
+    owner = StopResume()
+    owner.observe(event(0), now_ns=BASE + 1, drive_id=DRIVE)
+    owner.observe(event(1, [('accelCruise', True)]), now_ns=BASE + 10_000_001, drive_id=DRIVE)
+    owner.observe(event(2, [('accelCruise', False)]), now_ns=BASE + 20_000_001, drive_id=DRIVE)
+    self.assertTrue(owner.consume(now_ns=BASE + 20_000_002, drive_id=DRIVE, car_ns=BASE + 20_000_000))
+    self.assertFalse(owner.consumed_res)
+    self.assertFalse(owner.consume(now_ns=BASE + 25_000_002, drive_id=DRIVE, car_ns=BASE + 20_000_000))
+    self.assertFalse(owner.consumed_res)
+    owner.observe(event(3, [('resumeCruise', True)]), now_ns=BASE + 30_000_001, drive_id=DRIVE)
+    self.assertTrue(owner.consume(now_ns=BASE + 30_000_002, drive_id=DRIVE, car_ns=BASE + 30_000_000))
+    self.assertTrue(owner.consumed_res)

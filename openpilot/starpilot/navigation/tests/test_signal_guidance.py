@@ -37,7 +37,8 @@ def case(tmp_path):
 def select(owner, sm, desire=log.Desire.none, **kwargs):
   if owner.guidance.last_read_ns is None:
     owner.guidance.sample(NOW - 1)  # Observe a neutral sample before the test maneuver.
-  return owner.select(sm, NOW, desire, supported=kwargs.get('supported', True), model_stop=kwargs.get('model_stop', False))
+  return owner.select(sm, NOW, desire, supported=kwargs.get('supported', True), model_stop=kwargs.get('model_stop', False),
+                      plan_end_speed=kwargs.get('plan_end_speed', 5.))
 
 
 @pytest.mark.parametrize('brand', ['toyota', 'hyundai', 'honda', 'gm', 'ford'])

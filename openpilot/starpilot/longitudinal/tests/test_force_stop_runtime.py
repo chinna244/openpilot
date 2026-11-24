@@ -277,7 +277,7 @@ class ForceStopRuntimeTests(unittest.TestCase):
         self.assertFalse(self.sample(frame).forcing)
         self.assertTrue(self.sample(Frame(41, stopped=True)).should_stop)
 
-  def test_recorded_stop_tail_invalidity_preserves_manual_hold_until_resume(self):
+  def test_recorded_stop_tail_invalidity_preserves_light_hold_until_gas(self):
     self.prime()
     previous_distance = self.owner.plan.tracked_distance_m
     for tick in range(40, 70):
@@ -306,7 +306,12 @@ class ForceStopRuntimeTests(unittest.TestCase):
     for item in (button_event(497), button_event(498, [('resumeCruise', True)]),
                  button_event(499, [('resumeCruise', False)])):
       self.owner.resume.observe(item, now_ns=now, drive_id=DRIVE)
-    released = self.sample(Frame(100, horizon=190., stopped=True))
+    # a light stop: RES alone does not release it (route 08), the gas does
+    held = self.sample(Frame(100, horizon=190., stopped=True))
+    self.assertTrue(held.manual_hold)
+    sm = Frame(101, horizon=190., stopped=True)
+    sm['carState'].gasPressed = True
+    released = self.sample(sm)
     self.assertFalse(released.manual_hold)
     self.assertFalse(released.forcing)
     self.assertIsNone(released.speed_ceiling_mps)
@@ -382,10 +387,10 @@ class ForceStopRuntimeTests(unittest.TestCase):
       output = self.sample(Frame(tick, stopped=True, horizon=30.))
       self.assertTrue(output.should_stop)
       self.assertTrue(output.manual_hold)
-    for tick in range(80, 200):
+    for tick in range(80, 200):  # route 08: a light stop with no lead never expires on its own
       output = self.sample(Frame(tick, stopped=True, horizon=30.))
-      self.assertFalse(output.forcing)
-      self.assertFalse(output.manual_hold)
+      self.assertTrue(output.forcing)
+      self.assertTrue(output.manual_hold)
 
   def test_manual_hold_publishes_dedicated_bit_and_release_withdraws_same_cycle(self):
     from types import SimpleNamespace

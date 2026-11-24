@@ -31,7 +31,7 @@ def case(tmp_path):
 
 
 def sample(owner, sm, model_stop=False, supported=True, desire=log.Desire.none):
-  return owner.select(sm, NOW, desire, supported=supported, model_stop=model_stop)
+  return owner.select(sm, NOW, desire, supported=supported, model_stop=model_stop, plan_end_speed=5.)
 
 
 @pytest.mark.parametrize('right', [False, True])
@@ -128,3 +128,29 @@ def test_completed_stop_never_bypasses_remaining_admission(case, guard):
   elif guard == 'passive':
     owner.steering_capable = False
   assert sample(owner, sm, supported=guard != 'unsupported') == log.Desire.none
+
+
+# Route 08 t=375.35: blinker on at 0.39 m/s into a red light while the model's plan ended at 0.13 m/s; the turn desire
+# made the model drive on. A turn desire starts only when the car and the model's own plan already drive on.
+@pytest.mark.parametrize('v_ego,plan_end_speed', [(0.39, 0.13), (0.72, 0.13), (5., 0.13), (0.49, 5.), (1., None),
+                                                  (1., float('nan')), (float('nan'), 5.), (1., 1.55)])
+def test_turn_desire_needs_car_and_plan_driving_on(case, v_ego, plan_end_speed):
+  owner, sm = case
+  sm['carState'].vEgo = v_ego
+  assert owner.select(sm, NOW, log.Desire.none, supported=True, model_stop=False,
+                      plan_end_speed=plan_end_speed) == log.Desire.none
+
+
+@pytest.mark.parametrize('v_ego,plan_end_speed', [(0.5, 1.57), (1., 5.), (8., 10.)])
+def test_turn_desire_admitted_when_driving_on(case, v_ego, plan_end_speed):
+  owner, sm = case
+  sm['carState'].vEgo = v_ego
+  assert owner.select(sm, NOW, log.Desire.none, supported=True, model_stop=False,
+                      plan_end_speed=plan_end_speed) == log.Desire.turnLeft
+
+
+def test_gate_keeps_existing_desire(case):
+  owner, sm = case
+  sm['carState'].vEgo = 0.3
+  assert owner.select(sm, NOW, log.Desire.laneChangeLeft, supported=True, model_stop=False,
+                      plan_end_speed=0.) == log.Desire.laneChangeLeft

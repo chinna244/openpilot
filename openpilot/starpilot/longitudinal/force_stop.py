@@ -33,6 +33,16 @@ QUEUE_LEAD_LENGTH_M = 4.5
 QUEUE_CLEAR_M = 5.0
 QUEUE_SIGN_RECENT_NS = 10_000_000_000
 QUEUE_MAX_SPEED_MPS = 6.0
+# A fresh RES from a held, confirmed stop sign launches like any cruise launch (route 08 t=257.35: the 0.2 floor took
+# 3.7 s to 3 mph while the model held -0.3..-0.5 to ~4 m past the line). A light, a lead, a new stop, the brake, this
+# speed or this time ends it at once.
+RESUME_LAUNCH_NS = 6_000_000_000
+RESUME_LAUNCH_MAX_MPS = 4.5
+# Route 08 t=375.9: stopped at a red light with no lead, the model dropped its stop (a turn desire) and the car rolled.
+# There is no traffic-light state, only the model's stop guess, so an engaged no-lead stop is held until the driver
+# releases it: gas always, RES only at a confirmed stop sign. It is re-armed once the car has moved.
+HOLD_REARM_SPEED = 1.0
+HOLD_LEAD_M = 10.0  # a car this close is the queue ahead (its departure releases as before); farther is not
 
 
 @dataclass(frozen=True)
@@ -77,7 +87,7 @@ class StopFrame:
   road_curvature: float | None
   blinker: bool
   steering_angle_deg: float
-  resume_requested: bool = False
+  resume_requested: bool = False  # RES or SET+ (a moving approach still yields to either)
   perception_available: bool = True
   sign: bool = False
   dashboard_sign: bool = False
@@ -89,6 +99,7 @@ class StopFrame:
   always_hold: bool = False
   acceleration_ns: int = 0
   sample_ns: int = 0
+  res_pressed: bool = False  # the press was a physical RES: only it releases or launches from a standstill hold
 
 
 @dataclass(frozen=True)
@@ -106,10 +117,12 @@ class StopPlan:
   takeoff_light: bool = False
   resume_override: bool = False
   episode_ns: int = 0
+  resume_launch: bool = False
 
 
 class ForceStop:
   def __init__(self):
+    self.light_stop = False  # this stop was read as a light; survives a reset (brake tap) until the car moves
     self.reset()
 
   def reset(self):
@@ -120,6 +133,8 @@ class ForceStop:
     self.light_clear_ns = 0
     self.override_until_ns = 0
     self.resume_until_ns = 0
+    self.launch_until_ns = 0
+    self.released_here = False
     self.entry_speed = None
     self.activation_gate = False
     self.stop_seen_ns = 0
@@ -286,21 +301,44 @@ class ForceStop:
       self.standstill_since_ns = now
       self.standstill_reason = 'manual' if frame.always_hold else 'unclassified'
       self.distance = 0
+    no_lead = not (frame.lead_present and frame.lead_distance_m < HOLD_LEAD_M)
+    if abs(speed) >= HOLD_REARM_SPEED:
+      self.released_here = self.light_stop = False
+    if frame.standstill and frame.light and not frame.sign and not self.sign_confirmed:
+      self.light_stop = True
+    if frame.standstill and no_lead and self.standstill_reason is None and not self.released_here:
+      self.override_until_ns = 0  # a new stop after moving on: the previous release no longer applies
+      self.standstill_since_ns = now
+      self.standstill_reason = 'manual' if frame.always_hold else 'unclassified'
+      self.distance = 0
+    if self.standstill_reason in ('unclassified', 'manual') and self.light_stop:
+      self.standstill_reason = 'light'
     if self.standstill_reason is not None:
       if not available or stop_scene:
         self.standstill_clear_ns = 0
       elif not self.standstill_clear_ns:
         self.standstill_clear_ns = now
-    hold_expired = self.standstill_reason not in (None, 'sign', 'manual') and (
+    hold_expired = self.standstill_reason not in (None, 'sign', 'manual', 'light') and not no_lead and (
       now - self.standstill_since_ns >= STANDSTILL_HOLD_NS or
       self.standstill_clear_ns > 0 and now - self.standstill_clear_ns >= STANDSTILL_CLEAR_NS)
-    if held_before and frame.standstill and frame.resume_requested:
+    if held_before and frame.standstill and frame.res_pressed and self.standstill_reason == 'sign':
       self.resume_until_ns = now + 6_000_000_000
+      if self.standstill_reason == 'sign' and self.sign_confirmed and (frame.sign or not frame.light):
+        self.launch_until_ns = now + RESUME_LAUNCH_NS
     if abs(speed) >= 2.0 or frame.lead_present or frame.tracking_lead:
       self.resume_until_ns = 0
-    driver_release = frame.pedal_override or frame.resume_requested
+    # frame.light is any model stop with no lead: while the sign itself is seen it is the sign, not a traffic light
+    if (abs(speed) >= RESUME_LAUNCH_MAX_MPS or frame.lead_present or frame.tracking_lead or frame.light and not frame.sign or
+        not frame.enabled or frame.pedal_override):
+      self.launch_until_ns = 0
+    # A held light, unclassified or manual stop is released by the gas only; RES still releases a confirmed stop-sign
+    # hold and, as before, overrides a moving approach (no hold yet)
+    # SET+ at a standstill hold answers an SLA offer or changes SET; it never releases the hold or starts a launch
+    driver_release = (frame.pedal_override or frame.resume_requested and self.standstill_reason is None or
+                      frame.res_pressed and self.standstill_reason == 'sign')
     if self.standstill_reason is not None and (driver_release or hold_expired):
       self.override_until_ns = now + 10_000_000_000
+      self.released_here = True
       self._clear_standstill()
     held = self.standstill_reason is not None
     if not available and not self.forcing:
@@ -412,8 +450,11 @@ class ForceStop:
       obstacle = max(0.0,min(self.distance * .93 + offset + tune.distance_bias_m,
                              (self.distance + offset + tune.distance_bias_m) * .93))
     should_stop = self.stop_requested if tune.distance_control else bool(self.forcing and ceiling is not None and ceiling <= .5)
+    if self.forcing or should_stop:
+      self.launch_until_ns = 0  # a new stop ends the launch for good
     return StopPlan(now, ceiling, obstacle, self.forcing, should_stop,
                     max(0.0,self.distance) if self.forcing else 0.0, approach,
                     tune.jerk_scale if self.forcing or approach > 0 else 1.0, bool(held and self.forcing and not overridden),
-                    resume_override=now < self.resume_until_ns, episode_ns=self.episode_ns)
+                    resume_override=now < self.resume_until_ns, episode_ns=self.episode_ns,
+                    resume_launch=now < self.launch_until_ns)
 

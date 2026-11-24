@@ -518,6 +518,7 @@ def main(demo=False):
   # TODO Move smooth seconds to action function
   long_delay = CP.longitudinalActuatorDelay + LONG_SMOOTH_SECONDS
   prev_action = log.ModelDataV2.Action()
+  prev_plan_end_speed = None  # last published model plan's end speed; gates turn desires
 
   lane_preferences = LiveLaneChangePolicy(params, now_ns=time.monotonic_ns())
   saved_lane_policy = lane_preferences.applied
@@ -567,7 +568,8 @@ def main(demo=False):
     turn_models = (model.lateral, model.longitudinal) if isinstance(model, LaboratoryPair) else (model,)
     turn_supported = all(state.npy.get('desire') is not None and state.npy['desire'].shape[-1] == 8 for state in turn_models)
     desire = navigation_turn.select(sm, time.monotonic_ns(), DH.desire,
-                                     supported=turn_supported, model_stop=bool(prev_action.shouldStop))
+                                     supported=turn_supported, model_stop=bool(prev_action.shouldStop),
+                                     plan_end_speed=prev_plan_end_speed)
     is_rhd = sm["driverMonitoringState"].isRHD
     frame_id = sm["narrowRoadCameraState"].frameId
     v_ego = max(sm["carState"].vEgo, 0.)
@@ -675,6 +677,8 @@ def main(demo=False):
                      publish_state, meta_main.frame_id, meta_extra.frame_id, frame_id,
                      frame_drop_ratio, meta_main.timestamp_eof, model_execution_time, extrinsics_calibration_seen)
       modelv2_send.modelV2.big = model.chestnut
+      plan_velocity = modelv2_send.modelV2.velocity.x
+      prev_plan_end_speed = float(plan_velocity[-1]) if len(plan_velocity) else None
 
       desire_state = modelv2_send.modelV2.meta.desireState
       l_lane_change_prob = desire_state[log.Desire.laneChangeLeft]

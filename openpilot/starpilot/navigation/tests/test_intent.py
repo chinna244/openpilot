@@ -128,7 +128,7 @@ def test_turn_stop_hold_reuses_planner_stop_until_standstill(sm, tmp_path):
   sm.logMonoTime['longitudinalPlan'] = NOW
   sm.valid['longitudinalPlan'] = sm.alive['longitudinalPlan'] = True
   def sample(model_stop=False):
-    return owner.select(sm, NOW, log.Desire.none, supported=True, model_stop=model_stop)
+    return owner.select(sm, NOW, log.Desire.none, supported=True, model_stop=model_stop, plan_end_speed=5.)
   assert sample() == log.Desire.turnRight
   sm['longitudinalPlan'].shouldStop = True
   assert sample() == log.Desire.none

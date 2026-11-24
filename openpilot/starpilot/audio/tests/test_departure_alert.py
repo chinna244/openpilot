@@ -358,3 +358,43 @@ def test_stopped_physical_lead_departure_does_not_need_moving_control_tracking(t
   else:
     assert not emitted
   np.testing.assert_array_equal(planner.mpc.params, before)
+
+
+@pytest.mark.parametrize('desire,held', [(None, False), (1, False), (2, False), (3, False), (4, False), (None, True)])
+def test_turn_or_lane_change_desire_cannot_clear_a_light(tmp_path, desire, held):
+  """Route 08 t=376.45: a turn desire made the model go at a red light and Green Light chimed."""
+  import numpy as np
+  from openpilot.starpilot.conditional_mode.tests.test_projection import FakeSubMaster, serialized_scene
+
+  params = Params(str(tmp_path))
+  Path(params.get_param_path(KEYS[0])).write_bytes(b'1')
+  owner = DepartureNotifications(params)
+  cp = NS(openpilotLongitudinalControl=True, pcmCruise=False, carFingerprint='HYUNDAI_IONIQ_6', passive=False, dashcamOnly=False, notCar=False)
+  # held: Force Stop holds this no-lead stop (blinker off, route 08 replay); the model's clear is not a green light
+  planner = NS(mpc=NS(params=np.array([[0.0, 0.0, 0.0, 0.0, 1.45]])), force_stop_plan=NS(manual_hold=held),
+               stop_hold_latched=False)
+  emitted = []
+  for tick in range(180):
+    now = NOW + tick * 50_000_000
+    stationary, departing = tick >= 60, tick >= 100
+    payloads = {k: v.as_builder() for k, v in serialized_scene(
+      stamp=now, speed=0.0 if stationary else 10.0, horizon=80.0 if departing else 30.0, lead_present=False,
+      lead_distance=10.0, lead_speed=0.0, standstill=stationary).items()}
+    payloads['carState'].gearShifter = 'drive'
+    payloads['controlsState'].curvature = 0.0
+    payloads['modelV2'].action.shouldStop = not departing
+    if desire is not None and departing:
+      state = [0.] * 8
+      state[desire] = 1.
+      payloads['modelV2'].meta.desireState = state
+    payloads['radarState'].leadOne.radarTrackId = 7
+    payloads['deviceState'] = NS(started=True, startedMonoTime=DRIVE)
+    sm = FakeSubMaster(payloads, now)
+    for attr in ('valid', 'alive', 'seen'):
+      getattr(sm, attr)['deviceState'] = True
+    sm.logMonoTime['deviceState'] = now
+    sm.recv_time['deviceState'] = now / 1e9
+    sm.all_checks = lambda keys, sm=sm: all(sm.valid[k] and sm.alive[k] for k in keys)
+    if owner.sample(sm, cp, planner, clocks=(now, now, 0))[0]:
+      emitted.append(tick)
+  assert bool(emitted) == (desire is None and not held)

@@ -9,6 +9,18 @@ import pytest
 from openpilot.starpilot.longitudinal.scc.zoompilot.vision_controller import SmartCruiseControlVision
 from openpilot.starpilot.longitudinal.scc.tests.vision_harness import VisionCase, make_cp
 
+
+@pytest.fixture(autouse=True)
+def _mechanism_without_low_speed_cutoff():
+  """These turns run at 14-18 mph. Under the 20 mph low-speed cutoff (route 08) a turn below _FLOOR_TURN_LAT_CAP is the
+  plan's; the mechanism tested here still runs above the cutoff, so it is pinned to the pre-cutoff behaviour. The
+  cutoff has its own tests (test_zp_vision_low_speed_cutoff.py)."""
+  from unittest import mock
+  from openpilot.starpilot.longitudinal.scc import MIN_V
+  from openpilot.starpilot.longitudinal.scc.zoompilot import vision_controller as _vc
+  with mock.patch.object(_vc, 'LOW_SPEED_CUTOFF', MIN_V):
+    yield
+
 SIDES = pytest.mark.parametrize("side", [1., -1.], ids=["left", "right"])
 V_CRUISE = 20.
 TIGHT = 0.07  # 1/m: 3.0 m/s2 at 6.5 m/s

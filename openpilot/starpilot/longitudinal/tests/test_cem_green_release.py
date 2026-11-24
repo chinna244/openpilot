@@ -298,7 +298,8 @@ class CemGreenCallerTests(unittest.TestCase):
       self.assertFalse(self.owner.mode.projector.stop_detector.standstill_committed)
 
 
-  def test_res_releases_existing_force_and_cem_holds_together(self):
+  def test_set_plus_at_a_red_light_never_releases_the_force_stop_hold(self):
+    # route 08: a Force Stop hold at a light is released by the gas only; SET+ (and RES) at standstill never move the car
     from openpilot.starpilot.longitudinal.force_stop_runtime import ForceStopRuntime
     self.params.put_bool('ForceStops', True, block=True)
     force = ForceStopRuntime(self.params)
@@ -310,10 +311,10 @@ class CemGreenCallerTests(unittest.TestCase):
     self.cycle(stopped=True, position=RED_97_X, velocity=RED_97_V, force_stop_owner=force, resume=True)
     for _ in range(20):
       _, _, held, plan = self.cycle(stopped=True, position=RED_97_X, velocity=RED_97_V, force_stop_owner=force)
-      self.assertFalse(held)
-    self.assertTrue(self.planner.force_stop_plan.resume_override)
-    self.assertFalse(plan.shouldStop)
-    self.assertGreaterEqual(plan.aTarget, .1)
+      self.assertTrue(self.planner.force_stop_plan.manual_hold)
+      self.assertTrue(plan.shouldStop)
+    self.assertFalse(self.planner.force_stop_plan.resume_override)
+    self.assertLessEqual(plan.aTarget, 0.)
 
   def test_res_engagement_from_aol_preserves_red_light_hold(self):
     from openpilot.starpilot.longitudinal.force_stop_runtime import ForceStopRuntime

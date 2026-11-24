@@ -203,6 +203,7 @@ class ForceStopRuntime:
                         tracked is not None and tracked.tracked is True, bool(lead.present), float(lead.dRel), float(lead.vLead),
                         raw_curve[1] if raw_curve is not None else False, curvature[0] if curvature is not None else None,
                         bool(car.leftBlinker or car.rightBlinker), float(car.steeringAngleDeg), resume_requested=resume_requested,
+                        res_pressed=bool(resume_requested and self.resume.consumed_res),
                         perception_available=perception_available, sign=dashboard_sign or vision_fresh,
                         dashboard_sign=dashboard_sign, vision_distance_m=vision_distance, always_hold=self.always_hold,
                         acceleration_mps2=float(car.aEgo), actuator_delay_s=float(cp.longitudinalActuatorDelay),
