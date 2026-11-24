@@ -29,6 +29,11 @@ LIMIT_SETTLE_FRAMES = int(LIMIT_SETTLE / DT_CTRL)
 RECONCILE_AGREE_KPH = 2 * CV.MPH_TO_KPH
 ARBITER_BUTTONS = ('accelCruise', 'decelCruise', 'setCruise', 'resumeCruise')
 ENABLE_BUTTONS = ('decelCruise', 'accelCruise', 'setCruise', 'resumeCruise', 'cancel', 'mainCruise')
+# Route 08: the SET walk tapped SET+ to the factory ECU while the car stood at a held stop, and Mazda's ECU can take SET+ at a
+# standstill as a resume. No synthetic SET press while the car is stopped, held or crawling; queued ones are discarded and
+# the walk starts afresh only after the car has driven off for DEPARTURE_FRAMES. A driver's own SET+ still answers an offer.
+SET_WALK_MIN_SPEED = 1.0  # m/s
+DEPARTURE_FRAMES = int(1.0 / DT_CTRL)
 
 
 def _button_name(event) -> str:
@@ -51,6 +56,7 @@ class MazdaSlaSession:
     self.button_change_states = {'decelCruise': (False, False), 'accelCruise': (False, False)}
     self.prompting_published = False
     self._fresh_frames = 0
+    self._moving_frames = 0
     self._road_change_ns = 0
     self.enabled_prev = False
     self.enable_timers = dict.fromkeys(ENABLE_BUTTONS, 0)
@@ -145,9 +151,11 @@ class MazdaSlaSession:
     # card_ext.update_v_cruise_post: the plan regime plannerd reported, then reconcile
     self._reconcile(CS, limiter_active)
 
-    if road_changed or servo_v_target is None or not servo_v_target > 0.:
-      # Discard queued SET presses at a road change or when the planner target expires.
-      # The walk starts from a fresh decision once the planner supplies a target again.
+    stopped = bool(CS.standstill or CS.cruiseState.standstill or not CS.vEgo >= SET_WALK_MIN_SPEED)
+    self._moving_frames = 0 if stopped else self._moving_frames + 1
+    if road_changed or servo_v_target is None or not servo_v_target > 0. or self._moving_frames < DEPARTURE_FRAMES:
+      # Discard queued SET presses at a road change, when the planner target expires, or while the car is stopped or has
+      # not yet driven off. The walk starts from a fresh decision once the planner supplies a target again.
       self._next_button, self._next_hold = 'none', False
       self.send_button, self.hold = 'none', False
       self.servo.reset()
@@ -156,9 +164,6 @@ class MazdaSlaSession:
     # filter-dev runs ICBM in selfdrived on this frame's carState and card applies its button on the next frame, gated
     # by that frame's session: the button for CI.apply now is the one decided last frame
     self.send_button = arb.gate_send_button(self._next_button)
-    # At a stop the Mazda takes SET+ as a resume: the walk must never be what launches the car. It continues once moving.
-    if self.send_button == 'increase' and (CS.standstill or CS.cruiseState.standstill):
-      self.send_button = 'none'
     self.hold = self._next_hold and self.send_button != 'none'
 
     # ICBM (op long): walk the dash to the plan target, the setpoint under the session's ramped cap

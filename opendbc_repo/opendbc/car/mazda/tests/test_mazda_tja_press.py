@@ -136,9 +136,10 @@ class TestMrccUndo:
     held = drive(cc, cs, 100, available=False, brake_pressed=True, send_button=SendButtonState.increase)
     assert cc.mrcc_undo_pending  # the brake restarts the clock
     assert frames(held, CRZ_BTNS, bus=0) == []  # ICBM still suppressed while the undo owns the stream
-    resumed = drive(cc, cs, 110, available=False, send_button=SendButtonState.increase)
+    resumed = drive(cc, cs, 110, available=False, send_button=SendButtonState.increase, v_ego=13.)
     assert not cc.mrcc_undo_pending  # 1 s brake-free elapsed
-    assert frames(resumed, CRZ_BTNS, bus=0) != []  # ICBM has the stream back
+    # ICBM has the stream back (while moving: it never sends a synthetic SET at a standstill, route 08)
+    assert frames(resumed, CRZ_BTNS, bus=0) != []
 
   @pytest.mark.parametrize("activity", [dict(mrcc_button=1), dict(cancel_button=1), dict(accel_button=1),
                                         dict(handback=True)])

@@ -108,6 +108,9 @@ class DashSteerWarning:
     return steer_required and lat_active and not self.held and frame >= self.quiet_until
 
 
+ICBM_MIN_SPEED = 1.0  # m/s
+
+
 class CarController(CarControllerBase, IntelligentCruiseButtonManagementInterface, MadsCarController):
   def __init__(self, dbc_names, CP, CP_SP=None):
     CP_SP = CP_SP or context.CarParamsSP()
@@ -258,8 +261,11 @@ class CarController(CarControllerBase, IntelligentCruiseButtonManagementInterfac
 
     # Suppress ICBM while cancel/resume is active or the MRCC cleanup owns CRZ_BTNS:
     # the wheel's press pattern owns the counter stream until release.
+    # Never a synthetic SET press at a standstill: the ECU can read SET+ there as a resume (the session defers its walk,
+    # this is the last line).
     icbm_suppress = (CC.cruiseControl.cancel or CC.cruiseControl.resume or CS.cancel_button == 1 or
-                     self.mrcc_undo_pending or CS.tja_button == 1)
+                     self.mrcc_undo_pending or CS.tja_button == 1 or CS.out.standstill or CS.out.cruiseState.standstill or
+                     not CS.out.vEgo >= ICBM_MIN_SPEED)
     if not icbm_suppress:
       can_sends.extend(IntelligentCruiseButtonManagementInterface.update(self, CC_SP, CS, self.packer, self.frame, self.last_button_frame))
 
