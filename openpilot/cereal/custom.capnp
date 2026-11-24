@@ -222,6 +222,17 @@ struct StarPilotCarState @0xf35cc4560bbf6ec2 {
   feedbackPublication @37 :FeedbackPublication;
   steeringLimitInfo @39 :StarPilotCarControl.SteeringLimitInfo;
   toyotaCruise @38 :ToyotaCruise;
+  mazdaSlaSession @40 :MazdaSlaSession; # Mazda SLA (filter-dev port): card's session, plannerd mirrors it
+
+  struct MazdaSlaSession {
+    state @0 :UInt8; # filter-dev AssistState
+    vCap @1 :Float32; # m/s: the session target, a frozen hold while prompting, or 255
+    lastIntent @2 :UInt8; # filter-dev CruiseIntent
+    announceCounter @3 :UInt32;
+    setpointKph @4 :Float32;
+    longEnabled @5 :Bool;
+    target @6 :Float32; # m/s, the settled target (limit + offset) the session asks for and confirms against
+  }
 
   struct ToyotaCruise {
     version @0 :UInt16;
@@ -360,6 +371,24 @@ struct SlcState @0xa1680744031fdb2d {
   wheelOverrideSince @60 :UInt64; # nonzero while a wheel tap may cross the current adjusted limit
   wheelAdoptMonoTime @61 :UInt64; # Card's original wheel event timestamp, only on the approval frame
   wheelAdoptTargetMps @62 :Float32; # exact adjusted SET approved for that event
+  mazdaSla @63 :MazdaSla; # Mazda SLA (filter-dev port): plannerd's resolver and its mirror of card's session
+  struct MazdaSla {
+    speedLimit @0 :Float32; # m/s, the resolver's limit now, 0 for none
+    speedLimitFinalLast @1 :Float32; # m/s, the last limit plus offset (the session's target)
+    speedLimitValid @2 :Bool;
+    speedLimitLastValid @3 :Bool;
+    source @4 :UInt8; # none/car/map/vision (filter-dev LongitudinalPlanSP.SpeedLimit.Source)
+    assistState @5 :UInt8; # mirrored session state (filter-dev AssistState)
+    vTarget @6 :Float32; # m/s, the session's cap (255 for none)
+    planVTarget @7 :Float32; # m/s, the cap as the plan sees it, ramped down at CAP_FALL_RATE (255 for none)
+    announceCounter @8 :UInt32; # card's announce bumps, mirrored ("Adjusting to")
+    setpointKph @9 :Float32; # the setpoint the session owns (the prompt's direction is judged against it)
+    servoVTarget @10 :Float32; # m/s, the plan target the SET walk follows: carState.vCruise under planVTarget (filter-dev LP_SP.vTarget)
+    limiterActive @11 :Bool; # the cap drives the plan this tick (filter-dev longitudinalPlanSource != cruise)
+    offerTarget @12 :Float32; # m/s, the session's settled target: what the prompt names and a press is judged against
+    sessionValid @13 :Bool; # the mirror holds a session card published; announceCounter means nothing without one
+  }
+
   struct SourceReading {
     source @0 :Text;
     enabled @1 :Bool;

@@ -66,8 +66,9 @@ class AlertRenderer:
       text1, text2 = text1[len('driving personality: '):], 'Driving Personality'
     alert = replace(alert, text1=DisplayText(tr(text1)), text2=DisplayText(tr(text2)))
     if self.fonts.profile == Profile.COMPACT:
+      # Mazda SLA prompt/adjusting: filter-dev's mici presentation (case, layout, the prompt's blinking +/- arrow)
       lane_event = event_name in ('preLaneChangeLeft', 'preLaneChangeRight', 'laneChangeBlocked', 'laneChange',
-                                                                    'steerTempUnavailable', 'steerTempUnavailableSilent')
+                                  'steerTempUnavailable', 'steerTempUnavailableSilent', 'slcConfirmPrompt', 'slcAdjusting')
       if lane_event or (self._lane_visible and alert.size == AlertSize.NONE):
         if self._lane_renderer is None:
           self._lane_renderer = NativeAlertRenderer()

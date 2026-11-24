@@ -10,7 +10,6 @@ import pytest
 
 from opendbc.car.structs import car
 from openpilot.common.constants import CV
-from openpilot.selfdrive.car.cruise import SlcConsumedButton, SlcPendingConfirmation
 from openpilot.starpilot.car.mazda import sla_set_servo as m
 
 ButtonType = car.CarState.ButtonEvent.Type
@@ -238,23 +237,6 @@ def test_metric_units():
   assert servo.armed.target == 50
 
 
-def test_card_answer_binds_to_the_shown_offer():
-  from openpilot.selfdrive.car.card import Car
-  pending = SlcPendingConfirmation('s', 3, 38)
-  state = SimpleNamespace(presentationId=38, hasPresentationAdjustedLimit=True, presentationAdjustedLimit=30 * MPH,
-                          hasPending=True, hasPendingAdjustedLimit=True, pendingAdjustedLimit=30 * MPH)
-  fake = SimpleNamespace(sm=SimpleNamespace(seen={'slcState': True}, __getitem__=None), is_metric=False,
-                         mazda_sla_servo=m.MazdaSlaSetServo(), mazda_sla_confirm_frame=False)
-  fake.sm = type('SM', (), {'seen': {'slcState': True}, '__getitem__': lambda self, k: state})()
-  out = Car.mazda_sla_answer(fake, SlcConsumedButton(pending, 'decel'), cs(35), 5)
-  assert out.button == 'accel' and out.pending == pending and fake.mazda_sla_servo.armed.target == 30
-  assert fake.mazda_sla_confirm_frame
-  state.presentationId = 39  # a different offer than the press consumed: StarPilot's own meaning
-  fake.mazda_sla_servo.reset()
-  out = Car.mazda_sla_answer(fake, SlcConsumedButton(pending, 'decel'), cs(35), 6)
-  assert out.button == 'decel' and fake.mazda_sla_servo.armed is None
-
-
 def test_settled_walk_disarms_and_a_newer_acceptance_never_presses():
   """Review: settled at 36, factory SET later reads 35, a newer 36.3 mph acceptance rounds to 36 -> no SET+."""
   loop = Loop(30)
@@ -312,19 +294,6 @@ def test_changed_acknowledgment_after_a_stale_gap_ends_the_walk():
   loop.accepted_ns = loop.now  # a different planner acknowledgment returns
   loop.run(3)
   assert loop.ecu.set_mph == at and loop.servo.end_reason == 'target_changed'
-
-
-def test_route_132s_press_during_a_source_gap_still_confirms():
-  """Route 00000004--0ed7a0ac2e t=132.44: SET- for an open 30 at SET 36 while the source read 'none' (no presentation
-  target) declined the offer. filter-dev judges the press against the prompt's own target for its whole life."""
-  from openpilot.selfdrive.car.card import Car
-  pending = SlcPendingConfirmation('s', 4, 38)
-  state = SimpleNamespace(presentationId=38, hasPresentationAdjustedLimit=False, presentationAdjustedLimit=0.,
-                          hasPending=True, hasPendingAdjustedLimit=True, pendingAdjustedLimit=30 * MPH)
-  fake = SimpleNamespace(is_metric=False, mazda_sla_servo=m.MazdaSlaSetServo(), mazda_sla_confirm_frame=False)
-  fake.sm = type('SM', (), {'seen': {'slcState': True}, '__getitem__': lambda self, k: state})()
-  out = Car.mazda_sla_answer(fake, SlcConsumedButton(pending, 'decel'), cs(36), 5)
-  assert out.button == 'accel' and fake.mazda_sla_servo.armed.target == 30
 
 
 def test_open_offer_prefers_the_pending_target():

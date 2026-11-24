@@ -47,6 +47,31 @@ class IconLayout(NamedTuple):
   side: IconSide
   margin_x: int
   margin_y: int
+  alpha: float = 255.0
+
+
+class SlaPromptFade:
+  """filter-dev's AlertFadeAnimator for the Mazda SLA prompt arrow: on for 0.75 s of every second, fading between."""
+  def __init__(self, target_fps: int, duration_on: float = 0.75, rc: float = 0.05):
+    self._filter = FirstOrderFilter(1.0, rc, 1 / target_fps)
+    self._frame = 0
+    self._target_fps = target_fps
+    self._duration_on = duration_on
+
+  def update(self, active: bool) -> None:
+    if active:
+      self._frame += 1
+      if (self._frame % self._target_fps) < (self._target_fps * self._duration_on):
+        self._filter.x = 1.0
+      else:
+        self._filter.update(0.0)
+    else:
+      self._frame = 0
+      self._filter.update(1.0)
+
+  @property
+  def alpha(self) -> float:
+    return self._filter.x
 
 
 class AlertLayout(NamedTuple):
@@ -109,6 +134,7 @@ class AlertRenderer(Widget):
     self._turn_signal_timer = 0.0
     self._turn_signal_alpha_filter = FirstOrderFilter(0.0, 0.3, 1 / gui_app.target_fps)
     self._last_icon_side: IconSide | None = None
+    self._sla_prompt_fade = SlaPromptFade(gui_app.target_fps)
 
     self._load_icons()
 
@@ -117,6 +143,29 @@ class AlertRenderer(Widget):
     self._txt_turn_signal_right = gui_app.texture('icons_mici/onroad/turn_signal_left.png', 104, 96, flip_x=True)
     self._txt_blind_spot_left = gui_app.texture('icons_mici/onroad/blind_spot_left.png', 134, 150)
     self._txt_blind_spot_right = gui_app.texture('icons_mici/onroad/blind_spot_left.png', 134, 150, flip_x=True)
+    # Mazda SLA prompt (filter-dev SpeedLimitAlertRenderer, mici ARROW_SIZE 90)
+    self._txt_sla_arrow_up = gui_app.texture('icons_mici/onroad/sla_plus_arrow_up.png', 90, 90)
+    self._txt_sla_arrow_down = gui_app.texture('icons_mici/onroad/sla_minus_arrow_down.png', 90, 90)
+    blank = rl.gen_image_color(90, 90, rl.Color(0, 0, 0, 0))
+    self._txt_sla_arrow_blank = rl.load_texture_from_image(blank)
+    rl.unload_image(blank)
+
+  def _sla_prompt_icon(self):
+    """filter-dev speed_limit_pre_active_icon_helper: + or - arrow on the right, blinking. The direction is the session's
+    offer against the set speed, the same one the prompt text names and a press is judged against."""
+    icon_alpha = max(0.0, min(self._sla_prompt_fade.alpha * 255.0, 255.0))
+    txt_icon = self._txt_sla_arrow_blank
+    if icon_alpha > 0:
+      try:
+        offer = ui_state.sm['slcState'].mazdaSla.offerTarget
+        set_kph = ui_state.sm['carState'].vCruiseCluster
+        metric = ui_state.is_metric
+        set_round = round(set_kph if metric else set_kph / 1.609344)
+        offer_round = round(offer * (3.6 if metric else 2.2369363))
+        txt_icon = self._txt_sla_arrow_up if set_round < offer_round else self._txt_sla_arrow_down if set_round > offer_round else txt_icon
+      except (AttributeError, KeyError, TypeError):
+        pass
+    return IconSide.right, txt_icon, icon_alpha, 10, 18
 
   def get_alert(self, sm: messaging.SubMaster) -> Alert | None:
     """Generate the current alert based on selfdrive state."""
@@ -157,6 +206,7 @@ class AlertRenderer(Widget):
   def _icon_helper(self, alert: Alert, signal_direction: int | None = None) -> AlertLayout:
     icon_side = None
     txt_icon = None
+    icon_alpha = 255.0
     icon_margin_x = 20
     icon_margin_y = 18
 
@@ -190,6 +240,9 @@ class AlertRenderer(Widget):
       icon_margin_x = 8
       icon_margin_y = 0
 
+    elif event_name == 'slcConfirmPrompt':
+      icon_side, txt_icon, icon_alpha, icon_margin_x, icon_margin_y = self._sla_prompt_icon()
+
     else:
       self._turn_signal_timer = 0.0
 
@@ -211,7 +264,8 @@ class AlertRenderer(Widget):
       text_width,
       self._rect.height,
     )
-    icon_layout = IconLayout(txt_icon, icon_side, icon_margin_x, icon_margin_y) if txt_icon is not None and icon_side is not None else None
+    icon_layout = (IconLayout(txt_icon, icon_side, icon_margin_x, icon_margin_y, icon_alpha)
+                   if txt_icon is not None and icon_side is not None else None)
     return AlertLayout(text_rect, icon_layout)
 
   def _render(self, rect: rl.Rectangle) -> bool:
@@ -243,6 +297,12 @@ class AlertRenderer(Widget):
 
     self._draw_background(alert)
 
+    # the Mazda SLA prompt arrow blinks while the session's prompt is open (filter-dev SpeedLimitAlertRenderer.update)
+    try:
+      self._sla_prompt_fade.update(ui_state.sm['slcState'].mazdaSla.assistState == 2)
+    except (AttributeError, KeyError, TypeError):
+      self._sla_prompt_fade.update(False)
+
     alert_layout = self._icon_helper(alert, signal_direction)
     self._draw_text(alert, alert_layout)
     self._draw_icons(alert_layout)
@@ -267,7 +327,7 @@ class AlertRenderer(Widget):
       pos_x = int(self._rect.x + self._rect.width - alert_layout.icon.margin_x - alert_layout.icon.texture.width)
 
     if alert_layout.icon.texture not in (self._txt_turn_signal_left, self._txt_turn_signal_right):
-      icon_alpha = 255
+      icon_alpha = alert_layout.icon.alpha
     else:
       icon_alpha = int(min(self._turn_signal_alpha_filter.x, 255))
 

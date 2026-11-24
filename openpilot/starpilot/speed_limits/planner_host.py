@@ -7,6 +7,7 @@ from dataclasses import replace
 
 from openpilot.cereal import messaging
 from openpilot.cereal.services import SERVICE_LIST
+from openpilot.starpilot.car.mazda.sla import eligible as mazda_sla_eligible
 from openpilot.starpilot.feature_runtime import enabled as feature_enabled, slc_runtime_settings, vision_control_enabled
 from openpilot.starpilot.saved_source import read_saved
 from openpilot.starpilot.speed_limits import history
@@ -42,6 +43,10 @@ class SavedSlcLifecycle:
     saved_slc = read_slc_settings(self.params)
     admitted = feature_enabled(self.params, self.cp, 'slc', self.environment, saved_slc=saved_slc)
     settings = slc_runtime_settings(self.params, self.cp, self.environment, saved_slc=saved_slc)
+    if mazda_sla_eligible(self.cp) and not settings.errors:
+      # Mazda alpha long: the filter-dev SLA session (car/mazda/sla) owns every limit prompt and the factory SET; SLC
+      # here only shows the sign, so it adopts limits without offers of its own (no second prompt, wheel hint or answer)
+      settings = replace(settings, acceptance=replace(settings.acceptance, confirm_lower=False, confirm_higher=False))
     vision = admitted and feature_enabled(self.params, self.cp, 'vision', self.environment, saved_slc=saved_slc)
     configuration = (admitted and not settings.errors, settings, vision,
                      vision_control_enabled(self.params, self.cp, saved_slc=saved_slc),

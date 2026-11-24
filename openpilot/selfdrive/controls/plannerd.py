@@ -40,7 +40,8 @@ import secrets
 from openpilot.starpilot.feature_capabilities import longitudinal_supported
 from openpilot.starpilot.conditional_mode.projection import paired_clocks_ns
 from openpilot.starpilot.conditional_mode.ui_action import observation as ui_manual_observation
-from openpilot.starpilot.longitudinal.cruise_ceiling import CurveCeiling
+from openpilot.starpilot.longitudinal.cruise_ceiling import CruiseCeiling, CurveCeiling
+from openpilot.starpilot.car.mazda.sla import eligible as mazda_sla_eligible
 from openpilot.starpilot.feature_runtime import enabled as feature_enabled, requested as feature_requested, slc_transport_capable
 import time
 
@@ -391,6 +392,8 @@ def starpilot_main():
   mode_settings = ConditionalSettingsOwner(params) if mode_owner is not None else None
   slc_lifecycle = SavedSlcLifecycle(params, CP, os.environ)
   slc_lifecycle.refresh(0)
+  # Mazda alpha long: filter-dev's SLA (resolver + the mirror of card's session) owns the limit cap
+  mazda_sla = mazda_sla_planner(CP, params, slc_lifecycle) if mazda_sla_eligible(CP) else None
   slc_action_sock = (messaging.sub_sock("slcAction", conflate=False)
                      if slc_available or conditional_host is not None or mode_owner is not None else None)
   slc_cruise_sock = messaging.sub_sock("slcCruiseEvent", conflate=False)
@@ -402,7 +405,8 @@ def starpilot_main():
   pending_traffic_events = deque(maxlen=64)
   drive_start_ns = 0
   publish_services = ['longitudinalPlan', 'starpilotLongitudinalPlan', 'driverAssistance']
-  if slc_available or curve_host is not None or conditional_host is not None or traffic_owner is not None or mode_owner is not None:
+  if (slc_available or curve_host is not None or conditional_host is not None or traffic_owner is not None or mode_owner is not None or
+      mazda_sla is not None):
     publish_services.append('slcState')
   pm = messaging.PubMaster(publish_services)
   native_plan_checks = list(NATIVE_PLAN_INPUTS)
@@ -415,6 +419,8 @@ def starpilot_main():
     optional_slc.append('starpilotCarState')
   if force_stop_owner is not None and 'slcVisionObservation' not in optional_slc:
     optional_slc.append('slcVisionObservation')
+  if mazda_sla is not None:
+    optional_slc.extend(s for s in mazda_sla.services() if s not in optional_slc)
   subscribed_services.extend(optional_slc)
   subscribed_services.append('starpilotNavigation')
   optional_conditional = ['starpilotNavigation'] + (['starpilotRadarState'] if conditional_host is not None else []) + optional_slc
@@ -490,6 +496,13 @@ def starpilot_main():
         cruise_ceiling = slc_output.result.ceiling if slc_output is not None else None
         if slc_output is not None:
           planner_status = slc_output.message
+        if mazda_sla is not None:
+          # one owner on Mazda: the session's cap replaces StarPilot's SLC ceiling
+          cap = mazda_sla.step(sm, now_ns)
+          cruise_ceiling = CruiseCeiling(cap, MAZDA_SLA_AUTHORITY) if cap is not None else None
+          if planner_status is None:
+            planner_status = messaging.new_message('slcState', valid=True)
+          mazda_sla.fill(planner_status.slcState.mazdaSla)
         needs_clock = conditional_host is not None or traffic_owner is not None or force_stop_owner is not None or mode_owner is not None
         clock_pair = paired_clocks_ns() if needs_clock and 'REPLAY' not in os.environ else None
         controller_traffic_toggle = bool(wheel_coast.traffic_toggles % 2)
@@ -648,6 +661,28 @@ def starpilot_main():
       conditional_host.close()
     if curve_preferences is not None:
       close_curve_learning(longitudinal_planner, curve_preferences)
+
+
+def mazda_sla_planner(CP, params, slc_lifecycle):
+  from openpilot.starpilot.car.mazda.sla.planner import MazdaSlaPlanner
+  from openpilot.starpilot.speed_limits import speed_domain as sd
+
+  def offset_fn(limit_mps: float) -> float:
+    """StarPilot's SLC offset for this limit (the offsets the driver set for SLC)."""
+    runtime = slc_lifecycle.runtime
+    offsets = getattr(getattr(runtime, 'settings', None), 'offsets', None)
+    adjusted = sd.adjusted_limit(limit_mps, offsets) if offsets is not None else None
+    return adjusted - limit_mps if adjusted is not None else 0.
+  return MazdaSlaPlanner(CP, params, offset_fn)
+
+
+def _mazda_sla_authority():
+  from openpilot.starpilot.speed_limits import acceptance as acc
+  # select_cruise_ceiling still requires long control active and selfdrive enabled; the session only caps while engaged
+  return acc.Authority(acc.Mode.LONGITUDINAL_ONLY, acc.LongitudinalOwner.SYSTEM, False, True, False, False)
+
+
+MAZDA_SLA_AUTHORITY = _mazda_sla_authority()
 
 def main():
   # Manager stops plannerd offroad. Select once before constructing any planner

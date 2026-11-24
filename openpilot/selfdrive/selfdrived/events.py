@@ -1134,22 +1134,41 @@ def _slc_display(speed_mps: float, metric: bool) -> str:
   return f"{round(speed_mps * (CV.MS_TO_KPH if metric else CV.MS_TO_MPH))} {'km/h' if metric else 'mph'}"
 
 
+def _mazda_sla_set_mps(CS: car.CarState) -> float:
+  # filter-dev events_zp._set_speed_ms: vCruiseCluster is the setpoint the session owns (card), kph
+  return CS.vCruiseCluster * CV.KPH_TO_MS
+
+
 def mazda_slc_confirm_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.SubMaster, metric: bool, soft_disable_time: int,
                             personality) -> Alert:
-  """develop/filter-dev events_zp speed_limit_pre_active_alert (mici): the press toward the offer confirms it."""
-  from openpilot.starpilot.car.mazda.sla_set_servo import confirm_direction, open_offer_mps
-  target = open_offer_mps(sm['slcState'])
-  direction = confirm_direction(target, float(CS.cruiseState.speedCluster), metric) if target is not None else None
-  text = f"Press {'+' if direction == 'accel' else '-'} for\n{_slc_display(target, metric)}" if direction else ""
-  return Alert(text, "", AlertStatus.normal, AlertSize.small if text else AlertSize.none,
+  """filter-dev events_zp speed_limit_pre_active_alert (mici): which press confirms the session's offer. filter-dev names
+  the resolver's limit of the moment (speedLimitFinalLast); a camera flicker inside the open prompt then showed another
+  number and direction than the one the press is judged against. Here it names the session's own settled target."""
+  speed_conv = CV.MS_TO_KPH if metric else CV.MS_TO_MPH
+  set_speed_conv = round(_mazda_sla_set_mps(CS) * speed_conv)
+  target = float(sm['slcState'].mazdaSla.offerTarget)
+  target_conv = round(target * speed_conv)
+  text = ""
+  if set_speed_conv < target_conv:
+    text = f"Press + for\n{_slc_display(target, metric)}"
+  elif set_speed_conv > target_conv:
+    text = f"Press - for\n{_slc_display(target, metric)}"
+  # the chime is promptSingleLow: soundd plays it for this alert type (no schema slot for it). Size stays small with no
+  # direction, as events_zp on mici: between a confirm and plannerd's next tick the prompt is up with no text for <= 50 ms
+  return Alert(text, "", AlertStatus.normal, AlertSize.small,
                Priority.LOW, VisualAlert.none, AudibleAlert.prompt, .1)
 
 
 def mazda_slc_adjust_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.SubMaster, metric: bool, soft_disable_time: int,
                            personality) -> Alert:
-  """develop/filter-dev events_zp speed_limit_adjust_alert: names the accepted target the SET walks to."""
-  return Alert(f"Adjusting to\n{_slc_display(float(sm['slcState'].acceptedAdjustedLimit), metric)}", "",
-               AlertStatus.normal, AlertSize.small, Priority.LOW, VisualAlert.none, AudibleAlert.prompt, .1)
+  """filter-dev events_zp speed_limit_adjust_alert (mici): names the cap that moved, never above the set speed."""
+  speed = float(sm['slcState'].mazdaSla.vTarget)
+  set_speed = _mazda_sla_set_mps(CS)
+  if set_speed > 0:
+    speed = min(speed, set_speed)
+  # the chime is promptSingleHigh: soundd plays it for this alert type (no schema slot for it)
+  return Alert(f"Adjusting to\n{_slc_display(speed, metric)}", "", AlertStatus.normal, AlertSize.small,
+               Priority.LOW, VisualAlert.none, AudibleAlert.prompt, 5.)
 
 
 MAZDA_EVENTS: dict[str, dict[str, Alert | AlertCallbackType]] = {

@@ -138,7 +138,6 @@ def key_off_input(sm, service: str, now_ns: int):
     pass
   return None
 
-SLC_ADJUST_ALERT_NS = 3_000_000_000
 
 def track_key_off(sd, now_ns: int) -> None:
   """Every step, wire healthy or not: sd.key_off_since_ns is the first fresh panda report of the current key off. Only
@@ -294,7 +293,7 @@ class SelfdriveD:
       ignore += ['aolIntentWire']
     if self.axis_transport_required:
       ignore += ['aolSafetyWire']
-    from openpilot.starpilot.car.mazda.sla_set_servo import eligible as mazda_sla_eligible
+    from openpilot.starpilot.car.mazda.sla import eligible as mazda_sla_eligible
     # Mazda factory cruise: the SLA prompt/adjust alerts (develop/filter-dev events_zp) read slcState
     self.mazda_slc_alerts = mazda_sla_eligible(self.CP)
     slc_state_wanted = self.conditional_replay or self.switchback_capable or self.mazda_slc_alerts
@@ -498,27 +497,30 @@ class SelfdriveD:
     self.add_mazda_slc_events(CS)
 
   def add_mazda_slc_events(self, CS, now_ns: int | None = None):
-    """Mazda factory cruise, as develop/filter-dev (events_zp speedLimitPreActive / speedLimitActive): an open SLA
-    offer shows which wheel press confirms it ("Press + for" / "Press - for"), and an accept "Adjusting to"."""
-    if not getattr(self, 'mazda_slc_alerts', False) or not self.enabled:
+    """Mazda SLA (filter-dev port), as filter-dev's mirror raises its events from plannerd: the prompt while the session is
+    preActive (level, one per frame), "Adjusting to" on each announce bump card made (events_zp)."""
+    if not getattr(self, 'mazda_slc_alerts', False):
       return
     from openpilot.starpilot.speed_limits.physical_actions import STATE_MAX_AGE_NS
-    from openpilot.starpilot.car.mazda.sla_set_servo import confirm_direction, open_offer_mps
     now_ns = time.monotonic_ns() if now_ns is None else now_ns
     try:
       stamp = int(self.sm.logMonoTime['slcState'])
-      if not (self.sm.seen['slcState'] and self.sm.valid['slcState'] and self.sm.alive['slcState'] and
-              0 < stamp <= now_ns and now_ns - stamp <= STATE_MAX_AGE_NS):
+      # not sm.valid: that is StarPilot SLC's own verdict on the message; card runs the session from mazdaSla regardless
+      if not (self.sm.seen['slcState'] and self.sm.alive['slcState'] and 0 < stamp <= now_ns and now_ns - stamp <= STATE_MAX_AGE_NS):
         return
-      state = self.sm['slcState']
-      if not state.enabled or state.displayOnly:
+      sla = self.sm['slcState'].mazdaSla
+      announce = int(sla.announceCounter)
+      seen = getattr(self, 'mazda_sla_announce_seen', None)
+      # only a bump of a live session announces: a plannerd restart (no session mirrored yet) or a card restart (the counter
+      # going back) re-syncs silently, never "Adjusting to"
+      if not sla.sessionValid or (seen is not None and announce < seen):
+        seen = None
+      self.mazda_sla_announce_seen = announce if sla.sessionValid else None
+      if not self.enabled:
         return
-      offer = open_offer_mps(state)
-      if (state.hasPending and not state.automaticAdoptionPending and offer is not None and
-          confirm_direction(offer, float(CS.cruiseState.speedCluster), self.is_metric)):
+      if sla.assistState == 2:  # preActive
         self.mazda_events.add('slcConfirmPrompt')
-      elif (state.hasAcceptedAdjustedLimit and not state.acceptedIsPreview and
-            0 < int(state.acceptedMonoTime) <= now_ns <= int(state.acceptedMonoTime) + SLC_ADJUST_ALERT_NS):
+      if seen is not None and announce != seen:
         self.mazda_events.add('slcAdjusting')
     except (AttributeError, KeyError, TypeError, ValueError):
       return
