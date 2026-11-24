@@ -1,5 +1,5 @@
 """Offline rig for the Mazda SLA port: plannerd (MazdaSlaPlanner), card (MazdaSlaSession), selfdrived
-(SelfdriveD.add_mazda_slc_events -> MAZDA_EVENTS callbacks -> AlertManager) and soundd (alert_sound), in their production
+(SelfdriveD.add_mazda_slc_events -> MAZDA_EVENTS callbacks -> AlertManager), in their production
 order, on frame dicts. The factory SET is a model of the Mazda ECU: driver presses move it as given (a frame's 'dash'
 delta while a driver button is down or just released), the SET walk's taps register every 0.2 s with every fourth
 slot dropped, the hold stream at 4 mph/s.
@@ -110,7 +110,8 @@ class Rig:
         self.sm.put('mapdOut', NS(speedLimit=ml, nextSpeedLimit=ahead, nextSpeedLimitDistance=ahead_d), mt)
       if vt:
         self.sm.put('slcVisionObservation', NS(vision=NS(status='valid' if vl > 0 else 'absent', speedMps=vl)), vt)
-      self.sm.put('slcDashboardObservation', NS(status='valid' if f['car'] > 0 else 'absent', speedMps=f['car']), now)
+      self.sm.put('slcDashboardObservation', NS(status='valid' if f['car'] > 0 else 'absent', speedMps=f['car'],
+                                                  validUntilMonoTime=now + 1_000_000_000), now)
       if f['gps'][1]:
         self.sm.put('gpsLocationExternal', NS(hasFix=f['gps'][0]), f['gps'][1])
       self.sm.put('carState', NS(vEgo=f['v'], vCruise=self.last_vcruise), now)

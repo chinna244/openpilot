@@ -222,14 +222,15 @@ def _planner():
   return MazdaSlaPlanner(CP, NS(get_bool=lambda k, **kw: False), lambda lim: lim * 0.2)
 
 
-def _sm(now, *, session_age_ns=0, session_valid=True, dash_age_ns=0, dash_valid=True):
+def _sm(now, *, session_age_ns=0, session_valid=True, dash_age_ns=0, dash_valid=True, dash_ttl_ns=1_000_000_000):
   from openpilot.starpilot.car.mazda.sla.tests.rig import FakeSM
   sm = FakeSM()
   sm.put('carState', NS(vEgo=13., vCruise=60.), now)
   sm.put('starpilotCarState', NS(mazdaSlaSession=NS(state=5, vCap=30 / MPH, announceCounter=3, setpointKph=48.3,
                                                      target=30 / MPH)), now - session_age_ns)
   sm.valid['starpilotCarState'] = session_valid
-  sm.put('slcDashboardObservation', NS(status='valid', speedMps=20 / MPH), now - dash_age_ns)
+  sm.put('slcDashboardObservation', NS(status='valid', speedMps=20 / MPH, validUntilMonoTime=now - dash_age_ns + dash_ttl_ns),
+         now - dash_age_ns)
   sm.valid['slcDashboardObservation'] = dash_valid
   for k in ('mapdOut', 'slcVisionObservation', 'gpsLocation', 'gpsLocationExternal'):
     sm.seen.setdefault(k, False)
@@ -264,6 +265,15 @@ def test_plannerd_dashboard_reading_only_when_valid_and_current(age_s, valid, us
   now = 10**12
   src = sources_from_sm(_sm(now, dash_age_ns=int(age_s * 1e9), dash_valid=valid), now, 'gpsLocationExternal')
   assert (round(src.car * MPH) == 20) is used and (src.car == 0.) is (not used)
+
+
+@pytest.mark.parametrize('ttl_ms, used', [(1000, True), (1, True), (0, True), (-1, False), (-5000, False)])
+def test_plannerd_dashboard_reading_rejected_past_parser_timeout(ttl_ms, used):
+  # card republishes the last car reading at 100 Hz; once the CAN sign message timed out it is not evidence.
+  from openpilot.starpilot.car.mazda.sla.planner import sources_from_sm
+  now = 10**12
+  src = sources_from_sm(_sm(now, dash_ttl_ns=ttl_ms * 1_000_000), now, 'gpsLocationExternal')
+  assert (src.car > 0.) is used
 
 
 # ---------------------------------------------------------------- card: no offer is answered while plannerd's data is out
@@ -354,3 +364,60 @@ def test_press_at_a_map_zone_change_cannot_answer_the_old_offer():
   assert rows[boundary - 10].state == AssistState.preActive
   assert rows[boundary + 50].cap == 255. and setpoint(rows[boundary + 50]) == 35
   assert not [span for span in spans(rows) if span[2].startswith('Adjusting')]
+
+
+def test_offer_survives_a_road_change_with_the_same_limit():
+  # route 09 152.1 s: E Howard 25 -> S Iowa 25. The camera fence moves (old signs stay off the new road) but the zone did not
+  # change, so the offer stays open for the driver's answer; a different posted limit is a new zone.
+  p = _planner()
+  now = 10**12
+
+  def step(time, road, way_id, speed_mph=25, status='matchedLimit'):
+    sm = _sm(time)
+    sm.put('mapdOut', NS(wayId=way_id, roadName=road, wayRef='', wayName=road, roadStatus=status, speedLimit=speed_mph / MPH,
+                         nextSpeedLimit=0., nextSpeedLimitDistance=0.), time)
+    sm.valid['mapdOut'] = status != 'unknown'
+    p.step(sm, time)
+    out = NS()
+    p.fill(out)
+    return p.vision_fence_ns, out.roadChangeMonoTime
+
+  assert step(now, 'East Howard Avenue', 1) == (0, 0)
+  step(now + 100_000_000, '', 0, status='unknown')  # junction: no match
+  fence, zone = step(now + 200_000_000, 'South Iowa Avenue', 2)
+  assert fence == now + 200_000_000 and zone == 0
+  fence, zone = step(now + 300_000_000, 'South Iowa Avenue', 3, speed_mph=30)
+  assert fence == now + 300_000_000 and zone == now + 300_000_000
+
+
+
+def _walk_up(card, stop, n=4000):
+  """Active at 30 (cap 30) on a 25 with SET 30; the limit rises to 30 at frame 1000 -> "Press + for 36", answered; the walk
+  raises the factory SET 30 -> 36. v is 18 mph except at the frames in stop (0)."""
+  def go(presses):
+    rig, dash = Rig(card=card), 30
+    for i in range(n):
+      lim = 25 if i < 1000 else 30
+      btn = presses.get(i, ())
+      for name, pressed in btn:
+        if pressed and name in ('accelCruise', 'decelCruise'):
+          dash += 1 if name == 'accelCruise' else -1
+      rig.step(frame(i, v_mph=0. if i in stop else 18., dash=dash, map_mph=lim, vision_mph=lim, btn=btn))
+    return rig.rows
+  rows = go({})
+  p = first(rows, lambda r: r.text.startswith('Press +'), 1000)
+  return go(tap(p + 30, button='accelCruise')), p
+
+
+@pytest.mark.parametrize('card', [False, True])
+def test_set_walk_never_sends_set_plus_at_a_stop(card):
+  # the Mazda takes SET+ at a stop as a resume: an accepted raise walks the factory SET only while the car moves
+  moving, p = _walk_up(card, range(0))
+  walk = [i for i, r in enumerate(moving) if r.send == 'increase']
+  assert walk and moving[-1].dash == 36
+  stop = range(walk[0] + 20, walk[0] + 420)
+  rows, _ = _walk_up(card, stop)
+  assert rows[stop.start - 25].send == 'increase' or any(r.send == 'increase' for r in rows[walk[0]:stop.start])
+  assert all(rows[i].send != 'increase' for i in stop)
+  assert any(r.send == 'increase' for r in rows[stop.stop:]) and rows[-1].dash == 36
+  assert round(rows[-1].cap * MPH) == 36

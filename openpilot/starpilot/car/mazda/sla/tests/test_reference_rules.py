@@ -238,15 +238,68 @@ def test_alert_presentation():
   assert len(adj) == 1 and adj[0][1] - adj[0][0] == pytest.approx(5.0, abs=0.02)
 
 
-def test_soundd_plays_the_reference_chimes():
-  soundd = pytest.importorskip('openpilot.selfdrive.ui.soundd')
+@pytest.mark.parametrize('pack', ['stock', 'starpilot', 'custom'])
+def test_soundd_plays_the_selected_prompt_sound(tmp_path, pack):
+  """Both SLA alerts play StarPilot's ordinary prompt: the selected sound pack's prompt file at Prompt Volume, sample for
+  sample what any other prompt alert plays. The alerts come from the real selfdrived pipeline, the audio from soundd's
+  real selection and callback."""
+  import wave
+  from pathlib import Path
   from types import SimpleNamespace as NS
-  prompt = int(soundd.AudibleAlert.prompt)
-  assert soundd.alert_sound(NS(alertSound=NS(raw=prompt), alertType='slcConfirmPrompt/warning')) == soundd.PROMPT_SINGLE_LOW
-  assert soundd.alert_sound(NS(alertSound=NS(raw=prompt), alertType='slcAdjusting/warning')) == soundd.PROMPT_SINGLE_HIGH
-  assert soundd.alert_sound(NS(alertSound=NS(raw=prompt), alertType='someOther/warning')) == prompt
-  assert soundd.sound_list[soundd.PROMPT_SINGLE_LOW][0] == 'prompt_single_low.wav'
-  assert soundd.sound_list[soundd.PROMPT_SINGLE_HIGH][0] == 'prompt_single_high.wav'
+  import numpy as np
+  from openpilot.common.params import Params
+  from openpilot.selfdrive.ui import soundd
+  from openpilot.starpilot.audio.sound_pack import read_wav
+
+  rows0 = open_prompt()
+  rows = open_prompt(presses=tap(prompt_frame(rows0, 1000) + 50))
+  sla = [next(r for r in rows if r.text.startswith('Press')), next(r for r in rows if r.text.startswith('Adjusting'))]
+  assert [r.alert_type.split('/')[0] for r in sla] == ['slcConfirmPrompt', 'slcAdjusting']
+
+  params = Params(str(tmp_path / 'params'))
+  params.put('SoundPack', pack, block=True)
+  Path(params.get_param_path('PromptVolume')).write_bytes(b'40')
+  custom = (np.sin(np.arange(9000) / 7.) * 9000).astype(np.int16)
+  (tmp_path / 'packs/custom/sounds').mkdir(parents=True)
+  with wave.open(str(tmp_path / 'packs/custom/sounds/prompt.wav'), 'wb') as target:
+    target.setnchannels(1)
+    target.setsampwidth(2)
+    target.setframerate(48000)
+    target.writeframes(custom.tobytes())
+  assets = Path(soundd.__file__).resolve().parents[1] / 'assets'
+  expected = {'stock': read_wav(assets / 'sounds/warning.wav'), 'starpilot': read_wav(assets / 'sounds_starpilot/warning_1.wav'),
+              'custom': custom.astype(np.float32) / 32768}[pack]
+
+  daemon = soundd.Soundd(params, pack_root=tmp_path / 'packs')
+  daemon.refresh_saved_volumes(10.)
+
+  class State:
+    logMonoTime, valid, alive = {}, {'selfdriveState': True}, {'selfdriveState': True}
+
+    def __init__(self, sound, alert_type):
+      self.updated = {'selfdriveState': True}
+      self.state = NS(alertSound=NS(raw=int(sound)), alertType=alert_type)
+
+    def __getitem__(self, service):
+      return self.state
+
+  def play(sound, alert_type):
+    daemon.current_alert = soundd.AudibleAlert.none
+    daemon.get_audible_alert(State(sound, alert_type))
+    out = np.zeros((4096, 1), np.float32)
+    daemon.callback(out, 4096, None, None)
+    return daemon.current_alert, out[:, 0].copy()
+
+  ordinary_alert, ordinary = play(soundd.AudibleAlert.prompt, 'someOtherPrompt/warning')
+  assert ordinary_alert == soundd.AudibleAlert.prompt
+  n = min(4096, len(expected))
+  np.testing.assert_array_equal(ordinary[:n], expected[:n] * np.float32(.4))
+  for row in sla:
+    assert row.sound == log.SelfdriveState.AudibleAlert.prompt
+    alert, out = play(row.sound, row.alert_type)
+    assert alert == soundd.AudibleAlert.prompt and soundd.ALERT_VOLUME_KEYS[alert] == 'PromptVolume'
+    np.testing.assert_array_equal(out, ordinary)
+  assert set(soundd.sound_list) <= set(soundd.AudibleAlert.schema.enumerants.values()) | {soundd.CRITICAL_MAX}
 
 
 # ---------------------------------------------------------------- resolver lookahead and planner ramp

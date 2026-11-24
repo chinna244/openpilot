@@ -156,6 +156,9 @@ class MazdaSlaSession:
     # filter-dev runs ICBM in selfdrived on this frame's carState and card applies its button on the next frame, gated
     # by that frame's session: the button for CI.apply now is the one decided last frame
     self.send_button = arb.gate_send_button(self._next_button)
+    # At a stop the Mazda takes SET+ as a resume: the walk must never be what launches the car. It continues once moving.
+    if self.send_button == 'increase' and (CS.standstill or CS.cruiseState.standstill):
+      self.send_button = 'none'
     self.hold = self._next_hold and self.send_button != 'none'
 
     # ICBM (op long): walk the dash to the plan target, the setpoint under the session's ramped cap

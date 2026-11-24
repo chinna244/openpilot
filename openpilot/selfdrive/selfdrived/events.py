@@ -1153,7 +1153,7 @@ def mazda_slc_confirm_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.S
     text = f"Press + for\n{_slc_display(target, metric)}"
   elif set_speed_conv > target_conv:
     text = f"Press - for\n{_slc_display(target, metric)}"
-  # the chime is promptSingleLow: soundd plays it for this alert type (no schema slot for it). Size stays small with no
+  # the chime is StarPilot's ordinary prompt (selected sound pack, Prompt Volume). Size stays small with no
   # direction, as events_zp on mici: between a confirm and plannerd's next tick the prompt is up with no text for <= 50 ms
   return Alert(text, "", AlertStatus.normal, AlertSize.small,
                Priority.LOW, VisualAlert.none, AudibleAlert.prompt, .1)
@@ -1166,7 +1166,7 @@ def mazda_slc_adjust_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.Su
   set_speed = _mazda_sla_set_mps(CS)
   if set_speed > 0:
     speed = min(speed, set_speed)
-  # the chime is promptSingleHigh: soundd plays it for this alert type (no schema slot for it)
+  # the chime is StarPilot's ordinary prompt (selected sound pack, Prompt Volume)
   return Alert(f"Adjusting to\n{_slc_display(speed, metric)}", "", AlertStatus.normal, AlertSize.small,
                Priority.LOW, VisualAlert.none, AudibleAlert.prompt, 5.)
 

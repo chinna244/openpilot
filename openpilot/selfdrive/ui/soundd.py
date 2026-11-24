@@ -48,11 +48,6 @@ SafetyModel = CarParams.SafetyModel
 SAFETY_SWITCH_HOLD = 2.0  # seconds after the panda leaves the startup safety mode
 HOLD_EXEMPT = (AudibleAlert.warningSoft, AudibleAlert.warningImmediate)
 CRITICAL_MAX = -1 # internal sound key, not an AudibleAlert
-# Mazda SLA (filter-dev port): its prompt and "Adjusting to" chimes (sunnypilot promptSingleLow / promptSingleHigh). The
-# pinned schema has no AudibleAlert for them, so the alert goes out as `prompt` and its type picks the sound here.
-PROMPT_SINGLE_LOW = -2  # internal sound key, not an AudibleAlert
-PROMPT_SINGLE_HIGH = -3  # internal sound key, not an AudibleAlert
-ALERT_TYPE_SOUNDS = {'slcConfirmPrompt/': PROMPT_SINGLE_LOW, 'slcAdjusting/': PROMPT_SINGLE_HIGH}
 
 
 sound_list: dict[int, tuple[str, int | None, float]] = {
@@ -70,8 +65,6 @@ sound_list: dict[int, tuple[str, int | None, float]] = {
   AudibleAlert.warningSoft: ("critical.wav", None, MAX_VOLUME),
   AudibleAlert.warningImmediate: ("dm_critical.wav", None, MAX_VOLUME),
   CRITICAL_MAX: ("dm_critical_max.wav", None, MAX_VOLUME),
-  PROMPT_SINGLE_LOW: ("prompt_single_low.wav", 1, MAX_VOLUME),
-  PROMPT_SINGLE_HIGH: ("prompt_single_high.wav", 1, MAX_VOLUME),
 }
 
 ALERT_VOLUME_KEYS = {
@@ -80,22 +73,11 @@ ALERT_VOLUME_KEYS = {
   AudibleAlert.refuse: "RefuseVolume",
   AudibleAlert.prompt: "PromptVolume",
   AudibleAlert.promptRepeat: "PromptVolume",
-  PROMPT_SINGLE_LOW: "PromptVolume",
-  PROMPT_SINGLE_HIGH: "PromptVolume",
   AudibleAlert.preAlert: "PromptDistractedVolume",
   AudibleAlert.promptDistracted: "PromptDistractedVolume",
   AudibleAlert.warningSoft: "WarningSoftVolume",
   AudibleAlert.warningImmediate: "WarningImmediateVolume",
 }
-
-def alert_sound(selfdrive_state) -> int:
-  sound = selfdrive_state.alertSound.raw
-  if sound == AudibleAlert.prompt:
-    for prefix, key in ALERT_TYPE_SOUNDS.items():
-      if selfdrive_state.alertType.startswith(prefix):
-        return key
-  return sound
-
 
 def check_selfdrive_timeout_alert(sm):
   ss_missing = time.monotonic() - sm.recv_time['selfdriveState']
@@ -266,7 +248,7 @@ class Soundd:
   def get_audible_alert(self, sm):
     hold = self.safety_switch_hold(sm)
     if sm.updated['selfdriveState']:
-      new_alert = alert_sound(sm['selfdriveState'])
+      new_alert = sm['selfdriveState'].alertSound.raw
       now_ns = time.monotonic_ns()
       new_alert = self.axis_alerts.update(sm, new_alert, now_ns)
       if hold and new_alert not in (AudibleAlert.none, self.current_alert, *HOLD_EXEMPT):

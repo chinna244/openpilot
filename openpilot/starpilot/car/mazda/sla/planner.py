@@ -35,7 +35,8 @@ def sources_from_sm(sm, now_ns: int, gps_service: str) -> Sources:
   gps_fix = False
   if usable(sm, 'slcDashboardObservation', now_ns, DASHBOARD_MAX_AGE_NS):
     d = sm['slcDashboardObservation']
-    car = float(d.speedMps) if str(d.status) == 'valid' else 0.
+    # card republishes the car's last reading every frame; past the parser's timeout it is no longer evidence.
+    car = float(d.speedMps) if str(d.status) == 'valid' and now_ns <= int(d.validUntilMonoTime) else 0.
   if usable(sm, 'slcVisionObservation'):
     v = sm['slcVisionObservation'].vision
     vision = float(v.speedMps) if str(v.status) == 'valid' else 0.
@@ -59,6 +60,7 @@ class MazdaSlaPlanner:
     self.limiter_active = False
     self.matched_road: tuple[str | int, float] | None = None
     self.vision_fence_ns = 0
+    self.zone_change_ns = 0
 
   def services(self) -> list[str]:
     return ['slcDashboardObservation', 'slcVisionObservation', 'mapdOut', self.gps_service, 'starpilotCarState']
@@ -74,6 +76,10 @@ class MazdaSlaPlanner:
         identity = (road.wayRef or road.roadName or road.wayName or int(road.wayId), round(sources.map_limit, 3))
         if self.matched_road is not None and identity != self.matched_road:
           self.vision_fence_ns = sources.map_ns
+          # An open offer is for the old zone's limit. Onto another road with the same posted limit it still holds
+          # (route 09 152.1 s, E Howard 25 -> S Iowa 25: expiring it swallowed the driver's answer 0.4 s later).
+          if identity[1] != self.matched_road[1]:
+            self.zone_change_ns = sources.map_ns
         self.matched_road = identity
     # The camera republishes its last sign while no new sign is detected. A
     # fresh heartbeat cannot carry that evidence onto a different mapped road or speed-limit zone.
@@ -109,4 +115,4 @@ class MazdaSlaPlanner:
     out.limiterActive = bool(self.limiter_active)
     out.offerTarget = float(m.offer_target)
     out.sessionValid = bool(m.session_valid)
-    out.roadChangeMonoTime = self.vision_fence_ns
+    out.roadChangeMonoTime = self.zone_change_ns

@@ -101,6 +101,11 @@ class TestShadowLifecycle(unittest.TestCase):
     self.binary.chmod(0o644)
     self.assertFalse(self.preflight())
 
+  def test_shipped_package_matches_current_mapd_source(self):
+    # The committed provider must be rebuilt whenever mapd_repo changes; a stale manifest
+    # makes the manager refuse to start mapd (route 09: zero map messages).
+    self.assertTrue(shadow.preflight(offline_root=self.root, storage_anchor=self.anchor))
+
   def test_rejects_manifest_fifo_symlink_oversize_and_dynamic_elf(self):
     self.manifest.unlink()
     os.mkfifo(self.manifest)
