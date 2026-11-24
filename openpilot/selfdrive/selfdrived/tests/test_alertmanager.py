@@ -1,3 +1,4 @@
+import copy
 import random
 
 from openpilot.common.test import OpenpilotTestCase
@@ -17,6 +18,7 @@ class TestAlertManager(OpenpilotTestCase):
         event = random.choice([e for e in EVENTS.values() if len(e)])
         alert = random.choice(list(event.values()))
 
+      alert = copy.copy(alert)  # never change the shared EVENTS alerts other tests read
       alert.duration = duration
 
       # check two cases:

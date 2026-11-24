@@ -51,7 +51,7 @@ def test_full_lkas_long_only_actual_owners_output_and_presentation(alt, prearmed
     sd.initialized = True
     sd.state_machine.state = log.SelfdriveState.OpenpilotState.enabled
     audio = AxisAlerts()
-    audio_sm = messaging.SubMaster(['aolIntentWire', 'selfdriveState'])
+    audio_sm = messaging.SubMaster(['aolIntentWire', 'selfdriveState', 'aolAxisState'])  # soundd's own inputs
     now = 10_000_000_000
     captured = {}
 
@@ -126,7 +126,7 @@ def test_full_lkas_long_only_actual_owners_output_and_presentation(alt, prearmed
                             speed_limit=SpeedLimitObservation(), lateral_active=command.latActive, longitudinal_active=command.longActive)
       color = axis_status_color(display)
       assert (color.r, color.g, color.b) == ((22, 127, 64) if command.latActive else (255, 105, 180))
-      audio_sm.update_msgs(now / 1e9, [captured['aolIntentWire'], captured['selfdriveState']])
+      audio_sm.update_msgs(now / 1e9, [captured['aolIntentWire'], captured['selfdriveState'], captured['aolAxisState']])
       sound = audio.update(audio_sm, AudibleAlert.none, now)
       card.CC_prev = command
       controller.frame += controller.frame % 2  # LFA is transmitted at 50 Hz.
@@ -136,6 +136,7 @@ def test_full_lkas_long_only_actual_owners_output_and_presentation(alt, prearmed
     assert tick(True, False) == AudibleAlert.disengage
     assert tick(True, False) == AudibleAlert.none  # A held press cannot rearm.
     assert tick(False, False, native_lateral=False) == AudibleAlert.none
-    # Old long-only native acknowledgment cannot grant new lateral output.
-    assert tick(True, True, native_lateral=False) == AudibleAlert.engage
-    assert tick(False, True) == AudibleAlert.none
+    # Old long-only native acknowledgment cannot grant new lateral output, and the request alone does not chime
+    # (AxisAlerts announces an episode only at its first effective activation): the chime comes with the acknowledgment.
+    assert tick(True, True, native_lateral=False) == AudibleAlert.none
+    assert tick(False, True) == AudibleAlert.engage

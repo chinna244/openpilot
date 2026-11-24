@@ -88,7 +88,7 @@ def test_existing_card_settings_thread_refreshes_both_ford_sources(monkeypatch):
   instance = card.Car.__new__(card.Car)
   vars(instance).update(
     params=NS(get_bool=lambda _: False, get=lambda *_, **__: None),
-    CP=NS(openpilotLongitudinalControl=True), aol_card_intent=None,
+    CP=NS(brand="ford", openpilotLongitudinalControl=True), aol_card_intent=None,
     read_slc_configuration=lambda: None, v_cruise_helper=NS(),
     CI=NS(CC=NS(bluepilot_inputs=NS(refresh_settings=lambda: refreshed.append("lateral")),
                 hands_free_cluster_input=NS(refresh_settings=lambda: refreshed.append("cluster")))),

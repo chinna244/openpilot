@@ -19,6 +19,7 @@ class AudioFixture:
   def __init__(self):
     self.sm = messaging.SubMaster(['selfdriveState', 'aolAxisState', INTENT_SERVICE])
     self.sound = Soundd.__new__(Soundd)
+    self.sound.hold_applies = False  # a non-Mazda car: Mazda's safety-switch hold (soundd) does not apply
     self.sound.axis_alerts = AxisAlerts()
     self.sound.update_alert = Mock()
     self.now = 1_000_000_000
@@ -383,6 +384,7 @@ def test_actual_soundd_callback_plays_one_complete_prompt_during_repeated_select
   import numpy as np
   from openpilot.selfdrive.ui import soundd
   daemon = soundd.Soundd.__new__(soundd.Soundd)
+  daemon.hold_applies = False  # a non-Mazda car: no Mazda safety-switch hold
   daemon.axis_alerts = AxisAlerts()
   daemon.current_alert = daemon.current_sound = AudibleAlert.none
   daemon.current_sound_frame = 0

@@ -45,6 +45,7 @@ class TestAvailabilityWarningDelivery(unittest.TestCase):
   def sound(self):
     sound = Soundd.__new__(Soundd)
     sound.axis_alerts = AxisAlerts()
+    sound.hold_applies = False  # a non-Mazda car: Mazda's safety-switch hold (soundd) does not apply
     sound.current_alert = sound.current_sound = AudibleAlert.none
     sound.current_sound_frame = 0
     sound.pending_stop = False

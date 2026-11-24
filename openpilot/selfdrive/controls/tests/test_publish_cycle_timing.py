@@ -29,6 +29,7 @@ def run_publish(*, measured, blocked=''):
   owner.curvature = owner.desired_curvature = .001
   owner.calibrated_pose = None
   owner.LoC = NS(extension=None, long_control_state='off', pid=NS(p=0., i=0., f=0.))
+  owner.LaC = NS()  # no applied torque tuning to report (applied_tuning.write_applied_tuning skips it)
   owner.longitudinal_inputs = NS(lead_visible=lambda value: value)
   owner.steer_limited_by_safety = False
   owner.last_lane_centering_result = None

@@ -38,6 +38,10 @@ class Sources:
   def __getitem__(self, name):
     return self.data[name]
 
+  @property
+  def services(self):  # SubMaster.services: selfdrived's radar-fault check excludes radarState from it
+    return list(self.data)
+
   def all_alive(self, services=None):
     return all(self.alive[name] for name in self.data if services is None or name in services)
 
@@ -79,7 +83,7 @@ def events_drive():
 
 @pytest.mark.parametrize('fault,event', [('comm', EventName.commIssue),
   ('posenet', EventName.posenetInvalid), ('localizer', EventName.locationdTemporaryError),
-  ('can', EventName.canError), ('radar', EventName.canError), ('process', EventName.processNotRunning)])
+  ('can', EventName.canError), ('radar', EventName.radarFault), ('process', EventName.processNotRunning)])
 def test_real_selfdrived_faults_survive_jetlink_swap(fault, event):
   drive, cs = events_drive()
   with patch('openpilot.selfdrive.selfdrived.helpers.time.monotonic', return_value=100.):
