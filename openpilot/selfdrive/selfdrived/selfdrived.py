@@ -33,6 +33,8 @@ from opendbc.car.mazda.values import MazdaSafetyFlags
 MAZDA_CAN_FILTER = int(MazdaSafetyFlags.CAN_FILTER)
 # develop car_specific LOST_ENGAGED_FRAMES: a filter loss this soon after cruise was engaged is an engaged loss
 MAZDA_LOST_ENGAGED_FRAMES = int(0.5 / DT_CTRL)
+# Mazda SLA "Adjusting to": shown at most this long after an acceptance (filter-dev's 5 s alert)
+SLC_ADJUST_SHOW_NS = 5_000_000_000
 from openpilot.selfdrive.selfdrived.bookmarks import BookmarkCounter
 from openpilot.starpilot.bookmark_state import BookmarkCheckpoint
 from openpilot.starpilot.longitudinal.force_stop_alert import HoldAlertState, EVENT_TYPE as FORCE_STOP_HOLD
@@ -517,11 +519,21 @@ class SelfdriveD:
         seen = None
       self.mazda_sla_announce_seen = announce if sla.sessionValid else None
       if not self.enabled:
+        self.mazda_sla_adjust_since_ns = None
         return
       if sla.assistState == 2:  # preActive
         self.mazda_events.add('slcConfirmPrompt')
       if seen is not None and announce != seen:
-        self.mazda_events.add('slcAdjusting')
+        self.mazda_sla_adjust_since_ns = now_ns
+      # "Adjusting to" for 5 s from the acceptance, raised each frame only while that session is still adapting (4) or
+      # active (5): a road change (inactive) or a new offer (preActive) ends it at once. A refresh never restarts the
+      # window, and the unchanged alert type keeps soundd from replaying the chime.
+      since = getattr(self, 'mazda_sla_adjust_since_ns', None)
+      if since is not None:
+        if sla.sessionValid and sla.assistState in (4, 5) and 0 <= now_ns - since < SLC_ADJUST_SHOW_NS:
+          self.mazda_events.add('slcAdjusting')
+        else:
+          self.mazda_sla_adjust_since_ns = None
     except (AttributeError, KeyError, TypeError, ValueError):
       return
 

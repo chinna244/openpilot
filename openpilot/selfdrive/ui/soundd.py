@@ -28,6 +28,9 @@ ALERT_RAMP_TIME = 4 # seconds to ramp critical alerts to max volume
 ALERT_MAX_TIME = 8 # seconds before critical alerts switch to the max sound
 SELFDRIVE_STATE_TIMEOUT = 5 # 5 seconds
 STREAM_REPORT_INTERVAL = 5.0
+# Mazda SLA alerts share the prompt sound: switching to one of them is a new event (an offer, an acceptance) and
+# replays the chime even though the sound did not change (routes 00000010/00000011: every acceptance was silent)
+SLA_CHIME_ALERTS = ('slcConfirmPrompt', 'slcAdjusting')
 FILTER_DT = 1. / (micd.SAMPLE_RATE / micd.FFT_SAMPLES)
 
 AMBIENT_DB = 22 # DB where MIN_VOLUME is applied
@@ -248,10 +251,20 @@ class Soundd:
   def get_audible_alert(self, sm):
     hold = self.safety_switch_hold(sm)
     if sm.updated['selfdriveState']:
-      new_alert = sm['selfdriveState'].alertSound.raw
+      requested = sm['selfdriveState'].alertSound.raw
       now_ns = time.monotonic_ns()
-      new_alert = self.axis_alerts.update(sm, new_alert, now_ns)
+      new_alert = self.axis_alerts.update(sm, requested, now_ns)
+      alert_type = str(getattr(sm['selfdriveState'], 'alertType', ''))
+      previous_type = getattr(self, 'current_alert_type', '')
+      self.current_alert_type = alert_type
       if hold and new_alert not in (AudibleAlert.none, self.current_alert, *HOLD_EXEMPT):
+        return
+      # the same sound under a newly shown SLA alert: restart it once (never in the startup hold, never for an axis sound)
+      if (not hold and alert_type != previous_type and alert_type.split('/')[0] in SLA_CHIME_ALERTS and
+          new_alert == requested == self.current_alert != AudibleAlert.none):
+        self.pending_stop = False
+        self.current_sound = new_alert
+        self.current_sound_frame = 0
         return
       self.update_alert(new_alert)
     elif check_selfdrive_timeout_alert(sm):

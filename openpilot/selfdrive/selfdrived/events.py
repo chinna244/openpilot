@@ -1166,9 +1166,11 @@ def mazda_slc_adjust_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.Su
   set_speed = _mazda_sla_set_mps(CS)
   if set_speed > 0:
     speed = min(speed, set_speed)
-  # the chime is StarPilot's ordinary prompt (selected sound pack, Prompt Volume)
+  # the chime is StarPilot's ordinary prompt (selected sound pack, Prompt Volume). 0.1 s: selfdrived raises it every
+  # frame for at most 5 s after the acceptance and only while that session is still adapting/active, so a dropped
+  # session or a new offer clears it within 0.1 s instead of leaving a stale target up (route 00000010 t=137.5-141)
   return Alert(f"Adjusting to\n{_slc_display(speed, metric)}", "", AlertStatus.normal, AlertSize.small,
-               Priority.LOW, VisualAlert.none, AudibleAlert.prompt, 5.)
+               Priority.LOW, VisualAlert.none, AudibleAlert.prompt, .1)
 
 
 MAZDA_EVENTS: dict[str, dict[str, Alert | AlertCallbackType]] = {
