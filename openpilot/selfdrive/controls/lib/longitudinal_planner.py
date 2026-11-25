@@ -108,6 +108,44 @@ def mazda_slc_cruise_floor(cruise_min: float, slc_owned: bool) -> float:
   return max(cruise_min, A_CRUISE_MIN) if slc_owned else cruise_min
 
 
+# Mazda SLA: a lower limit the session adopted (the driver's prompt answer, or an automatic lowering) moves openpilot's
+# set speed straight to the target. Route 00000010--bc43783821 t=136: 36 -> 25 mph on "Press -", no SLA ceiling left, so
+# the set-speed drop braked at the driver's profile (-1.20) where filter-dev coasts at A_CRUISE_MIN. The drop counts as the
+# SLA's until the car is down to the set speed, the driver lowers it further, or long control / the session ends.
+MAZDA_SLA_SETPOINT_TOL_KPH = 0.5
+MAZDA_SLA_SESSION_MAX_AGE_NS = 200_000_000  # card publishes it at 100 Hz (plannerd's SESSION_MAX_AGE_NS)
+MAZDA_SLA_ADOPTING_STATES = (4, 5)  # AssistState.adapting, active
+
+
+class MazdaSlaDrop:
+  def __init__(self):
+    self.setpoint_kph: float | None = None
+    self.latched_kph: float | None = None
+
+  def reset(self) -> None:
+    self.setpoint_kph = self.latched_kph = None
+
+  def update(self, session, long_active: bool, v_ego: float, driver_v_cruise: float) -> bool:
+    """session: a fresh, valid starpilotCarState.mazdaSlaSession, or None. True while the set speed drop is the SLA's."""
+    if session is None or not long_active:
+      self.reset()
+      return False
+    setpoint = float(session.setpointKph)
+    if not 0. < setpoint < V_CRUISE_UNSET:
+      self.reset()
+      return False
+    target_kph = float(session.target) * CV.MS_TO_KPH
+    if (self.setpoint_kph is not None and setpoint < self.setpoint_kph - MAZDA_SLA_SETPOINT_TOL_KPH and
+        int(session.state) in MAZDA_SLA_ADOPTING_STATES and abs(setpoint - target_kph) <= MAZDA_SLA_SETPOINT_TOL_KPH):
+      self.latched_kph = setpoint
+    elif self.latched_kph is not None and setpoint < self.latched_kph - MAZDA_SLA_SETPOINT_TOL_KPH:
+      self.latched_kph = None  # the driver lowered it further: their own drop
+    self.setpoint_kph = setpoint
+    if self.latched_kph is not None and v_ego <= driver_v_cruise:
+      self.latched_kph = None
+    return self.latched_kph is not None
+
+
 def get_mazda_cruise_accel(v_cruise, v_ego, a_cruise_prev, a_target_prev, dt, cruise_min=A_CRUISE_MIN, max_accel=ACCEL_MAX):
   """Mazda: develop's cruise law (upstream #39266): the set speed error smoothed over 1 s, clipped to [cruise_min,
   max_accel], jerk-limited by J_CRUISE_VALS from the lower of the last candidate and the last plan. The bounds are
@@ -200,6 +238,7 @@ class LongitudinalPlanner:
     self.mazda = self.cruise_handover
     self.curve_speed = CurveSpeed(dt) if self.mazda else None
     self.firm_stop = FirmStop(dt) if self.mazda else None
+    self.mazda_sla_drop = MazdaSlaDrop() if self.mazda else None
     self.scc = None
     if self.mazda and CP.openpilotLongitudinalControl:
       from openpilot.starpilot.longitudinal.scc.planner import SmartCruiseTargets
@@ -302,6 +341,7 @@ class LongitudinalPlanner:
     v_ego = sm['carState'].vEgo
     v_cruise_kph = min(sm['carState'].vCruise, V_CRUISE_MAX)
     v_cruise = v_cruise_kph * CV.KPH_TO_MS
+    driver_v_cruise = v_cruise
     ceiling = select_cruise_ceiling(
       cruise_ceiling, driver_v_cruise_kph=sm['carState'].vCruise, driver_cruise_mps=v_cruise,
       system_long_available=self.CP.openpilotLongitudinalControl,
@@ -583,9 +623,15 @@ class LongitudinalPlanner:
     if self.mazda:
       # develop's law, whatever experimentalMode says; then Smart Cruise Control's rebuild while it is the target
       mazda_min = max(ACCEL_MIN, -cruise_profile.cruise_brake_magnitude) if cruise_profile is not None else max(ACCEL_MIN, global_floor)
+      # plannerd subscribes the session only with the Mazda SLA; without it (or without a fresh one) no drop is the SLA's
+      session_fresh = bool(getattr(sm, 'seen', {}).get('starpilotCarState', False) and sm.valid.get('starpilotCarState', False) and
+                           0 <= sample_now_ns - int(sm.logMonoTime['starpilotCarState']) <= MAZDA_SLA_SESSION_MAX_AGE_NS)
+      sla_drop = self.mazda_sla_drop.update(sm['starpilotCarState'].mazdaSlaSession if session_fresh else None,
+                                            bool(sm['carControl'].longActive), v_ego, driver_v_cruise)
       mazda_min = mazda_slc_cruise_floor(mazda_min, slc_owned=bool(
-        ceiling.effective_mps is not None and v_cruise == ceiling.effective_mps and not relevant_lead and
-        curve.effective_mps is None and navigation_target is None and self.force_stop_plan.speed_ceiling_mps is None))
+        ((ceiling.effective_mps is not None and v_cruise == ceiling.effective_mps) or (sla_drop and v_cruise == driver_v_cruise)) and
+        not relevant_lead and curve.effective_mps is None and navigation_target is None and
+        self.force_stop_plan.speed_ceiling_mps is None))
       mazda_max = min(x for x in (ACCEL_MAX, cruise_profile.acceleration_max if cruise_profile is not None else None,
                                   selected_acceleration) if x is not None)
       def mazda_cruise(a_prev, a_target_prev, dt, unlimited=False):
