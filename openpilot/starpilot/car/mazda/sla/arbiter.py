@@ -515,7 +515,8 @@ class CruiseArbiter:
           # The driver dialed onto the limit: wait for release so they can continue through
           # it. A dash the servo walked onto it is not a dial.
           self._activate(from_prompt=False)
-        elif self._reprompt_due(CS) and not self._raise_blocked():
+        elif self._reprompt_due(CS) and self.inputs_fresh and not self._raise_blocked():
+          # inputs_fresh: the re-ask survives an expiry (expire_inputs), and asks again only on a limit settled on fresh data
           self._reprompts_left -= 1
           self._reprompt_hold = 0
           self._enter_prompt(rearm=False)
@@ -550,7 +551,10 @@ class CruiseArbiter:
 
   def expire_inputs(self) -> None:
     """StarPilot: plannerd's data expired. An open offer closes without counting as unanswered (no re-ask, no late answer),
-    a confirm no longer follows, a press in flight is a plain press, and the limit must settle again from fresh data."""
+    a confirm no longer follows, a press in flight is a plain press, and the limit must settle again from fresh data.
+    An offer that already closed unanswered keeps its re-ask (route 0f 199.7-200.1: a road change 0.4 s after "Press + for
+    43" closed dropped the re-ask, and SET stayed 30 under the 35 for 2 min). A changed limit re-arms the re-ask anyway
+    (_enter_prompt); the re-ask itself waits for fresh data (step)."""
     self.inputs_fresh = False
     if self.state == SessionState.preActive:
       self._reoffer = True
@@ -560,7 +564,6 @@ class CruiseArbiter:
       self.v_cap = V_CRUISE_UNSET
     self._late_answer_timer = 0
     self._confirm_follow_timer = 0
-    self._ignored_prompt = False
     self._limit_seen_frames = 0
     for press in self._press.values():
       if press.cls == _PRESS_PROMPT and not press.resolved:

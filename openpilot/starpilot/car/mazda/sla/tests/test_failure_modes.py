@@ -421,3 +421,38 @@ def test_set_walk_never_sends_set_plus_at_a_stop(card):
   assert all(rows[i].send != 'increase' for i in stop)
   assert any(r.send == 'increase' for r in rows[stop.stop:]) and rows[-1].dash == 36
   assert round(rows[-1].cap * MPH) == 36
+
+
+@pytest.mark.parametrize('zone_change', [False, True])
+def test_unanswered_prompt_is_asked_again_after_a_road_change_with_the_same_limit(zone_change):
+  # route 0f 194.8-199.8: "Press + for 43" closed unanswered, 0.4 s later the map matched a new road with the same 35; the
+  # road change cleared the re-ask, so SET stayed 30 under the 35 for 2 min. The same limit on a new road keeps the re-ask.
+  rig = Rig(card=True)
+  fill = rig.planner.fill
+  rows = run(Rig(card=True), 900, lambda _: 35, dash=30, v_mph=30.)
+  prompt = first(rows, lambda r: r.state == AssistState.preActive)
+  closed = first(rows, lambda r: r.state == AssistState.inactive, prompt)
+  change = closed + 40
+
+  def fill_with_zone(out):
+    fill(out)
+    out.roadChangeMonoTime = 10**12 + change if zone_change and rig.frame >= change else 0
+
+  rig.planner.fill = fill_with_zone
+  rows = run(rig, 4500, lambda _: 35, dash=30, v_mph=30.)
+  again = [s for s in spans(rows[change + 1:]) if s[2].startswith('Press +')]
+  assert again, 'the unanswered offer was never asked again'
+
+
+def test_planner_outage_when_the_re_ask_falls_due_keeps_the_re_ask():
+  # an outage while the re-ask is due must not use the re-asks up on data the card cannot trust: once the limit settled again
+  # on fresh data the unanswered offer is still asked
+  rows = run(Rig(card=True), 900, lambda _: 35, dash=30, v_mph=30.)
+  prompt = first(rows, lambda r: r.state == AssistState.preActive)
+  closed = first(rows, lambda r: r.state == AssistState.inactive, prompt)
+  due = closed + 2500  # REPROMPT_COOLDOWN 25 s after the unanswered close
+  outage = range(due - 100, due + 600)
+  rows = run(Rig(card=True), 6000, lambda _: 35, dash=30, v_mph=30., stall=lambda i: i in outage)
+  again = [s for s in spans(rows[outage.stop:]) if s[2].startswith('Press +')]
+  assert again, 'the outage used the re-asks up'
+  assert not [s for s in spans(rows[outage.start:outage.stop]) if s[2].startswith('Press +')]
