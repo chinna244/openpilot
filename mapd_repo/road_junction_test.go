@@ -37,15 +37,19 @@ func TestJunctionContinuity(t *testing.T) {
 		way                      int64
 	}{
 		{"straight through crossing", []syntheticWay{road, crossing}, true, 35.15046, -97.9, 8, 0, 5, 0, custom.MapdOut_SampleStatus_matchedLimit, 1},
-		{"turn toward crossing", []syntheticWay{road, crossing}, true, 35.1505, -97.89996, 5, 90, 5, 0, custom.MapdOut_SampleStatus_unknown, 0},
-		{"reverse heading", []syntheticWay{road, crossing}, true, 35.15046, -97.9, 8, 180, 5, 0, custom.MapdOut_SampleStatus_unknown, 0},
+		// resolved ambiguity (way.go resolveAmbiguity): a reliable heading along one road and across the other picks the
+		// road the car heads along, the cross street on a turn; a U-turn takes the same road's limit for the new direction
+		{"turn toward crossing", []syntheticWay{road, crossing}, true, 35.1505, -97.89996, 5, 90, 5, 0, custom.MapdOut_SampleStatus_matchedLimit, 2},
+		{"reverse heading", []syntheticWay{road, crossing}, true, 35.15046, -97.9, 8, 180, 5, 0, custom.MapdOut_SampleStatus_matchedLimit, 1},
 		{"unreliable heading", []syntheticWay{road, crossing}, true, 35.15046, -97.9, 8, 0, 20, 0, custom.MapdOut_SampleStatus_unknown, 0},
 		{"low speed", []syntheticWay{road, crossing}, true, 35.15046, -97.9, 2, 0, 5, 0, custom.MapdOut_SampleStatus_unknown, 0},
 		{"nonfinite speed", []syntheticWay{road, crossing}, true, 35.15046, -97.9, float32(math.Inf(1)), 0, 5, 0, custom.MapdOut_SampleStatus_unknown, 0},
-		{"parallel rival", []syntheticWay{road, crossing, parallel}, true, 35.15046, -97.9, 8, 0, 5, 0, custom.MapdOut_SampleStatus_unknown, 0},
-		{"cannot acquire using heading alone", []syntheticWay{road, crossing}, false, 35.15046, -97.9, 8, 0, 5, 0, custom.MapdOut_SampleStatus_unknown, 0},
+		// the rival ~11 m away is not clearly farther (margin 15 m at 5 m accuracy), but the car is still on the road it was on
+		{"parallel rival", []syntheticWay{road, crossing, parallel}, true, 35.15046, -97.9, 8, 0, 5, 0, custom.MapdOut_SampleStatus_matchedLimit, 1},
+		{"acquire along the heading", []syntheticWay{road, crossing}, false, 35.15046, -97.9, 8, 0, 5, 0, custom.MapdOut_SampleStatus_matchedLimit, 1},
 		{"expired fix", []syntheticWay{road, crossing}, true, 35.15046, -97.9, 8, 0, 5, 2_000_000_000, custom.MapdOut_SampleStatus_noGps, 0},
-		{"connected different directional limit", []syntheticWay{road, crossing, reversed}, true, 35.15046, -97.9, 8, 0, 5, 0, custom.MapdOut_SampleStatus_unknown, 0},
+		// 4 m before its end the car is still on its road (continuity); the next piece's own limit applies on it
+		{"connected different directional limit", []syntheticWay{road, crossing, reversed}, true, 35.15046, -97.9, 8, 0, 5, 0, custom.MapdOut_SampleStatus_matchedLimit, 1},
 		{"connected same limit", []syntheticWay{road, crossing, continuation}, true, 35.15067, -97.9, 8, 0, 5, 0, custom.MapdOut_SampleStatus_matchedLimit, 4},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

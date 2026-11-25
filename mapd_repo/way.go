@@ -186,6 +186,127 @@ func junctionKeep(currentWay CurrentWay, candidates []maps.Way, location log.Gps
 	return *kept, true
 }
 
+// Resolving the rest of the ambiguity (MATCHING.md "Resolved ambiguity"). The envelope above is deliberately wide (twice
+// accuracy plus road width: 25 m for a 2-lane road, 40 m for 4 lanes), so a ramp, a turn lane or a parallel piece of the
+// same road beside the car's road made every such fix unknown: on routes 0e/0f the freeway had no map limit 57% of the
+// time with GPS accuracy ~2 m (develop's matcher: 97%). Only roads running the car's way count, and only on a reliable
+// heading; one of three rules must then decide, or the fix stays unknown:
+//   - every aligned road posts the same limit: which one the car is on does not change the limit;
+//   - one aligned road is clearly nearest: ambiguityMargin closer than every other aligned one, and narrow-matched;
+//   - the road matched on the previous fix is still narrow-matched and aligned (continuity through a ramp's gore).
+//
+// A road 30-50 deg off the heading (a branch peeling away) keeps the fix unknown; one at 50 deg or more is a crossing.
+const (
+	ambiguityAlignedSin = 0.5  // |sin| of heading vs a road: within 30 deg runs the car's way
+	ambiguityMarginMin  = 10.0 // m: the nearest aligned road must be this much nearer than the next ...
+	ambiguityMarginAcc  = 3.0  // ... and at least this many times the fix's reported accuracy
+	// continuity keeps the previous road only while it is no farther than the nearest aligned road by this (or accuracy)
+	continuityToleranceMin = 3.0 // m
+	ambiguityLeaveFactor   = 2.0 // leaving the road held for one clearly nearer takes this many margins
+)
+
+type alignedWay struct {
+	way      maps.Way
+	distance float32
+	sin      float32
+	narrow   bool
+	limit    CurrentWay // the way with its direction of travel, for the directional limit
+}
+
+func resolveAmbiguity(currentWay CurrentWay, candidates []maps.Way, location log.GpsLocationData) (maps.Way, bool) {
+	speed, bearing := float64(location.Speed()), location.BearingDeg()
+	if !(speed >= junctionMinSpeed) || math.IsInf(speed, 0) || !(bearing >= 0 && bearing <= 360) {
+		return maps.Way{}, false
+	}
+	if acc := location.BearingAccuracyDeg(); !(acc > 0 && acc <= junctionMaxBearingAcc) {
+		return maps.Way{}, false
+	}
+	aligned := make([]alignedWay, 0, len(candidates))
+	for i := range candidates {
+		w := candidates[i]
+		s, err := w.BearingAlignment(location)
+		if err != nil {
+			return maps.Way{}, false
+		}
+		if s >= junctionCrossingSin {
+			continue // a crossing street
+		}
+		if s > ambiguityAlignedSin {
+			return maps.Way{}, false // neither running along nor crossing
+		}
+		broad, err := w.OnWay(location, 2)
+		if err != nil || !broad.OnWay {
+			return maps.Way{}, false
+		}
+		narrow, err := w.OnWay(location, w.DistanceMultiplier())
+		aligned = append(aligned, alignedWay{w, broad.Distance.Distance, s, err == nil && narrow.OnWay, CurrentWay{Way: w, OnWay: broad}})
+	}
+	if len(aligned) == 0 {
+		return maps.Way{}, false
+	}
+	nearest := 0
+	for i := range aligned {
+		if aligned[i].distance < aligned[nearest].distance {
+			nearest = i
+		}
+	}
+	// The previous fix's road, if it is still under the car (narrow), along the heading and driven the same direction.
+	held := -1
+	if currentWay.Way.Nodes.Len() >= 2 {
+		for i := range aligned {
+			a := &aligned[i]
+			if a.way.Id() == currentWay.Way.Id() && a.narrow && a.sin <= junctionAlignedSin && a.limit.OnWay.IsForward == currentWay.OnWay.IsForward {
+				held = i
+			}
+		}
+	}
+	// Same posted limit on every aligned road (and the same conditional rule): the road held is kept, else the nearest is
+	// published (no flipping between equal-limit pieces, which would move the planner's camera fence each time).
+	first := aligned[0].limit.EffectiveMaxSpeed()
+	same := first > 0
+	for i := range aligned {
+		if aligned[i].limit.EffectiveMaxSpeed() != first || aligned[i].limit.ConditionalMaxSpeedRaw() != aligned[0].limit.ConditionalMaxSpeedRaw() {
+			same = false
+		}
+	}
+	if same && held >= 0 {
+		return aligned[held].way, true
+	}
+	if same && aligned[nearest].narrow {
+		return aligned[nearest].way, true
+	}
+	// Clearly nearest. Leaving a road still held takes twice the margin: one fix pulled toward a road beside it (multipath,
+	// with an understated accuracy) must not swap the limit (review 2026-11-24).
+	margin := float32(max(ambiguityMarginMin, ambiguityMarginAcc*float64(location.HorizontalAccuracy())))
+	if held >= 0 && held != nearest {
+		margin *= ambiguityLeaveFactor
+	}
+	if aligned[nearest].narrow {
+		clear := true
+		for i := range aligned {
+			if i != nearest && aligned[i].distance-aligned[nearest].distance < margin {
+				clear = false
+			}
+		}
+		if clear {
+			return aligned[nearest].way, true
+		}
+	}
+	// Continuity: the previous fix's road, still under the car along its heading, driven the same direction, and still
+	// the nearest within the fix's accuracy. A freeway's narrow match is ~30 m wide, so narrow alone would keep the old
+	// road after the car moved onto a parallel one beside it.
+	tolerance := float32(max(continuityToleranceMin, float64(location.HorizontalAccuracy())))
+	if held >= 0 {
+		for i := range aligned {
+			a := &aligned[i]
+			if i == held && a.distance <= aligned[nearest].distance+tolerance {
+				return a.way, true
+			}
+		}
+	}
+	return maps.Way{}, false
+}
+
 func GetCurrentWay(currentWay CurrentWay, nextWays []maps.NextWayResult, offlineMaps *maps.Offline, location log.GpsLocationData) (CurrentWay, error) {
 	candidates := plausibleLoadedWays(offlineMaps, location)
 	if len(candidates) == 0 {
@@ -193,6 +314,9 @@ func GetCurrentWay(currentWay CurrentWay, nextWays []maps.NextWayResult, offline
 	}
 	if len(candidates) > 1 {
 		kept, ok := junctionKeep(currentWay, candidates, location)
+		if !ok {
+			kept, ok = resolveAmbiguity(currentWay, candidates, location)
+		}
 		if !ok {
 			return CurrentWay{SelectionType: custom.WaySelectionType_fail}, ErrAmbiguousWay
 		}
