@@ -95,7 +95,10 @@ class MazdaSlaSession:
       road_change_ns = int(getattr(resolver, 'roadChangeMonoTime', 0))
       road_changed = road_change_ns != self._road_change_ns
       self._road_change_ns = road_change_ns
-      if road_changed:
+      if road_changed and not arb.keep_offer_across_road_change(resolver):
+        arb.expire_inputs()
+        self._fresh_frames = 0
+      elif not road_changed and arb.kept_offer_lapsed(resolver):
         arb.expire_inputs()
         self._fresh_frames = 0
     if resolver is None:

@@ -11,7 +11,7 @@ import time
 from opendbc.car.structs import car
 from openpilot.common.constants import CV
 from openpilot.common.realtime import DT_CTRL
-from openpilot.starpilot.car.mazda.sla import (ACTIVE_STATES, V_CRUISE_UNSET, AssistState, CruiseIntent, compare_cluster_target,
+from openpilot.starpilot.car.mazda.sla import (ACTIVE_STATES, V_CRUISE_UNSET, AssistState, CruiseIntent, Source, compare_cluster_target,
                                                confirm_needed_for_change, settle_conv)
 
 ButtonType = car.CarState.ButtonEvent.Type
@@ -132,6 +132,9 @@ class CruiseArbiter:
     # Without fresh inputs no offer opens or is answered and no session forms: every press is a manual SET press.
     self.inputs_fresh = True
     self._reoffer = False  # StarPilot: an offer the expiry closed is asked again on fresh data, unless the driver pressed
+    self._offer_dir = (False, False)  # (req_plus, req_minus) when the open offer was made
+    self._kept_offer = None  # (speedLimit, speedLimitFinalLast, direction) of an offer kept across a road change
+    self._offer_window_restarted = False  # the open offer's 5 s window was restarted by a road change (once per offer)
 
   def update_limit(self, resolver, ramp=(0, 0., 0)):
     """resolver: slcState.mazdaSla (speedLimit, speedLimitFinalLast, speedLimitValid, speedLimitLastValid); ramp: no
@@ -216,6 +219,9 @@ class CruiseArbiter:
     self._set_state(SessionState.preActive)
     self.v_cap = float(hold)
     self.pre_active_timer = int(PRE_ACTIVE_GUARD_PERIOD / DT_CTRL)
+    self._offer_dir = compare_cluster_target(self._cluster_conv / self._conv, self._slf, self.is_metric)
+    self._kept_offer = None
+    self._offer_window_restarted = False
 
   @property
   def _speed_moves(self) -> bool:
@@ -549,6 +555,45 @@ class CruiseArbiter:
     it too, so the alert and the wheel answer always refer to the same offer)."""
     return float(self._slf)
 
+  def _offer_evidence(self, resolver, new_zone: bool = False):
+    """(posted limit, exact target, direction) the resolver gives now, or None without a current limit. At the road change
+    itself only the map counts: its limit is the new way's own, while a vision or car value may be a read from before."""
+    if resolver is None or not resolver.speedLimitValid or (new_zone and int(resolver.source) != Source.map):
+      return None
+    slf = float(resolver.speedLimitFinalLast)
+    return float(resolver.speedLimit), slf, compare_cluster_target(self._cluster_conv / self._conv, slf, self.is_metric)
+
+  def keep_offer_across_road_change(self, resolver) -> bool:
+    """StarPilot: a road change while an offer is open. The offer stays pending (frozen hold, nothing applied, a fresh
+    press still confirms) only when fresh evidence for the new zone gives the same posted limit, the exact same internal
+    target and the same press direction; equal display numbers are not enough. Otherwise the caller expires it as before."""
+    if self.state != SessionState.preActive or self._ramp_prompt is not None or not self.inputs_fresh:
+      return False
+    ev = self._offer_evidence(resolver, new_zone=True)
+    if ev is None or ev != (self._speed_limit, self._slf, self._offer_dir):
+      return False
+    self._kept_offer = ev
+    if not self._offer_window_restarted:
+      # the offer as made on the new zone: one full window to answer, never extended again for this offer
+      self._offer_window_restarted = True
+      self.pre_active_timer = int(PRE_ACTIVE_GUARD_PERIOD / DT_CTRL)
+    # a press already down at the road change answered the old zone's offer: it is a plain SET press, and only a new press
+    # after its release confirms
+    for press in self._press.values():
+      if press.cls == _PRESS_PROMPT and not press.resolved and not press.released:
+        press.cls = _PRESS_NORMAL
+        press.late = False
+    return True
+
+  def kept_offer_lapsed(self, resolver) -> bool:
+    """A kept offer whose evidence lapsed or changed (target, limit or direction) is discarded with any queued confirm."""
+    if self._kept_offer is None:
+      return False
+    if self.state != SessionState.preActive:
+      self._kept_offer = None
+      return False
+    return self._offer_evidence(resolver) != self._kept_offer
+
   def expire_inputs(self) -> None:
     """StarPilot: plannerd's data expired. An open offer closes without counting as unanswered (no re-ask, no late answer),
     a confirm no longer follows, a press in flight is a plain press, and the limit must settle again from fresh data.
@@ -556,6 +601,7 @@ class CruiseArbiter:
     43" closed dropped the re-ask, and SET stayed 30 under the 35 for 2 min). A changed limit re-arms the re-ask anyway
     (_enter_prompt); the re-ask itself waits for fresh data (step)."""
     self.inputs_fresh = False
+    self._kept_offer = None
     if self.state == SessionState.preActive:
       self._reoffer = True
     if self.state == SessionState.preActive or self._ramp_prompt is not None:
