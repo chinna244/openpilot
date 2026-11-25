@@ -247,6 +247,29 @@ SCHOOL_ZONE_FALLBACK_MIN_CONFIDENCE = 0.35
 
 NON_SCHOOL_LOW_SPEED_COMPETING_MIN_CONFIDENCE = 0.95
 
+# Mazda fork (filter-dev b97f554ea8 + dusk): a "SCHOOL" plaque (solid yellow band across the top over a pale sign) marks a
+# school zone limit, which holds only "when children present" or when flashing, so it is not published as the road limit.
+# Route 10 (2026-11-25) East Howard Ave: car TSR and camera both read the school 20, the 2-of-3 vote took it over the map's
+# 30 and SLA asked for 25. Rows of the top third that are mostly yellow, and a middle that is not. filter-dev validation:
+# routes 0f/10/12/1b every 4th frame, every school sighting flagged, 0 of 955 confident 15/20/25 reads of other signs.
+SCHOOL_BAND_ROW_YELLOW = 0.7
+SCHOOL_BAND_MIN_ROWS = 0.2
+SCHOOL_BODY_YELLOW_MAX = 0.35
+# At dusk the plaque is dim and washed out: judged against the sign's own body (filter-dev route 29 355 s).
+SCHOOL_DUSK_SAT_MIN = 40
+SCHOOL_DUSK_SAT_OVER_BODY = 30
+SCHOOL_DUSK_VALUE_MIN = 30
+SCHOOL_DUSK_VALUE_OF_BODY = 0.7
+# That number is ignored a while: some crops of the same sign cut the plaque off. Only that number: the regular 25 just
+# past a school zone is a real limit.
+SCHOOL_ZONE_IGNORE_S = 10.
+# Mazda fork (filter-dev adab64aafa): a read this far above both the map and the car's sign is a misread (filter-dev route
+# 52 65 in a park lot, 46 55 at a Costco pump; StarPilot routes 05 t=118 60 on a residential street, 0e t=905 45 in a
+# Costco lot); with neither, only reads this high. On StarPilot routes 01-10 these were the only 4 of 1447 camera sign
+# changes it matched. m/s.
+IMPLAUSIBLE_ABOVE_OTHERS_MS = 20 * 0.44704
+IMPLAUSIBLE_ALONE_MIN_MS = 50 * 0.44704
+
 
 @dataclass(frozen=True)
 class Detection:
@@ -327,6 +350,8 @@ class VisionModelCore:
     self.last_published_support_at = 0.0
     self.episode = 0
     self.published_support_count = 0
+    self.school_zone_read = (0, 0.)  # (mph, ignore until) from a crop showing the SCHOOL plaque
+    self._observe_now = None
 
   def reset(self) -> None:
     """Discard evidence from a previous camera, stream or sign-unit setting."""
@@ -342,6 +367,7 @@ class VisionModelCore:
     self.last_published_support_at = 0.0
     self.published_support_count = 0
     self.episode = 0
+    self.school_zone_read = (0, 0.)
 
   def _load_detector_net(self):
     return self._load_net("speed_limit_us_detector.onnx", self.DETECTOR_SHA256)
@@ -384,16 +410,32 @@ class VisionModelCore:
       if face_filter is not None:
         face_filter.end_frame()
 
-  def observe(self, frame_bgr: np.ndarray, *, now: float) -> tuple[int, float, int, int] | None:
-    """Return the confirmed sign numeral in the configured units until reset or replacement."""
+  def observe(self, frame_bgr: np.ndarray, *, now: float, other_limit_ms: float | None = None) -> tuple[int, float, int, int] | None:
+    """Return the confirmed sign numeral in the configured units until reset or replacement.
+    other_limit_ms: the higher of the map's and the car's limit (0 when neither has one), None without them."""
     if not math.isfinite(now) or now <= 0:
       raise ValueError("Invalid observation time")
-    detection = self.infer(frame_bgr)
+    self._observe_now = now
+    try:
+      detection = self.infer(frame_bgr)
+    finally:
+      self._observe_now = None
     if detection is not None and math.isfinite(detection.confidence) and 0 <= detection.confidence <= 1:
       self.last_detection_at = now
+      if other_limit_ms is not None:
+        read = detection.speed_limit_mph * (1 / 3.6 if getattr(self, 'is_metric', False) else 0.44704)
+        if read - other_limit_ms >= IMPLAUSIBLE_ABOVE_OTHERS_MS if other_limit_ms > 0. else read >= IMPLAUSIBLE_ALONE_MIN_MS:
+          if other_limit_ms == 0.:
+            # with nothing else to go on, an older lower camera limit must not stay up past a sign it could not use
+            self._withdraw_published()
+          detection = None
+    if detection is not None and math.isfinite(detection.confidence) and 0 <= detection.confidence <= 1:
       self.history.append(HistoryEntry(detection.speed_limit_mph, detection.confidence, now, detection.strong_consensus))
       self._prune_history(now)
       confirmed = self._confirm_detection()
+      school_value, school_until = getattr(self, 'school_zone_read', (0, 0.))
+      if confirmed is not None and confirmed[0] == school_value and now < school_until:
+        confirmed = None  # a read of this frame from a crop that missed the SCHOOL plaque
       if confirmed is not None:
         speed, confidence = confirmed
         reverting_early = (speed != self.published_speed_limit_mph and
@@ -753,6 +795,7 @@ class VisionModelCore:
       return None
 
     speed_class_count = len(US_CLASSIFIER_SPEED_VALUES)
+    school_zone = self._is_school_zone_sign(sign_crop)
 
     input_size = self.classifier_input_size
     sign_crop = _primary_regulatory_panel(sign_crop)
@@ -798,8 +841,53 @@ class VisionModelCore:
     )
     if confidence < minimum_confidence:
       return None
+    observe_now = getattr(self, '_observe_now', None)
+    now = observe_now if observe_now is not None else time.monotonic()
+    if school_zone and speed_limit in SCHOOL_ZONE_SPEED_VALUES:  # school limits are 15-25: leaves can fool the band test
+      self.school_zone_read = (speed_limit, now + SCHOOL_ZONE_IGNORE_S)
+      if (getattr(self, 'published_speed_limit_mph', 0) == speed_limit and
+          now - getattr(self, 'last_publish_change_at', 0.) < SCHOOL_ZONE_IGNORE_S):
+        # the box cut the plaque off until the sign was close: withdrawn before SLA's 2 s settle acts on it
+        self._withdraw_published()
+      return None
+    school_value, school_until = getattr(self, 'school_zone_read', (0, 0.))
+    if speed_limit == school_value and now < school_until:
+      return None  # the same school sign with its plaque cropped off
 
     return speed_limit, confidence
+
+  def _withdraw_published(self) -> None:
+    self.history.clear()
+    self.previous_published_speed_limit_mph = self.published_speed_limit_mph
+    self.published_speed_limit_mph = 0
+    self.published_confidence = 0.0
+    self.published_support_count = 0
+    self.last_publish_change_at = 0.0
+    self.last_published_support_at = 0.0
+
+  @staticmethod
+  def _is_school_zone_sign(sign_crop):
+    """A solid yellow band across the top of a pale sign: the SCHOOL plaque (filter-dev, verbatim)."""
+    if sign_crop is None or sign_crop.ndim != 3 or sign_crop.shape[2] != 3:
+      return False
+    height, width = sign_crop.shape[:2]
+    x1, x2 = int(width * 0.15), int(width * 0.85)
+    top, body = sign_crop[:max(2, int(height * 0.35)), x1:x2], sign_crop[int(height * 0.45):int(height * 0.85), x1:x2]
+    if top.size == 0 or body.size == 0:
+      return False
+
+    top_hsv, body_hsv = cv2.cvtColor(top, cv2.COLOR_BGR2HSV), cv2.cvtColor(body, cv2.COLOR_BGR2HSV)
+
+    def plaque(sat_min, value_min):
+      def yellow(hsv):
+        return ((hsv[:, :, 0] >= REGULATORY_YELLOW_HUE_MIN) & (hsv[:, :, 0] <= REGULATORY_YELLOW_HUE_MAX) &
+                (hsv[:, :, 1] >= sat_min) & (hsv[:, :, 2] >= value_min))
+      band_rows = float((yellow(top_hsv).mean(axis=1) >= SCHOOL_BAND_ROW_YELLOW).mean())
+      return band_rows >= SCHOOL_BAND_MIN_ROWS and float(yellow(body_hsv).mean()) <= SCHOOL_BODY_YELLOW_MAX
+
+    dusk_sat = max(SCHOOL_DUSK_SAT_MIN, float(np.median(body_hsv[:, :, 1])) + SCHOOL_DUSK_SAT_OVER_BODY)
+    dusk_value = max(SCHOOL_DUSK_VALUE_MIN, SCHOOL_DUSK_VALUE_OF_BODY * float(np.median(body_hsv[:, :, 2])))
+    return plaque(90, 60) or plaque(dusk_sat, dusk_value)
 
 
   def _detect_sign_from_detector_classifier(
@@ -1304,6 +1392,17 @@ class VisionModelCore:
     has_strong_consensus = any(entry.strong_consensus for entry in matching_entries)
     current_speed_limit = self.published_speed_limit_mph
     current_count = counts.get(current_speed_limit, 0) if current_speed_limit > 0 else 0
+
+    # Mazda fork (filter-dev): the newest read wins when it is strong and every read of another value is weak. filter-dev
+    # route 12 t=262, a turn: a far 30 read twice at 0.64 outvoted the new road's 25 read once with strong consensus at
+    # 0.95, and 30 stayed up for 58 s. The low speed change bar still applies.
+    latest = self.history[-1]
+    if (latest.strong_consensus and latest.confidence >= CHANGE_SINGLE_READ_MIN_CONFIDENCE and
+        latest.speed_limit_mph != current_speed_limit and
+        all(not entry.strong_consensus and entry.confidence < STRONG_DETECTION_CONFIDENCE
+            for entry in self.history if entry.speed_limit_mph != latest.speed_limit_mph) and
+        not (current_speed_limit >= 30 and latest.speed_limit_mph < 30 and latest.confidence < LOW_SPEED_CHANGE_MIN_CONFIDENCE)):
+      return latest.speed_limit_mph, latest.confidence
 
     if current_speed_limit > 0 and candidate_speed_limit != current_speed_limit:
       required_count = CHANGE_CONSISTENT_DETECTIONS

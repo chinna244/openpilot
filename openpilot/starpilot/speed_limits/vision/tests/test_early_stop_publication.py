@@ -164,7 +164,7 @@ class Tests(unittest.TestCase):
       and any(isinstance(x, ast.Assign) and any(isinstance(v, ast.Attribute) and v.attr == '_stop_ready_callback' for v in x.targets) for x in n.finalbody)
     )
     core = Core()
-    ns = {'core': core, 'frame': None, 'source_observed_ns': 100}
+    ns = {'core': core, 'frame': None, 'source_observed_ns': 100, 'other_limit_ms': None}
     with self.assertRaises(ReaderFailure):
       exec(compile(ast.Module(body=[node], type_ignores=[]), 'actual_finally', 'exec'), ns)
     self.assertIsNone(core._stop_ready_callback)

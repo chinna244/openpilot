@@ -25,6 +25,27 @@ FOLLOWUP_INFERENCE_INTERVAL_NS = 100_000_000
 FOLLOWUP_WINDOW_NS = 2_000_000_000
 # Retain a cooldown even when processing reaches the result-age budget.
 BUSY_INFERENCE_INTERVAL_NS = MAX_RESULT_AGE_NS * 3 // 2
+# Mazda fork: the map's and the car's limit for the reader's implausible-read check, aged as the Mazda SLA resolver's
+# inputs are (map_source.EVENT_MAX_AGE_NS; card's dashboard reading at 100 Hz, plannerd's DASHBOARD_MAX_AGE_NS).
+OTHER_MAP_MAX_AGE_NS = 250_000_000
+OTHER_DASHBOARD_MAX_AGE_NS = 500_000_000
+
+
+def _other_limit_ms(sm, now_ns: int) -> float | None:
+  """The higher of the map's and the car's limit (0 when neither has one), None when neither source is live."""
+  def fresh(service, max_age_ns):
+    return bool(sm.seen.get(service, False) and sm.valid.get(service, False) and
+                0 <= now_ns - sm.logMonoTime.get(service, 0) <= max_age_ns)
+  map_ok, dash_ok = fresh('mapdOut', OTHER_MAP_MAX_AGE_NS), fresh('slcDashboardObservation', OTHER_DASHBOARD_MAX_AGE_NS)
+  if not (map_ok or dash_ok):
+    return None
+  map_limit = float(sm['mapdOut'].speedLimit) if map_ok else 0.
+  car = 0.
+  if dash_ok:
+    d = sm['slcDashboardObservation']
+    car = float(d.speedMps) if str(d.status) == 'valid' and now_ns <= int(d.validUntilMonoTime) else 0.
+  other = max(map_limit, car)
+  return other if math.isfinite(other) and other > 0. else 0.
 
 
 def _requested_tasks(params) -> tuple[bool, bool]:
@@ -189,7 +210,7 @@ def main() -> None:
   _configure_process()
   params = Params()
   pm = messaging.PubMaster(['slcVisionObservation'])
-  sm = messaging.SubMaster(['drivingModelData'])
+  sm = messaging.SubMaster(['drivingModelData', 'mapdOut', 'slcDashboardObservation'])
   session = uuid.uuid4().hex
   stream = 'unknown'
   client = None
@@ -409,6 +430,7 @@ def main() -> None:
         # The observation belongs to the original camera frame, not the end of
         # CPU inference. Completion never restamps an older camera observation.
         source_observed_ns = eof_boot_ns - offset_ns
+        other_limit_ms = _other_limit_ms(sm, pair[0])
         core._stop_ready_callback = partial(_publish_ready_stop,
           pm, sm, params, session=session, stream=stream, is_metric=is_metric, offset_ns=offset_ns,
           source_observed_ns=source_observed_ns, eof_boot_ns=eof_boot_ns, frame_id=frame_id,
@@ -416,7 +438,7 @@ def main() -> None:
           last_result_session=last_result_session, last_result_observed_ns=last_result_observed_ns,
           last_result_valid_until_ns=last_result_valid_until_ns) if tasks[1] else None
         try:
-          result = core.observe(frame, now=source_observed_ns / 1e9)
+          result = core.observe(frame, now=source_observed_ns / 1e9, other_limit_ms=other_limit_ms)
         finally:
           core._stop_ready_callback = None
       except Exception as error:

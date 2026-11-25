@@ -199,7 +199,7 @@ class TestVisionProducer(unittest.TestCase):
     client.recv.side_effect = receive
     core = Mock(last_published_support_at=1., last_detection_at=0., stop_detections=())
 
-    def observe(_frame, *, now):
+    def observe(_frame, *, now, other_limit_ms=None):
       self.assertEqual(released, [12] if core.observe.call_count == 1 else [12, 13, 14, 15, 16, 17])
       self.assertEqual(now, 1. if core.observe.call_count == 1 else 1.7)
       return None
