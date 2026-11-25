@@ -47,6 +47,8 @@ type State struct {
 	ProducerSession           uint64
 	MatchedLimitMps           float32
 	LimitPreview              LimitPreview
+	RampEnd                   RampEnd
+	rampJunction              rampJunction
 	lastMapLoadAttempt        time.Time
 	bootNow                   func() uint64
 	// The fix the current road result was computed from. The loop runs at
@@ -92,6 +94,7 @@ func (s *State) clearRoadDerived() {
 	s.MapCurveSpeed = 0
 	s.MatchedLimitMps = 0
 	s.LimitPreview = LimitPreview{}
+	s.RampEnd = RampEnd{}
 	s.NextHazard.Reset()
 	s.NextAdvisorySpeed.Reset()
 	s.clearSpeedLimitEvidence()
@@ -258,6 +261,7 @@ func (s *State) ProcessGps(sample cereal.GpsSample, success bool, load MapLoader
 		s.RoadStatus = custom.MapdOut_SampleStatus_matchedLimit
 	}
 	s.LimitPreview = s.previewLimit()
+	s.RampEnd = s.rampEnd(location)
 }
 
 func (s *State) SuggestedSpeed() float32 {
@@ -377,6 +381,10 @@ func (s *State) buildMessageAt(now uint64) (*capnp.Message, error) {
 		output.SetSpeedLimitSuggestedSpeed(s.SpeedLimit.Suggestion.Value)
 		output.SetNextSpeedLimit(s.SpeedLimit.NextLimit.Value)
 		output.SetNextSpeedLimitDistance(s.SpeedLimit.NextLimit.Distance)
+	}
+	if s.ShadowOnly && s.RampEnd.Speed > 0 {
+		output.SetNextSpeedLimit(s.RampEnd.Speed)
+		output.SetNextSpeedLimitDistance(s.RampEnd.Distance)
 	}
 
 	hazard := s.CurrentWay.Way.Hazard()

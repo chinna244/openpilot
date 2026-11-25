@@ -84,6 +84,11 @@ AHEAD_RAISE_S = 4.
 AHEAD_RAISE_MIN = 50 * CV.MPH_TO_MS  # m/s; a slower road's limit ahead is not raised to before its sign (town streets)
 AHEAD_RAISE_MAX_M = 800.  # only a fast road this close (ramps 478-701 m: routes 44/86/18f); not one kilometres on
 AHEAD_RAISE_GAP_S = 1.  # the ahead value missing this briefly (a mapd frame) neither ends the raise nor restarts its clock
+# an exit ramp's street limit, once taken early as the limit ahead, held only while mapd showed it inside the braking
+# distance: a ramp lost for one fix, or the car already slowed to near it, gave the freeway's limit back (replay 2026-11-25
+# routes 43/44/85/186: 30 -> 50 -> 30 on the ramp, and a + to 50 can apply unasked). Once taken it holds until the map gives
+# a limit of its own, another limit ahead, the car reads a sign, or the car has driven this far past where it was ahead
+AHEAD_TAKE_PAST_M = 100.
 
 
 class SpeedLimitResolver:
@@ -221,12 +226,14 @@ class SpeedLimitResolver:
 
     if self._gps_fix_age(sm) is None:
       self._reset_ahead_raise()
+      self._reset_ahead_take()
       return
 
     # plannerd ignores liveMapDataSP liveness: a mapd that stopped publishing leaves its last limit in the SubMaster
     map_data_age = self._message_age(sm.map_ns)
     if map_data_age is None:
       self._reset_ahead_raise()
+      self._reset_ahead_take()
       return
 
     speed_limit = sm.map_limit if sm.map_limit > 0. else 0.
@@ -255,6 +262,20 @@ class SpeedLimitResolver:
       if distance_to_speed_limit_ahead <= adapt_distance:
         self.limit_solutions[SpeedLimitSource.map] = next_speed_limit
         self.distance_solutions[SpeedLimitSource.map] = distance_to_speed_limit_ahead
+        if self._ahead_take is None or abs(self._ahead_take[0] - next_speed_limit) > .1:
+          self._ahead_take = (next_speed_limit, speed_limit, self.limit_solutions[SpeedLimitSource.car])
+        self._ahead_take_left = distance_to_speed_limit_ahead
+        self._ahead_take_frame = self.frame
+    if self._ahead_take is not None and self._ahead_take_frame != self.frame:
+      take, own, car_then = self._ahead_take
+      car_now = self.limit_solutions[SpeedLimitSource.car]
+      self._ahead_take_left -= self.v_ego * DT_MDL
+      if ((speed_limit > 0. and abs(speed_limit - own) > .1) or (next_speed_limit > 0. and abs(next_speed_limit - take) > .1) or
+          (car_now > 0. and abs(car_now - car_then) > VOTE_TOLERANCE) or self._ahead_take_left < -AHEAD_TAKE_PAST_M):
+        self._reset_ahead_take()
+      else:
+        self.limit_solutions[SpeedLimitSource.map] = take
+        self.distance_solutions[SpeedLimitSource.map] = max(0., self._ahead_take_left)
 
     # the on-ramp raise: its clock runs per value shown with the map blank; it starts raising only above the limit given,
     # and then keeps raising while that value shows (the limit given becomes the raised one)
@@ -278,6 +299,11 @@ class SpeedLimitResolver:
     if self._ahead_raising:
       self.limit_solutions[SpeedLimitSource.map] = self._ahead_raise
       self.distance_solutions[SpeedLimitSource.map] = 0.
+
+  def _reset_ahead_take(self) -> None:
+    """AHEAD_TAKE_PAST_M: the (limit ahead, map's own limit, car's reading) when it was taken, the metres still to it."""
+    self._ahead_take: tuple[float, float, float] | None = None
+    self._ahead_take_left, self._ahead_take_frame = 0., -1
 
   def _reset_ahead_raise(self) -> None:
     """The on-ramp raise (AHEAD_RAISE_S): the ahead limit, since when, last seen, raising, the car's reading then, ended."""
@@ -344,6 +370,7 @@ class SpeedLimitResolver:
     self._wait_held = 0.
     self._car_read_frame = -10 ** 9  # when the car last read a new limit
     self._reset_ahead_raise()
+    self._reset_ahead_take()
 
   def _hold_on_evidence(self, speed_limit: float, distance: float, source: Source):
     """Combined: the limit changes on evidence of a new one, not on a source dropping out. Routes 54/66/67/6a "Press +
