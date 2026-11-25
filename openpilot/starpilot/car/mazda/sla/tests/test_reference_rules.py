@@ -233,7 +233,7 @@ def test_alert_presentation():
   adjust = next(r for r in rows if r.text.startswith('Adjusting'))
   small = log.SelfdriveState.AlertSize.small
   assert prompt.alert_type == 'slcConfirmPrompt/warning' and prompt.size == small and prompt.duration == 10  # frames: 0.1 s, re-raised every frame while open
-  assert adjust.alert_type == 'slcAdjusting/warning' and adjust.size == small and adjust.duration == 500  # frames: 5 s
+  assert adjust.alert_type == 'slcAdjusting/warning' and adjust.size == small and adjust.duration == 10  # frames: 0.1 s, re-raised every frame for the 5 s below
   adj = [s for s in spans(rows) if s[2].startswith('Adjusting')]
   assert len(adj) == 1 and adj[0][1] - adj[0][0] == pytest.approx(5.0, abs=0.02)
 
