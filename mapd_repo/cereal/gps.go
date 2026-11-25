@@ -222,13 +222,21 @@ func (c *gpsCandidate) updateWrapped(event DecodedEvent[custom.StarPilotCarState
 	return c.updateWithAge(DecodedEvent[log.GpsLocationData]{Value: location, Valid: valid, LogMonoTime: sourceTime}, clock, barrierMono, maxAge)
 }
 
-func (s *GpsSub) clockReady(clock clockSample) bool {
+// clockReady reports whether held fixes can be judged in BOOTTIME (fresh) and
+// whether new Events can be dated with this clock pair (intake).
+func (s *GpsSub) clockReady(clock clockSample) (fresh, intake bool) {
 	if clock.monoAfter < clock.monoBefore || clock.boot < clock.monoBefore ||
-		clock.monoAfter-clock.monoBefore > maxClockPairSkew || clock.boot > math.MaxInt64 || clock.monoAfter > math.MaxInt64 {
+		clock.boot > math.MaxInt64 || clock.monoAfter > math.MaxInt64 {
 		s.clearCandidates()
 		s.barrierMono = clock.monoAfter
 		s.clockInitialized = false
-		return false
+		return false, false
+	}
+	if clock.monoAfter-clock.monoBefore > maxClockPairSkew {
+		// A preempted pair cannot date a new Event, but it is no clock step:
+		// held fixes keep their BOOTTIME age and queued Events wait for the
+		// next tight pair, whose offset check still fences a suspend.
+		return s.clockInitialized, false
 	}
 	low := int64(clock.boot) - int64(clock.monoAfter)
 	high := int64(clock.boot) - int64(clock.monoBefore)
@@ -240,7 +248,7 @@ func (s *GpsSub) clockReady(clock clockSample) bool {
 		s.offsetLow, s.offsetHigh = low, high
 		s.clockInitialized = true
 	}
-	return true
+	return true, true
 }
 
 // ReadSample retains a recently received fix across 20 Hz map loops. Its
@@ -251,24 +259,26 @@ func (s *GpsSub) ReadSample() (sample GpsSample, success bool) {
 	if s.clock != nil {
 		clock = s.clock()
 	}
-	ready := s.clockReady(clock)
+	ready, intake := s.clockReady(clock)
 	internalNew, externalNew, carNew, phoneNew := false, false, false, false
-	if event, ok := s.gpsLocation.ReadEvent(); ok && ready {
-		internalNew = s.internal.update(event, clock, s.barrierMono)
-	}
-	if event, ok := s.gpsLocationExternal.ReadEvent(); ok && ready {
-		externalNew = s.external.update(event, clock, s.barrierMono)
-	}
-
-	if s.carGps != nil {
-		if event, ok := s.carGps.ReadEvent(); ok && ready {
-			carNew = s.car.updateWrapped(event, log.GpsLocationData_SensorSource_car, clock, s.barrierMono, carFixMaxAge)
+	// A pair that cannot date an Event leaves the queues unread for the next loop.
+	if intake {
+		if event, ok := s.gpsLocation.ReadEvent(); ok {
+			internalNew = s.internal.update(event, clock, s.barrierMono)
 		}
-	}
-	if s.phoneGps != nil {
-		if event, ok := s.phoneGps.ReadEvent(); ok && ready {
-			// The enum has no phone value; android is the closest.
-			phoneNew = s.phone.updateWrapped(event, log.GpsLocationData_SensorSource_android, clock, s.barrierMono, phoneFixMaxAge)
+		if event, ok := s.gpsLocationExternal.ReadEvent(); ok {
+			externalNew = s.external.update(event, clock, s.barrierMono)
+		}
+		if s.carGps != nil {
+			if event, ok := s.carGps.ReadEvent(); ok {
+				carNew = s.car.updateWrapped(event, log.GpsLocationData_SensorSource_car, clock, s.barrierMono, carFixMaxAge)
+			}
+		}
+		if s.phoneGps != nil {
+			if event, ok := s.phoneGps.ReadEvent(); ok {
+				// The enum has no phone value; android is the closest.
+				phoneNew = s.phone.updateWrapped(event, log.GpsLocationData_SensorSource_android, clock, s.barrierMono, phoneFixMaxAge)
+			}
 		}
 	}
 

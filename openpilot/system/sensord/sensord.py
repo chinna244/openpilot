@@ -19,6 +19,9 @@ from openpilot.system.sensord.sensors.lsm6ds3_temp import LSM6DS3_Temp
 
 I2C_BUS_IMU = 1
 IMU_PUBLICATION_TIMEOUT = 2.0
+# the reading is the sensor's latest sample; an edge older than this (a backlog after a stall, the kernel keeps
+# only the first 16) does not date it. Same window locationd uses, so nothing it would accept is dropped here.
+MAX_IRQ_AGE_NS = 100_000_000
 
 def interrupt_loop(sensors: list[tuple[Sensor, str, bool]], event, last_publish: dict[str, float]) -> None:
   pm = messaging.PubMaster([service for sensor, service, interrupt in sensors if interrupt])
@@ -53,7 +56,8 @@ def interrupt_loop(sensors: list[tuple[Sensor, str, bool]], event, last_publish:
       continue
 
     dat = os.read(fd, ctypes.sizeof(gpioevent_data)*16)
-    evd = gpioevent_data.from_buffer_copy(dat)
+    # newest queued edge, not the oldest
+    evd = gpioevent_data.from_buffer_copy(dat, len(dat) - ctypes.sizeof(gpioevent_data))
 
     cur_offset = time.time_ns() - time.monotonic_ns()
     if abs(cur_offset - offset) > 10 * 1e6:  # ms
@@ -62,6 +66,8 @@ def interrupt_loop(sensors: list[tuple[Sensor, str, bool]], event, last_publish:
       continue
 
     ts = evd.timestamp - cur_offset
+    if time.monotonic_ns() - ts > MAX_IRQ_AGE_NS:
+      continue
     for sensor, service, interrupt in sensors:
       if interrupt:
         try:
@@ -94,7 +100,9 @@ def polling_loop(sensor: Sensor, service: str, event: threading.Event) -> None:
     rk.keep_time()
 
 def main() -> None:
-  config_realtime_process([1, ], 1)
+  # pinned to core 1, so it must outrank the SCHED_FIFO 5 daemons (torqued, locationd, paramsd, ...) that may run
+  # there: at 1, torqued's 12 s cache write starved it for ~0.3 s and the next IMU reading was rejected by locationd
+  config_realtime_process([1, ], 6)
 
   sensors_cfg = [
     (LSM6DS3_Accel(I2C_BUS_IMU), "accelerometer", True),

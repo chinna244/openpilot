@@ -656,7 +656,8 @@ def main(demo=False):
       frame_dropped_filter.x = 0.
       frame_drop_ratio = 0.
       if model.chestnut:
-        receipt_owner.loaded(None, ModelVariant.CHESTNUT)
+        # the joined model forwards .spec to the Jetson model now driving (JoiningModelState.__getattr__)
+        receipt_owner.loaded_jetlink(getattr(getattr(model, 'spec', None), 'sha256', None))
       else:
         receipt_owner.loaded(small_prepared, ModelVariant.SMALL, model_id=small_model.model_id)
       cloudlog.event("jetlinkHandover", state=HOOKS.state(model), handovers=model.handovers)

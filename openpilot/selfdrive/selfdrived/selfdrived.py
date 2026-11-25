@@ -127,6 +127,12 @@ KEY_OFF_MAX_PERIODS = 3
 KEY_OFF_DEVICE_WAIT_NS = 1_000_000_000
 
 
+def initialization_waits_for_native(CP) -> bool:
+  # Mazda also waits for a current native: its panda's rx checks settle up to one 1 Hz safety
+  # tick after the mode is set (route 11), and initializing first raises that as controlsMismatch.
+  return bool(native_bootstrap_supported(CP) or CP.brand == 'mazda')
+
+
 def key_off_input(sm, service: str, now_ns: int):
   """The service's message when it is fresh and valid enough to prove key-off, else None."""
   try:
@@ -1090,7 +1096,7 @@ class SelfdriveD:
 
     if not self.initialized:
       all_valid = CS.canValid and self.sm.all_checks()
-      if self.axis_transport_required and native_bootstrap_supported(self.CP):
+      if self.axis_transport_required and initialization_waits_for_native(self.CP):
         now_ns = self.aol_car_state_log_ns if REPLAY and self.aol_car_state_log_ns else time.monotonic_ns()
         all_valid = all_valid and current_native(self.sm, self.CP, now_ns=now_ns,
                                                 axis_session_id=self.aol_session_id) is not None

@@ -28,6 +28,7 @@ UBLOX_SOS_ACK = b"\xb5\x62\x09\x14\x08\x00\x02\x00\x00\x00\x01\x00\x00\x00"
 UBLOX_SOS_NACK = b"\xb5\x62\x09\x14\x08\x00\x02\x00\x00\x00\x00\x00\x00\x00"
 UBLOX_BACKUP_RESTORE_MSG = b"\xb5\x62\x09\x14\x08\x00\x03"
 UBLOX_ASSIST_ACK = b"\xb5\x62\x13\x60\x08\x00"
+UBLOX_GNSS_STOP = b"\xB5\x62\x06\x04\x04\x00\x00\x00\x08\x00\x16\x74"  # UBX-CFG-RST controlled GNSS stop, BBR kept
 
 # the Jetson's USB GPS aids a ublox that has had no fix this long, at most once a period
 JETSON_AID_AFTER = 20.  # s
@@ -162,7 +163,7 @@ def send_time(pigeon: TTYPigeon, t_now: datetime | None = None, acc_s: int = 30)
   pigeon.send_with_ack(msg, ack=UBLOX_ASSIST_ACK)
 
 def save_almanac(pigeon: TTYPigeon) -> None:
-  # store almanac in flash
+  # store almanac in flash; send after a controlled GNSS stop (every save while running NACKed, routes 10/11)
   pigeon.send(b"\xB5\x62\x09\x14\x04\x00\x00\x00\x00\x00\x21\xEC")
   try:
     if pigeon.wait_for_ack(ack=UBLOX_SOS_ACK, nack=UBLOX_SOS_NACK):
@@ -291,8 +292,9 @@ def init_pigeon(pigeon: TTYPigeon) -> bool:
 
 def deinitialize_and_exit(pigeon: TTYPigeon | None):
   if pigeon is not None:
-    # controlled GNSS stop
-    pigeon.send(b"\xB5\x62\x06\x04\x04\x00\x00\x00\x08\x00\x16\x74")
+    pigeon.send(UBLOX_GNSS_STOP)
+    time.sleep(0.1)
+    save_almanac(pigeon)
 
   # turn off power and exit cleanly
   set_power(False)
@@ -325,7 +327,6 @@ def run_receiving(duration: int = 0):
   init(pigeon)
 
   start_time = time.monotonic()
-  last_almanac_save = time.monotonic()
   assist_attempted = False
   assist_messages = None
   jetson_reader = JetsonGpsReader(period=1.)
@@ -385,11 +386,6 @@ def run_receiving(duration: int = 0):
       msg = messaging.new_message('ubloxRaw', len(dat), valid=True)
       msg.ubloxRaw = dat[:]
       pm.send('ubloxRaw', msg)
-
-      # save almanac every 5 minutes
-      if (time.monotonic() - last_almanac_save) > 60*5:
-        save_almanac(pigeon)
-        last_almanac_save = time.monotonic()
     else:
       # prevent locking up a CPU core if ublox disconnects
       time.sleep(0.001)

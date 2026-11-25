@@ -73,7 +73,7 @@ func TestGpsSuspendFencesQueuedEventsAndRequiresPostResumeFix(t *testing.T) {
 	}
 }
 
-func TestGpsUncertainClockPairInvalidatesHeldEvidence(t *testing.T) {
+func TestGpsPreemptedClockPairHoldsFixAndDefersQueuedEvents(t *testing.T) {
 	mono := uint64(10_000_000_000)
 	clock := clockSample{mono, mono, mono}
 	internal, _ := wireQueue(GpsLocationReader)
@@ -83,24 +83,58 @@ func TestGpsUncertainClockPairInvalidatesHeldEvidence(t *testing.T) {
 	mono += 100_000_000
 	clock = clockSample{mono, mono, mono}
 	*eq = append(*eq, gpsWire(t, GpsSourceExternal, mono, true, true, 3, 4, 5))
-	if _, ok := s.ReadSample(); !ok {
+	first, ok := s.ReadSample()
+	if !ok || first.SourceGeneration != 1 {
 		t.Fatal("pre-skew fix unavailable")
 	}
-	mono += 100_000_000
+	// A preempted pair keeps the held fix at its original age and leaves a
+	// queued Event for the next tight pair to date.
+	mono += 50_000_000
 	clock = clockSample{mono - 2_000_000, mono, mono}
-	if sample, ok := s.ReadSample(); ok || sample.Source != GpsSourceNone || sample.SourceGeneration != 2 {
-		t.Fatalf("uncertain paired read retained source: %+v %v", sample, ok)
+	*eq = append(*eq, gpsWire(t, GpsSourceExternal, mono-1_000_000, true, true, 3, 4, 5))
+	sample, ok := s.ReadSample()
+	if !ok || sample.Source != GpsSourceExternal || sample.SourceChanged || sample.NewFix ||
+		sample.SourceGeneration != 1 || sample.FixMonoTime != first.FixMonoTime {
+		t.Fatalf("preempted pair dropped or renewed the held fix: %+v %v", sample, ok)
 	}
-	mono += 100_000_000
+	mono += 50_000_000
 	clock = clockSample{mono, mono, mono}
-	*eq = append(*eq, gpsWire(t, GpsSourceExternal, mono-1, true, true, 3, 4, 5))
+	sample, ok = s.ReadSample()
+	if !ok || !sample.NewFix || sample.SourceChanged || sample.SourceGeneration != 1 || sample.FixMonoTime != mono-51_000_000 {
+		t.Fatalf("deferred Event was not dated by the next tight pair: %+v %v", sample, ok)
+	}
+	// Held evidence still expires by BOOTTIME age through preempted pairs.
+	mono += externalFixMaxAge
+	clock = clockSample{mono - 2_000_000, mono, mono}
 	if sample, ok := s.ReadSample(); ok || sample.Source != GpsSourceNone {
-		t.Fatalf("uncertain-pair recovery accepted a queued fix: %+v %v", sample, ok)
+		t.Fatalf("expired fix survived a preempted pair: %+v %v", sample, ok)
 	}
+}
+
+func TestGpsSuspendBehindPreemptedClockPairStillFences(t *testing.T) {
+	mono := uint64(10_000_000_000)
+	offset := uint64(3_000_000_000)
+	clock := clockSample{mono, mono + offset, mono}
+	internal, _ := wireQueue(GpsLocationReader)
+	external, eq := wireQueue(GpsLocationExternalReader)
+	s := GpsSub{gpsLocation: internal, gpsLocationExternal: external, clock: func() clockSample { return clock }}
+	s.ReadSample()
 	mono += 100_000_000
-	clock = clockSample{mono, mono, mono}
+	clock = clockSample{mono, mono + offset, mono}
 	*eq = append(*eq, gpsWire(t, GpsSourceExternal, mono, true, true, 3, 4, 5))
-	if sample, ok := s.ReadSample(); !ok || sample.SourceGeneration != 3 {
-		t.Fatalf("post-fence fix failed to recover: %+v %v", sample, ok)
+	if _, ok := s.ReadSample(); !ok {
+		t.Fatal("pre-suspend fix unavailable")
+	}
+	preSuspend := mono
+	mono += 1_000_000
+	offset += 3_000_000_000
+	*eq = append(*eq, gpsWire(t, GpsSourceExternal, preSuspend+500_000, true, true, 9, 9, 5))
+	clock = clockSample{mono - 2_000_000, mono + offset, mono}
+	if sample, ok := s.ReadSample(); ok || sample.Source != GpsSourceNone {
+		t.Fatalf("suspend-aged fix survived a preempted pair: %+v %v", sample, ok)
+	}
+	clock = clockSample{mono, mono + offset, mono}
+	if sample, ok := s.ReadSample(); ok || sample.Source != GpsSourceNone {
+		t.Fatalf("queued pre-suspend Event passed the offset fence: %+v %v", sample, ok)
 	}
 }

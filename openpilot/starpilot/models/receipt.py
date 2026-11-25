@@ -397,12 +397,14 @@ class ModelReceiptOwner:
     self.record = record
     self.load = None
     self.pair_load = None
+    self.jetlink_sha256 = None
     self._identity_since_ns = time.monotonic_ns()
     self._last_publication_ns = 0
 
   def start(self) -> None:
     self.load = None
     self.pair_load = None
+    self.jetlink_sha256 = None
     self._identity_since_ns = time.monotonic_ns()
     self._last_publication_ns = 0
     try:
@@ -447,9 +449,13 @@ class ModelReceiptOwner:
     try:
       from openpilot.cereal import messaging
       message = messaging.new_message(None, valid=True, logMonoTime=now_ns)
-      message.logMessage = (recorded_model_message(self.load) if self.load is not None else
-                            json.dumps({'msg': {'event': 'modeld.identity-unavailable',
-                                                'sinceMonoNs': self._identity_since_ns}}))
+      if self.load is not None:
+        message.logMessage = recorded_model_message(self.load)
+      else:
+        # no local receipt; a Jetson's model is named by its ONNX sha256, which this device cannot verify
+        extra = {'jetlinkArtifactSha256': self.jetlink_sha256} if self.jetlink_sha256 is not None else {}
+        message.logMessage = json.dumps({'msg': {'event': 'modeld.identity-unavailable',
+                                                 'sinceMonoNs': self._identity_since_ns, **extra}})
       publisher.send('modelIdentity', message)
       self._last_publication_ns = now_ns
       return True
@@ -479,6 +485,15 @@ class ModelReceiptOwner:
       self.report("log-failed")
     return True
 
+  def loaded_jetlink(self, artifact_sha256: object) -> bool:
+    """Jetlink handover to its big model: retire the local identity, as loaded(None) does, and carry the
+    Jetson's ONNX sha256 on the heartbeat. No receipt: that is for artifacts this device verified."""
+    self.start()
+    if not isinstance(artifact_sha256, str) or _DIGEST.fullmatch(artifact_sha256) is None:
+      self.report("jetlink-identity-unavailable")
+      return False
+    self.jetlink_sha256 = artifact_sha256
+    return True
 
   def loaded_pair(self, pair, plan_sha256: str) -> bool:
     self.load = self.pair_load = None

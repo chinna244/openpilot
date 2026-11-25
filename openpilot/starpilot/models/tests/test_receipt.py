@@ -144,6 +144,32 @@ class TestModelReceipt(unittest.TestCase):
     self.assertIsNone(read_receipt(self.path))
     self.assertEqual(reasons[-1], 'record-failed')
 
+  def test_jetlink_handover_retires_local_identity_and_names_the_jetson_model(self):
+    write_receipt(self.load, self.path)
+    reasons = []
+    owner = ModelReceiptOwner(self.path, reasons.append, record=lambda _load: None)
+    owner.load = self.load
+
+    class Publisher:
+      raw = b''
+      def send(self, _service, message):
+        self.raw = message.to_bytes()
+
+    from openpilot.cereal import messaging
+    sha = 'bc125a9af33033de' + '0' * 48
+    self.assertTrue(owner.loaded_jetlink(sha))
+    self.assertIsNone(owner.load)
+    self.assertIsNone(read_receipt(self.path))
+    publisher = Publisher()
+    self.assertTrue(owner.publish(publisher, self.load.loaded_mono_ns + 1))
+    payload = json.loads(str(messaging.log_from_bytes(publisher.raw).logMessage))['msg']
+    self.assertEqual((payload['event'], payload['jetlinkArtifactSha256']), ('modeld.identity-unavailable', sha))
+    self.assertFalse(owner.loaded_jetlink(None))
+    self.assertIsNone(owner.jetlink_sha256)
+    self.assertFalse(owner.loaded_jetlink('bc125a9af33033de'))  # a short prefix is not an artifact sha256
+    self.assertIsNone(owner.jetlink_sha256)
+    self.assertEqual(reasons, ['jetlink-identity-unavailable'] * 2)
+
   def test_failed_clear_remains_nonfatal_and_unavailable_heartbeat(self):
     write_receipt(self.load, self.path)
     reasons = []

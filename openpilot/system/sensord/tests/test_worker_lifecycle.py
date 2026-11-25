@@ -103,8 +103,8 @@ class TestSensorWorkerLifecycle(OpenpilotTestCase):
              patch.object(sensord.os.path, 'exists', return_value=False), \
              patch.object(sensord.select, 'poll') as poller, \
              patch.object(sensord.os, 'read', side_effect=receive), \
-             patch.object(sensord.time, 'time_ns', return_value=2_000_000_000), \
-             patch.object(sensord.time, 'monotonic_ns', return_value=1_000_000_000), \
+             patch.object(sensord.time, 'time_ns', return_value=1_000_002_000), \
+             patch.object(sensord.time, 'monotonic_ns', return_value=2_000), \
              patch.object(sensord.time, 'monotonic', return_value=cycle + 10.):
           poller.return_value.poll.return_value = [(20, sensord.select.POLLIN)]
           sensord.interrupt_loop(sensors, event, published)
@@ -197,8 +197,8 @@ class TestSensorWorkerLifecycle(OpenpilotTestCase):
                patch.object(sensord.os.path, 'exists', return_value=False), \
                patch.object(sensord.select, 'poll') as poller, \
                patch.object(sensord.os, 'read', side_effect=receive), \
-               patch.object(sensord.time, 'time_ns', return_value=2_000_000_000), \
-               patch.object(sensord.time, 'monotonic_ns', return_value=1_000_000_000), \
+               patch.object(sensord.time, 'time_ns', return_value=1_000_002_000), \
+               patch.object(sensord.time, 'monotonic_ns', return_value=2_000), \
                patch.object(sensord.time, 'monotonic', return_value=15.), \
                patch.object(sensord.cloudlog, 'exception'):
             poller.return_value.poll.return_value = [(20, sensord.select.POLLIN)]
@@ -236,3 +236,45 @@ class TestSensorWorkerLifecycle(OpenpilotTestCase):
         self.assertEqual(published, {'accelerometer': 10., 'gyroscope': 10.})
         publisher.return_value.send.assert_not_called()
         sensor.get_event.assert_not_called()
+
+  def test_backlog_after_stall_uses_newest_edge_and_skips_stale_reading(self):
+    # 16 queued edges, 10 ms apart; the kernel kept the oldest, so even the newest can predate the reading
+    for newest_age_ns, expect in ((1_000_000, 1_000_000_000 - 1_000_000), (80_000_000, 1_000_000_000 - 80_000_000),
+                                  (150_000_000, None)):
+      with self.subTest(newest_age_ns=newest_age_ns):
+        edges = []
+        for i in range(16):
+          irq = sensord.gpioevent_data()
+          irq.timestamp = 1_000_000_000 - newest_age_ns - (15 - i) * 10_000_000 + 1_000_000_000  # realtime
+          irq.id = 1
+          edges.append(bytes(irq))
+        event = threading.Event()
+        sensor = Mock()
+        def reading(stamp):
+          event.set()
+          data = log.SensorEventData.new_message()
+          data.timestamp = stamp
+          data.init('acceleration').v = [0., 0., 0.]
+          return data
+        sensor.get_event.side_effect = reading
+        sensor.is_data_valid.return_value = True
+        reads = []
+        def receive(*_):
+          reads.append(True)
+          if len(reads) > 1:
+            event.set()
+          return b''.join(edges)
+        with patch.object(sensord.messaging, 'PubMaster') as publisher, \
+             patch.object(sensord, 'gpiochip_get_ro_value_fd', return_value=20), \
+             patch.object(sensord.os.path, 'exists', return_value=False), \
+             patch.object(sensord.select, 'poll') as poller, \
+             patch.object(sensord.os, 'read', side_effect=receive), \
+             patch.object(sensord.time, 'time_ns', return_value=2_000_000_000), \
+             patch.object(sensord.time, 'monotonic_ns', return_value=1_000_000_000):
+          poller.return_value.poll.return_value = [(20, sensord.select.POLLIN)]
+          sensord.interrupt_loop([(cast(sensord.Sensor, sensor), 'accelerometer', True)], event, {})
+        if expect is None:
+          sensor.get_event.assert_not_called()
+          publisher.return_value.send.assert_not_called()
+        else:
+          sensor.get_event.assert_called_once_with(expect)
