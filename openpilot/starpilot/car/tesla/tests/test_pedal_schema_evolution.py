@@ -370,6 +370,7 @@ def test_additive_force_stop_fields_preserve_defaults_and_incumbent_relay(histor
     assert decoded.forceStopEpisodeMonoTime == 0
     assert decoded.departureAlertKind == 0
     assert decoded.departureAlertMonoTime == 0
+    assert not decoded.forceStopGasHold
     current = decoded.as_builder()
   current.forceStopBraking = True
   current.forceStopEpisodeMonoTime = 44

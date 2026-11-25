@@ -83,7 +83,8 @@ class ForceStopRuntimeTests(unittest.TestCase):
     with patch('openpilot.cereal.messaging.time.monotonic', return_value=(sm.stamp + 1_000_000) / 1e9):
       planner.publish(sm, SimpleNamespace(send=lambda name, event: published.__setitem__(name, event)))
     self.assertTrue(published['starpilotLongitudinalPlan'].valid)
-    self.assertTrue(published['starpilotLongitudinalPlan'].starpilotLongitudinalPlan.forceStopHolding)
+    # Held, but not at a stop sign: RES cannot release it, so no 'Press RES' banner
+    self.assertFalse(published['starpilotLongitudinalPlan'].starpilotLongitudinalPlan.forceStopHolding)
     self.assertTrue(published['longitudinalPlan'].longitudinalPlan.shouldStop)
     self.sample(Frame(121), drive_id=DRIVE + 1)
     self.assertFalse(self.owner.always_hold)
@@ -415,7 +416,8 @@ class ForceStopRuntimeTests(unittest.TestCase):
       self.assertEqual(companion.logMonoTime, event.logMonoTime)
       self.assertEqual(hold.modelMonoTime, event.longitudinalPlan.modelMonoTime)
       self.assertEqual(hold.driveStartMonoTime, DRIVE)
-      self.assertEqual(hold.forceStopHolding, not gas)
+      # no driving history yet (sign memory unknown): green cannot release it, so only the gas banner shows
+      self.assertEqual((hold.forceStopHolding, hold.forceStopGasHold), (not gas, not gas))
       self.assertEqual(planner.force_stop_plan.manual_hold, not gas)
       self.assertEqual(event.longitudinalPlan.modelMonoTime, sm.stamp)
       if not gas:
@@ -451,6 +453,27 @@ class ForceStopRuntimeTests(unittest.TestCase):
           controls.publish(cc, lateral)
         self.assertFalse(cc.cruiseControl.resume)
         self.assertTrue(event.longitudinalPlan.shouldStop)
+
+  def test_banner_bits_follow_sign_and_gas_holds(self):
+    from dataclasses import replace
+    from types import SimpleNamespace
+    from unittest.mock import patch
+    self.prime()
+    for tick, (sign_hold, gas_hold) in enumerate(((False, False), (True, False), (False, True)), 40):
+      with self.subTest(sign_hold=sign_hold, gas_hold=gas_hold):
+        planner = LongitudinalPlanner(self.cp)
+        published = {}
+        sm = Frame(tick, stopped=True, horizon=30.)
+        sm.all_checks = lambda _: True
+        planner.update(sm, now_ns=sm.stamp + 1_000_000, drive_id=DRIVE,
+                       force_stop_provider=lambda follow: replace(self.sample(sm, follow_seconds=follow),
+                                                                    sign_hold=sign_hold, gas_hold=gas_hold))
+        self.assertTrue(planner.force_stop_plan.manual_hold)
+        with patch('openpilot.cereal.messaging.time.monotonic', return_value=(sm.stamp + 1_000_000) / 1e9):
+          planner.publish(sm, SimpleNamespace(send=lambda name, event: published.__setitem__(name, event)))
+        hold = published['starpilotLongitudinalPlan'].starpilotLongitudinalPlan
+        self.assertEqual((hold.forceStopHolding, hold.forceStopGasHold), (sign_hold or gas_hold, gas_hold))
+        self.assertTrue(published['longitudinalPlan'].longitudinalPlan.shouldStop)  # the hold itself is unchanged
 
   def test_saved_malformed_and_safe_mode_disable_instead_of_defaulting_on(self):
     for key, raw in (('ForceStops', b'true'), ('ForceStopDistanceOffset', b'21'),

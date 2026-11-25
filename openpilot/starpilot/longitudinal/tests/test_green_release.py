@@ -150,6 +150,80 @@ class GreenReleaseTests(unittest.TestCase):
       self.hold(cue=dict(sign=True, dashboard_sign=True), reason='sign')
       self.assertIsNone(self.release_after(GREEN))
 
+  def test_gas_banner_marks_exactly_the_holds_green_cannot_release(self):
+    def held(**extra):
+      plan = None
+      for _ in range(2 * HOLD_TICKS):
+        plan = self.step(**RED, **extra)
+      return plan
+    cases = (('sign lost before the line', lambda: (self.approach(), self.approach(ticks=10, sign=True), self.approach(ticks=7)), True),
+             ('no driving history yet', lambda: None, True),
+             ('a sign a block back', lambda: (self.approach(ticks=4, sign=True), self.approach()), False),
+             ('plain light', lambda: self.approach(), False))
+    for name, setup, gas in cases:
+      with self.subTest(name):
+        self.setUp()
+        setup()
+        plan = held()
+        self.assertTrue(plan.manual_hold)
+        self.assertEqual((plan.gas_hold, plan.sign_hold), (gas, False))
+        self.assertEqual(self.release_after(GREEN, n=200) is None, gas)
+    with self.subTest('always hold: no banner (user choice), even where green is blocked'):
+      self.setUp()
+      plan = held(always_hold=True)  # no driving history: without Always Hold this is a gas hold
+      self.assertEqual((plan.manual_hold, plan.gas_hold, plan.sign_hold), (True, False, False))
+    with self.subTest('confirmed stop sign: RES banner, not the gas one'):
+      self.setUp()
+      self.approach()
+      for _ in range(4):
+        self.step(speed_mps=3., standstill=False, horizon_m=8., sign=True, dashboard_sign=True)
+      for _ in range(2 * HOLD_TICKS):
+        plan = self.step(sign=True, dashboard_sign=True)
+      self.assertEqual((plan.manual_hold, plan.sign_hold, plan.gas_hold), (True, True, False))
+
+  def test_no_gas_banner_on_a_hold_a_close_lead_expires(self):
+    # an unclassified hold behind a lead within HOLD_LEAD_M ends by itself (hold_expired): it must not ask for the gas
+    for _ in range(40):
+      self.step(speed_mps=5., standstill=False, **dict(RED, horizon_m=20.))
+    for _ in range(3):
+      self.step(speed_mps=1., standstill=False, **dict(RED, horizon_m=3.))
+    lead = dict(light=False, horizon_m=6., raw_model_stopped=True, model_should_stop=True, lead_present=True, lead_distance_m=6.)
+    held = 0
+    for _ in range(120):
+      plan = self.step(**lead)
+      held += plan.manual_hold
+      self.assertFalse(plan.gas_hold)
+    self.assertGreater(held, 10)  # the scenario really holds first
+
+  def test_gas_banner_invariants_fuzzed(self):
+    import random
+    rng = random.Random(7)
+    gas_frames = 0
+    near, far = dict(lead_present=True, lead_distance_m=6.), dict(lead_present=True, lead_distance_m=15.)
+    cues = (RED, CREEP, GREEN, SLOW_GREEN, {}, dict(RED, sign=True), dict(GREEN, sign=True), dict(RED, dashboard_sign=True),
+            dict(RED, **near), dict(GREEN, **near), dict(RED, light=False, **near), dict(RED, **far), dict(GREEN, **far))
+    for trial in range(300):
+      self.setUp()
+      prev = None
+      for _ in range(rng.randrange(20, 200)):
+        moving = rng.random() < 0.3
+        extra = dict(speed_mps=rng.choice((3., 10.)), standstill=False, horizon_m=190., raw_model_stopped=False) if moving else {}
+        cue = dict(rng.choice(cues), **extra)
+        if rng.random() < 0.03:
+          cue['pedal_override'] = True
+        if rng.random() < 0.05:
+          cue['always_hold'] = True
+        plan = self.step(**cue)
+        self.assertFalse(plan.gas_hold and plan.sign_hold, trial)
+        self.assertLessEqual(plan.gas_hold, plan.manual_hold, trial)
+        self.assertLessEqual(plan.sign_hold, plan.manual_hold, trial)
+        # the gas banner is never shown on a hold that then goes by itself
+        if prev is not None and prev.gas_hold and not cue.get('pedal_override') and not moving:
+          self.assertTrue(plan.manual_hold, (trial, 'gas hold released without the gas'))
+          gas_frames += 1
+        prev = plan
+    self.assertGreater(gas_frames, 1000)  # the fuzz really exercises gas holds
+
   def test_gas_still_releases(self):
     self.approach()
     self.hold()

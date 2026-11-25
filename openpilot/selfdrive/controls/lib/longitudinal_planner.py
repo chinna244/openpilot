@@ -877,7 +877,9 @@ class LongitudinalPlanner:
     hold.sourcePlanMonoTime = plan_send.logMonoTime
     hold.modelMonoTime = longitudinalPlan.modelMonoTime
     hold.driveStartMonoTime = self.plan_drive_id
-    hold.forceStopHolding = bool(self.force_stop_plan.manual_hold)
+    # The hold banner: a stop-sign hold waits for RES/gas, a gas hold for the gas; a light hold goes on green by itself
+    hold.forceStopHolding = bool(self.force_stop_plan.sign_hold or self.force_stop_plan.gas_hold)
+    hold.forceStopGasHold = bool(self.force_stop_plan.gas_hold)
     hold.forceStopBraking = bool(self.force_stop_distance_braking and self.force_stop_plan.forcing and
                                 self.force_stop_plan.should_stop)
     hold.forceStopEpisodeMonoTime = self.force_stop_plan.episode_ns

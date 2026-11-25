@@ -142,6 +142,8 @@ class StopPlan:
   resume_override: bool = False
   episode_ns: int = 0
   resume_launch: bool = False
+  sign_hold: bool = False  # manual_hold at a confirmed stop sign: the only hold RES releases and green never does
+  gas_hold: bool = False  # a light/unclassified manual_hold green cannot release (a sign nearby/unknown): only the gas does
 
 
 class ForceStop:
@@ -374,6 +376,12 @@ class ForceStop:
       self.released_here = True
       self._clear_standstill()
     held = self.standstill_reason is not None
+    sign_held = self.standstill_reason == 'sign'
+    # The static half of the green-release gate above: when it blocks, this hold waits for the gas like a sign hold
+    # (an unclassified hold behind a close lead still expires by itself: hold_expired above)
+    gas_held = (self.standstill_reason in ('light', 'unclassified') and not frame.always_hold and
+                (self.standstill_reason == 'light' or no_lead) and
+                (frame.sign or self.sign_confirmed or not frame.sign_clear_m >= GREEN_SIGN_CLEAR_M))
     if not available and not self.forcing:
       self.timer = 0
     elif active and not frame.standstill:
@@ -489,5 +497,7 @@ class ForceStop:
                     max(0.0,self.distance) if self.forcing else 0.0, approach,
                     tune.jerk_scale if self.forcing or approach > 0 else 1.0, bool(held and self.forcing and not overridden),
                     resume_override=now < self.resume_until_ns, episode_ns=self.episode_ns,
-                    resume_launch=now < self.launch_until_ns)
+                    resume_launch=now < self.launch_until_ns,
+                    sign_hold=bool(sign_held and self.forcing and not overridden),
+                    gas_hold=bool(gas_held and self.forcing and not overridden))
 

@@ -88,6 +88,44 @@ class TestForceStopAlert(unittest.TestCase):
       drive.sm['starpilotLongitudinalPlan'].forceStopHolding = True
       self.assertEqual(self.update(drive, cs).alert_text_1, 'Enhanced Stop')
 
+  def test_gas_hold_asks_for_the_accelerator_and_ignores_res(self):
+    drive, cs = fixture()
+    drive.sm['starpilotLongitudinalPlan'].forceStopGasHold = True
+    alert = self.update(drive, cs)
+    self.assertEqual((alert.alert_text_1, alert.alert_text_2), ('Enhanced Stop', 'Press accelerator to proceed'))
+    for pressed in (True, False, True):  # RES cannot release a gas hold, so it must not hide the prompt
+      cs.buttonEvents = [{'type': 'resumeCruise', 'pressed': pressed}]
+      drive.sm.frame += 1
+      drive.aol_car_state_log_ns += 1_000_000
+      self.assertEqual(self.update(drive, cs).alert_text_2, 'Press accelerator to proceed')
+    cs.buttonEvents, cs.gasPressed = [], True
+    drive.sm.frame += 1
+    drive.aol_car_state_log_ns += 1_000_000
+    self.assertEqual(self.update(drive, cs).alert_text_1, '')
+
+  def test_res_in_the_call_where_a_gas_hold_first_arrives_does_not_hide_it(self):
+    drive, cs = fixture()
+    plan = drive.sm['starpilotLongitudinalPlan']
+    plan.forceStopHolding = False
+    self.assertEqual(self.update(drive, cs).alert_text_1, '')
+    cs.buttonEvents = [{'type': 'resumeCruise', 'pressed': True}]  # observed while not held: arms the press edge
+    drive.aol_car_state_log_ns += 1_000_000
+    drive.sm.frame += 1
+    self.update(drive, cs)
+    cs.buttonEvents = [{'type': 'resumeCruise', 'pressed': False}]
+    drive.aol_car_state_log_ns += 1_000_000
+    drive.sm.frame += 1
+    self.update(drive, cs)
+    plan.forceStopHolding = plan.forceStopGasHold = True
+    cs.buttonEvents = [{'type': 'resumeCruise', 'pressed': True}]  # consumed in the same call the gas hold arrives
+    drive.aol_car_state_log_ns += 1_000_000
+    drive.sm.frame += 1
+    self.assertEqual(self.update(drive, cs).alert_text_2, 'Press accelerator to proceed')
+    cs.buttonEvents = []
+    drive.aol_car_state_log_ns += 1_000_000
+    drive.sm.frame += 1
+    self.assertEqual(self.update(drive, cs).alert_text_2, 'Press accelerator to proceed')
+
   def test_press_already_present_at_subscription_does_not_clear_hold(self):
     drive, cs = fixture()
     cs.buttonEvents = [{'type': 'resumeCruise', 'pressed': True}]

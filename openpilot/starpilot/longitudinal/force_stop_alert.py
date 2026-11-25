@@ -14,6 +14,8 @@ class HoldAlertState:
     self.released = False
     self.resume = StopResume()
     self.pair = None
+    self.gas_only = False
+    self.res_pending = False
 
   def active(self, sm, cp, cs, *, enabled, car_ns, car_valid, now_ns):
     if not enabled or not cp.openpilotLongitudinalControl or cp.passive or cp.dashcamOnly or cp.notCar:
@@ -21,6 +23,7 @@ class HoldAlertState:
       self.released = False
       self.resume.reset()
       self.pair = None
+      self.res_pending = False
       return False
     try:
       device = sm['deviceState']
@@ -32,11 +35,14 @@ class HoldAlertState:
       if drive_id != self.drive_id:
         self.drive_id, self.released = drive_id, False
         self.pair = None
+        self.res_pending = False
         self.resume.reset()
       self.resume.observe(SimpleNamespace(logMonoTime=car_ns, valid=car_valid, carState=cs), now_ns=now_ns, drive_id=drive_id)
       resume = self.resume.consume(now_ns=now_ns, drive_id=drive_id, car_ns=car_ns)
-      if cs.gasPressed or resume:
+      if cs.gasPressed:
         self.released = True
+      # RES is judged against the pair it meets below: it cannot release a gas hold
+      self.res_pending = self.res_pending or bool(resume)
       for name in names:
         stamp, received = int(sm.logMonoTime[name]), int(sm.recv_time[name] * 1e9)
         max_age = max(MAX_AGE_NS, int(2.5e9 / SERVICE_LIST[name].frequency))
@@ -54,10 +60,14 @@ class HoldAlertState:
       if source_ns == plan_ns:
         if model_ns != plan.modelMonoTime:
           return False
-        self.pair = (source_ns, model_ns, bool(hold.forceStopHolding))
+        self.pair = (source_ns, model_ns, bool(hold.forceStopHolding), bool(hold.forceStopGasHold))
       # Retain only the last matched, still-fresh pair during staggered delivery.
       if self.pair is None or now_ns - self.pair[0] > MAX_AGE_NS or now_ns - self.pair[1] > MAX_AGE_NS:
         return False
+      self.gas_only = self.pair[3]
+      if self.res_pending:
+        self.res_pending = False
+        self.released = self.released or not self.gas_only
       if not self.pair[2]:
         self.released = False
         return False

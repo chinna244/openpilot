@@ -265,6 +265,7 @@ class ForceStopTests(unittest.TestCase):
       self.assertTrue(plan.forcing)
       self.assertTrue(plan.should_stop)
       self.assertTrue(plan.manual_hold)
+      self.assertFalse(plan.sign_hold)
   def test_moving_stop_hold_without_lead_does_not_expire(self):
     for tick in range(15):
       self.owner.step(frame(tick, horizon_m=30.), self.tune)
@@ -289,6 +290,7 @@ class ForceStopTests(unittest.TestCase):
         held = self.owner.step(frame(0, speed_mps=0., horizon_m=30., raw_model_stopped=True, standstill=True, light=light),
                                self.tune)
         self.assertTrue(held.manual_hold)
+        self.assertFalse(held.sign_hold)  # a light/unclassified hold shows no 'Press RES' banner
         for tick in range(1, 31):
           plan = self.owner.step(frame(tick, speed_mps=.01, horizon_m=30., raw_model_stopped=True, standstill=False,
                                        light=light), self.tune)
@@ -323,9 +325,11 @@ class ForceStopTests(unittest.TestCase):
         for tick in range(15, 415):
           plan = self.owner.step(frame(tick, speed_mps=0., horizon_m=190., light=False, standstill=True), self.tune)
           self.assertTrue(plan.manual_hold)
+          self.assertTrue(plan.sign_hold)
           self.assertTrue(plan.should_stop)
         released = self.owner.step(frame(415, speed_mps=0., horizon_m=190., light=False, standstill=True, **changes), self.tune)
         self.assertEqual(released.manual_hold, not releases)
+        self.assertEqual(released.sign_hold, not releases)
         self.assertEqual(released.forcing, not releases)
         self.assertEqual(released.resume_launch, action == 'RES')  # confirmed sign: only a physical RES launches
         for tick in range(416, 600):
