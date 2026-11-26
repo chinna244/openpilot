@@ -9,8 +9,10 @@ import math
 import platform
 
 from openpilot.cereal import log
+from openpilot.common.hardware.hw import Paths
 from openpilot.common.params import Params
 from openpilot.sunnypilot.mapd.live_map_data.base_map_data import BaseMapData
+from openpilot.sunnypilot.mapd.live_map_data.ramp_end import RampEnd
 from openpilot.sunnypilot.navd.helpers import Coordinate
 
 
@@ -18,6 +20,7 @@ class OsmMapData(BaseMapData):
   def __init__(self):
     super().__init__()
     self.mem_params = Params("/dev/shm/params") if platform.system() != "Darwin" else self.params
+    self.ramp_end = RampEnd(f"{Paths.mapd_root()}/offline")
 
   def update_location(self) -> None:
     location = self.sm['liveLocationKalman']
@@ -62,5 +65,12 @@ class OsmMapData(BaseMapData):
     if next_speed_limit_latitude and next_speed_limit_longitude:
       next_speed_limit_coordinates = Coordinate(next_speed_limit_latitude, next_speed_limit_longitude)
       next_speed_limit_distance = (self.last_position or Coordinate(0, 0)).distance_to(next_speed_limit_coordinates)
+
+    # mapd gives no limit ahead on a freeway ramp that joins its road mid-way or ends in an untagged piece: the limit of
+    # the road the ramp joins (ramp_end.py). Only when mapd gives none, so every limit ahead mapd gives is unchanged
+    if not next_speed_limit > 0. and self.localizer_valid and self.last_position is not None:
+      next_speed_limit, next_speed_limit_distance = self.ramp_end.update(
+        self.last_position.latitude, self.last_position.longitude, self.last_bearing,
+        self.get_current_speed_limit(), self.get_current_road_name())
 
     return next_speed_limit, next_speed_limit_distance

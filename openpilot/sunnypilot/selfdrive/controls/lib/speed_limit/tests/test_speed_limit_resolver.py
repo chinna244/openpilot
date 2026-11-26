@@ -14,7 +14,7 @@ from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit import LIMIT_MAX_MA
 
 from openpilot.common.realtime import DT_MDL
 from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.speed_limit_resolver import SpeedLimitResolver, ALL_SOURCES, CAR_LIMIT_MIN, \
-  LAST_LIMIT_SETTLE, NEW_MAP_WAIT_S, AHEAD_RAISE_S
+  LAST_LIMIT_SETTLE, NEW_MAP_WAIT_S, AHEAD_RAISE_S, AHEAD_TAKE_PAST_M
 from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.common import Policy
 from openpilot.common.test import OpenpilotTestCase
 
@@ -851,3 +851,67 @@ class TestSpeedLimitResolverMapDropout(OpenpilotTestCase):
     self._feed(resolver, mocker, 4., car_limit=0., map_limit=25 * MPH)
     self._feed(resolver, mocker, 1., car_limit=35 * MPH, map_limit=0.)
     assert resolver.source == SpeedLimitSource.car and resolver.speed_limit == 35 * MPH
+
+
+class TestSpeedLimitResolverRampAhead(OpenpilotTestCase):
+  """A lower limit ahead taken on a road with no limit of its own (an exit ramp: the street's limit at its end) holds to the
+  street (AHEAD_TAKE_PAST_M, StarPilot 195d0258da). On a road with a limit of its own nothing changes."""
+
+  def _resolver(self):
+    resolver = SpeedLimitResolver()
+    resolver.policy = Policy.combined
+    resolver.update_params = lambda: None
+    return resolver
+
+  def _feed(self, resolver, mocker, seconds, v_mph, car=50., own=0., ahead=0., ahead_m=0., has_fix=True):
+    for _ in range(max(1, int(seconds / DT_MDL))):
+      resolver.update(v_mph * MPH, gps_sm(mocker, car * MPH, own * MPH, has_fix=has_fix, ahead_limit=ahead * MPH,
+                                          ahead_distance=ahead_m))
+    return round(resolver.speed_limit / MPH)
+
+  def _on_ramp(self, mocker, car=50.):
+    """Off a 50 freeway (car read 50) onto a ramp whose street is 30, 200 m on (inside the braking distance)."""
+    resolver = self._resolver()
+    assert self._feed(resolver, mocker, NEW_MAP_WAIT_S + 4., 57, car=car, own=50) == 50
+    assert self._feed(resolver, mocker, DT_MDL, 57, car=car, ahead=30, ahead_m=200) == 30
+    return resolver
+
+  def test_street_limit_holds_through_a_blank_map_and_a_slowed_car(self, mocker):
+    resolver = self._on_ramp(mocker)
+    assert self._feed(resolver, mocker, .5, 50) == 30  # the ramp's ahead value lost for 0.5 s
+    assert self._feed(resolver, mocker, .5, 25, ahead=30, ahead_m=60) == 30  # slowed below the street limit
+    assert self._feed(resolver, mocker, 1., 20, own=30) == 30  # the street matched
+
+  def test_ends_on_a_new_car_reading(self, mocker):
+    resolver = self._on_ramp(mocker)
+    assert self._feed(resolver, mocker, .5, 40, car=40) == 40
+
+  def test_ends_on_another_limit_ahead(self, mocker):
+    resolver = self._on_ramp(mocker)
+    self._feed(resolver, mocker, 2 * DT_MDL, 45, ahead=35, ahead_m=900)
+    assert resolver._ahead_take is None
+
+  def test_ends_past_the_ramp_end(self, mocker):
+    resolver = self._on_ramp(mocker)
+    metres = 200 + AHEAD_TAKE_PAST_M + 20
+    self._feed(resolver, mocker, metres / (20 * MPH), 20)
+    assert resolver._ahead_take is None
+
+  def test_ends_without_gps(self, mocker):
+    resolver = self._on_ramp(mocker)
+    self._feed(resolver, mocker, DT_MDL, 40, has_fix=False)
+    assert resolver._ahead_take is None
+
+  def test_a_mapped_road_approach_is_not_held(self, mocker):
+    # town: a 35 road with a 25 ahead. The limit ahead is used as before, and nothing is held once it is gone
+    resolver = self._resolver()
+    assert self._feed(resolver, mocker, NEW_MAP_WAIT_S + 4., 38, car=35, own=35) == 35
+    self._feed(resolver, mocker, DT_MDL, 38, car=35, own=35, ahead=25, ahead_m=60)
+    assert resolver._ahead_take is None
+
+  def test_an_untagged_town_street_is_not_held(self, mocker):
+    # a 30 street, then an untagged piece with a 25 ahead: the limit ahead is used as before, nothing is held
+    resolver = self._resolver()
+    assert self._feed(resolver, mocker, NEW_MAP_WAIT_S + 4., 33, car=30, own=30) == 30
+    self._feed(resolver, mocker, DT_MDL, 33, car=30, ahead=25, ahead_m=30)
+    assert resolver._ahead_take is None
