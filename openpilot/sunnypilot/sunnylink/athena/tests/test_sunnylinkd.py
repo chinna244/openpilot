@@ -76,6 +76,19 @@ class TestSunnylinkdMethods(OpenpilotTestCase):
     assert self.saved_params[0][0] == "SpeedLimitOffset"
     assert self.saved_params[0][1] == "10"
 
+  def test_saveParams_plain_text_value_skipped(self):
+    # sunnylink web map download: OsmLocationTitle arrives as plain text, the rest as base64
+    osm_params = {
+      "OsmLocationName": "VVM=",
+      "OsmLocationTitle": "United States",
+      "OsmLocal": "MQ==",
+      "OsmDbUpdatesCheck": "MQ==",
+    }
+
+    sunnylinkd.dispatcher["saveParams"](osm_params, False)
+
+    assert [p[0] for p in self.saved_params] == ["OsmLocationName", "OsmLocal", "OsmDbUpdatesCheck"]
+
   def test_getParamsMetadata_default_big_model(self):
     jetlink = SimpleNamespace(default_model="Cinque Terre V3 Model")
     for chestnut, expected in ((False, "Cinque Terre V3 Model"), (True, DEFAULT_BIG_MODEL)):

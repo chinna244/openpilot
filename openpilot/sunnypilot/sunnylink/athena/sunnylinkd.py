@@ -248,12 +248,17 @@ def getParams(params_keys: list[str], compression: bool = False) -> str | dict[s
     raise
 
 
-@dispatcher.add_method(params_to_update=dict_of(PARAM_KEY, BASE64), compression=boolean)
+@dispatcher.add_method(params_to_update=dict_of(PARAM_KEY, lambda v: isinstance(v, str)), compression=boolean)
 def saveParams(params_to_update: dict[str, str], compression: bool = False) -> None:
   for key, value in params_to_update.items():
     # disallow modifications to blocked parameters
     if key in BLOCKED_PARAMS:
       cloudlog.warning(f"sunnylinkd.saveParams.blocked: Attempted to modify blocked parameter '{key}'")
+      continue
+
+    # skip a value that is not base64 (sunnylink sends OsmLocationTitle as plain text) instead of rejecting the whole call
+    if not BASE64(value):
+      cloudlog.warning(f"sunnylinkd.saveParams.not_base64: skipped parameter '{key}'")
       continue
 
     try:
