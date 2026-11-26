@@ -6,7 +6,7 @@ from unittest import mock
 import pytest
 
 from openpilot.selfdrive.car.cruise import V_CRUISE_UNSET
-from openpilot.starpilot.longitudinal.scc import VisionState
+from openpilot.starpilot.longitudinal.scc import MIN_V, VisionState
 from openpilot.starpilot.longitudinal.scc.zoompilot import vision_controller
 from openpilot.starpilot.longitudinal.scc.zoompilot.vision_controller import SmartCruiseControlVision
 from openpilot.starpilot.longitudinal.scc.tests.vision_harness import VisionCase, make_cp
@@ -53,7 +53,7 @@ class TestLowSpeedCutoff(VisionCase):
     with cutoff(cutoff_mph):
       self.step(13.5, 0.02, 0.02)  # 30 mph into a 50 m curve: a cycle starts
       assert self.scc_v.is_active
-      self.step((cutoff_mph - 3) * MPH, 0.02, 0.02)  # slowed under the cutoff, the rest of the curve is gentle
+      self.step((cutoff_mph - 3) * MPH, 0.02, 0.02, n=25)  # slowed under the cutoff, the rest of the curve is gentle
       assert self.scc_v.state == VisionState.enabled
       assert self.scc_v.output_v_target == V_CRUISE_UNSET
 
@@ -92,5 +92,69 @@ class TestLowSpeedCutoff(VisionCase):
       assert self.scc_v.is_active
       self.step(v, lambda s: tight if s < 4. else 0.03, tight, n=10)
       assert self.scc_v.is_active
-      self.step(v, 0.03, 0.03, n=10)  # out of the peak and gentle ahead: handed back
+      self.step(v, 0.03, 0.03, n=25)  # out of the peak and gentle ahead: handed back after the release time
       assert self.scc_v.state == VisionState.enabled
+
+  @CUTOFFS
+  def test_corner_read_near_the_cap_does_not_flap(self, cutoff_mph):
+    # one threshold switched the cycle on and off every frame for a corner read 2.75/2.85 and its braking never built
+    v = 8.0
+    with cutoff(cutoff_mph):
+      self.step(v, lambda s: 3.2 / v ** 2 if s > 3. else 0.01, 0.01, n=10)
+      assert self.scc_v.is_active
+      for i in range(16):
+        lat = 2.85 if i % 2 else 2.75
+        self.step(v, (lambda k: lambda s: k if s > 3. else 0.01)(lat / v ** 2), 0.01, n=1)
+        assert self.scc_v.is_active
+        assert self.scc_v.output_v_target != V_CRUISE_UNSET
+
+  @CUTOFFS
+  def test_cycle_is_handed_back_once_the_turn_reads_under_the_release(self, cutoff_mph):
+    v = 8.0
+    with cutoff(cutoff_mph):
+      self.step(v, lambda s: 3.2 / v ** 2 if s > 3. else 0.01, 0.01, n=10)
+      assert self.scc_v.is_active
+      gentle = lambda s: 2.4 / v ** 2 if s > 3. else 0.01  # noqa: E731
+      self.step(v, gentle, 0.01, n=10)
+      assert self.scc_v.is_active  # not before _LOW_SPEED_RELEASE_T
+      self.step(v, gentle, 0.01, n=15)
+      assert self.scc_v.state == VisionState.enabled
+      assert self.scc_v.output_v_target == V_CRUISE_UNSET
+
+  @CUTOFFS
+  def test_stock_acc_is_unchanged(self, cutoff_mph):
+    # no openpilot plan to take the turn over on stock ACC: the dash setpoint stays
+    today, cut = SmartCruiseControlVision(make_cp(False)), SmartCruiseControlVision(make_cp(False))
+    today.enabled = cut.enabled = self.scc_v.enabled
+    was_active_under = False
+    for v, k, n in ((13.5, 0.02, 10), ((cutoff_mph - 3) * MPH, 0.02, 30), ((cutoff_mph - 5) * MPH, 0.02, 30)):
+      with cutoff(MIN_V / MPH):
+        self.step(v, k, k, n=n, scc=today)
+      with cutoff(cutoff_mph):
+        self.step(v, k, k, n=n, scc=cut)
+      assert cut.state == today.state
+      assert cut.output_v_target == today.output_v_target
+      was_active_under |= v < cutoff_mph * MPH and today.is_active and k * v ** 2 < 2.5
+    assert was_active_under  # the case the cutoff would have handed back on openpilot long
+
+  @CUTOFFS
+  def test_override_keeps_priority_under_the_cutoff(self, cutoff_mph):
+    v = 8.0
+    with cutoff(cutoff_mph):
+      self.step(v, lambda s: 3.2 / v ** 2 if s > 3. else 0.01, 0.01, n=10)
+      sm = self.make_sm(v, lambda s: 2.0 / v ** 2, 0.01)
+      self.scc_v.update(sm, True, True, v, 0., 30.)
+      assert self.scc_v.state == VisionState.overriding
+      assert self.scc_v.output_v_target == V_CRUISE_UNSET
+
+  @CUTOFFS
+  def test_noisy_reading_around_the_release_does_not_flap(self, cutoff_mph):
+    # a 5%-noisy corner read 2.45/2.55 around the release: one-frame hand-backs flapped the cycle in closed loop
+    v = 8.0
+    with cutoff(cutoff_mph):
+      self.step(v, lambda s: 3.2 / v ** 2 if s > 3. else 0.01, 0.01, n=10)
+      assert self.scc_v.is_active
+      for i in range(40):
+        lat = 2.55 if i % 2 else 2.45
+        self.step(v, (lambda k: lambda s: k if s > 3. else 0.01)(lat / v ** 2), 0.01, n=1)
+        assert self.scc_v.is_active
