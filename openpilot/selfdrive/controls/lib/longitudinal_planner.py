@@ -61,6 +61,16 @@ SLC_BRAKE_ONSET_ACCEL = -0.3  # m/s^2: past this the brakes are engaged and norm
 RESUME_LAUNCH_FADE_JERK = 1.0  # m/s^3: a stop-sign RES launch that ends before the model caught up lets go this gently
 STOP_HOLD_LATCH_MAX_V = 0.3  # m/s: a Force Stop standstill hold outlives a perception reset only while still stopped
 RESUME_LAUNCH_MODEL_BRAKE = -1.0  # m/s^2: the model braking this hard is a new hazard, not its hold at the line (-0.5)
+# Routes 10 241.7 / 0b 199.4: past ~7 mph the model's hold grows to -1.0 (a hazard handback, then a brake in the junction);
+# at ~6 mph it is ~-0.4 and its plan itself asks 5-7 mph (routes 08, 11). Until the model asks to go (this much), the
+# launch holds this speed instead of pushing on; the model let go 5.1-6.6 s after the RES in every logged launch
+RESUME_LAUNCH_HOLD_MPS = 2.7
+RESUME_LAUNCH_MODEL_GO = 0.5  # m/s^2
+# ... or it stops holding back this long (a gentle go; route 10's longest blip of >= 0 in the hold was 0.55 s, every
+# real go passed RESUME_LAUNCH_MODEL_GO 0.3-0.8 s after reaching 0)
+RESUME_LAUNCH_MODEL_GO_S = 1.0
+RESUME_LAUNCH_HOLD_GAIN = 1.5  # (m/s^2)/(m/s) toward the hold speed
+RESUME_LAUNCH_HOLD_MIN = -0.3  # m/s^2: the hold never brakes harder than this
 CONTROL_N_T_IDX = ModelConstants.T_IDXS[:CONTROL_N]
 MIN_ALLOW_THROTTLE_SPEED = 2.5
 NATIVE_ALLOW_THROTTLE_PROBABILITY = 0.4
@@ -268,6 +278,9 @@ class LongitudinalPlanner:
     self.resume_launch_floor: float | None = None
     self.resume_launch_state: str | None = None  # None, 'active', 'fade' or 'done' (until the launch window closes)
     self.resume_launch_model_released = False
+    self.resume_launch_model_go = False  # the model asked RESUME_LAUNCH_MODEL_GO this launch: the plain launch runs on
+    self.resume_launch_holding = False  # holding RESUME_LAUNCH_HOLD_MPS while the model still holds back
+    self.resume_launch_go_s = 0.0  # the model has not held back (>= 0) this long
     self.stop_hold_latched = False
     from openpilot.starpilot.audio.departure_alert import DepartureNotifications
     self.departure_notifications = DepartureNotifications()
@@ -287,10 +300,12 @@ class LongitudinalPlanner:
     raw_accel, raw_stop = float(action.desiredAcceleration), bool(action.shouldStop)
     launch = self.force_stop_plan.resume_launch
     if not launch and self.resume_launch_state == 'active':
-      ended_at_cap = v_ego >= 0.9 * RESUME_LAUNCH_MAX_MPS
+      ended_at_cap = v_ego >= 0.9 * RESUME_LAUNCH_MAX_MPS or self.resume_launch_holding
       self.resume_launch_state = 'fade' if ended_at_cap and self.resume_launch_floor is not None else None
     if launch and self.resume_launch_state is None:
       self.resume_launch_state, self.resume_launch_floor, self.resume_launch_model_released = 'active', None, False
+      self.resume_launch_model_go = self.resume_launch_holding = False
+      self.resume_launch_go_s = 0.0
     elif not launch and self.resume_launch_state == 'done':
       self.resume_launch_state = None
     if self.resume_launch_state == 'active':
@@ -298,6 +313,15 @@ class LongitudinalPlanner:
       hazard = (not clear or raw_accel <= RESUME_LAUNCH_MODEL_BRAKE or
                 self.resume_launch_model_released and raw_stop)
       floor = max(0.2, min(mpc_accel, self.a_cruise))
+      self.resume_launch_go_s = self.resume_launch_go_s + self.dt if raw_accel >= 0. else 0.0
+      self.resume_launch_model_go |= raw_accel >= RESUME_LAUNCH_MODEL_GO or self.resume_launch_go_s >= RESUME_LAUNCH_MODEL_GO_S
+      self.resume_launch_holding = not self.resume_launch_model_go and (self.resume_launch_holding or
+                                                                       v_ego >= RESUME_LAUNCH_HOLD_MPS)
+      if self.resume_launch_holding and not hazard:
+        # never more than the plain launch, never less than the model itself asks
+        hold = min(floor, max(RESUME_LAUNCH_HOLD_MIN, RESUME_LAUNCH_HOLD_GAIN * (RESUME_LAUNCH_HOLD_MPS - v_ego)))
+        self.resume_launch_floor = hold
+        return (model_accel, model_stop) if model_accel >= hold else (hold, False)
       if hazard or raw_accel >= floor:
         self.resume_launch_state, self.resume_launch_floor = 'done', None
         return model_accel, model_stop

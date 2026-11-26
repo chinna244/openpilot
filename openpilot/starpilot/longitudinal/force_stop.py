@@ -38,6 +38,12 @@ QUEUE_MAX_SPEED_MPS = 6.0
 # speed or this time ends it at once.
 RESUME_LAUNCH_NS = 6_000_000_000
 RESUME_LAUNCH_MAX_MPS = 4.5
+# The sign is often beside the car at the line (route 11 147.0: last seen 0.7 m before the stop, RES 148.85): a sign seen
+# within this much driving before the stop is the same evidence as one still seen at the RES
+RESUME_SIGN_RECENT_M = 5.0
+# Such a launch starts while the model's stop flag (frame.light) is still up from the stop itself (route 11: down 1.65 s
+# after the RES); it is not a new light until the flag has dropped once, or after this long
+RESUME_SIGN_LIGHT_GRACE_NS = 2_500_000_000
 # Route 08 t=375.9: stopped at a red light with no lead, the model dropped its stop (a turn desire) and the car rolled.
 # There is no traffic-light state, only the model's stop guess, so an engaged no-lead stop is held until the driver
 # releases it: gas always, RES only at a confirmed stop sign. It is re-armed once the car has moved.
@@ -160,6 +166,9 @@ class ForceStop:
     self.override_until_ns = 0
     self.resume_until_ns = 0
     self.launch_until_ns = 0
+    self.sign_travel_m = math.inf  # driven since the last frame.sign
+    self.launch_recent_sign_ns = 0  # a launch armed by a recent (no longer seen) sign: its start
+    self.launch_stop_dropped = False
     self.released_here = False
     self.green_since_ns = 0
     self.entry_speed = None
@@ -254,7 +263,8 @@ class ForceStop:
       self.reset()
       return StopPlan()
     available = frame.perception_available
-    sign_estimate = self._sign_estimate(frame, now, max(0.0, speed) * dt)
+    self.sign_travel_m = 0.0 if frame.sign else self.sign_travel_m + max(0.0, speed) * dt
+    sign_estimate =self._sign_estimate(frame, now, max(0.0, speed) * dt)
     lead = (frame.lead_present and frame.lead_distance_m < tune.lead_veto_m and frame.lead_speed_mps < speed + 2)
     self._queue_step(frame, now, max(0.0, speed) * dt, lead or frame.tracking_lead)
     if available and (frame.light or frame.raw_model_stopped) or frame.sign or self.queue_line is not None:
@@ -350,13 +360,18 @@ class ForceStop:
       self.standstill_clear_ns > 0 and now - self.standstill_clear_ns >= STANDSTILL_CLEAR_NS)
     if held_before and frame.standstill and frame.res_pressed and self.standstill_reason == 'sign':
       self.resume_until_ns = now + 6_000_000_000
-      if self.standstill_reason == 'sign' and self.sign_confirmed and (frame.sign or not frame.light):
+      recent_sign = not frame.sign and frame.light and self.sign_travel_m <= RESUME_SIGN_RECENT_M
+      if self.standstill_reason == 'sign' and self.sign_confirmed and (frame.sign or not frame.light or recent_sign):
         self.launch_until_ns = now + RESUME_LAUNCH_NS
+        self.launch_recent_sign_ns, self.launch_stop_dropped = (now if recent_sign else 0), False
     if abs(speed) >= 2.0 or frame.lead_present or frame.tracking_lead:
       self.resume_until_ns = 0
+    self.launch_stop_dropped |= not frame.model_should_stop
+    stop_light_grace = (self.launch_recent_sign_ns > 0 and not self.launch_stop_dropped and
+                        now - self.launch_recent_sign_ns < RESUME_SIGN_LIGHT_GRACE_NS)
     # frame.light is any model stop with no lead: while the sign itself is seen it is the sign, not a traffic light
-    if (abs(speed) >= RESUME_LAUNCH_MAX_MPS or frame.lead_present or frame.tracking_lead or frame.light and not frame.sign or
-        not frame.enabled or frame.pedal_override):
+    if (abs(speed) >= RESUME_LAUNCH_MAX_MPS or frame.lead_present or frame.tracking_lead or
+        frame.light and not frame.sign and not stop_light_grace or not frame.enabled or frame.pedal_override):
       self.launch_until_ns = 0
     # A held light, unclassified or manual stop is released by the gas only; RES still releases a confirmed stop-sign
     # hold and, as before, overrides a moving approach (no hold yet)

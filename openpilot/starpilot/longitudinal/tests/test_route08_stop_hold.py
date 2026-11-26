@@ -131,7 +131,8 @@ class PlannerLaunchTests(unittest.TestCase):
     from openpilot.selfdrive.controls.lib.longitudinal_planner import LongitudinalPlanner
     self.fn = LongitudinalPlanner._resume_launch
     self.p = NS(force_stop_plan=StopPlan(resume_launch=True), a_cruise=1.2, dt=.05, resume_launch_state=None,
-                resume_launch_floor=None, resume_launch_model_released=False)
+                resume_launch_floor=None, resume_launch_model_released=False, resume_launch_model_go=False,
+                resume_launch_holding=False, resume_launch_go_s=0.)
 
   def run_(self, v=0., model=-.3, stop=False, mpc=3., clear=True):
     return self.fn(self.p, v, model, stop, mpc, clear, NS(desiredAcceleration=model, shouldStop=stop))
@@ -155,7 +156,8 @@ class PlannerLaunchTests(unittest.TestCase):
     self.assertEqual(self.run_(stop=True), (-.3, True))  # ... and a new stop ends the launch
 
   def test_cap_end_fades_other_ends_do_not(self):
-    self.run_(v=4.4)
+    self.run_(v=1., model=.6)  # the model asks to go: the plain launch runs to the cap
+    self.run_(v=4.4, model=.2)
     self.p.force_stop_plan = StopPlan()
     a, _ = self.run_(v=4.5, model=.2)
     self.assertAlmostEqual(a, 1.2 - .05)
@@ -163,6 +165,107 @@ class PlannerLaunchTests(unittest.TestCase):
     self.run_(v=1.)
     self.p.force_stop_plan = StopPlan()
     self.assertEqual(self.run_(v=1., model=.2)[0], .2)
+
+  def test_holds_6_mph_while_the_model_holds_back(self):  # routes 10 241.7, 0b 199.4
+    self.assertEqual(self.run_(v=2.), (1.2, False))  # below the hold speed: the plain launch
+    self.assertEqual(self.run_(v=2.7), (0., False))
+    self.assertTrue(self.p.resume_launch_holding)
+    self.assertAlmostEqual(self.run_(v=3.4, model=-.6)[0], -.3)  # never brakes harder than -0.3
+    self.assertAlmostEqual(self.run_(v=2.5)[0], .3)  # latched: no plain push again below it
+    self.assertEqual(self.p.resume_launch_state, 'active')
+
+  def test_hold_never_below_the_model_never_above_the_launch(self):
+    self.run_(v=2.7)
+    self.assertEqual(self.run_(v=3., model=.4), (.4, False))  # the model asks more: it gets it
+    self.assertEqual(self.p.resume_launch_state, 'active')
+    self.setUp()
+    self.run_(v=2.7, mpc=.1)
+    self.assertAlmostEqual(self.run_(v=2., mpc=.1)[0], .2)  # capped by the plain launch floor (0.2)
+
+  def test_model_go_resumes_the_plain_launch(self):  # route 0b 127.2: same as before the hold existed
+    self.run_(v=1., model=.6)
+    self.assertEqual(self.run_(v=3.5, model=.8), (1.2, False))
+    self.assertFalse(self.p.resume_launch_holding)
+    self.run_(v=2.7)
+    self.assertEqual(self.run_(v=3.5, model=.9), (1.2, False))  # go from the hold: plain launch again
+    self.assertEqual(self.run_(v=3.5, model=1.3), (1.3, False))
+    self.assertEqual(self.p.resume_launch_state, 'done')
+
+  def test_gentle_go_releases_after_a_second_a_blip_does_not(self):
+    self.run_(v=2.7)
+    for _ in range(11):  # route 10 244.0: 0.55 s at +0.15
+      self.assertEqual(self.run_(v=2.7, model=.15), (.15, False))
+    self.run_(v=2.7)
+    self.assertFalse(self.p.resume_launch_model_go)
+    for _ in range(19):
+      self.run_(v=2.8, model=.4)
+    self.assertTrue(self.p.resume_launch_holding)
+    self.assertEqual(self.run_(v=2.8, model=.4), (1.2, False))  # 1.0 s at +0.4: the plain launch runs on
+    self.assertFalse(self.p.resume_launch_holding)
+
+  def test_hazards_end_the_hold_at_once(self):
+    for kw in ({'clear': False}, {'model': -1.0}):
+      with self.subTest(kw=kw):
+        self.setUp()
+        self.run_(v=2.8)
+        self.assertEqual(self.run_(v=2.8, **kw)[0], kw.get('model', -.3))
+        self.assertEqual(self.p.resume_launch_state, 'done')
+
+  def test_hold_window_end_fades(self):
+    self.run_(v=2.7)
+    self.assertEqual(self.run_(v=2.6)[0], RESUME_HOLD_AT_2_6)
+    self.p.force_stop_plan = StopPlan()
+    self.assertAlmostEqual(self.run_(v=2.6, model=-.5)[0], RESUME_HOLD_AT_2_6 - .05)
+    self.assertEqual(self.p.resume_launch_state, 'fade')
+
+
+class RecentSignLaunchTests(unittest.TestCase):
+  """Route 11 148.8: the sign beside the car at the line, the model's stop still up at the RES."""
+  def setUp(self):
+    self.owner, self.tune = ForceStop(), StopTune()
+
+  def step(self, tick, **changes):
+    return self.owner.step(frame(tick, **changes), self.tune)
+
+  def hold(self, roll_m):
+    for tick in range(20):  # the sign confirmed on the approach
+      self.step(tick, speed_mps=3., standstill=False, horizon_m=8., sign=True, dashboard_sign=True)
+    ticks = round(roll_m / (1. * .05))
+    for tick in range(20, 20 + ticks):  # sign out of view for the last metres
+      self.step(tick, speed_mps=1., standstill=False, horizon_m=4.)
+    tick = 20 + ticks
+    self.assertTrue(self.step(tick, light=True).manual_hold)
+    self.assertEqual(self.owner.standstill_reason, 'sign')
+    return tick + 1
+
+  def test_recent_sign_arms_and_survives_the_stop_flag(self):
+    t = self.hold(1.)
+    self.assertTrue(self.step(t, light=True, resume_requested=True, res_pressed=True).resume_launch)
+    for tick in range(t + 1, t + 30):  # 1.5 s: the stop flag of the stop itself
+      self.assertTrue(self.step(tick, speed_mps=1., standstill=False, light=True).resume_launch)
+    self.assertTrue(self.step(t + 30, speed_mps=1.5, standstill=False, model_should_stop=False).resume_launch)
+    self.assertFalse(self.step(t + 31, speed_mps=1.5, standstill=False, light=True, model_should_stop=False).resume_launch)
+
+  def test_stop_flag_grace_is_bounded(self):
+    t = self.hold(1.)
+    self.assertTrue(self.step(t, light=True, resume_requested=True, res_pressed=True).resume_launch)
+    for tick in range(t + 1, t + 50):  # 2.45 s
+      self.assertTrue(self.step(tick, speed_mps=1., standstill=False, light=True).resume_launch)
+    self.assertFalse(self.step(t + 50, speed_mps=1., standstill=False, light=True).resume_launch)
+
+  def test_sign_seen_further_back_does_not_arm(self):
+    t = self.hold(6.)  # route 11: 0.7 m; 6 m is not the sign at this line
+    plan = self.step(t, light=True, resume_requested=True, res_pressed=True)
+    self.assertTrue(plan.resume_override)  # the RES still releases the hold (0.2 crawl), as before
+    self.assertFalse(plan.resume_launch)
+
+  def test_visible_sign_launch_keeps_its_light_end(self):
+    t = self.hold(1.)
+    self.assertTrue(self.step(t, light=True, sign=True, resume_requested=True, res_pressed=True).resume_launch)
+    self.assertFalse(self.step(t + 1, speed_mps=1., standstill=False, light=True).resume_launch)  # as before
+
+
+RESUME_HOLD_AT_2_6 = min(1.2, max(-.3, 1.5 * (2.7 - 2.6)))
 
 
 if __name__ == '__main__':
