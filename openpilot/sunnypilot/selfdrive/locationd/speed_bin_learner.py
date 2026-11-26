@@ -91,6 +91,12 @@ class SpeedBinLearner:
       self.speed_bin_centers = list(DEFAULT_SPEED_BIN_CENTERS)
 
     n_bins = len(self.speed_bin_bounds)
+    # bins centered below the entry's learn_min_speed (m/s) keep their seed: they take no points,
+    # never fit and never restore a cached value. There the lateral accel is too small beside its
+    # noise to fit a factor, so a fit only drifts (CX-5 2022: 0.87 against a 1.80 seed doubled the
+    # low-speed torque gain and the wheel's wobble). 0 when absent: every bin learns.
+    learn_min_speed = float(cfg.get('learn_min_speed', 0.0))
+    self.speed_bin_frozen = [c < learn_min_speed for c in self.speed_bin_centers]
 
     self.speed_bin_points = [self._make_speed_bin_bucket() for _ in range(n_bins)]
     # a bin with points since its last fit: a full bin's length stops changing while its ring
@@ -140,8 +146,9 @@ class SpeedBinLearner:
       return
     for i, (lo, hi) in enumerate(self.speed_bin_bounds):
       if lo <= vego < hi:
-        self.speed_bin_points[i].add_point(steer, lateral_acc)
-        self._speed_bin_dirty[i] = True
+        if not self.speed_bin_frozen[i]:
+          self.speed_bin_points[i].add_point(steer, lateral_acc)
+          self._speed_bin_dirty[i] = True
         break
 
   @staticmethod
@@ -228,9 +235,10 @@ class SpeedBinLearner:
       bin_ok = (self._within_bounds(cached_lafs, self.speed_bin_lat_accel_factor_bounds)
                 & self._within_bounds(cached_frictions, self.speed_bin_friction_bounds)
                 & np.isfinite(decays))
-      restored = learned & bin_ok
-      if (learned & ~bin_ok).any():
-        cloudlog.warning(f"speed-dep: cached bins {np.flatnonzero(learned & ~bin_ok).tolist()} non-finite or outside sanity bounds, reseeding them")
+      frozen = np.array(self.speed_bin_frozen, dtype=bool)
+      restored = learned & bin_ok & ~frozen
+      if (learned & ~bin_ok & ~frozen).any():
+        cloudlog.warning(f"speed-dep: cached bins {np.flatnonzero(learned & ~bin_ok & ~frozen).tolist()} non-finite or outside sanity bounds, reseeding them")
       # torqued only writes a decay inside this range; the clip guards a hand-edited cache
       decays = np.clip(np.nan_to_num(decays, nan=torqued.MIN_FILTER_DECAY), torqued.MIN_FILTER_DECAY, torqued.MAX_FILTER_DECAY)
       self.speed_bin_learned = restored.tolist()
@@ -240,7 +248,8 @@ class SpeedBinLearner:
       cached_points = self._load_points_cache(cache_sp, n_bins)
       if cached_points is not None:
         for i in range(n_bins):
-          self.speed_bin_points[i].load_points(cached_points[i])
+          if not frozen[i]:
+            self.speed_bin_points[i].load_points(cached_points[i])
       # a bin resumes at its own decay; one on its seed learns from MIN like a fresh one
       self.speed_bin_decays = [float(d) if ok else torqued.MIN_FILTER_DECAY for d, ok in zip(decays, restored, strict=True)]
       for filters, bin_decay in zip(self.speed_bin_filtered, self.speed_bin_decays, strict=True):
@@ -298,7 +307,7 @@ class SpeedBinLearner:
 
     results = []
     for i, bucket in enumerate(self.speed_bin_points):
-      if not bucket.is_valid():
+      if not bucket.is_valid() or self.speed_bin_frozen[i]:
         results.append((i, False))
         continue
 
