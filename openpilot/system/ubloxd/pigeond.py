@@ -162,17 +162,6 @@ def send_time(pigeon: TTYPigeon, t_now: datetime | None = None, acc_s: int = 30)
   ))
   pigeon.send_with_ack(msg, ack=UBLOX_ASSIST_ACK)
 
-def save_almanac(pigeon: TTYPigeon) -> None:
-  # store almanac in flash; send after a controlled GNSS stop (every save while running NACKed, routes 10/11)
-  pigeon.send(b"\xB5\x62\x09\x14\x04\x00\x00\x00\x00\x00\x21\xEC")
-  try:
-    if pigeon.wait_for_ack(ack=UBLOX_SOS_ACK, nack=UBLOX_SOS_NACK):
-      cloudlog.info("Done storing almanac")
-    else:
-      cloudlog.error("Error storing almanac")
-  except TimeoutError:
-    pass
-
 def init_baudrate(pigeon: TTYPigeon):
   # ublox default setting on startup is 9600 baudrate
   pigeon.set_baud(9600)
@@ -292,9 +281,8 @@ def init_pigeon(pigeon: TTYPigeon) -> bool:
 
 def deinitialize_and_exit(pigeon: TTYPigeon | None):
   if pigeon is not None:
+    # no almanac save: this C4's ublox NACKed every UBX-UPD-SOS backup (39/39 since 2026-10-12, never restored)
     pigeon.send(UBLOX_GNSS_STOP)
-    time.sleep(0.1)
-    save_almanac(pigeon)
 
   # turn off power and exit cleanly
   set_power(False)

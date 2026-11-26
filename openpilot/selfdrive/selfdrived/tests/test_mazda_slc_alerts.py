@@ -171,6 +171,94 @@ def test_offer_and_acceptance_chime_once_each_and_the_banner_clears():
   assert all(a == '' for a in shown[331:])   # cleared within 0.1 s of the road change at 3.2 s
 
 
+def _chime_run(cover_from, cover_to, bump_at=None, frames=700):
+  """offer at 0 s, accepted at 1 s (announce 5, 25 mph); optional auto bump (announce 6, 20 mph) at bump_at; a
+  higher-priority silent cover alert ("Changing Lanes") over [cover_from, cover_to). Returns (chimes, shown types)."""
+  from unittest.mock import Mock
+  import numpy as np
+  from openpilot.cereal import log, messaging
+  from openpilot.selfdrive.selfdrived.alertmanager import AlertManager
+  from openpilot.selfdrive.selfdrived.events import Alert, AlertStatus, AlertSize, Priority, VisualAlert
+  from openpilot.selfdrive.ui.soundd import Soundd, sound_list
+  AudibleAlert = log.SelfdriveState.AudibleAlert
+
+  s = Soundd.__new__(Soundd)
+  s.current_alert = s.current_sound = AudibleAlert.none
+  s.current_sound_frame = 0
+  s.current_volume = s.ramp_start_volume = .1
+  s.ramp_start_time = 0.
+  s.pending_stop = False
+  s.selfdrive_timeout_alert = False
+  s.startup_safety_time = None
+  s.hold_applies = True
+  s.loaded_sounds = {key: np.zeros(20, dtype=np.float32) for key in sound_list}
+  s.axis_alerts = Mock(update=Mock(side_effect=lambda sm, alert, now_ns: alert))
+
+  class FakeSM(dict):
+    updated = {'selfdriveState': True}
+    seen = {'pandaStates': False}
+
+  cover = Alert("Changing Lanes", "", AlertStatus.normal, AlertSize.small, Priority.LOW + 1, VisualAlert.none, AudibleAlert.none, .1)
+  cover.alert_type = 'laneChange/warning'
+
+  def state_at(t):
+    if t < 1.:
+      return sla(assistState=PRE_ACTIVE, announceCounter=4, offerTarget=25 * MPH)
+    if bump_at is not None and t >= bump_at:
+      return sla(assistState=ACTIVE, announceCounter=6, vTarget=20 * MPH)
+    return sla(assistState=ACTIVE, announceCounter=5, vTarget=25 * MPH)
+
+  am, sd, chimes, shown = AlertManager(), None, 0, []
+  for frame in range(frames):
+    t = frame / 100.
+    sd = run(state_at(t), 35, sd=sd, now=NOW + int(t * 1e9))
+    alerts = sd.mazda_events.create_alerts([ET.WARNING], [None, cs(35), sd.sm, False, 0, None])
+    if cover_from <= t < cover_to:
+      alerts.append(cover)
+    am.add_many(frame, alerts)
+    am.process_alerts(frame, set())
+    ss = messaging.new_message('selfdriveState')
+    ss.selfdriveState.alertSound = am.current_alert.audible_alert
+    ss.selfdriveState.alertType = am.current_alert.alert_type
+    before = (s.current_alert, s.current_sound_frame)
+    s.get_audible_alert(FakeSM(selfdriveState=ss.selfdriveState, pandaStates=[]))
+    if s.current_alert == AudibleAlert.prompt and s.current_sound_frame == 0 and before != (AudibleAlert.prompt, 0):
+      chimes += 1
+    s.current_sound_frame += 1
+    shown.append((am.current_alert.alert_type.split('/')[0], am.current_alert.alert_text_1))
+  return chimes, shown
+
+
+def test_adjusting_back_after_a_cover_alert_is_silent():
+  """Route 00000013 57.7-62.7 s: "Changing Lanes" covered "Adjusting to" for 4 s; when it ended the banner came back for
+  0.3 s and replayed the chime. The banner still comes back (rest of its 5 s), without a second chime."""
+  chimes, shown = _chime_run(1.6, 5.7)
+  types = [a for a, _ in shown]
+  assert chimes == 2   # the offer and the acceptance only
+  assert set(types[100:160]) == {'slcAdjusting'}
+  assert set(types[165:570]) == {'laneChange'}
+  assert set(types[575:600]) == {'slcAdjusting'}   # back for the rest of its window, silent
+  assert all(a == '' for a in types[612:])
+
+
+def test_new_target_during_a_cover_alert_chimes_when_the_banner_returns():
+  """A limit change applied without a prompt (announce bump, session still active) while the cover is up is a new
+  event: the banner comes back naming the new target, with its chime."""
+  chimes, shown = _chime_run(1.6, 5.7, bump_at=3.0, frames=900)
+  assert chimes == 3
+  assert shown[580] == ('slcAdjusting', 'Adjusting to\n20 mph')
+  assert all(a == '' for a, _ in shown[812:])   # the bump restarted the 5 s window (3.0 + 5)
+
+
+def test_new_target_on_a_shown_banner_does_not_blank_or_chime_it():
+  """Without a cover the bump keeps the banner up on every frame (the skipped frame is bridged by the alert's
+  duration) and stays silent as before: same alert type, same sound."""
+  chimes, shown = _chime_run(99., 99., bump_at=3.0, frames=700)
+  assert chimes == 2
+  assert all(a == 'slcAdjusting' for a, _ in shown[100:600])
+  assert shown[310] == ('slcAdjusting', 'Adjusting to\n20 mph')
+
+
 def test_adjusting_names_the_cap_or_the_set_speed_below_it():
   sd = run(sla(assistState=ACTIVE, vTarget=42 * MPH), 35)
   assert alert(sd, 'slcAdjusting').alert_text_1 == 'Adjusting to\n35 mph'

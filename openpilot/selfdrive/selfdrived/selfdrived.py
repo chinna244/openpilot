@@ -529,7 +529,11 @@ class SelfdriveD:
         return
       if sla.assistState == 2:  # preActive
         self.mazda_events.add('slcConfirmPrompt')
-      if seen is not None and announce != seen:
+      bumped = seen is not None and announce != seen
+      # a bump inside a running window is a new target: skip one frame so AlertManager starts a fresh entry, which
+      # clears sound_once's interrupted flag (a bump while another alert covers the banner chimes when it comes back)
+      restart = bumped and getattr(self, 'mazda_sla_adjust_since_ns', None) is not None
+      if bumped:
         self.mazda_sla_adjust_since_ns = now_ns
       # "Adjusting to" for 5 s from the acceptance, raised each frame only while that session is still adapting (4) or
       # active (5): a road change (inactive) or a new offer (preActive) ends it at once. A refresh never restarts the
@@ -537,7 +541,8 @@ class SelfdriveD:
       since = getattr(self, 'mazda_sla_adjust_since_ns', None)
       if since is not None:
         if sla.sessionValid and sla.assistState in (4, 5) and 0 <= now_ns - since < SLC_ADJUST_SHOW_NS:
-          self.mazda_events.add('slcAdjusting')
+          if not restart:
+            self.mazda_events.add('slcAdjusting')
         else:
           self.mazda_sla_adjust_since_ns = None
     except (AttributeError, KeyError, TypeError, ValueError):
