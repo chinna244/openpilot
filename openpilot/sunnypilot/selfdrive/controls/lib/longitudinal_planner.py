@@ -14,8 +14,6 @@ from opendbc.car import structs
 from opendbc.car.interfaces import ACCEL_MAX
 from openpilot.common.constants import CV
 from openpilot.common.realtime import DT_MDL
-from openpilot.common.gps import get_gps_location_service
-from openpilot.common.params import Params
 from openpilot.common.swaglog import cloudlog
 from openpilot.selfdrive.car.cruise import V_CRUISE_MAX
 from openpilot.selfdrive.controls.lib.drive_helpers import CONTROL_N, get_accel_from_plan
@@ -29,7 +27,6 @@ from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.assist_mirror impor
 from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.helpers import pcm_machine_owns_sla
 from openpilot.sunnypilot.selfdrive.car.intelligent_cruise_button_management.icbm_latch import icbm_active
 from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.speed_limit_assist_zp import SpeedLimitAssistZP
-from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.ramp_resolver import NO_OFFER, RampAdvisoryResolver, camera_sample
 from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.speed_limit_resolver import SpeedLimitResolver
 from openpilot.sunnypilot.selfdrive.selfdrived.events import EventsSP
 from openpilot.sunnypilot.models.helpers import get_active_bundle
@@ -55,9 +52,6 @@ class LongitudinalPlannerSP:
     self.CP = CP
     self.CP_SP = CP_SP
     self.resolver = SpeedLimitResolver(CP)
-    self.ramp_advisory = RampAdvisoryResolver()
-    self.ramp_offer = NO_OFFER
-    self.ramp_gps_service = get_gps_location_service(Params()) if self.ramp_advisory.binder is not None else None
     # cars whose setpoint only the driver can move run the SLA machine here; everywhere
     # else it runs in card (the cruise arbiter, next to the buttons and the setpoint) and
     # gets mirrored (speed_limit.helpers.pcm_machine_owns_sla). On Mazda alpha long the owner
@@ -103,25 +97,6 @@ class LongitudinalPlannerSP:
     if sla is not self.sla:
       sla.reset()
       self.sla = sla
-    if self.ramp_gps_service is not None:
-      gps = self.ramp_gps_service
-      now = sm.logMonoTime['modelV2'] * 1e-9
-      pose = None
-      if sm.valid.get(gps, False):
-        fix = sm[gps]
-        pose = (sm.logMonoTime[gps] * 1e-9, fix.latitude, fix.longitude, fix.speed,
-                fix.bearingDeg, fix.horizontalAccuracy, fix.hasFix)
-      sign = None
-      if sm.valid.get('customReserved10', False):
-        vision = sm['customReserved10']
-        if vision.rampAdvisoryMonoTime:
-          sign = vision.rampAdvisoryMonoTime * 1e-9, vision.rampAdvisoryMph, vision.rampAdvisorySide
-      self.ramp_offer = self.ramp_advisory.update(
-        now, pose, sign, CS.vEgo, v_cruise_cluster,
-        long_enabled and not long_override and sla is self.sla_mirror,
-        self.resolver.speed_limit if self.resolver.speed_limit_valid else 0.,
-        camera_sample(now, sm['modelV2']) if self.ramp_advisory.bound else None,
-      )
     self.sla_mirror.session = sm['carStateSP'].zoompilot.cruiseSession
     has_speed_limit = self.resolver.speed_limit_valid or self.resolver.speed_limit_last_valid
     self.sla.update(long_enabled, long_override, v_ego, a_ego, v_cruise_cluster, self.resolver.speed_limit,
@@ -239,7 +214,6 @@ class LongitudinalPlannerSP:
 
     # Speed Limit
     speedLimit = longitudinalPlanSP.speedLimit
-    speedLimit.rampSpeed, speedLimit.rampId, speedLimit.rampExpiresMonoTime = self.ramp_offer
     resolver = speedLimit.resolver
     resolver.speedLimit = float(self.resolver.speed_limit)
     resolver.speedLimitLast = float(self.resolver.speed_limit_last)

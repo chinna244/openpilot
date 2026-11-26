@@ -37,8 +37,6 @@ from openpilot.common.constants import CV
 from openpilot.common.hardware import PC
 from openpilot.common.realtime import set_core_affinity
 from openpilot.common.swaglog import cloudlog
-from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.ramp_map import RAMP_GRAPH_PATH
-from openpilot.sunnypilot.speed_limit_vision.ramp_sign import RampSignReader
 
 SERVICE = "customReserved10"
 SEND_INTERVAL = 0.2  # s, customReserved10 at 5 Hz
@@ -584,9 +582,6 @@ class SpeedLimitVisionDaemon:
     self.parked_prev = False
 
     self.history: deque[HistoryEntry] = deque()
-    self.ramp_reader = RampSignReader()
-    self.ramp_scan_at = -float("inf")
-    self.ramp_graph_available = RAMP_GRAPH_PATH.is_file()
     self.published_speed_limit_mph = 0
     self.published_confidence = 0.0
     self.previous_published_speed_limit_mph = 0
@@ -2234,13 +2229,13 @@ class SpeedLimitVisionDaemon:
     dusk_value = max(SCHOOL_DUSK_VALUE_MIN, SCHOOL_DUSK_VALUE_OF_BODY * float(np.median(body_hsv[:, :, 2])))
     return plaque(90, 60) or plaque(dusk_sat, dusk_value)
 
-  def _classify_speed_limit_from_model(self, sign_crop, *, advisory=False):
+  def _classify_speed_limit_from_model(self, sign_crop):
     if self.classifier_net is None or sign_crop.size == 0:
       return None
     if self._center_blue_ratio(sign_crop) > SIGN_CENTER_BLUE_MAX:
       return None
     now = time.monotonic()
-    school_zone = not advisory and self._is_school_zone_sign(sign_crop)
+    school_zone = self._is_school_zone_sign(sign_crop)
 
     speed_class_count = len(US_CLASSIFIER_SPEED_VALUES)
 
@@ -2291,7 +2286,7 @@ class SpeedLimitVisionDaemon:
         self._clear_detection()
       return None
     school_value, school_until = getattr(self, "school_zone_read", (0, 0.))
-    if not advisory and speed_limit == school_value and now < school_until:
+    if speed_limit == school_value and now < school_until:
       return None  # the same school sign with its plaque cropped off
 
     return speed_limit, confidence
@@ -3215,9 +3210,6 @@ class SpeedLimitVisionDaemon:
       out.stopImageHeight = height
       out.stopConfidences = [float(score) for score, _ in boxes]
       out.stopBoxes = [int(v) for _, box in boxes for v in box]
-    observation = self.ramp_reader.observation
-    if observation is not None and 0 <= time.monotonic_ns() - observation[0] < 2_000_000_000:
-      out.rampAdvisoryMonoTime, out.rampAdvisoryMph, out.rampAdvisorySide = observation
     self.pm.send(SERVICE, msg)
 
   def run(self):
@@ -3257,8 +3249,6 @@ class SpeedLimitVisionDaemon:
           self._disconnect_camera()
         self.last_road_name = ""
         self.road_name = RoadName()
-        if getattr(self, "ramp_graph_available", False):
-          self.ramp_reader = RampSignReader()
         self.started_prev = False
         self.parked_prev = False
         self.current_frame_bgr = None
@@ -3320,11 +3310,7 @@ class SpeedLimitVisionDaemon:
       track_due = self._track_classification_due(now)
       detector_interval = self._detector_interval(inference_interval)
       detector_due = now - self.last_inference_at >= detector_interval
-      ramp_due = (getattr(self, "ramp_graph_available", False) and not self.is_metric and self.classifier_net is not None
-                  and self.memory_pressure_state not in ("pressure", "critical")
-                  and not self.last_cpu_busy and self.sm.valid.get("carState", False)
-                  and self.sm["carState"].vEgo >= 40 * CV.MPH_TO_MS and now - self.ramp_scan_at >= .13)
-      if not track_due and not detector_due and not ramp_due:
+      if not track_due and not detector_due:
         self.interval_skip_count += 1
         if self.last_cpu_busy:
           self.busy_skip_count += 1
@@ -3361,10 +3347,6 @@ class SpeedLimitVisionDaemon:
 
       self.current_frame_bgr = frame_bgr
 
-      if ramp_due and self.frame_meta is not None:
-        self.ramp_scan_at = now
-        self.ramp_reader.update(frame_bgr, self.frame_meta[1] or self.frame_meta[0],
-                                lambda crop: self._classify_speed_limit_from_model(crop, advisory=True))
       if detector_due:
         self.detector_inference_count += 1
         self.last_inference_at = now
@@ -3373,10 +3355,8 @@ class SpeedLimitVisionDaemon:
           self.stop_sample = (self.frame_meta, sorted(self.pass_stop_boxes, reverse=True)[:4])
         self.stop_followup = bool(getattr(self, "force_stop_enabled", False) and self.pass_stop_boxes)
         self._start_latest_detector_track(frame_bgr, now)
-      elif track_due:
-        detection = self._classify_proposal_track(frame_bgr, now)
       else:
-        detection = None
+        detection = self._classify_proposal_track(frame_bgr, now)
       self.last_frame_process_duration_s = time.monotonic() - inference_started_at
       if detection is not None:
         self.detection_count += 1

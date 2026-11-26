@@ -266,9 +266,10 @@ struct LongitudinalPlanSP @0xf35cc4560bbf6ec2 {
   struct SpeedLimit {
     resolver @0 :Resolver;
     assist @1 :Assist;
-    rampSpeed @2 :Float32;  # confirmed ramp advisory in m/s, without the posted-limit offset
-    rampId @3 :UInt64;
-    rampExpiresMonoTime @4 :UInt64;
+    # ramp advisory offers (reverted 2026-11-26); kept so the ordinals are never reused
+    rampSpeedDEPRECATED @2 :Float32;
+    rampIdDEPRECATED @3 :UInt64;
+    rampExpiresMonoTimeDEPRECATED @4 :UInt64;
 
     struct Resolver {
       speedLimit @0 :Float32;
@@ -513,9 +514,10 @@ struct CustomReserved10 @0xcb9fd56c7057593a {
   stopImageHeight @13 :UInt16;
   stopConfidences @14 :List(Float32);  # up to 4 boxes, >= 0.6
   stopBoxes @15 :List(Int32);          # x1, y1, x2, y2 per box, frame pixels
-  rampAdvisoryMph @16 :UInt8;
-  rampAdvisorySide @17 :Int8;
-  rampAdvisoryMonoTime @18 :UInt64;
+  # ramp advisory sign reads (reverted 2026-11-26); kept so the ordinals are never reused
+  rampAdvisoryMphDEPRECATED @16 :UInt8;
+  rampAdvisorySideDEPRECATED @17 :Int8;
+  rampAdvisoryMonoTimeDEPRECATED @18 :UInt64;
 }
 
 struct CustomReserved11 @0xc2243c65e0340384 {
@@ -718,7 +720,7 @@ struct CarStateZP @0xc879af11c43cb400 {
     vCap @1 :Float32;
     lastIntent @2 :CruiseIntent;
     announceCounter @3 :UInt32;     # bumps when an activation must raise the alert
-    rampPromptSpeed @4 :Float32;     # m/s, zero unless the driver can accept a ramp offer
+    rampPromptSpeedDEPRECATED @4 :Float32;  # ramp advisory offers (reverted 2026-11-26); kept so the ordinals stay
     # m/s, the arbiter's target (limit + offset) a prompt press is judged against; it follows the limit as it
     # settles (LIMIT_SETTLE), also mid-prompt. Zero without a limit or arbiter (pcm SLA machine). The prompt
     # text and arrow name this, not the resolver's live value.

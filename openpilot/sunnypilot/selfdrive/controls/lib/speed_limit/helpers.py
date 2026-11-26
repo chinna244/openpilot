@@ -75,19 +75,9 @@ def set_speed_limit_assist_availability(CP: car.CarParams, CP_SP: custom.CarPara
   return allowed
 
 
-def ramp_prompt_speed(sm) -> float:
-  try:
-    return float(sm['carStateSP'].zoompilot.cruiseSession.rampPromptSpeed)
-  except (KeyError, AttributeError):
-    return 0.
-
-
 def prompt_target(sm) -> float:
-  """m/s the confirm prompt names: a ramp offer, else the arbiter's target (what a press is judged against),
-  else (pcm machine or no arbiter limit) the resolver's speedLimitFinalLast."""
-  ramp = ramp_prompt_speed(sm)
-  if ramp:
-    return ramp
+  """m/s the confirm prompt names: the arbiter's target (what a press is judged against), else (pcm machine or no
+  arbiter limit) the resolver's speedLimitFinalLast."""
   try:
     offer = float(sm['carStateSP'].zoompilot.cruiseSession.offerTarget)
   except (KeyError, AttributeError):

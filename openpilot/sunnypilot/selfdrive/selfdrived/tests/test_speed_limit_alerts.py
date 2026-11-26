@@ -19,7 +19,7 @@ from openpilot.sunnypilot.selfdrive.selfdrived.events_base import ET, AlertSize
 EventNameSP = custom.OnroadEventSP.EventName
 
 
-def _alert(event, target: float, set_speed: float, metric: bool = False, pcm_long: bool = False, adapting: bool = False, ramp: float = 0., offer: float = 0.):
+def _alert(event, target: float, set_speed: float, metric: bool = False, pcm_long: bool = False, adapting: bool = False, offer: float = 0.):
   """target and set_speed in display units; the resolver carries m/s, carState kph."""
   to_ms = CV.KPH_TO_MS if metric else CV.MPH_TO_MS
   lp_sp = messaging.new_message('longitudinalPlanSP').longitudinalPlanSP
@@ -32,7 +32,6 @@ def _alert(event, target: float, set_speed: float, metric: bool = False, pcm_lon
     'controlsState': messaging.new_message('controlsState').controlsState,
     'carStateSP': messaging.new_message('carStateSP').carStateSP,
   }
-  sm['carStateSP'].zoompilot.cruiseSession.rampPromptSpeed = ramp * to_ms
   sm['carStateSP'].zoompilot.cruiseSession.offerTarget = offer * to_ms
   CP = structs.CarParams()
   CP.openpilotLongitudinalControl = pcm_long
@@ -52,9 +51,6 @@ class TestPreActivePrompt:
   def test_names_the_target(self, mici, set_speed, text):
     assert _alert(EventNameSP.speedLimitPreActive, 45, set_speed).alert_text_1 == text
 
-  def test_ramp_names_the_unoffset_advisory(self, mici):
-    assert _alert(EventNameSP.speedLimitPreActive, 75, 70, ramp=50).alert_text_1 == "Press - for\n50 mph"
-
   def test_metric(self, mici):
     assert _alert(EventNameSP.speedLimitPreActive, 80, 100, metric=True).alert_text_1 == "Press - for\n80 km/h"
 
@@ -66,9 +62,6 @@ class TestPreActivePrompt:
   ])
   def test_names_the_open_offer(self, mici, live, set_speed, offer, text):
     assert _alert(EventNameSP.speedLimitPreActive, live, set_speed, offer=offer).alert_text_1 == text
-
-  def test_ramp_offer_outranks_the_session_offer(self, mici):
-    assert _alert(EventNameSP.speedLimitPreActive, 75, 70, ramp=50, offer=75).alert_text_1 == "Press - for\n50 mph"
 
   def test_no_session_offer_names_the_resolver(self, mici):
     assert _alert(EventNameSP.speedLimitPreActive, 45, 40, offer=0).alert_text_1 == "Press + for\n45 mph"
