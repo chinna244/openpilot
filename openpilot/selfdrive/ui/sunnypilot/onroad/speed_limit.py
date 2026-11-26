@@ -10,7 +10,7 @@ from enum import StrEnum
 import raylib_nb as rl
 
 from openpilot.cereal import custom
-from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.helpers import ramp_prompt_speed
+from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.helpers import prompt_target
 from openpilot.common.constants import CV
 from openpilot.selfdrive.ui.onroad.hud_renderer import UI_CONFIG
 from openpilot.selfdrive.ui.ui_state import ui_state
@@ -73,7 +73,7 @@ class SpeedLimitAlertRenderer:
 
     if icon_alpha > 0:
       speed_conv = CV.MS_TO_KPH if ui_state.is_metric else CV.MS_TO_MPH
-      speed_limit_final_last = ramp_prompt_speed(ui_state.sm) or ui_state.sm['longitudinalPlanSP'].speedLimit.resolver.speedLimitFinalLast
+      speed_limit_final_last = prompt_target(ui_state.sm)
 
       v_cruise_cluster = ui_state.sm['carState'].vCruiseCluster
       set_speed = ui_state.sm['controlsState'].deprecated.vCruise if v_cruise_cluster == 0.0 else v_cruise_cluster

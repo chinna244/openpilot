@@ -493,3 +493,48 @@ class TestPromptFreezeOvershoot:
     loop.run(0.5)
     assert loop.sla.state == SlaState.preActive
     assert loop.sla.v_cap < 45 * MPH_MS, f"active-session hold released: {loop.sla.v_cap}"
+
+
+class TestOfferTarget:
+  @staticmethod
+  def _offer(loop):
+    from openpilot.cereal import custom
+    msg = custom.CarStateSP.new_message()
+    loop.helper.cruise_arbiter.fill_msg(msg)
+    return msg.zoompilot.cruiseSession.offerTarget
+
+  def test_names_the_offer_and_keeps_it_past_the_prompt(self):
+    """The prompt text/arrow read offerTarget: the limit the arbiter judges a press against. It stays set after the
+    confirm (the 20 Hz alert and the arrow fade outlive the prompt) and is zero only without a limit."""
+    loop = Loop(baseline_mph=48, seed=22)
+    assert self._offer(loop) == 0.
+    loop.limit_mph = 40
+    loop.run(2.0)
+    assert loop.sla.state == SlaState.preActive
+    assert self._offer(loop) == pytest.approx(40 * MPH_MS, abs=0.05)
+    loop.driver_press(ButtonType.decelCruise, in_seconds=0.1)
+    loop.run(1.0)
+    assert loop.sla.state == SlaState.active
+    assert self._offer(loop) == pytest.approx(40 * MPH_MS, abs=0.05)
+
+  def test_a_live_value_shorter_than_the_settle_is_not_named(self, monkeypatch):
+    """The resolver's value moving for less than LIMIT_SETTLE mid-prompt does not move the offer (route 86 t=857)."""
+    from openpilot.sunnypilot.selfdrive.car import cruise_arbiter
+    monkeypatch.setattr(cruise_arbiter, "LIMIT_SETTLE", 2.)  # conftest turns it off for session tests
+    loop = Loop(baseline_mph=48, seed=22)
+    loop.limit_mph = 40
+    loop.run(2.5)
+    assert loop.sla.state == SlaState.preActive
+    loop.limit_mph = 30
+    loop.run(0.8)
+    assert loop.sla.state == SlaState.preActive
+    assert self._offer(loop) == pytest.approx(40 * MPH_MS, abs=0.05)
+
+  def test_follows_a_new_offer(self):
+    """A rise mid-session opens a new offer: offerTarget names the new limit, not the one just confirmed."""
+    loop = Loop(baseline_mph=48, seed=22)
+    settle_in_zone(loop, limit=40)
+    loop.limit_mph = 45
+    loop.run(2.0)
+    assert loop.sla.state == SlaState.preActive
+    assert self._offer(loop) == pytest.approx(45 * MPH_MS, abs=0.05)

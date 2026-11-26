@@ -719,6 +719,10 @@ struct CarStateZP @0xc879af11c43cb400 {
     lastIntent @2 :CruiseIntent;
     announceCounter @3 :UInt32;     # bumps when an activation must raise the alert
     rampPromptSpeed @4 :Float32;     # m/s, zero unless the driver can accept a ramp offer
+    # m/s, the arbiter's target (limit + offset) a prompt press is judged against; it follows the limit as it
+    # settles (LIMIT_SETTLE), also mid-prompt. Zero without a limit or arbiter (pcm SLA machine). The prompt
+    # text and arrow name this, not the resolver's live value.
+    offerTarget @5 :Float32;
 
     enum CruiseIntent {
       none @0;

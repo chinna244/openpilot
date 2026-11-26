@@ -564,6 +564,11 @@ class CruiseArbiter:
     session = cs_sp.zoompilot.cruiseSession
     session.state = SessionState.preActive if self._ramp_prompt is not None else self.state
     session.rampPromptSpeed = self._ramp_prompt[1] if self._ramp_prompt is not None else 0.
+    # the target the arbiter judges a press against: the resolver's live value can move (or flip direction) while the
+    # prompt is up (routes 55/6a/76/79/82/86, e.g. 86 t=857 'Press + for 64' then 'Press - for 29'). Published whenever
+    # the arbiter has a limit, not only while prompting: the alert (20 Hz events) and the arrow's fade outlive the
+    # prompt by a frame or more and must not fall back to the live value then (review 2026-11-26)
+    session.offerTarget = float(self._slf) if self._has_limit else 0.
     session.vCap = float(self.v_cap)
     session.lastIntent = self.last_intent
     session.announceCounter = self.announce_counter
