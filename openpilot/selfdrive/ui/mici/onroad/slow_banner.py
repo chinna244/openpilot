@@ -123,7 +123,7 @@ class SlowBanner(Widget):
 
   def _update_state(self) -> None:
     sm = ui_state.sm
-    if sm.recv_frame['carControl'] < ui_state.started_frame:
+    if not ui_state.received_since_started('carControl'):
       self._filter = SlowReasonFilter()
       self._alpha_filter.x = 0.0
       self._text = ''
