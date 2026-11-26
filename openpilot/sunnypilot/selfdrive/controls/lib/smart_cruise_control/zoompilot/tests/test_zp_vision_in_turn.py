@@ -19,6 +19,18 @@ from openpilot.sunnypilot.selfdrive.controls.lib.smart_cruise_control.zoompilot 
 from openpilot.sunnypilot.selfdrive.controls.lib.smart_cruise_control.zoompilot.vision_controller import SmartCruiseControlVision
 from openpilot.sunnypilot.selfdrive.controls.lib.smart_cruise_control.zoompilot.tests.vision_harness import VisionCase, make_cp
 
+
+@pytest.fixture(autouse=True)
+def _mechanism_without_low_speed_cutoff():
+  """These turns run at 14-18 mph. Under the 20 mph low-speed cutoff (route 08) a turn below _FLOOR_TURN_LAT_CAP is the
+  plan's; the mechanism tested here still runs above the cutoff, so it is pinned to the pre-cutoff behaviour. The
+  cutoff has its own tests (test_zp_vision_low_speed_cutoff.py)."""
+  from unittest import mock
+  from openpilot.sunnypilot.selfdrive.controls.lib.smart_cruise_control import MIN_V
+  from openpilot.sunnypilot.selfdrive.controls.lib.smart_cruise_control.zoompilot import vision_controller as _vc
+  with mock.patch.object(_vc, 'LOW_SPEED_CUTOFF', MIN_V):
+    yield
+
 A_MIN = vision_controller._IN_TURN_A_MIN
 SIDES = pytest.mark.parametrize("side", [1., -1.], ids=["left", "right"])
 V_CRUISE = 20.
