@@ -97,3 +97,49 @@ class TestLowSpeedCutoff(VisionCase):
       assert self.scc_v.is_active
       self.step(v, 0.03, 0.03, n=10)  # out of the peak and gentle ahead: handed back
       assert self.scc_v.state == VisionState.enabled
+
+  @CUTOFFS
+  def test_corner_read_near_the_cap_does_not_flap(self, cutoff_mph):
+    # one threshold switched the cycle on and off every frame for a corner read 2.75/2.85 and its braking never built
+    v = 8.0
+    with cutoff(cutoff_mph):
+      self.step(v, lambda s: 3.2 / v ** 2 if s > 3. else 0.01, 0.01, n=10)
+      assert self.scc_v.is_active
+      for i in range(16):
+        lat = 2.85 if i % 2 else 2.75
+        self.step(v, (lambda k: lambda s: k if s > 3. else 0.01)(lat / v ** 2), 0.01, n=1)
+        assert self.scc_v.is_active
+        assert self.scc_v.output_v_target != V_CRUISE_UNSET
+
+  @CUTOFFS
+  def test_cycle_is_handed_back_once_the_turn_reads_under_the_release(self, cutoff_mph):
+    v = 8.0
+    with cutoff(cutoff_mph):
+      self.step(v, lambda s: 3.2 / v ** 2 if s > 3. else 0.01, 0.01, n=10)
+      assert self.scc_v.is_active
+      self.step(v, lambda s: 2.4 / v ** 2 if s > 3. else 0.01, 0.01)
+      assert self.scc_v.state == VisionState.enabled
+      assert self.scc_v.output_v_target == V_CRUISE_UNSET
+
+  @CUTOFFS
+  def test_stock_acc_is_unchanged(self, cutoff_mph):
+    # no openpilot plan to take the turn over on stock ACC: the dash setpoint stays
+    today, cut = SmartCruiseControlVision(make_cp(False)), SmartCruiseControlVision(make_cp(False))
+    today.enabled = cut.enabled = self.scc_v.enabled
+    for v, k in ((13.5, 0.02), (9.0, 0.025), (7.0, 0.04), (6.0, 0.05)):
+      with cutoff(MIN_V / MPH):
+        self.step(v, k, k, scc=today)
+      with cutoff(cutoff_mph):
+        self.step(v, k, k, scc=cut)
+      assert cut.state == today.state
+      assert cut.output_v_target == today.output_v_target
+
+  @CUTOFFS
+  def test_override_keeps_priority_under_the_cutoff(self, cutoff_mph):
+    v = 8.0
+    with cutoff(cutoff_mph):
+      self.step(v, lambda s: 3.2 / v ** 2 if s > 3. else 0.01, 0.01, n=10)
+      sm = self.make_sm(v, lambda s: 2.0 / v ** 2, 0.01)
+      self.scc_v.update(sm, True, True, v, 0., 30.)
+      assert self.scc_v.state == VisionState.overriding
+      assert self.scc_v.output_v_target == V_CRUISE_UNSET

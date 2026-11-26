@@ -130,6 +130,9 @@ _FLOOR_TURN_PROJ_T = 1.0  # s
 # at 21-25 mph to the plan. 98 filter-dev drives: 25 removed 1 s more dip but dropped braking into 5 turns that peaked
 # 3.0-4.6 m/s2 within 5 s, so 20.
 LOW_SPEED_CUTOFF = 20 * 0.44704  # m/s
+# A cycle under the cutoff starts at _FLOOR_TURN_LAT_CAP but is kept until both readings fall below this: with one
+# threshold a corner read near the cap switched the cycle on and off every frame and its braking never built.
+_LOW_SPEED_RELEASE_LAT = 2.5  # m/s2
 
 # In-turn braking (openpilot long, town speed). Through an intersection corner the near field still reads the bend
 # the car is in, and the solver held -1.2 until the exit, where this driver was already back on the gas (13 of 22
@@ -349,10 +352,14 @@ class SmartCruiseControlVision(VisionProfile, UpstreamVision):
           self.current_lat_acc >= _FLOOR_TURN_LAT_ACC):
       self.floor_turn = True
 
-  def _tight_turn(self) -> bool:
-    """Under the low-speed cutoff only a turn at or past _FLOOR_TURN_LAT_CAP, now or past the actuation lead, keeps
-    (or may start) a cycle: the plan never takes over a car already at the cap mid-corner."""
-    return self.lat_ahead >= _FLOOR_TURN_LAT_CAP or self.current_lat_acc >= _FLOOR_TURN_LAT_CAP
+  def _under_cutoff(self) -> bool:
+    """openpilot long only: on stock ACC there is no plan to take the turn over, so the dash setpoint stays."""
+    return self.limits.op_long and LOW_SPEED_CUTOFF > MIN_V and self.v_ego < LOW_SPEED_CUTOFF
+
+  def _tight_turn(self, lat: float = _FLOOR_TURN_LAT_CAP) -> bool:
+    """Under the low-speed cutoff only a turn at or past _FLOOR_TURN_LAT_CAP, now or past the actuation lead, may start
+    a cycle, and one at or past _LOW_SPEED_RELEASE_LAT keeps it: the plan never takes over a car near the cap mid-corner."""
+    return self.lat_ahead >= lat or self.current_lat_acc >= lat
 
   def _update_state_machine(self) -> tuple[bool, bool]:
     self._update_floor_turn()
@@ -366,7 +373,7 @@ class SmartCruiseControlVision(VisionProfile, UpstreamVision):
       else:
         if self.state == VisionState.enabled:
           # Do not start a turn-control cycle below the operating speed.
-          if self.v_ego <= MIN_V or self.v_ego < LOW_SPEED_CUTOFF and not self._tight_turn():
+          if self.v_ego <= MIN_V or self._under_cutoff() and not self._tight_turn():
             pass
           elif self.solver_active and not self.floor_turn:
             self.state = VisionState.entering
@@ -375,7 +382,7 @@ class SmartCruiseControlVision(VisionProfile, UpstreamVision):
           if not self.long_override:
             self.state = VisionState.enabled
 
-        elif LOW_SPEED_CUTOFF > MIN_V and self.v_ego < LOW_SPEED_CUTOFF and not self._tight_turn():
+        elif self._under_cutoff() and not self._tight_turn(_LOW_SPEED_RELEASE_LAT):
           self.state = VisionState.enabled  # under the cutoff the plan owns the turn
 
         elif self.state == VisionState.entering:
