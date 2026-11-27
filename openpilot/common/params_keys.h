@@ -311,11 +311,14 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"SpeedLimitVision", {PERSISTENT | BACKUP, BOOL, "0"}},
     {"VisionForceStop", {PERSISTENT | BACKUP, BOOL, "0"}},
 
-    // Per-speed offsets (stored in kph)
-    {"SpeedLimitOffsetTier1", {PERSISTENT | BACKUP, INT, "5"}},  // < 50 kph
-    {"SpeedLimitOffsetTier2", {PERSISTENT | BACKUP, INT, "10"}}, // 51 - 60 kph
-    {"SpeedLimitOffsetTier3", {PERSISTENT | BACKUP, INT, "15"}}, // 61 - 80 kph
-    {"SpeedLimitOffsetTier4", {PERSISTENT | BACKUP, INT, "20"}}, // > 80 kph
+    // Per-speed offsets, in the driver's unit (ranges: TIER_LIMITS_* in speed_limit/common.py)
+    {"SpeedLimitOffsetTier1", {PERSISTENT | BACKUP, INT, "5"}},
+    {"SpeedLimitOffsetTier2", {PERSISTENT | BACKUP, INT, "5"}},
+    {"SpeedLimitOffsetTier3", {PERSISTENT | BACKUP, INT, "5"}},
+    {"SpeedLimitOffsetTier4", {PERSISTENT | BACKUP, INT, "5"}},
+    {"SpeedLimitOffsetTier5", {PERSISTENT | BACKUP, INT, "5"}},
+    {"SpeedLimitOffsetTier6", {PERSISTENT | BACKUP, INT, "5"}},
+    {"SpeedLimitOffsetTier7", {PERSISTENT | BACKUP, INT, "5"}},
 
     // Smart Cruise Control
     {"MapTargetVelocities", {CLEAR_ON_ONROAD_TRANSITION, STRING}},

@@ -5,7 +5,6 @@ This file is part of zoompilot and is licensed under the MIT License.
 See the LICENSE.md file in the root directory for more details.
 """
 
-from openpilot.common.constants import CV
 from openpilot.selfdrive.ui.sunnypilot.mici.layouts.alpha_longitudinal import AlphaLongitudinalTogglesMici
 from openpilot.selfdrive.ui.sunnypilot.mici.widgets.button import (
   BigButtonSP,
@@ -19,6 +18,7 @@ from openpilot.system.ui.widgets.scroller import NavScroller
 from openpilot.selfdrive.ui.ui_state import ui_state
 from openpilot.system.ui.lib.application import gui_app
 from openpilot.sunnypilot.selfdrive.car.intelligent_cruise_button_management.helpers import icbm_moves_speed_limits
+from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.common import TIER_PARAMS, tier_bounds
 
 SL_MODE_LABELS = [tr("off"), tr("info"), tr("warn"), tr("assist")]
 SL_SOURCE_LABELS = [tr("car"), tr("map"), tr("car-first"), tr("map-first"), tr("combined"), tr("vision-first")]
@@ -33,14 +33,6 @@ OFFSET_FIXED = 1
 OFFSET_PERCENT = 2
 OFFSET_PER_SPEED = 3
 
-# Per-speed tiers: a limit up to each threshold (km/h) uses that tier's offset, anything above the last uses the last tier.
-# Tier offsets (SpeedLimitOffsetTier1..4) are stored in km/h and shown in mph for imperial users.
-TIER_LIMITS_KPH = (50, 60, 80)
-TIER_PARAMS = ("SpeedLimitOffsetTier1", "SpeedLimitOffsetTier2", "SpeedLimitOffsetTier3", "SpeedLimitOffsetTier4")
-
-
-def _mph(kph):
-  return round(kph * CV.KPH_TO_MPH)
 
 
 def _offset_unit():
@@ -57,39 +49,29 @@ def _offset_label(value):
   return f"{value}{unit}" if unit else tr("none")
 
 
-def _tier_label(kph_value):
-  # tier offsets are stored in km/h
-  value = kph_value if ui_state.is_metric else _mph(kph_value)
+def _tier_label(value):
   return f"{value}{speed_unit()}"
 
-def _tier_offset_label(tier, lo, hi):
-  if ui_state.is_metric:
-    unit = "km/h"
-    lower = lo
-    upper = hi
-  else:
-    unit = "mph"
-    lower = _mph(lo) if lo is not None else None
-    upper = _mph(hi) if hi is not None else None
 
-  if lower is None:
-    speed_range = f"0–{upper} {unit}"
-  elif upper is None:
-    speed_range = f">{lower} {unit}"
+def _tier_offset_label(lo, hi):
+  if lo is None:
+    speed_range = f"0–{hi} {speed_unit()}"
+  elif hi is None:
+    speed_range = f">{lo} {speed_unit()}"
   else:
-    speed_range = f"{lower + 1}–{upper} {unit}"
-
+    speed_range = f"{lo + 1}–{hi} {speed_unit()}"
   return f"{speed_range} {tr('offset')}"
 
+
 def _tier_description(lo, hi):
-  """lo/hi are the tier's km/h bounds; lo=None means 'up to hi', hi=None means 'over lo'."""
+  """lo/hi are the range's bounds in the driver's unit; lo=None means 'up to hi', hi=None means 'over lo'."""
   if lo is None:
-    rng = tr("Used when the speed limit is {} km/h ({} mph) or lower.").format(hi, _mph(hi))
+    rng = tr("Used when the speed limit is {} {} or lower.").format(hi, speed_unit())
   elif hi is None:
-    rng = tr("Used when the speed limit is over {} km/h ({} mph).").format(lo, _mph(lo))
+    rng = tr("Used when the speed limit is over {} {}.").format(lo, speed_unit())
   else:
-    rng = tr("Used when the speed limit is over {} up to {} km/h (over {} up to {} mph).").format(lo, hi, _mph(lo), _mph(hi))
-  return rng + "\n" + tr("Shown in km/h or mph to match your unit. Negative values go below the limit.")
+    rng = tr("Used when the speed limit is over {} up to {} {}.").format(lo, hi, speed_unit())
+  return rng + "\n" + tr("Negative values go below the limit.")
 
 
 class CruiseLayoutMici(NavScroller):
@@ -181,13 +163,9 @@ class CruiseLayoutMici(NavScroller):
     # single offset value is replaced by the per-tier values when the type is per speed
     self._sl_offset_value.set_visible(lambda: self._offset_type_value() != OFFSET_PER_SPEED)
 
-    tier_bounds = [(None, TIER_LIMITS_KPH[0]),
-                   (TIER_LIMITS_KPH[0], TIER_LIMITS_KPH[1]),
-                   (TIER_LIMITS_KPH[1], TIER_LIMITS_KPH[2]),
-                   (TIER_LIMITS_KPH[2], None)]
     self._sl_tier_options = []
-    for i, (param, (lo, hi)) in enumerate(zip(TIER_PARAMS, tier_bounds, strict=True), start=1):
-      option = BigParamOption(_tier_offset_label(i, lo, hi), param,
+    for param, (lo, hi) in zip(TIER_PARAMS, tier_bounds(ui_state.is_metric), strict=True):
+      option = BigParamOption(_tier_offset_label(lo, hi), param,
                               min_value=-30, max_value=30, label_callback=_tier_label, picker_unit=speed_unit,
                               description=_tier_description(lo, hi))
       option.set_visible(lambda: self._offset_type_value() == OFFSET_PER_SPEED)

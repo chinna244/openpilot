@@ -13,6 +13,7 @@ from openpilot.selfdrive.ui.sunnypilot.layouts.settings.cruise_sub_layouts.speed
 from openpilot.selfdrive.ui.ui_state import ui_state
 from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.common import Mode as SpeedLimitMode
 from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.common import OffsetType as SpeedLimitOffsetType
+from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.common import TIER_PARAMS, tier_bounds
 from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.helpers import pcm_machine_owns_sla
 from openpilot.system.ui.lib.multilang import tr
 from openpilot.system.ui.sunnypilot.widgets import get_highlighted_description
@@ -41,21 +42,6 @@ SPEED_LIMIT_OFFSET_DESCRIPTIONS = [
   tr("Per Speed: Each speed limit range has its own fixed offset [Speed Limit + Range Offset]"),
 ]
 
-# Upper bound of tiers 1-3 in the user's unit; tier 4 is everything above the last value.
-# Keep in sync with the tier lookup in speed_limit_resolver.py.
-TIER_LIMITS_METRIC = (50, 60, 80)    # km/h
-TIER_LIMITS_IMPERIAL = (30, 40, 50)  # mph
-
-# Tier boundaries are stored in km/h internally.
-# Keep these aligned with the resolver's thresholds.
-TIER_LIMITS_KPH = (50, 60, 80)
-
-TIER_PARAMS = (
-  "SpeedLimitOffsetTier1",
-  "SpeedLimitOffsetTier2",
-  "SpeedLimitOffsetTier3",
-  "SpeedLimitOffsetTier4",
-)
 
 
 class PanelType(IntEnum):
@@ -110,17 +96,10 @@ class SpeedLimitSettingsLayout(Widget):
 
     # One offset control per speed limit range.
     # The title and description dynamically follow the selected speed unit.
-    tier_bounds = [
-      (None, TIER_LIMITS_KPH[0]),
-      (TIER_LIMITS_KPH[0], TIER_LIMITS_KPH[1]),
-      (TIER_LIMITS_KPH[1], TIER_LIMITS_KPH[2]),
-      (TIER_LIMITS_KPH[2], None),
-    ]
-
     self._tier_offsets = []
-    for idx, (param, (lo, hi)) in enumerate(zip(TIER_PARAMS, tier_bounds, strict=True)):
+    for idx, param in enumerate(TIER_PARAMS):
       item = option_item_sp(
-        title=lambda lower=lo, upper=hi: self._get_tier_offset_title(lower, upper),
+        title=lambda i=idx: self._get_tier_offset_title(i),
         param=param,
         min_value=-30,
         max_value=30,
@@ -172,42 +151,28 @@ class SpeedLimitSettingsLayout(Widget):
     return f"{value} {unit}"
 
   @staticmethod
-  def _mph(kph: int) -> int:
-    from openpilot.common.constants import CV
-    return round(kph * CV.KPH_TO_MPH)
-
-  @classmethod
-  def _get_tier_offset_title(cls, lo, hi):
+  def _get_tier_offset_title(idx: int):
     """Build the tier title using the driver's selected speed unit."""
-    if ui_state.is_metric:
-      unit = tr("km/h")
-      lower = lo
-      upper = hi
-    else:
-      unit = tr("mph")
-      lower = cls._mph(lo) if lo is not None else None
-      upper = cls._mph(hi) if hi is not None else None
-
+    lower, upper = tier_bounds(ui_state.is_metric)[idx]
+    unit = tr("km/h") if ui_state.is_metric else tr("mph")
     if lower is None:
       speed_range = f"0–{upper} {unit}"
     elif upper is None:
       speed_range = f"Over {lower} {unit}"
     else:
       speed_range = f"{lower + 1}–{upper} {unit}"
-
     return f"{tr('Offset')} - {speed_range}"
 
   @staticmethod
   def _get_tier_description(idx: int):
     """Describe which speed limits this tier covers in the driver's selected unit."""
-    limits = TIER_LIMITS_METRIC if ui_state.is_metric else TIER_LIMITS_IMPERIAL
+    lower, upper = tier_bounds(ui_state.is_metric)[idx]
     unit = tr("km/h") if ui_state.is_metric else tr("mph")
-
-    if idx == 0:
-      return tr("Applies when the speed limit is 0 to {} {}.").format(limits[0], unit)
-    if idx < len(limits):
-      return tr("Applies when the speed limit is {} to {} {}.").format(limits[idx - 1] + 1, limits[idx], unit)
-    return tr("Applies when the speed limit is over {} {}.").format(limits[-1], unit)
+    if lower is None:
+      return tr("Applies when the speed limit is 0 to {} {}.").format(upper, unit)
+    if upper is None:
+      return tr("Applies when the speed limit is over {} {}.").format(lower, unit)
+    return tr("Applies when the speed limit is {} to {} {}.").format(lower + 1, upper, unit)
 
   def _update_state(self):
     super()._update_state()

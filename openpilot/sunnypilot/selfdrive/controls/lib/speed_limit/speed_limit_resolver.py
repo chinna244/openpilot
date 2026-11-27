@@ -15,7 +15,7 @@ from openpilot.common.realtime import DT_MDL
 from openpilot.sunnypilot import PARAMS_UPDATE_PERIOD, get_sanitize_int_param
 from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit import LIMIT_MAX_MAP_DATA_AGE, LIMIT_ADAPT_ACC
 from openpilot.sunnypilot.selfdrive.controls.lib.smart_cruise_control.limits import COMMIT_FRAC, OP_LONG_COAST_A, get_planning_limits
-from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.common import Policy, OffsetType
+from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.common import Policy, OffsetType, TIER_LIMITS_IMPERIAL, TIER_LIMITS_METRIC, TIER_PARAMS
 
 SpeedLimitSource = custom.LongitudinalPlanSP.SpeedLimit.Source
 
@@ -68,17 +68,6 @@ AHEAD_RAISE_GAP_S = 1.  # the ahead value missing this briefly (a mapd frame) ne
 # Held until the map gives a limit of its own, another limit ahead, the car reads a new sign, or the car is this far past it.
 # Only on a road with no limit of its own, left from a 50+ road: approaches on mapped or slow roads are unchanged (StarPilot 195d0258da)
 AHEAD_TAKE_PAST_M = 100.
-
-TIER_PARAMS = (
-  "SpeedLimitOffsetTier1",
-  "SpeedLimitOffsetTier2",
-  "SpeedLimitOffsetTier3",
-  "SpeedLimitOffsetTier4",
-)
-# upper bound of tiers 1-3 in the user's unit; tier 4 is everything above.
-# must match TIER_LIMITS_* in speed_limit_settings.py and the descriptions in cruise.yaml
-TIER_LIMITS_METRIC = (50, 60, 80)    # km/h
-TIER_LIMITS_IMPERIAL = (30, 40, 50)  # mph
 
 
 class SpeedLimitResolver:

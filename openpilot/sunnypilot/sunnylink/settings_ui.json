@@ -1052,8 +1052,8 @@
                 {
                   "key": "SpeedLimitOffsetTier1",
                   "widget": "option",
-                  "title": "Per Speed - 0\u201350 km/h (0\u201331 mph)",
-                  "description": "Applies when the speed limit is up to 50 km/h (30 mph).",
+                  "title": "Per Speed - 0\u201325 mph (0\u201340 km/h)",
+                  "description": "Applies when the speed limit is up to 25 mph (up to 40 km/h).",
                   "min": -30,
                   "max": 30,
                   "step": 1,
@@ -1073,8 +1073,8 @@
                 {
                   "key": "SpeedLimitOffsetTier2",
                   "widget": "option",
-                  "title": "Per Speed - 51\u201360 km/h (31\u201340 mph)",
-                  "description": "Applies when the speed limit is 51 to 60 km/h (31 to 40 mph).",
+                  "title": "Per Speed - 26\u201330 mph (41\u201350 km/h)",
+                  "description": "Applies when the speed limit is 26 to 30 mph (41 to 50 km/h).",
                   "min": -30,
                   "max": 30,
                   "step": 1,
@@ -1094,8 +1094,8 @@
                 {
                   "key": "SpeedLimitOffsetTier3",
                   "widget": "option",
-                  "title": "Per Speed - 61\u201380 km/h (41\u201350 mph)",
-                  "description": "Applies when the speed limit is 61 to 80 km/h (41 to 50 mph).",
+                  "title": "Per Speed - 31\u201335 mph (51\u201360 km/h)",
+                  "description": "Applies when the speed limit is 31 to 35 mph (51 to 60 km/h).",
                   "min": -30,
                   "max": 30,
                   "step": 1,
@@ -1115,8 +1115,71 @@
                 {
                   "key": "SpeedLimitOffsetTier4",
                   "widget": "option",
-                  "title": "Per Speed - >80 km/h (>50 mph)",
-                  "description": "Applies when the speed limit is over 80 km/h (over 50 mph).",
+                  "title": "Per Speed - 36\u201340 mph (61\u201370 km/h)",
+                  "description": "Applies when the speed limit is 36 to 40 mph (61 to 70 km/h).",
+                  "min": -30,
+                  "max": 30,
+                  "step": 1,
+                  "unit": {
+                    "metric": "km/h",
+                    "imperial": "mph"
+                  },
+                  "visibility": [
+                    {
+                      "type": "param_compare",
+                      "key": "SpeedLimitOffsetType",
+                      "op": ">",
+                      "value": 2
+                    }
+                  ]
+                },
+                {
+                  "key": "SpeedLimitOffsetTier5",
+                  "widget": "option",
+                  "title": "Per Speed - 41\u201345 mph (71\u201380 km/h)",
+                  "description": "Applies when the speed limit is 41 to 45 mph (71 to 80 km/h).",
+                  "min": -30,
+                  "max": 30,
+                  "step": 1,
+                  "unit": {
+                    "metric": "km/h",
+                    "imperial": "mph"
+                  },
+                  "visibility": [
+                    {
+                      "type": "param_compare",
+                      "key": "SpeedLimitOffsetType",
+                      "op": ">",
+                      "value": 2
+                    }
+                  ]
+                },
+                {
+                  "key": "SpeedLimitOffsetTier6",
+                  "widget": "option",
+                  "title": "Per Speed - 46\u201355 mph (81\u2013100 km/h)",
+                  "description": "Applies when the speed limit is 46 to 55 mph (81 to 100 km/h).",
+                  "min": -30,
+                  "max": 30,
+                  "step": 1,
+                  "unit": {
+                    "metric": "km/h",
+                    "imperial": "mph"
+                  },
+                  "visibility": [
+                    {
+                      "type": "param_compare",
+                      "key": "SpeedLimitOffsetType",
+                      "op": ">",
+                      "value": 2
+                    }
+                  ]
+                },
+                {
+                  "key": "SpeedLimitOffsetTier7",
+                  "widget": "option",
+                  "title": "Per Speed - over 55 mph (over 100 km/h)",
+                  "description": "Applies when the speed limit is over 55 mph (over 100 km/h).",
                   "min": -30,
                   "max": 30,
                   "step": 1,

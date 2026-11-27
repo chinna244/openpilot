@@ -242,8 +242,8 @@ sections:
         value: 3
     - key: SpeedLimitOffsetTier1
       widget: option
-      title: Per Speed - 0–50 km/h (0–31 mph)
-      description: Applies when the speed limit is up to 50 km/h (30 mph).
+      title: Per Speed - 0–25 mph (0–40 km/h)
+      description: Applies when the speed limit is up to 25 mph (up to 40 km/h).
       min: -30
       max: 30
       step: 1
@@ -257,8 +257,8 @@ sections:
         value: 2
     - key: SpeedLimitOffsetTier2
       widget: option
-      title: Per Speed - 51–60 km/h (31–40 mph)
-      description: Applies when the speed limit is 51 to 60 km/h (31 to 40 mph).
+      title: Per Speed - 26–30 mph (41–50 km/h)
+      description: Applies when the speed limit is 26 to 30 mph (41 to 50 km/h).
       min: -30
       max: 30
       step: 1
@@ -272,8 +272,8 @@ sections:
         value: 2
     - key: SpeedLimitOffsetTier3
       widget: option
-      title: Per Speed - 61–80 km/h (41–50 mph)
-      description: Applies when the speed limit is 61 to 80 km/h (41 to 50 mph).
+      title: Per Speed - 31–35 mph (51–60 km/h)
+      description: Applies when the speed limit is 31 to 35 mph (51 to 60 km/h).
       min: -30
       max: 30
       step: 1
@@ -287,8 +287,53 @@ sections:
         value: 2
     - key: SpeedLimitOffsetTier4
       widget: option
-      title: Per Speed - >80 km/h (>50 mph)
-      description: Applies when the speed limit is over 80 km/h (over 50 mph).
+      title: Per Speed - 36–40 mph (61–70 km/h)
+      description: Applies when the speed limit is 36 to 40 mph (61 to 70 km/h).
+      min: -30
+      max: 30
+      step: 1
+      unit:
+        metric: km/h
+        imperial: mph
+      visibility:
+      - type: param_compare
+        key: SpeedLimitOffsetType
+        op: '>'
+        value: 2
+    - key: SpeedLimitOffsetTier5
+      widget: option
+      title: Per Speed - 41–45 mph (71–80 km/h)
+      description: Applies when the speed limit is 41 to 45 mph (71 to 80 km/h).
+      min: -30
+      max: 30
+      step: 1
+      unit:
+        metric: km/h
+        imperial: mph
+      visibility:
+      - type: param_compare
+        key: SpeedLimitOffsetType
+        op: '>'
+        value: 2
+    - key: SpeedLimitOffsetTier6
+      widget: option
+      title: Per Speed - 46–55 mph (81–100 km/h)
+      description: Applies when the speed limit is 46 to 55 mph (81 to 100 km/h).
+      min: -30
+      max: 30
+      step: 1
+      unit:
+        metric: km/h
+        imperial: mph
+      visibility:
+      - type: param_compare
+        key: SpeedLimitOffsetType
+        op: '>'
+        value: 2
+    - key: SpeedLimitOffsetTier7
+      widget: option
+      title: Per Speed - over 55 mph (over 100 km/h)
+      description: Applies when the speed limit is over 55 mph (over 100 km/h).
       min: -30
       max: 30
       step: 1
