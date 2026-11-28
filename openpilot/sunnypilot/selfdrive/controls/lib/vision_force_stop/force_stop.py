@@ -117,6 +117,8 @@ class ForceStop:
     self.forcing = False
     self.from_light = False
     self.light_clear_ns = 0
+    self.from_queue = False
+    self.queue_clear_ns = 0
     self.override_until_ns = 0
     self.resume_until_ns = 0
     self.entry_speed = None
@@ -238,11 +240,18 @@ class ForceStop:
                  (horizon < SIGN_MODEL_AGREE_M or self.forcing and plausible))
     line_blocked = (self.queue_line is not None and frame.lead_present and
                     frame.lead_distance_m < self.queue_line + QUEUE_CLEAR_M)
+    # fork: the queue line needs the model to agree, as the sign path does (route 19 t=424/478: a false STOP before a
+    # signal stop armed it, and on green it forced 0 mph inside the intersection with the model's path at 98 m)
     queue_path = (self.queue_line is not None and not line_blocked and not frame.standstill and available and
-                  now >= self.override_until_ns and not frame.driving_in_curve and not turn)
+                  now >= self.override_until_ns and not frame.driving_in_curve and not turn and
+                  (horizon < SIGN_MODEL_AGREE_M or frame.model_should_stop))
     if sign_path or queue_path:
       self.sign_confirmed = True
     active = model_path or sign_path or queue_path
+    if model_path or sign_path:
+      self.from_queue = False
+    elif queue_path and not self.forcing:
+      self.from_queue = True
     if model_path:
       self.from_light = True
       self.light_clear_ns = 0
@@ -304,6 +313,20 @@ class ForceStop:
         self.light_clear_ns = 0
     else:
       self.light_clear_ns = 0
+    # fork: a stop forced by the queue line alone ends like a light's once the model shows a clear road for 0.5 s
+    queue_cleared = (not held and self.forcing and self.from_queue and not frame.standstill and available and
+                     not frame.sign and go_scene)
+    if queue_cleared:
+      if not self.queue_clear_ns:
+        self.queue_clear_ns = now
+      elif now - self.queue_clear_ns >= 500_000_000:
+        self.forcing = self.from_queue = self.sign_confirmed = force = False
+        self.timer = 0
+        self.queue_clear_ns = 0
+        self.queue_line = None
+        self.queue_sign_ns = 0
+    else:
+      self.queue_clear_ns = 0
     if self.forcing and frame.standstill and not force:
       self.override_until_ns = now + 10_000_000_000
     if driver_release and force:
@@ -346,7 +369,7 @@ class ForceStop:
         decel = SIGN_APPROACH_DECEL if frame.sign else MODEL_APPROACH_DECEL
         ceiling = math.sqrt(2 * decel * max(0, effective - tune.handoff_m))
     else:
-      self.forcing = False
+      self.forcing = self.from_queue = False
       self.entry_speed = None
       self.sign_confirmed = False
       self.ranged_stop = False

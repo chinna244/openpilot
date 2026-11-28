@@ -474,6 +474,60 @@ class ForceStopTests(unittest.TestCase):
       plan = self.owner.step(frame(tick, speed_mps=1., horizon_m=15., light=False), self.tune)
       self.assertFalse(plan.forcing)
 
+  def test_queue_line_ignored_while_model_drives_on(self):
+    # fork: route 19 t=424, a signal turned green; the model's path ran to 98 m and the queue line forced 0 mph
+    self.queue_behind_lead()
+    for tick in range(30, 60):
+      plan = self.owner.step(frame(tick, speed_mps=1. + .1 * (tick - 30), horizon_m=98., light=False), self.tune)
+      self.assertFalse(plan.forcing)
+      self.assertIsNone(plan.speed_ceiling_mps)
+
+  def test_queue_stop_released_when_model_shows_clear_road(self):
+    self.queue_behind_lead()
+    for tick in range(30, 40):
+      plan = self.owner.step(frame(tick, speed_mps=1., horizon_m=15., light=False), self.tune)
+    self.assertTrue(plan.forcing)
+    for tick in range(40, 51):
+      plan = self.owner.step(frame(tick, speed_mps=1., horizon_m=98., light=False), self.tune)
+      self.assertEqual(plan.forcing, tick < 50)
+    self.assertIsNone(self.owner.queue_line)
+    for tick in range(51, 80):
+      plan = self.owner.step(frame(tick, speed_mps=1., horizon_m=98., light=False), self.tune)
+      self.assertFalse(plan.forcing)
+
+  def test_queue_stop_kept_while_model_should_stop(self):
+    self.queue_behind_lead()
+    for tick in range(30, 60):
+      plan = self.owner.step(frame(tick, speed_mps=1., horizon_m=98., light=False, model_should_stop=True), self.tune)
+    self.assertTrue(plan.forcing)
+
+  def test_queue_stop_kept_once_the_sign_is_seen_again(self):
+    self.queue_behind_lead()
+    for tick in range(30, 40):
+      plan = self.owner.step(frame(tick, speed_mps=1., horizon_m=15., light=False), self.tune)
+    self.assertTrue(plan.forcing)
+    self.owner.step(frame(40, speed_mps=1., horizon_m=15., light=False, sign=True), self.tune)
+    for tick in range(41, 70):
+      plan = self.owner.step(frame(tick, speed_mps=1., horizon_m=98., light=False), self.tune)
+    self.assertTrue(plan.forcing)
+
+  def test_queue_stop_held_at_standstill_not_released_by_clear_road(self):
+    self.queue_behind_lead()
+    for tick in range(30, 40):
+      plan = self.owner.step(frame(tick, speed_mps=1., horizon_m=15., light=False), self.tune)
+    self.assertTrue(plan.forcing)
+    for tick in range(40, 80):
+      plan = self.owner.step(frame(tick, speed_mps=0., horizon_m=98., light=False, standstill=True), self.tune)
+      self.assertTrue(plan.manual_hold)
+
+  def test_sign_stop_not_released_by_clear_road(self):
+    for tick in range(20):
+      plan = self.owner.step(frame(tick, speed_mps=8., horizon_m=45., light=False, sign=True), self.tune)
+    self.assertTrue(plan.forcing)
+    for tick in range(20, 60):
+      plan = self.owner.step(frame(tick, speed_mps=8., horizon_m=98., light=False), self.tune)
+      self.assertTrue(plan.forcing)
+
   def test_positive_offset_keeps_stop_target_until_native_stop(self):
     for tick in range(40):
       plan = self.owner.step(frame(tick, horizon_m=12.), self.tune, 8)
