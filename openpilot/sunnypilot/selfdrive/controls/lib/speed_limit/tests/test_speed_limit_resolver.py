@@ -14,7 +14,7 @@ from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit import LIMIT_MAX_MA
 
 from openpilot.common.realtime import DT_MDL
 from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.speed_limit_resolver import SpeedLimitResolver, ALL_SOURCES, CAR_LIMIT_MIN, \
-  LAST_LIMIT_SETTLE, NEW_MAP_WAIT_S, AHEAD_RAISE_S, AHEAD_TAKE_PAST_M
+  LAST_LIMIT_SETTLE, NEW_MAP_WAIT_S, AHEAD_RAISE_S, AHEAD_TAKE_PAST_M, AHEAD_FAR_M, AHEAD_VANISH_S, DROPOUT_HOLD_MAX_M
 from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.common import Policy
 from openpilot.common.test import OpenpilotTestCase
 
@@ -183,6 +183,12 @@ def gps_sm(mocker, car_limit, map_limit, has_fix=True, fix_age=0., ahead_limit=0
   return sm_mock
 
 
+def seen_ahead(resolver, mocker, v, *args, ahead_distance=0., map_age=0., **kw):
+  """mapd showed the same limit ahead one message (1 s) earlier, from 1 s of driving further back: a limit ahead counts
+  only once mapd has kept it (AHEAD_TRACK_S)."""
+  resolver.update(v, gps_sm(mocker, *args, ahead_distance=ahead_distance + v * 1., map_age=map_age + 1., **kw))
+
+
 MAP_POLICIES = [Policy.map_data_only, Policy.map_data_priority, Policy.combined]
 UNUSABLE_FIXES = [
   ("no_fix", False, 0.),
@@ -277,6 +283,7 @@ class TestSpeedLimitResolverGpsFix(OpenpilotTestCase):
     # 150 m it takes to slow at LIMIT_ADAPT_ACC, so the next limit applies
     resolver = resolver_class()
     resolver.policy = Policy.map_data_only
+    seen_ahead(resolver, mocker, 20., 0., 15., ahead_limit=10., ahead_distance=100., map_age=2.)
     resolver.update(20., gps_sm(mocker, 0., 15., ahead_limit=10., ahead_distance=100., map_age=2.))
     assert resolver.speed_limit == 10.
     assert abs(resolver.distance - 60.) < 0.5
@@ -302,6 +309,7 @@ class TestSpeedLimitResolverGpsFix(OpenpilotTestCase):
   def test_a_lower_limit_ahead_with_no_current_limit_still_applies(self, resolver_class, mocker):
     resolver = resolver_class()
     resolver.policy = Policy.map_data_only
+    seen_ahead(resolver, mocker, 20., 0., 0., ahead_limit=10., ahead_distance=100.)
     resolver.update(20., gps_sm(mocker, 0., 0., ahead_limit=10., ahead_distance=100.))
     assert resolver.speed_limit == 10.
 
@@ -431,6 +439,7 @@ class TestSpeedLimitResolverVision(OpenpilotTestCase):
     # route 6a t=195: map 30 with 25 just ahead (already taken), car 30, camera read a school 20 -> map and car agree
     resolver = SpeedLimitResolver()
     resolver.policy = Policy.combined
+    seen_ahead(resolver, mocker, 35 * MPH, 30 * MPH, 30 * MPH, ahead_limit=25 * MPH, ahead_distance=10., vision=20 * MPH)
     resolver.update(35 * MPH, gps_sm(mocker, 30 * MPH, 30 * MPH, ahead_limit=25 * MPH, ahead_distance=10., vision=20 * MPH))
     assert resolver.source == SpeedLimitSource.map
     assert resolver.speed_limit == 25 * MPH  # the early slow-down for the limit ahead stays
@@ -439,6 +448,7 @@ class TestSpeedLimitResolverVision(OpenpilotTestCase):
     # routes 43-67 t~117: car 25, map 30 with 25 ahead, camera 30 -> the slow-down for the 25 ahead stays
     resolver = SpeedLimitResolver()
     resolver.policy = Policy.combined
+    seen_ahead(resolver, mocker, 35 * MPH, 25 * MPH, 30 * MPH, ahead_limit=25 * MPH, ahead_distance=10., vision=30 * MPH)
     resolver.update(35 * MPH, gps_sm(mocker, 25 * MPH, 30 * MPH, ahead_limit=25 * MPH, ahead_distance=10., vision=30 * MPH))
     assert resolver.source == SpeedLimitSource.map and resolver.speed_limit == 25 * MPH
 
@@ -446,6 +456,7 @@ class TestSpeedLimitResolverVision(OpenpilotTestCase):
     # no current map limit: the lower limit ahead is the map's value in the vote, as before
     resolver = SpeedLimitResolver()
     resolver.policy = Policy.combined
+    seen_ahead(resolver, mocker, 35 * MPH, 25 * MPH, 0., ahead_limit=25 * MPH, ahead_distance=10., vision=20 * MPH)
     resolver.update(35 * MPH, gps_sm(mocker, 25 * MPH, 0., ahead_limit=25 * MPH, ahead_distance=10., vision=20 * MPH))
     assert resolver.source == SpeedLimitSource.map and resolver.speed_limit == 25 * MPH
 
@@ -679,6 +690,7 @@ class TestSpeedLimitResolverMapDropout(OpenpilotTestCase):
     # route 18f t=2196: the expressway ending into a 35 street; the early slow-down stays
     v = 67 * MPH
     resolver = self._settled_map(mocker, 55 * MPH, map_limit=55 * MPH, v=v)
+    seen_ahead(resolver, mocker, v, car_limit=55 * MPH, map_limit=55 * MPH, ahead_limit=35 * MPH, ahead_distance=50.)
     self._feed(resolver, mocker, .1, v=v, car_limit=55 * MPH, map_limit=55 * MPH, ahead_limit=35 * MPH, ahead_distance=50.)
     assert resolver.speed_limit == 35 * MPH
 
@@ -769,6 +781,7 @@ class TestSpeedLimitResolverMapDropout(OpenpilotTestCase):
     # review: off-ramp, car still 55, the map's own limit just went 45 with a 30 50 m ahead -> the early 30 stays
     v = 50 * MPH
     resolver = self._settled_map(mocker, 55 * MPH, map_limit=55 * MPH, v=v)
+    seen_ahead(resolver, mocker, v, car_limit=55 * MPH, map_limit=45 * MPH, ahead_limit=30 * MPH, ahead_distance=50.)
     self._feed(resolver, mocker, .1, v=v, car_limit=55 * MPH, map_limit=45 * MPH, ahead_limit=30 * MPH, ahead_distance=50.)
     assert resolver.source == SpeedLimitSource.map and resolver.speed_limit == 30 * MPH and resolver.distance > 0.
 
@@ -777,6 +790,7 @@ class TestSpeedLimitResolverMapDropout(OpenpilotTestCase):
     v = 40 * MPH
     resolver = self._settled_map(mocker, 45 * MPH, map_limit=45 * MPH, v=v)
     self._feed(resolver, mocker, 1., v=v, car_limit=45 * MPH, map_limit=40 * MPH)
+    seen_ahead(resolver, mocker, v, car_limit=25 * MPH, map_limit=40 * MPH, ahead_limit=25 * MPH, ahead_distance=20.)
     self._feed(resolver, mocker, .1, v=v, car_limit=25 * MPH, map_limit=40 * MPH, ahead_limit=25 * MPH, ahead_distance=20.)
     assert resolver.speed_limit == 25 * MPH
 
@@ -825,6 +839,7 @@ class TestSpeedLimitResolverMapDropout(OpenpilotTestCase):
     # review 2: a 30 ahead was given at 100 m; the map's own limit goes 45 and the ahead drops: 45, not 30 at distance 0
     v = 50 * MPH
     resolver = self._settled_map(mocker, 55 * MPH, map_limit=55 * MPH, v=v)
+    seen_ahead(resolver, mocker, v, car_limit=55 * MPH, map_limit=55 * MPH, ahead_limit=30 * MPH, ahead_distance=100.)
     self._feed(resolver, mocker, .1, v=v, car_limit=55 * MPH, map_limit=55 * MPH, ahead_limit=30 * MPH, ahead_distance=100.)
     assert resolver.speed_limit == 30 * MPH and resolver.distance > 0.
     self._feed(resolver, mocker, .1, v=v, car_limit=55 * MPH, map_limit=45 * MPH)
@@ -873,6 +888,7 @@ class TestSpeedLimitResolverRampAhead(OpenpilotTestCase):
     """Off a 50 freeway (car read 50) onto a ramp whose street is 30, 200 m on (inside the braking distance)."""
     resolver = self._resolver()
     assert self._feed(resolver, mocker, NEW_MAP_WAIT_S + 4., 57, car=car, own=50) == 50
+    seen_ahead(resolver, mocker, 57 * MPH, car * MPH, 0., ahead_limit=30 * MPH, ahead_distance=200.)  # mapd kept it 1 s
     assert self._feed(resolver, mocker, DT_MDL, 57, car=car, ahead=30, ahead_m=200) == 30
     return resolver
 
@@ -915,3 +931,123 @@ class TestSpeedLimitResolverRampAhead(OpenpilotTestCase):
     assert self._feed(resolver, mocker, NEW_MAP_WAIT_S + 4., 33, car=30, own=30) == 30
     self._feed(resolver, mocker, DT_MDL, 33, car=30, ahead=25, ahead_m=30)
     assert resolver._ahead_take is None
+
+
+class TestSpeedLimitResolverAheadTrack:
+  """A limit ahead counts only once mapd has kept it (AHEAD_TRACK_S), and a source far from two that agree is left out
+  of the vote (OUTLIER_GAP). Route 00000019 t=1776: on I-94 at 80 mph mapd, blank on the freeway, matched the overpass
+  "38th Street" for one message (45 at 67 m); taken as an off-ramp's end it cut a confirmed 80 to 63."""
+
+  def _resolver(self):
+    resolver = SpeedLimitResolver()
+    resolver.policy = Policy.combined
+    resolver.update_params = lambda: None
+    return resolver
+
+  def _msg(self, resolver, v_mph, car=70., own=0., ahead=0., ahead_m=0., map_age=0., vision=0.):
+    resolver.update(v_mph * MPH, gps_sm(self.mocker, car * MPH, own * MPH, ahead_limit=ahead * MPH, ahead_distance=ahead_m,
+                                        map_age=map_age, vision=vision * MPH))
+    return round(resolver.speed_limit / MPH)
+
+  def _feed(self, resolver, seconds, v_mph, **kw):
+    for _ in range(max(1, int(seconds / DT_MDL))):
+      out = self._msg(resolver, v_mph, **kw)
+    return out
+
+  def _on_freeway_map_blank(self, mocker):
+    self.mocker = mocker
+    resolver = self._resolver()
+    assert self._feed(resolver, NEW_MAP_WAIT_S + 4., 80, own=70) == 70
+    assert self._feed(resolver, 3., 80) == 70  # mapd blank on the freeway: the 70 holds
+    return resolver
+
+  def test_an_overpass_limit_shown_once_is_not_taken(self, mocker):
+    resolver = self._on_freeway_map_blank(mocker)
+    assert self._feed(resolver, DT_MDL * 20, 80, ahead=45, ahead_m=67) == 70
+    assert resolver._ahead_take is None
+    assert self._feed(resolver, 5., 80) == 70
+
+  def test_a_limit_ahead_whose_distance_does_not_count_down_is_not_taken(self, mocker):
+    # a cross street's point, passed under at 36 m/s: 67 m, then 76 m a second later instead of ~31 m
+    resolver = self._on_freeway_map_blank(mocker)
+    self._msg(resolver, 80, ahead=45, ahead_m=67, map_age=1.)
+    assert self._msg(resolver, 80, ahead=45, ahead_m=76) == 70
+    assert resolver._ahead_take is None
+
+  def test_a_limit_ahead_kept_and_counting_down_is_taken(self, mocker):
+    resolver = self._on_freeway_map_blank(mocker)
+    v = 80 * MPH
+    self._msg(resolver, 80, ahead=45, ahead_m=120 + v, map_age=1.)
+    assert self._msg(resolver, 80, ahead=45, ahead_m=120) == 45
+
+  def test_a_far_first_sighting_counts_at_once(self, mocker):
+    # off-ramps showed their street limit from 212-480 m out (routes 1c 5546, 60 898, 85 514, 89 871)
+    resolver = self._on_freeway_map_blank(mocker)
+    assert self._msg(resolver, 56, car=55, ahead=30, ahead_m=AHEAD_FAR_M + 10.) == 30
+
+  def test_a_far_first_sighting_that_then_jumps_stops_counting(self, mocker):
+    resolver = self._on_freeway_map_blank(mocker)
+    self._msg(resolver, 80, ahead=45, ahead_m=AHEAD_FAR_M + 100., map_age=1.)
+    self._msg(resolver, 80, ahead=45, ahead_m=AHEAD_FAR_M + 100.)  # not ~36 m closer a second later
+    assert not resolver._ahead_counts(resolver._ahead_track)
+
+  def test_a_counted_limit_ahead_survives_the_last_metres_jumping(self, mocker):
+    # route 5e t=447: 9 m, then 20 m, as the car reached the on-ramp's end
+    resolver = self._on_freeway_map_blank(mocker)
+    v = 56 * MPH
+    self._msg(resolver, 56, car=55, ahead=50, ahead_m=60 + v, map_age=1.)
+    assert self._msg(resolver, 56, car=55, ahead=50, ahead_m=60) == 50
+    assert self._msg(resolver, 56, car=55, ahead=50, ahead_m=20) == 50
+
+  def test_a_taken_limit_ahead_that_vanishes_far_off_is_dropped(self, mocker):
+    resolver = self._on_freeway_map_blank(mocker)
+    assert self._msg(resolver, 70, ahead=45, ahead_m=AHEAD_FAR_M + 100.) == 45
+    assert resolver._ahead_take is not None
+    self._feed(resolver, AHEAD_VANISH_S + 0.2, 70)
+    assert resolver._ahead_take is None
+
+  def test_a_taken_far_sighting_whose_next_message_does_not_count_down_is_dropped(self, mocker):
+    resolver = self._on_freeway_map_blank(mocker)
+    assert self._msg(resolver, 70, ahead=45, ahead_m=AHEAD_FAR_M + 100., map_age=1.) == 45
+    assert self._msg(resolver, 70, ahead=45, ahead_m=AHEAD_FAR_M + 100.) == 70  # 1 s on, not ~31 m closer: not our road
+    assert resolver._ahead_take is None
+
+  def test_a_brief_gap_does_not_drop_a_taken_limit_ahead(self, mocker):
+    resolver = self._on_freeway_map_blank(mocker)
+    assert self._msg(resolver, 70, ahead=45, ahead_m=AHEAD_FAR_M + 100.) == 45
+    self._feed(resolver, AHEAD_VANISH_S - 0.5, 70)
+    assert resolver._ahead_take is not None
+
+  # OUTLIER_GAP
+
+  def test_a_camera_far_from_map_and_car_is_left_out(self, mocker):
+    # route 00000019 t=3141 (80 mph, Tri-State): camera 35 (an exit advisory), map 65, car 60 -> 65, not 35
+    self.mocker = mocker
+    resolver = self._resolver()
+    assert self._feed(resolver, NEW_MAP_WAIT_S + 4., 80, car=60, own=65, vision=35) == 65
+
+  def test_a_close_three_way_split_keeps_the_order(self, mocker):
+    # routes 74/84 school zone: car 25, map 30, camera 20 -> the camera's 20, as before
+    self.mocker = mocker
+    resolver = self._resolver()
+    assert self._feed(resolver, NEW_MAP_WAIT_S + 4., 34, car=25, own=30, vision=20) == 20
+
+  # cross street after a long map blank
+
+  def test_the_cross_match_fallback_waits_for_a_long_map_blank(self, mocker):
+    # at the start of a drive nothing has settled yet: a car-only limit is no reference for the cross-street hold
+    self.mocker = mocker
+    resolver = self._resolver()
+    self._feed(resolver, NEW_MAP_WAIT_S + 4., 50, car=55)
+    assert resolver._out_settled > 0. and resolver._map_settled == 0.
+    assert self._feed(resolver, NEW_MAP_WAIT_S + 3., 50, car=55, own=15) == 15
+
+  def test_a_cross_match_after_a_long_map_blank_waits_for_the_car(self, mocker):
+    # route 0000001a t=2714: mapd blank 92 s on the Tri-State (past DROPOUT_HOLD_MAX_M), then "I 294 EXPR" 15 at 50 mph
+    self.mocker = mocker
+    resolver = self._resolver()
+    assert self._feed(resolver, NEW_MAP_WAIT_S + 4., 50, car=55, own=55) == 55
+    self._feed(resolver, DROPOUT_HOLD_MAX_M / (50 * MPH) + 5., 50, car=55)
+    assert resolver._map_settled == 0.
+    assert self._feed(resolver, NEW_MAP_WAIT_S + 3., 50, car=55, own=15) == 55
+

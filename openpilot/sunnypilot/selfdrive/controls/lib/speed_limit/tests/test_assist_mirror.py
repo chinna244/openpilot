@@ -13,8 +13,8 @@ from openpilot.cereal import custom
 from opendbc.car.structs import car as car_struct
 from openpilot.selfdrive.car.cruise import V_CRUISE_UNSET
 from openpilot.common.realtime import DT_MDL
-from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.assist_mirror import CAP_FALL_RATE, SpeedLimitAssistMirror
-from openpilot.sunnypilot.selfdrive.selfdrived.events import EventsSP
+from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.assist_mirror import CAP_FALL_RATE, PROMPT_RESOUND_TICKS, SpeedLimitAssistMirror
+from openpilot.sunnypilot.selfdrive.selfdrived.events import EventsSP, EventNameSP
 
 SpeedLimitAssistState = custom.LongitudinalPlanSP.SpeedLimit.AssistState
 
@@ -125,3 +125,28 @@ class TestCapRamp:
     _update(mirror, self._session(30.0), v_ego=20.0, distance=0., a_ego=0.)
     _update(mirror, self._session(25.0), v_ego=20.0, distance=0., a_ego=0.)
     assert mirror.plan_v_target == pytest.approx(25.0)
+
+
+class TestPromptResound:
+  """The arbiter reopens its prompt for a new limit without a gap; the alert's sound plays only when an alert starts,
+  so a new offer in the same prompt drops the alert for PROMPT_RESOUND_TICKS (route 0000001a t=3023: "Press - for 20"
+  turned into "Press + for 70" silently)."""
+
+  def _prompting(self, mirror, offer):
+    session = custom.CarStateSP.new_message().zoompilot.cruiseSession
+    session.state = SpeedLimitAssistState.preActive
+    session.vCap = 30.
+    session.offerTarget = offer
+    events = EventsSP()
+    mirror.session = session
+    mirror.update(True, False, 25., 0., 0., 0., 0., False, 0., events)
+    return EventNameSP.speedLimitPreActive in events.names
+
+  def test_a_new_offer_drops_the_alert_then_brings_it_back(self):
+    CP = car_struct.CarParams(brand="mazda", pcmCruise=True, openpilotLongitudinalControl=True)
+    mirror = SpeedLimitAssistMirror(CP, custom.CarParamsSP(pcmCruiseSpeed=False))
+    assert self._prompting(mirror, 9.)
+    assert self._prompting(mirror, 9.)
+    gaps = [self._prompting(mirror, 31.) for _ in range(PROMPT_RESOUND_TICKS)]
+    assert not any(gaps)
+    assert self._prompting(mirror, 31.)

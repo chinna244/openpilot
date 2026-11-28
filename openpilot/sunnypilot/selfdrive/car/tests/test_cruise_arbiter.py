@@ -337,9 +337,59 @@ class TestCruiseArbiterNonPcm:
     assert self.arb.state == SpeedLimitAssistState.preActive
     assert abs(self.arb.v_cap - 55 * self.MPH) < 0.1
 
-  def test_limit_falling_announces(self):
+  def test_limit_falling_asks_and_holds(self):
+    """Every change asks, down too: route 00000019 t=1776 an unasked drop cut a confirmed 80 to 63 on I-94."""
     self.active_at(70, 65)
-    assert self.announces(70, 55)
+    v_cruise = self.v_cruise_kph
+    for _ in range(int(cruise_arbiter.LIMIT_SETTLE / DT_CTRL) + 1):
+      self.frame(70, 55)
+    assert self.arb.state == SpeedLimitAssistState.preActive
+    assert abs(self.arb.v_cap - 65 * self.MPH) < 0.1  # the confirmed target holds while asking
+    assert self.v_cruise_kph == v_cruise  # the setpoint is not lowered unasked
+
+  def test_an_unanswered_drop_changes_nothing(self):
+    self.active_at(70, 65)
+    v_cruise = self.v_cruise_kph
+    for _ in range(int((cruise_arbiter.LIMIT_SETTLE + ARBITER_PROMPT_PERIOD) / DT_CTRL) + 2):
+      self.frame(70, 55)
+    assert self.arb.state == SpeedLimitAssistState.inactive
+    assert self.v_cruise_kph == v_cruise
+
+  def test_a_confirmed_drop_applies(self):
+    self.active_at(70, 65)
+    for _ in range(int(cruise_arbiter.LIMIT_SETTLE / DT_CTRL) + 1):
+      self.frame(70, 55)
+    self.press(ButtonType.decelCruise, 70, 55)
+    assert self.arb.state == SpeedLimitAssistState.active
+    assert abs(self.arb.v_cap - 55 * self.MPH) < 0.1
+
+  def test_a_new_limit_while_asking_reopens_with_a_full_window(self):
+    """Route 0000001a t=3023: "Press - for 20" became "Press + for 70" with 2.7 s of the old window left."""
+    self.go_pre_active(cluster_mph=50, limit_mph=20)
+    for _ in range(int(3. / DT_CTRL)):
+      self.frame(50, 20)
+    for _ in range(int(cruise_arbiter.LIMIT_SETTLE / DT_CTRL) + 1):
+      self.frame(50, 70)
+    assert self.arb.state == SpeedLimitAssistState.preActive
+    assert round(self.arb._slf / self.MPH) == 70
+    assert self.arb.pre_active_timer >= int(ARBITER_PROMPT_PERIOD / DT_CTRL) - 2
+    assert self.arb._reprompts_left == REPROMPT_MAX  # still the same question budget, not re-armed past it
+
+  def test_a_dash_the_servo_walked_onto_a_new_target_changes_nothing(self):
+    """Review 2026-11-27: confirmed 80, the servo walking the dash up shows 70 when a 70 target settles. Not the
+    driver's choice: the confirmed 80 holds, and the 70 is asked once the dash moves off it."""
+    self.active_at(80, 80)
+    for _ in range(int(cruise_arbiter.LIMIT_SETTLE / DT_CTRL) + 1):
+      self.frame(70, 70)
+    assert self.arb.state == SpeedLimitAssistState.active and round(self.arb.v_cap / self.MPH) == 80
+    self.frame(75, 70)
+    assert self.arb.state == SpeedLimitAssistState.preActive and round(self.arb.v_cap / self.MPH) == 80
+
+  def test_a_new_limit_matching_the_dash_while_asking_closes_the_prompt(self):
+    self.go_pre_active(cluster_mph=50, limit_mph=40)
+    for _ in range(int(cruise_arbiter.LIMIT_SETTLE / DT_CTRL) + 1):
+      self.frame(50, 50)
+    assert self.arb.state == SpeedLimitAssistState.active
 
   def test_limit_reaching_the_setpoint_below_the_threshold_announces(self):
     """Below the confirm threshold a limit equal to the setpoint skips the prompt, but a
@@ -410,15 +460,14 @@ class TestCruiseArbiterNonPcm:
         assert round(self.arb.v_cap / self.MPH) == 25
     assert self.arb.announce_counter == before
 
-  def test_a_held_limit_change_lands_after_the_settle_period(self, monkeypatch):
+  def test_a_held_limit_change_asks_after_the_settle_period(self, monkeypatch):
     self.active_at(70, 65)
     monkeypatch.setattr(cruise_arbiter, "LIMIT_SETTLE", 2.)
-    before = self.arb.announce_counter
     for _ in range(int(2. / DT_CTRL) - 1):
       self.frame(70, 55)
-    assert round(self.arb.v_cap / self.MPH) == 65 and self.arb.announce_counter == before
+    assert self.arb.state == SpeedLimitAssistState.active and round(self.arb.v_cap / self.MPH) == 65
     self.frame(70, 55)
-    assert round(self.arb.v_cap / self.MPH) == 55 and self.arb.announce_counter == before + 1
+    assert self.arb.state == SpeedLimitAssistState.preActive and round(self.arb.v_cap / self.MPH) == 65
 
   # a prompt nobody answered asks again while the set speed and the car are still over the limit's target
 

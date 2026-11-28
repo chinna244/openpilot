@@ -68,6 +68,22 @@ AHEAD_RAISE_GAP_S = 1.  # the ahead value missing this briefly (a mapd frame) ne
 # Held until the map gives a limit of its own, another limit ahead, the car reads a new sign, or the car is this far past it.
 # Only on a road with no limit of its own, left from a 50+ road: approaches on mapped or slow roads are unchanged (StarPilot 195d0258da)
 AHEAD_TAKE_PAST_M = 100.
+# A limit ahead is used only once mapd has kept showing it, with its distance counting down as the car drives toward it.
+# Route 00000019 t=1776 (I-94, 80 mph): mapd, blank on the freeway, matched the overpass "38th Street" for one message
+# and gave its 45 at 67 m; taken as an off-ramp's end, the session cut 80 to 63. Real off-ramps (routes 1c 5546, 60 898,
+# 85 514, 89 871) show their 30 from 212-480 m out, every second, the distance falling with the car's travel.
+AHEAD_TRACK_S = 0.8       # s between the first and the latest message showing the same limit ahead (two mapd messages at 1 Hz)
+AHEAD_TRACK_TOL_M = 30.   # m a message's distance may differ from the previous one less the distance driven
+# a first sighting this far out counts at once (off-ramps 212-480 m; the overpass 67 m), until the next message: an exit's
+# gore sign (the freeway's limit, car 55 at route 1c 5545) would otherwise settle as the limit for the wait and ask "+"
+AHEAD_FAR_M = 150.
+AHEAD_VANISH_S = 2.       # s a taken limit ahead may be missing from mapd before it is dropped (not reached: not our road)
+AHEAD_VANISH_LEFT_M = 20.  # m: missing this far before reaching it
+# Combined policy: a source this far from both others, while those two are close, is a misread, not a vote: route 00000019
+# t=3141/3272 the camera read 35 (an exit advisory) at 80 mph on the Tri-State while the map said 65 and the car 60; with no
+# pair inside VOTE_TOLERANCE the order alone gave the camera's 35 ("Press - for 41").
+OUTLIER_GAP = 15 * CV.MPH_TO_MS   # m/s from each of the other two
+OUTLIER_PAIR = 6 * CV.MPH_TO_MS  # m/s the other two may differ (route 19: map 65, car 60; mapd and TSR round apart)
 
 
 class SpeedLimitResolver:
@@ -96,6 +112,8 @@ class SpeedLimitResolver:
     self._gps_location_service = get_gps_location_service(self.params)
     self.limit_solutions = {}  # Store for speed limit solutions from different sources
     self._map_vote_limit = 0.
+    # AHEAD_TRACK_S, every policy: (limit ahead, first msg ns, last msg ns, its distance, first distance)
+    self._ahead_track: tuple[float, int, int, float, float] | None = None
     self._reset_hold()
     self.distance_solutions = {}  # Store for distance to current speed limit start for different sources
 
@@ -289,9 +307,27 @@ class SpeedLimitResolver:
     self.limit_solutions[SpeedLimitSource.map] = speed_limit
     self.distance_solutions[SpeedLimitSource.map] = 0.
 
+    # AHEAD_TRACK_S: the limit ahead counts once mapd has kept it, its distance falling with the car's travel
+    msg_t = sm.logMonoTime['liveMapDataSP']
+    if next_speed_limit > 0. and (self._ahead_track is None or msg_t != self._ahead_track[2]):
+      d = map_data.speedLimitAheadDistance
+      tr = self._ahead_track
+      # once it counts, the same limit keeps counting: mapd's distance jumps by tens of metres in the last 50 m
+      # (route 5e t=447 9 -> 20 m, route 67 t=117 18 -> 33 m), and a ramp's value can miss a message or two
+      # (AHEAD_VANISH_S); a value missing longer starts over
+      same = tr is not None and abs(tr[0] - next_speed_limit) <= .1 and (msg_t - tr[2]) * 1e-9 <= AHEAD_VANISH_S + 1.
+      # until it has counted AHEAD_TRACK_S, each message must agree with the last (a far first sighting included)
+      confirmed = same and (tr[2] - tr[1]) * 1e-9 >= AHEAD_TRACK_S
+      if same and (confirmed or abs(tr[3] - self.v_ego * (msg_t - tr[2]) * 1e-9 - d) <= AHEAD_TRACK_TOL_M):
+        self._ahead_track = (tr[0], tr[1], msg_t, d, tr[4])
+      else:
+        # a new value may count at once from far away; the same value jumping about (not counting down) may not
+        self._ahead_track = (next_speed_limit, msg_t, msg_t, d, 0. if same else d)
+    tracked = next_speed_limit > 0. and self._ahead_track is not None and self._ahead_counts(self._ahead_track)
+
     # FIXME-SP: this is not working as expected
     # only a lower limit ahead is braked for early: above both, a higher one would lift the current limit before its sign
-    if 0. < next_speed_limit < self.v_ego and (speed_limit <= 0. or next_speed_limit < speed_limit):
+    if tracked and 0. < next_speed_limit < self.v_ego and (speed_limit <= 0. or next_speed_limit < speed_limit):
       adapt_time = (next_speed_limit - self.v_ego) / self._adapt_acc
       adapt_distance = self.v_ego * adapt_time + 0.5 * self._adapt_acc * adapt_time ** 2
 
@@ -308,7 +344,9 @@ class SpeedLimitResolver:
       take, car_then = self._ahead_take
       car_now = self.limit_solutions[SpeedLimitSource.car]
       self._ahead_take_left -= self.v_ego * DT_MDL
-      if (speed_limit > 0. or (next_speed_limit > 0. and abs(next_speed_limit - take) > .1) or
+      self._ahead_take_missing = self._ahead_take_missing + 1 if next_speed_limit <= 0. else 0
+      vanished = self._ahead_take_missing >= int(AHEAD_VANISH_S / DT_MDL) and self._ahead_take_left > AHEAD_VANISH_LEFT_M
+      if (speed_limit > 0. or (next_speed_limit > 0. and (abs(next_speed_limit - take) > .1 or not tracked)) or vanished or
           (car_now > 0. and abs(car_now - car_then) > VOTE_TOLERANCE) or self._ahead_take_left < -AHEAD_TAKE_PAST_M):
         self._reset_ahead_take()
       else:
@@ -338,10 +376,18 @@ class SpeedLimitResolver:
       self.limit_solutions[SpeedLimitSource.map] = self._ahead_raise
       self.distance_solutions[SpeedLimitSource.map] = 0.
 
+  @staticmethod
+  def _ahead_counts(track: tuple[float, int, int, float, float]) -> bool:
+    """AHEAD_TRACK_S: shown in messages AHEAD_TRACK_S apart, or first seen AHEAD_FAR_M or more away and every message since
+    agreeing (a message that disagrees starts the track over with no far credit)."""
+    _, first, last, _, first_d = track
+    return (last - first) * 1e-9 >= AHEAD_TRACK_S or first_d >= AHEAD_FAR_M
+
   def _reset_ahead_take(self) -> None:
     """AHEAD_TAKE_PAST_M: the (limit ahead, car's reading) when it was taken on a road with no limit, the metres still to it."""
     self._ahead_take: tuple[float, float] | None = None
     self._ahead_take_left, self._ahead_take_frame = 0., -1
+    self._ahead_take_missing = 0  # frames mapd has shown no limit ahead while one is taken
 
   def _reset_ahead_raise(self) -> None:
     """The on-ramp raise (AHEAD_RAISE_S): the ahead limit, since when, last seen, raising, the car's reading then, ended."""
@@ -354,6 +400,14 @@ class SpeedLimitResolver:
       # 2 of 3 decide: routes 45/48 the camera read 40/45 on the highway for 10-14% of the time while map and car both
       # said 55/70; the first source in order that another agrees with wins, and only with no agreement the order alone
       found = [s for s in sources if self.limit_solutions[s] > 0.]
+      if len(found) == 3:
+        # OUTLIER_GAP: one source far from both others, those two close, is left out of the vote and the order
+        for s in found:
+          a, b = (self.limit_solutions[o] for o in found if o != s)
+          if abs(a - b) <= OUTLIER_PAIR and min(abs(self.limit_solutions[s] - a), abs(self.limit_solutions[s] - b)) > OUTLIER_GAP:
+            sources = [o for o in sources if o != s]
+            found = [o for o in found if o != s]
+            break
       for source in found:
         if any(abs(self.limit_solutions[source] - self.limit_solutions[other]) <= VOTE_TOLERANCE for other in found if other != source):
           return source
@@ -398,6 +452,7 @@ class SpeedLimitResolver:
     self._out, self._out_frame, self._out_settled = 0., 0, 0.  # the limit given, since when, and the last one that held
     self._map_own, self._map_own_frame, self._map_settled = 0., 0, 0.  # the same for the map's own limit
     self._dropout_frame: int | None = None
+    self._map_cleared = False  # DROPOUT_HOLD_MAX_M cleared the map's settled limit (not the start of a drive)
     self._dropout_m = 0.
     self._dropout_limit = 0.
     self._cross: tuple[int, float, float] | None = None  # (since, the map limit waited on, the limit held)
@@ -427,6 +482,7 @@ class SpeedLimitResolver:
       self._map_own, self._map_own_frame = own, self.frame
     elif self.frame - self._map_own_frame >= settle:
       self._map_settled = own
+      self._map_cleared = False
 
     dropout = self.limit_solutions[SpeedLimitSource.map] <= 0. and self._map_settled > 0. and self._out_settled > 0.
     if not dropout:
@@ -438,6 +494,7 @@ class SpeedLimitResolver:
       self._dropout_m += self.v_ego * DT_MDL
       if self._dropout_m >= DROPOUT_HOLD_MAX_M:
         self._map_settled = 0.  # no map this far: what the sources give now stands
+        self._map_cleared = True
       elif source not in (SpeedLimitSource.map, SpeedLimitSource.none):
         usable = [s for s in self._policy_to_sources_map[Policy.combined] if self._usable_in_dropout(s)]
         if not usable:
@@ -452,8 +509,11 @@ class SpeedLimitResolver:
       since, waited_on, _ = self._cross
       if abs(own - waited_on) > .1 or (car > 0. and abs(car - own) <= VOTE_TOLERANCE) or self.frame - since >= int(CROSS_MATCH_S / DT_MDL):
         self._cross = None
-    if (self._cross is None and source == SpeedLimitSource.map and self._out_settled > 0. and 0. < own < self._map_settled - VOTE_TOLERANCE and
-        own < self.v_ego - CROSS_MATCH_GAP and abs(car - self._map_settled) <= VOTE_TOLERANCE):
+    # against the map's settled limit, or after a long map blank cleared it (DROPOUT_HOLD_MAX_M) the limit settled since:
+    # route 0000001a t=2714 the map came back after 92 s blank on the Tri-State with "I 294 EXPR" 15 at 50 mph, car 55
+    ref = self._map_settled if self._map_settled > 0. else (self._out_settled if self._map_cleared else 0.)
+    if (self._cross is None and source == SpeedLimitSource.map and self._out_settled > 0. and 0. < own < ref - VOTE_TOLERANCE and
+        own < self.v_ego - CROSS_MATCH_GAP and abs(car - ref) <= VOTE_TOLERANCE):
       self._cross = (self.frame, own, self._out_settled)
     if self._cross is not None:
       self._out = 0.

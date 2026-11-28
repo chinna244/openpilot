@@ -237,19 +237,20 @@ class TestDriverInteractions:
 
   @pytest.mark.parametrize("op_long", [False, True], ids=["stock_acc", "alpha_long"])
   @pytest.mark.parametrize("rise", [64, 75])
-  def test_unasked_drop_then_rise_never_walks_up(self, op_long, rise):
-    """A drop at highway speed applies unasked; it must lower the setpoint too, or the next rise (back to the
-    confirmed limit, or past it with the prompt ignored) walks the dash up from the drop unasked."""
+  def test_an_unanswered_drop_then_rise_never_moves_the_dash(self, op_long, rise):
+    """Every change asks, down too (route 00000019 t=1776: an unasked drop cut a confirmed 80 to 63 on I-94 from a map
+    mismatch). With nothing answered, neither the drop nor the rise after it moves the dash."""
     loop = Loop(baseline_mph=70, seed=32, op_long=op_long)
     settle_in_zone(loop, limit=64)
     loop.limit_mph = 55
-    loop.run(10.0)
-    assert loop.ecu.dash == 55 and loop.v_cruise_mph == 55, (loop.ecu.dash, loop.v_cruise_mph)
+    loop.run(3.0)
+    assert loop.sla.state == SlaState.preActive, loop.sla.state
 
+    def unmoved(lo):
+      assert lo.ecu.dash == 64, f"dash moved unasked at {lo.tick_n / 100.:.2f}s: {lo.ecu.dash}"
+    loop.run(10.0, assert_each=unmoved)
     loop.limit_mph = rise
-    def never_up(lo):
-      assert lo.ecu.dash <= 55, f"dash rose unasked at {lo.tick_n / 100.:.2f}s: {lo.ecu.dash}"
-    loop.run(25.0, assert_each=never_up)
+    loop.run(25.0, assert_each=unmoved)
 
   def test_pre_active_decline_by_opposite_press(self):
     """A release against the confirm direction declines the prompt: the session ends at

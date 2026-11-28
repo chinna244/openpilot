@@ -19,7 +19,7 @@ from openpilot.common.constants import CV
 from openpilot.common.realtime import DT_CTRL
 from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit import ACTIVE_STATES, V_CRUISE_UNSET
 from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.common import Mode
-from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.helpers import compare_cluster_target, confirm_needed_for_change, pcm_machine_owns_sla, \
+from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.helpers import compare_cluster_target, pcm_machine_owns_sla, \
   settle_conv
 
 ButtonType = car.CarState.ButtonEvent.Type
@@ -110,6 +110,7 @@ class CruiseArbiter:
     self._has_limit = False
     self._current = False  # a source has a limit now, not only the last one held
     self._raise_deferred = False  # a raise prompt waits for a current limit
+    self._match_held = False  # a new target met by a dash the servo was walking: the confirmed cap holds, asked once it moves
     self._limit_seen = (0., 0., False, False)  # the resolver's latest (speedLimit, speedLimitFinalLast, valid, current)
     self._limit_seen_frames = 0
 
@@ -221,7 +222,14 @@ class CruiseArbiter:
       self._reprompts_left = REPROMPT_MAX
       self._ignored_prompt = False
     if self._target_conv() == self._cluster_conv:
-      self._activate(from_prompt=False)  # the dash already shows the limit: nothing to confirm
+      held_conv = round(self.v_cap * self._conv) if self.v_cap < V_CRUISE_UNSET else None
+      if held_conv is None or held_conv == self._target_conv() or self._driver_dial_timer > 0:
+        self._activate(from_prompt=False)  # the dash the driver set already shows the limit: nothing to confirm
+        return
+      # a session holds another cap and the servo (a confirm's walk, a curve) has the dash on the new target: not the
+      # driver's choice. The confirmed cap stays; the new target is asked once the dash moves off it (review 2026-11-27)
+      self._match_held = True
+      self._set_state(SessionState.active)
       return
     # Preserve an active session's cap while prompting. From idle, leave the cap unset to
     # avoid round-trip error that would incorrectly classify cruise as a limiter.
@@ -238,6 +246,7 @@ class CruiseArbiter:
 
   def _activate(self, from_prompt: bool):
     self._raise_deferred = False
+    self._match_held = False
     # Announce confirmations and sessions that move the speed, not an existing match.
     self._set_state(SessionState.active, announce=from_prompt or self._speed_moves)
     # only the ICBM servo walks the dash to the target; an openpilot-owned setpoint has nothing in transit
@@ -430,28 +439,35 @@ class CruiseArbiter:
         # a target above the speed the session holds asks first, at any speed: route 00000018 14:26 raised a
         # confirmed 58 to 64 unasked
         held_conv = round(self.v_cap * self._conv) if self.v_cap < V_CRUISE_UNSET else self._cluster_conv
-        raises = self._target_conv() > held_conv
-        if self._limit_changed and (raises or confirm_needed_for_change(self._cluster_conv, self._target_conv(), self.is_metric)):
+        # every change asks, down as well as up: route 00000019 t=1776 an unasked drop cut a confirmed 80 to 63 on I-94
+        # from a map mismatch, and t=2206/2262 a 5 s camera 65 dropped 80 to 75 with only a + prompt to get back
+        if self._limit_changed and self._target_conv() != held_conv:
+          self._match_held = False
           self._enter_prompt()
-        elif self._limit_changed and self._speed_moves:
-          # Auto-apply target changes that do not require confirmation; a limit above the
-          # setpoint the car already holds changes nothing to announce.
-          self.announce_counter += 1
-        if self._limit_changed and self.state in ACTIVE_STATES and not self.op_owns_setpoint and self.target_kph < v_cruise_kph:
-          # an unasked drop lowers the ICBM setpoint too, or a later rise walks the car back up to it unasked
-          v_cruise_kph = self.target_kph
-          self.adopted_this_frame = True
+        elif self._match_held and self._target_conv() != self._cluster_conv:
+          self._match_held = False
+          if self._target_conv() != held_conv:
+            self._enter_prompt()
 
       elif self.state == SessionState.preActive:
         # a press resolves the prompt (above); the ICBM servo may walk the dash through the
         # limit for a curve meanwhile, which confirms nothing
-        if self.pre_active_timer <= 0 and any(p.cls == _PRESS_PROMPT and not p.released for p in self._press.values()):
+        if self._limit_changed and not self._press:
+          # a new limit while asking is a new question: its own full window (the alert re-sounds, assist_mirror), not the
+          # old one's remainder. Route 0000001a t=3023 "Press - for 20" became "Press + for 70" with 2.7 s left
+          self._enter_prompt()
+        elif self.pre_active_timer <= 0 and any(p.cls == _PRESS_PROMPT and not p.released for p in self._press.values()):
           # a press held across the timeout answers this prompt at its release
           for p in self._press.values():
             if p.cls == _PRESS_PROMPT and not p.released:
               p.late = True
           self._set_state(SessionState.inactive)
         elif self.pre_active_timer <= 0:
+          if self.op_owns_setpoint and self.v_cap < V_CRUISE_UNSET:
+            # an unanswered prompt changes nothing: openpilot's setpoint re-anchors to the cap held, or ending the
+            # session would release the car up to the old set speed unasked (review 2026-11-27; ICBM's dash already is it)
+            v_cruise_kph = min(v_cruise_kph, self.v_cap * CV.MS_TO_KPH)
+            self.adopted_this_frame = True
           self._set_state(SessionState.inactive)
           self._ignored_prompt = True
           self._reprompt_cooldown = int(REPROMPT_COOLDOWN / DT_CTRL)
@@ -488,10 +504,14 @@ class CruiseArbiter:
 
     # Prompts retain the previous cap; active sessions publish the current target.
     if self.state in ACTIVE_STATES:
-      self.v_cap = float(self._slf) if self._has_limit else V_CRUISE_UNSET
+      # a deferred raise or a servo-met target keeps the confirmed cap until asked
+      if not ((self._raise_deferred or self._match_held) and self.v_cap < V_CRUISE_UNSET):
+        self.v_cap = float(self._slf) if self._has_limit else V_CRUISE_UNSET
     elif self.state != SessionState.preActive:  # a prompt keeps its frozen hold
       self.v_cap = V_CRUISE_UNSET
 
+    if self.state not in ACTIVE_STATES:
+      self._match_held = False
     self._slf_prev = self._slf
     self.long_enabled_prev = long_enabled
     return v_cruise_kph

@@ -15,7 +15,8 @@ from openpilot.common.constants import CV
 from openpilot.common.params import Params
 from openpilot.common.realtime import DT_CTRL
 from openpilot.selfdrive.car.cruise import V_CRUISE_UNSET, VCruiseHelper
-from openpilot.sunnypilot.selfdrive.car.cruise_arbiter import DISABLED_GUARD_PERIOD as ARBITER_GUARD_PERIOD
+from openpilot.sunnypilot.selfdrive.car import cruise_arbiter
+from openpilot.sunnypilot.selfdrive.car.cruise_arbiter import DISABLED_GUARD_PERIOD as ARBITER_GUARD_PERIOD, PRE_ACTIVE_GUARD_PERIOD
 from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.common import Mode
 
 SpeedLimitAssistState = custom.LongitudinalPlanSP.SpeedLimit.AssistState
@@ -143,3 +144,16 @@ class TestOpLongNonPcmDismiss:
     assert arb.press_owned(ButtonType.accelCruise)
     assert not arb.adopted_this_frame
     assert h.v_cruise_kph == pytest.approx(60 * CV.MPH_TO_KPH, abs=0.05)
+
+  def test_an_unanswered_drop_keeps_the_car_at_the_cap(self):
+    """Every change asks; ignoring the prompt for a lower limit ends the session, and openpilot's setpoint re-anchors to
+    the cap held so the car does not speed back up to the old set speed unasked (review 2026-11-27)."""
+    h = self.active_session(False)
+    lp = custom.LongitudinalPlanSP()
+    lp.speedLimit.resolver.speedLimit = 40 * CV.MPH_TO_MS
+    lp.speedLimit.resolver.speedLimitFinalLast = 40 * CV.MPH_TO_MS
+    lp.speedLimit.resolver.speedLimitLastValid = lp.speedLimit.resolver.speedLimitValid = True
+    h.update_speed_limit_assist(False, lp)
+    self.frames(h, int((cruise_arbiter.LIMIT_SETTLE + PRE_ACTIVE_GUARD_PERIOD) / DT_CTRL) + 20)
+    assert not h.cruise_arbiter.session_active and not h.cruise_arbiter.prompting
+    assert h.v_cruise_kph == pytest.approx(self.LIMIT_MPH * CV.MPH_TO_KPH, abs=0.1)

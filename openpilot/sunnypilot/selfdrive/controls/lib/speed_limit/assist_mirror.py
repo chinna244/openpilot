@@ -39,6 +39,7 @@ _T_ACTIVE = float(ModelConstants.T_IDXS[CONTROL_N])
 # Local tuning (zoompilot 0.6): this driver lifting off at 15-25 mph slows at a median 0.26 m/s^2 (routes 00000097-0000016e),
 # and pressed the gas in 10 of 12 lower-zone slowdowns at 0.6. Model, lead and curve braking still win the plan min().
 CAP_FALL_RATE = 0.35  # m/s^2
+PROMPT_RESOUND_TICKS = 3  # 0.15 s at 20 Hz: longer than the prompt alert's 0.1 s duration
 
 
 class SpeedLimitAssistMirror:
@@ -57,6 +58,8 @@ class SpeedLimitAssistMirror:
     self._v_ramp: float | None = None  # the plan cap last published, walking down toward a lower cap
     self.plan_v_target = V_CRUISE_UNSET
     self._announce_seen: int | None = None  # sync on first update (plannerd restarts)
+    self._offer_seen = 0.  # the open prompt's offer last tick
+    self._resound = 0  # ticks the prompt alert stays off so a new offer in the same prompt sounds again
 
   @property
   def is_enabled(self) -> bool:
@@ -101,7 +104,18 @@ class SpeedLimitAssistMirror:
     self.output_a_target = self._a_out
 
     if self.state == SessionState.preActive:
-      events_sp.add(EventNameSP.speedLimitPreActive)
+      # the arbiter reopens its prompt for a new limit without a gap; the alert's sound plays only when it starts, so it
+      # drops out for PROMPT_RESOUND_TICKS and comes back with the new offer and its sound
+      offer = float(session.offerTarget)
+      if self._offer_seen > 0. and abs(offer - self._offer_seen) > .1:
+        self._resound = PROMPT_RESOUND_TICKS
+      self._offer_seen = offer
+      if self._resound > 0:
+        self._resound -= 1
+      else:
+        events_sp.add(EventNameSP.speedLimitPreActive)
+    else:
+      self._offer_seen, self._resound = 0., 0
 
     announce = int(session.announceCounter)
     if self._announce_seen is not None and announce != self._announce_seen:
